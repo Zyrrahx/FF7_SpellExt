@@ -15,6 +15,9 @@ game file on disk: everything happens in memory.
   by the unmodified game.
 - Fixes: MP costs above 255, damage caps, more than 256 texts in a field, and others.
 
+Every feature, change and fix, with how to see it and how far it has been confirmed in the game:
+[`docs/FEATURES_CHECKLIST.md`](docs/FEATURES_CHECKLIST.md).
+
 ## Installing (7th Heaven)
 SpellExt runs as a 7th Heaven mod beside FFNx, on the Steam 2013 release of the game (`ff7_en.exe`).
 
