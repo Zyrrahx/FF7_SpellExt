@@ -21,16 +21,17 @@ SpellExt runs as a 7th Heaven mod beside FFNx, on the Steam 2013 release of the 
 1. **Download** `FF7_SpellExt_PublicBeta.zip` from the
    [Releases](https://github.com/Zyrrahx/FF7_SpellExt/releases) page. It holds the compiled `FF7_SpellExt.dll`, its
    `mod.xml`, and the `SpellExtConfig` folder with the default `.ini` files and a readme for each.
-2. **Extract the .zip to a folder** (right-click, Extract All, or any unzip tool). The folder holds `mod.xml`,
-   `FF7_SpellExt.dll` and `SpellExtConfig/` directly.
-3. **Import that folder into 7th Heaven** with its Import Mod option, choosing the extracted folder. Do not pack it as
-   an `.iro`: the DLL and its `.ini` files must stay real files.
+2. **Extract the .zip into a folder called `SpellExt` inside 7th Heaven's `mods` folder**, so that you have
+   `7th Heaven/mods/SpellExt/mod.xml`, `7th Heaven/mods/SpellExt/FF7_SpellExt.dll` and
+   `7th Heaven/mods/SpellExt/SpellExtConfig/`.
+3. **Restart 7th Heaven** so it lists the mod. Do not use 7th Heaven's Import Mod for it: importing packs the mod into
+   an `.iro` archive, and the `.ini` files could then no longer be edited.
 4. **Tick the mod** in 7th Heaven's mod list and play. Only one SpellExt mod may be ticked at a time.
 5. **Close 7th Heaven normally** (its window's close button) after changing ticks: a forced stop loses the change.
 
 ### Configuring
-Everything is set in the `.ini` files of the mod's `SpellExtConfig` folder, inside 7th Heaven's `mods` folder (for
-example `7th Heaven/mods/<the mod's name>/SpellExtConfig/`). Open them with any text editor; each kind has its readme
+Everything is set in the `.ini` files of the mod's `SpellExtConfig` folder, inside 7th Heaven's `mods` folder
+(`7th Heaven/mods/SpellExt/SpellExtConfig/`). Open them with any text editor; each kind has its readme
 in `SpellExtConfig/Readme/`. The files are read when the game starts.
 
 - Problems are reported in `FF7_SpellExt.log`, beside `ff7_en.exe`, with the file and line number.
