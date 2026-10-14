@@ -154,8 +154,9 @@ reported in `FF7_SpellExt.log` beside `ff7_en.exe`, with the file and line.
 - [ ] **Loose files** under `SpellExtConfig/files/` (portraits, effect swaps) without touching the game's archives.
       *Played*
 - [ ] **Names too wide for a box are drawn narrower**. *Built*
-- [ ] **Patched community tools**: Makou Reactor (field Add / Remove / Check Item) and Scarlet (enemy drop, steal,
-      morph) accept item numbers up to 65534. *Played*
+- [ ] **Patched community tools**: Currently direct edits to the flevel and scene.bin are required to reference items
+      outside of the regular range of 511. This has been achieved already but I cannot share the tool edits without
+      permission (edits were made to Scarlet and Makou Reactor as they are my favored tools for these kinds of edits).
 
 ## Known limits (not in SpellExt yet)
 - Materia beyond 254 kinds (left as it is by choice).
