@@ -4,6 +4,8 @@ A DLL mod for **Final Fantasy VII** (Steam 2013 PC release, `ff7_en.exe`) that l
 driven entirely by plain text files. It runs as a 7th Heaven mod beside FFNx and Enhanced Stock UI, and changes no
 game file on disk: everything happens in memory.
 
+Expect bugs and issues not everything has been tested.
+
 ## What it adds
 - New spells, materia (up to 254 kinds), items, weapons, armour and accessories, defined in `.ini` files.
 - A wider item list: item numbers 1024-9999 and an item list of up to 510 rows.
