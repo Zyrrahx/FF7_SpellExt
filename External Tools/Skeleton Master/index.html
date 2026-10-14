@@ -33,14 +33,47 @@
   .summary span:nth-child(odd) { color:var(--dim); }
   code { background:#111318; padding:1px 4px; border-radius:3px; }
   @media (max-width: 900px) { main { grid-template-columns: 1fr; } section.wide { grid-column:auto; } }
+  /* tabs */
+  nav.tabs { display:flex; gap:4px; margin-top:10px; flex-wrap:wrap; }
+  nav.tabs button { background:transparent; border:1px solid var(--line); border-bottom-width:2px; color:var(--dim); padding:6px 14px; }
+  nav.tabs button.on { color:var(--text); border-bottom-color:var(--acc); background:#262a33; }
+  main[hidden] { display:none; }
+  /* retarget */
+  input[type=file] { max-width:100%; }
+  input[type=number] { width:72px; padding:2px 4px; } input[type=text] { padding:2px 4px; min-width:0; }
+  .col { display:flex; flex-direction:column; gap:16px; min-width:0; }
+  .files { display:grid; grid-template-columns: minmax(0,1fr) minmax(0,1fr); gap:8px 14px; }
+  .files label { display:flex; flex-direction:column; gap:3px; font-size:13px; min-width:0; }
+  .files label.wide { grid-column: 1 / 3; }
+  .views { display:grid; grid-template-columns: minmax(0,1fr) minmax(0,1fr); gap:8px; }
+  .view { position:relative; height:340px; background:#101216; border:1px solid var(--line); border-radius:4px; overflow:hidden; touch-action:none; }
+  .view canvas { display:block; }
+  .view .cap { position:absolute; left:6px; top:4px; font-size:12px; color:var(--dim); pointer-events:none; text-shadow:0 0 3px #000; }
+  .view .over { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; text-align:center; padding:16px; color:var(--dim); font-size:13px; pointer-events:none; }
+  .view .tip { position:absolute; right:6px; bottom:4px; font-size:12px; color:var(--text); background:rgba(0,0,0,.55); padding:1px 6px; border-radius:3px; pointer-events:none; }
+  .legend { font-size:12px; color:var(--dim); display:flex; flex-wrap:wrap; gap:4px 12px; margin:6px 0; }
+  .legend i { display:inline-block; width:10px; height:10px; border-radius:5px; margin-right:4px; vertical-align:-1px; }
+  .banner { background:#3a2f1c; color:#ffd59a; padding:6px 10px; border-radius:4px; font-size:13px; margin:6px 0; }
+  .grid2 { display:grid; grid-template-columns: 150px minmax(0,1fr); gap:6px 10px; align-items:center; font-size:13px; }
+  .grid2 > span:nth-child(odd) { color:var(--dim); }
+  .grid2 .row { margin:0; }
+  h3 { margin:14px 0 6px; font-size:13px; }
+  details { margin-top:12px; border-top:1px solid var(--line); padding-top:6px; } summary { cursor:pointer; color:var(--acc); }
+  .seg button.on { background:#1f4a76; border-color:#2f6aa8; }
+  .timeline { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin:8px 0; }
+  .timeline input[type=range] { flex:1 1 160px; min-width:0; }
+  .grid2 > *, #tab-retarget .msg, .view .cap { overflow-wrap:anywhere; min-width:0; }
+  @media (max-width: 700px) { .views, .files { grid-template-columns: 1fr; } .files label.wide { grid-column:auto; } .view { height:260px; } .grid2 { grid-template-columns: 1fr; } }
+  @media (max-width: 600px) { header { padding:12px 16px; } main { padding:16px; } }
 </style>
 </head>
 <body>
 <header>
   <h1>Skeleton Master <span style="color:var(--dim);font-weight:400;font-size:14px">FF7 battle animation slots</span></h1>
-  <p>Add extra animations to a battle model, with no game files changed: load the model, pick animations, download the two new files.</p>
+  <p id="tab-intro">Add extra animations to a battle model, with no game files changed: load the model, pick animations, download the two new files.</p>
+  <nav class="tabs"><button id="tab-b-add" class="on">Add slots</button><button id="tab-b-retarget">Retarget</button></nav>
 </header>
-<main>
+<main id="tab-add">
   <section>
     <h2><span class="n">1</span>Load the model</h2>
     <p class="help">Choose the model's two files together: the skeleton <code>xxaa</code> and the animations <code>xxda</code> (for Cloud: <code>rtaa</code> and <code>rtda</code>, from <code>battle.lgp</code> or the mod that supplies them). Use the files the game actually loads: a model mod (Ninostyle, for example) has its own.</p>
@@ -51,7 +84,7 @@
 
   <section>
     <h2><span class="n">2</span>Load animations to add</h2>
-    <p class="help">Any <code>xxda</code> (another model's, or this one's own), a limit pack <code>.a00</code>, or a single <code>.anim</code> saved by <code>anim_tool.py extract</code>. The animation must be made for this model's skeleton (the same number of bones). Its weapon track comes with it when the file has one.</p>
+    <p class="help">Any <code>xxda</code> (another model's, or this one's own), a limit pack <code>.a00</code>, or a single animation saved as <code>.anim</code> (one record, e.g. from the Retarget tab). The animation must be made for this model's skeleton (the same number of bones). Its weapon track comes with it when the file has one.</p>
     <div class="row"><input id="source-files" type="file" multiple></div>
     <div id="source-msg"></div>
     <div class="scroll"><table id="sources"><thead><tr><th>File</th><th>No.</th><th>Frames</th><th>Bones</th><th>Weapon</th></tr></thead><tbody></tbody></table></div>
@@ -84,6 +117,83 @@
     <p class="help"><b>Enemies</b> have no weapon tracks: their new animations are simply added after the last, up to ff. Models with 16 body + 16 weapon tracks are not handled yet.</p>
     <p class="help"><b>Testing.</b> Put the two files (and a changed <code>xxab</code>) in a mod. If the log says "ANM ERROR" or the weapon is missing during a new animation, the files do not match the model the game loads. Keep the originals.</p>
     <p class="help"><b>Other tools.</b> Model editors that read the header's second count as "weapon animations" may not understand the new files; the game does.</p>
+  </section>
+</main>
+
+<main id="tab-retarget" hidden>
+  <section>
+    <h2><span class="n">1</span>Load the files</h2>
+    <p class="help">The <b>source</b> is the model whose animations you want; the <b>target</b> is the model that will play them. Each needs its skeleton <code>xxaa</code> and its animations <code>xxda</code> (for its reference pose and weapon reference). Starting from a map? Open it in step 2 first: the list below then says which files it still needs. Files are matched to the names in a map by their base name, ignoring case and folders.</p>
+    <div class="files">
+      <label>Source skeleton (xxaa)<input id="rt-src-aa" type="file"></label>
+      <label>Source animations (xxda)<input id="rt-src-da" type="file"></label>
+      <label>Target skeleton (xxaa)<input id="rt-tgt-aa" type="file"></label>
+      <label>Target animations (xxda)<input id="rt-tgt-da" type="file"></label>
+      <label class="wide">Animations to retarget: an <code>xxda</code> (pick animations from it), a limit pack <code>.a00</code>, or a single <code>.anim</code>; several at once<input id="rt-anims" type="file" multiple></label>
+      <label class="wide">Other files a map names (optional), for example a target weapon reference kept in another <code>xxda</code><input id="rt-other" type="file" multiple></label>
+    </div>
+    <div id="rt-files-msg"></div>
+    <div id="rt-files" class="grid2"></div>
+  </section>
+
+  <section>
+    <h2><span class="n">2</span>The map: open, save, start again</h2>
+    <p class="help">A map says which bone of the target follows which bone of the source, and how. It is a text file (<code>.map</code>), the same format as <code>FF7_SpellExt/tools/maps</code>: open one to start from it, or build one in step 3. Saving writes the settings afresh: comments in an opened file are not kept.</p>
+    <div class="row">
+      <label class="row" style="margin:0">Open a .map <input id="rt-open" type="file" accept=".map,.txt"></label>
+      <button id="rt-save" class="primary">Save the map</button>
+      <button id="rt-new" title="Remove every pair and setting; the loaded files stay">New empty map</button>
+    </div>
+    <div id="rt-map-msg"></div>
+    <div id="rt-needs"></div>
+    <div id="rt-problems"></div>
+  </section>
+
+  <section>
+    <h2><span class="n">3</span>Map editor</h2>
+    <p class="help">Both skeletons stand in their reference poses. Drag to turn the view, wheel or pinch to zoom, right-drag to move. <b>Click a source bone, then a target bone</b>, to make the target bone follow it (or the other way round). Hover a bone to see its number.</p>
+    <div class="views"><div class="view" id="rt-v-src"></div><div class="view" id="rt-v-tgt"></div></div>
+    <div class="legend"><span><i style="background:#5ab0ff"></i>aim</span><span><i style="background:#7be07b"></i>follow</span><span><i style="background:#c9a0ff"></i>reach</span><span><i style="background:#ffb347"></i>picked</span><span><i style="background:#4fd1c5"></i>loose</span><span><i style="background:#ff6b9a"></i>foot</span><span><i style="background:#ffe066"></i>weapon hand</span><span><i style="background:#5d6573"></i>not used</span></div>
+    <div class="row"><label><input id="rt-all-labels" type="checkbox"> show every bone number</label><button id="rt-reset-views">Reset the views</button></div>
+    <div id="rt-banner"></div>
+    <div id="rt-pick-msg" class="help"></div>
+    <div id="rt-editor"></div>
+  </section>
+
+  <div class="col">
+    <section>
+      <h2><span class="n">4</span>Preview</h2>
+      <p class="help">The source animation plays on the source skeleton (left) and the retargeted one on the target (right). It is worked out again shortly after every change to the map. The ball and short line are the weapon track (where the weapon is held and its own Z axis), when there is one.</p>
+      <div class="row"><label>Animation <select id="rt-item" style="max-width:100%"></select></label></div>
+      <div class="views"><div class="view" id="rt-p-src"></div><div class="view" id="rt-p-tgt"></div></div>
+      <div class="timeline">
+        <button id="rt-play">Play</button>
+        <input id="rt-scrub" type="range" min="0" max="0" value="0">
+        <span id="rt-frame" class="mono">0 / 0</span>
+        <label>speed <select id="rt-fps"><option value="15">15 frames/s</option><option value="30" selected>30 frames/s</option><option value="5">5 frames/s</option></select></label>
+      </div>
+      <div id="rt-prev-msg"></div>
+    </section>
+
+    <section>
+      <h2><span class="n">5</span>Export</h2>
+      <p class="help">Download the animation shown in the preview for the target model, or send it to the Add slots tab to give it a new number on the target model. A whole limit pack is retargeted at once and keeps its name.</p>
+      <div class="row">
+        <button id="rt-dl" class="primary">Download as .anim</button>
+        <button id="rt-send">Send to Add slots</button>
+      </div>
+      <div id="rt-packs"></div>
+      <div id="rt-exp-msg"></div>
+    </section>
+  </div>
+
+  <section class="wide">
+    <h2>How retargeting works</h2>
+    <p class="help"><b>What it does.</b> Each frame of the source animation, every paired target bone takes the movement of its source bone: how far the source bone has turned away from the source's reference pose, the target bone turns away from the target's reference pose. With <b>aim</b> it is then pointed exactly where the source bone points; with <b>reach</b> it points from the model's origin to where the source bone ends. Bones without a pair keep their reference pose and ride on their parent, or swing behind it if they are loose. The model's position is the source's, scaled, and the feet keep the source's height above the floor.</p>
+    <p class="help"><b>Choosing pairs.</b> Pair bones that do the same job: chest to chest, upper arm to upper arm. Limbs are usually <b>aim</b>; a pelvis that points the other way on one model is <b>follow</b>; a bone that only carries a shoulder out from the body is <b>follow</b> or <b>reach</b>. A target with a hand where the source has none can pair the hand with the source's forearm. Check the numbers on the hover label: bone numbers differ from model to model.</p>
+    <p class="help"><b>What only your eye can judge.</b> The page measures nothing for you: hands through the body, feet sliding, a snap between frames or an odd twist must be looked for in the preview, and in the game. The preview draws the skeleton only (no model parts), so a pose that looks right as sticks can still show a gap or a crease on the model. Test in the game before you share an animation.</p>
+    <p class="help"><b>Where the results go.</b> A retargeted animation is for the target's skeleton. Add it to the target model with the Add slots tab, or use the .anim with your own tools. A limit pack (<code>.a00</code>) goes in the <code>magic</code> folder under its own name, replacing the one it was made from: keep the original.</p>
+    <p class="help"><b>Internet.</b> The 3D views use three.js, loaded from cdn.jsdelivr.net the first time (the browser keeps it afterwards). Without it the views stay empty; maps, retargeting and downloads still work, and bones can be paired by number.</p>
   </section>
 </main>
 
@@ -209,6 +319,34 @@ function refresh() {
   $('b-build').disabled = !model || !adds.length || model.kind === 'other';
 }
 refresh();
+
+/* ---------- the Retarget tab hands animations over here ---------- */
+window.SM_ADD_SLOTS = {
+  // it: { file, index, body: Uint8Array record, weapon: Uint8Array record | null }
+  addSource(it) { sources.push(it); picked = sources.length - 1; msg('source-msg', 'Received from Retarget: ' + esc(it.file) + '. Load the target model in step 1 if it is not loaded, pick a number and add it.', 'ok'); refresh(); }
+};
+
+/* ---------- tabs ---------- */
+const TAB_INTRO = {
+  add: 'Add extra animations to a battle model, with no game files changed: load the model, pick animations, download the two new files.',
+  retarget: 'Move animations from one model\'s skeleton to another\'s: load both models, pair their bones, preview, download.'
+};
+function showTab(name) {
+  ['add', 'retarget'].forEach(t => { $('tab-' + t).hidden = t !== name; $('tab-b-' + t).classList.toggle('on', t === name); });
+  $('tab-intro').textContent = TAB_INTRO[name];
+  try { history.replaceState(null, '', name === 'retarget' ? '#retarget' : '#'); } catch (e) {}
+  window.dispatchEvent(new Event('sm-tab'));
+}
+window.SM_SHOW_TAB = showTab;
+$('tab-b-add').onclick = () => showTab('add');
+$('tab-b-retarget').onclick = () => showTab('retarget');
+if (location.hash === '#retarget') showTab('retarget');
 </script>
+<!-- the Retarget tab: three.js for its 3D views (needs the internet once), the retarget core, its page logic -->
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/build/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+<script src="retarget_core.js"></script>
+<script src="ui_logic.js"></script>
+<script src="retarget_ui.js"></script>
 </body>
 </html>

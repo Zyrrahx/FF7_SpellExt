@@ -107,8 +107,10 @@ Firefox, Chrome or Edge; nothing to install.
 - [**CAMMY**](External%20Tools/CAMMY/): a battle camera editor. Shows a camera in 3D, opens any of the game's cameras
   to start from, and saves the camera files SpellExt loads (`SpellExtConfig/cameras/`). Guide:
   [`docs/Cameras_Guide.md`](docs/Cameras_Guide.md).
-- [**Skeleton Master**](External%20Tools/Skeleton%20Master/): adds extra animations to a battle model (up to about 100
-  more on a party member), keeping every existing one as it was, and tells you the script byte that plays each.
+- [**Skeleton Master**](External%20Tools/Skeleton%20Master/): two tabs. **Add slots** adds extra animations to a battle
+  model (up to about 100 more on a party member), keeping every existing one as it was, and tells you the script byte
+  that plays each. **Retarget** moves animations from one model's skeleton to another's: pair the bones in 3D, watch
+  the result, export it or give it a new slot.
 
 ## Source
 `src/spellext.c` is the whole DLL. Each hook is commented with the game addresses it works on.
