@@ -55,7 +55,9 @@ and `build/AF3DN.P` (a stand-in for the original graphics driver, for setups wit
 
 ## Configuring
 The DLL reads its settings from a `SpellExtConfig` folder next to it. `docs/ExampleConfig` holds one file of each
-kind with a commented example; `docs/Readme` explains every key. Problems are reported in `FF7_SpellExt.log`
+kind with a commented example; `docs/Readme` explains every key.
+[`docs/Spells_Guide.md`](docs/Spells_Guide.md) walks through new spells and their materia with worked examples
+(element families, statuses, summons, MP above 255, fixed damage, cameras, materia with more than five levels). Problems are reported in `FF7_SpellExt.log`
 beside `ff7_en.exe`, with the file and line number.
 
 Distribute the mod as a zipped folder, not as an `.iro`: the DLL and its `.ini` files must be real files.
