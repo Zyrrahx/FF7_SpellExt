@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Skeleton Master</title>
+<style>
+  :root { --bg:#14161b; --panel:#1d2027; --line:#2c313b; --text:#dde3ea; --dim:#8b95a3; --acc:#5ab0ff; --ok:#7be07b; --warn:#ffb347; --bad:#ff6b6b; }
+  * { box-sizing:border-box; }
+  html, body { margin:0; background:var(--bg); color:var(--text); font:14px/1.45 system-ui, sans-serif; }
+  header { padding:14px 20px; background:var(--panel); border-bottom:1px solid var(--line); }
+  header h1 { margin:0; font-size:18px; } header p { margin:4px 0 0; color:var(--dim); }
+  main { display:grid; grid-template-columns: minmax(0,1fr) minmax(0,1fr); gap:16px; padding:16px 20px; max-width:1400px; }
+  section { background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:14px; min-width:0; }
+  section.wide { grid-column: 1 / 3; }
+  h2 { margin:0 0 8px; font-size:15px; } h2 .n { color:var(--acc); margin-right:6px; }
+  .help { color:var(--dim); font-size:13px; }
+  button, select, input { font:inherit; color:var(--text); background:#262a33; border:1px solid var(--line); border-radius:4px; }
+  button { padding:5px 11px; cursor:pointer; } button:hover:not(:disabled) { border-color:var(--acc); } button:disabled { opacity:.45; cursor:default; }
+  button.primary { background:#1f4a76; border-color:#2f6aa8; }
+  .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin:8px 0; }
+  table { border-collapse:collapse; width:100%; font-size:13px; }
+  th, td { text-align:left; padding:3px 6px; border-bottom:1px solid var(--line); }
+  th { color:var(--dim); font-weight:600; }
+  td.mono, .mono { font-family:ui-monospace, monospace; }
+  .scroll { max-height:340px; overflow:auto; border:1px solid var(--line); border-radius:4px; }
+  .tag { font-size:11px; padding:1px 6px; border-radius:8px; background:#2a2f3a; color:var(--dim); white-space:nowrap; }
+  .tag.body { color:#9fd3ff; } .tag.weapon { color:#c9a0ff; } .tag.pack { color:var(--warn); } .tag.ph { color:#a0705a; } .tag.new { color:var(--ok); }
+  tr.sel { background:#1d2a3a; } tr.pick { cursor:pointer; } tr.pick:hover { background:#222833; }
+  .msg { padding:8px 10px; border-radius:4px; margin:8px 0; font-size:13px; }
+  .msg.bad { background:#3a1f22; color:#ffb4b4; } .msg.warn { background:#3a2f1c; color:#ffd59a; } .msg.ok { background:#1f3a24; color:#b8f0b8; }
+  .summary { display:grid; grid-template-columns: 170px 1fr; gap:4px 10px; font-size:13px; }
+  .summary span:nth-child(odd) { color:var(--dim); }
+  code { background:#111318; padding:1px 4px; border-radius:3px; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } section.wide { grid-column:auto; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>Skeleton Master <span style="color:var(--dim);font-weight:400;font-size:14px">FF7 battle animation slots</span></h1>
+  <p>Add extra animations to a battle model, with no game files changed: load the model, pick animations, download the two new files.</p>
+</header>
+<main>
+  <section>
+    <h2><span class="n">1</span>Load the model</h2>
+    <p class="help">Choose the model's two files together: the skeleton <code>xxaa</code> and the animations <code>xxda</code> (for Cloud: <code>rtaa</code> and <code>rtda</code>, from <code>battle.lgp</code> or the mod that supplies them). Use the files the game actually loads: a model mod (Ninostyle, for example) has its own.</p>
+    <div class="row"><input id="model-files" type="file" multiple></div>
+    <div id="model-msg"></div>
+    <div id="model-summary" class="summary"></div>
+  </section>
+
+  <section>
+    <h2><span class="n">2</span>Load animations to add</h2>
+    <p class="help">Any <code>xxda</code> (another model's, or this one's own), a limit pack <code>.a00</code>, or a single <code>.anim</code> saved by <code>anim_tool.py extract</code>. The animation must be made for this model's skeleton (the same number of bones). Its weapon track comes with it when the file has one.</p>
+    <div class="row"><input id="source-files" type="file" multiple></div>
+    <div id="source-msg"></div>
+    <div class="scroll"><table id="sources"><thead><tr><th>File</th><th>No.</th><th>Frames</th><th>Bones</th><th>Weapon</th></tr></thead><tbody></tbody></table></div>
+    <div class="row">
+      <label>Add as number <select id="target"></select></label>
+      <button id="b-add" class="primary" disabled>Add the selected animation</button>
+    </div>
+  </section>
+
+  <section class="wide">
+    <h2><span class="n">3</span>What will be added</h2>
+    <div class="scroll" style="max-height:240px"><table id="adds"><thead><tr><th>Number</th><th>Play it with</th><th>Animation</th><th>Frames</th><th>Weapon track</th><th></th></tr></thead><tbody></tbody></table></div>
+    <div id="build-msg"></div>
+    <div class="row">
+      <button id="b-build" class="primary" disabled>Build and download the two files</button>
+      <span class="help">They keep the names you loaded (e.g. <code>rtaa</code>, <code>rtda</code>). Every animation the model already has stays byte for byte as it was.</span>
+    </div>
+  </section>
+
+  <section class="wide">
+    <h2>The model's animation table</h2>
+    <p class="help"><span class="tag body">body</span> plays as the model's own animation &nbsp; <span class="tag weapon">weapon</span> the weapon track of body animation (number &minus; 34) &nbsp; <span class="tag pack">limit pack</span> numbers 2c-33: a party member's limit animations &nbsp; <span class="tag ph">placeholder</span> empty &nbsp; <span class="tag new">new</span> added here</p>
+    <div class="scroll"><table id="slots"><thead><tr><th>No.</th><th>Kind</th><th>Frames</th><th>Bones</th><th>Script byte</th></tr></thead><tbody></tbody></table></div>
+  </section>
+
+  <section class="wide">
+    <h2>How it works</h2>
+    <p class="help"><b>Why this was hard.</b> A party model has 52 body animations: 0-2b its own, 2c-33 the limit pack's. The game finds the weapon track of body animation <i>n</i> at <i>n</i>+34 (hex), so the slots after the 52 are taken by weapon tracks, and a new animation cannot simply be added at the end. The free numbers are <b>68-9b</b> and <b>d0-ff</b>; each new animation's weapon track goes 34 further on, and every slot in between is filled with the game's own placeholder. The skeleton file's header is updated so the game makes room for all of them. No DLL is needed.</p>
+    <p class="help"><b>Playing them.</b> In the model's action scripts (the <code>xxab</code> file), a byte from 00 to 8d plays that animation: numbers 68-8d are played by their own byte. Numbers above 8d are played with <code>a7 NN</code>. The table above shows the bytes for each new number. Never use 2c-33 (the limit pack) or 34-67 (weapon tracks) as body animations on a party model.</p>
+    <p class="help"><b>Enemies</b> have no weapon tracks: their new animations are simply added after the last, up to ff. Models with 16 body + 16 weapon tracks are not handled yet.</p>
+    <p class="help"><b>Testing.</b> Put the two files (and a changed <code>xxab</code>) in a mod. If the log says "ANM ERROR" or the weapon is missing during a new animation, the files do not match the model the game loads. Keep the originals.</p>
+    <p class="help"><b>Other tools.</b> Model editors that read the header's second count as "weapon animations" may not understand the new files; the game does.</p>
+  </section>
+</main>
+
+<script src="anim_core.js"></script>
+<script>
+'use strict';
+const A = window.SKELETON_MASTER;
+const $ = id => document.getElementById(id);
+const hx = A.hex;
+let model = null, modelNames = null, sources = [], picked = null, adds = [];
+
+function msg(box, text, kind) { $(box).innerHTML = text ? '<div class="msg ' + (kind || 'ok') + '">' + text + '</div>' : ''; }
+function esc(s) { return String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
+function readFile(f) { return new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(new Uint8Array(r.result)); r.onerror = () => rej(r.error); r.readAsArrayBuffer(f); }); }
+
+/* ---------- 1: the model ---------- */
+$('model-files').onchange = async e => {
+  const files = Array.from(e.target.files);
+  const aa = files.find(f => /aa$/i.test(f.name.replace(/\.[^.]*$/, ''))), da = files.find(f => /da$/i.test(f.name.replace(/\.[^.]*$/, '')));
+  if (!aa || !da) { msg('model-msg', 'Choose both files at once: the skeleton (name ending in aa, e.g. rtaa) and the animations (ending in da, e.g. rtda).', 'bad'); return; }
+  try {
+    model = A.openModel(await readFile(aa), await readFile(da));
+    modelNames = { aa: aa.name, da: da.name };
+    adds = []; picked = null;
+    const kinds = { party: 'a party member (52 body animations + weapon tracks)', enemy: 'an enemy (no weapon tracks)', other: 'a 16 + 16 enemy: not handled yet' };
+    $('model-summary').innerHTML = [['Model', esc(aa.name) + ' + ' + esc(da.name)], ['Kind', kinds[model.kind]], ['Skeleton bones', model.bones],
+      ['Animations now', model.count + ' (' + model.header[7] + ' + ' + model.header[10] + ')'], ['Free new numbers', A.freeNumbers(model, new Set()).length]]
+      .map(([k, v]) => '<span>' + k + '</span><span>' + v + '</span>').join('');
+    msg('model-msg', model.kind === 'other' ? 'This model has a layout the tool does not handle yet.' : 'Loaded.', model.kind === 'other' ? 'warn' : 'ok');
+  } catch (err) { model = null; $('model-summary').innerHTML = ''; msg('model-msg', esc(err.message), 'bad'); }
+  refresh();
+};
+
+/* ---------- 2: sources ---------- */
+$('source-files').onchange = async e => {
+  const bad = [];
+  for (const f of Array.from(e.target.files)) {
+    try { const s = A.sourceList(f.name, await readFile(f)); s.items.forEach(it => { it.file = f.name; sources.push(it); }); }
+    catch (err) { bad.push(f.name + ': ' + err.message); }
+  }
+  msg('source-msg', bad.length ? esc(bad.join(' | ')) : '', 'bad');
+  e.target.value = ''; refresh();
+};
+function renderSources() {
+  const tb = $('sources').tBodies[0]; tb.innerHTML = '';
+  sources.forEach((s, i) => {
+    const h = A.headOf(s.body), tr = document.createElement('tr'); tr.className = 'pick' + (picked === i ? ' sel' : '');
+    const fits = !model || h.bones === model.bodyBones;
+    tr.innerHTML = '<td>' + esc(s.file) + '</td><td class="mono">' + hx(s.index) + '</td><td>' + h.frames + '</td><td>' + h.bones + (fits ? '' : ' <span class="tag ph">other skeleton</span>') + '</td><td>' + (s.weapon ? A.headOf(s.weapon).frames + ' frames' : '<span class="help">none</span>') + '</td>';
+    tr.onclick = () => { picked = i; refresh(); };
+    tb.appendChild(tr);
+  });
+  if (!sources.length) tb.innerHTML = '<tr><td colspan="5" class="help">No animations loaded yet.</td></tr>';
+}
+function renderTargets() {
+  const sel = $('target'); sel.innerHTML = '';
+  if (!model) return;
+  const taken = new Set(adds.map(a => a.number));
+  A.freeNumbers(model, taken).forEach(n => sel.add(new Option(hx(n) + '  (play with ' + A.scriptBytes(n) + ')', n)));
+  const ph = A.placeholderNumbers(model).filter(n => !taken.has(n));
+  if (ph.length) { const g = document.createElement('optgroup'); g.label = 'Replace an empty slot (the old way)'; ph.forEach(n => g.appendChild(new Option(hx(n) + '  (placeholder, play with ' + A.scriptBytes(n) + ')', n))); sel.appendChild(g); }
+}
+$('b-add').onclick = () => {
+  if (!model || picked === null) return;
+  const s = sources[picked], n = Number($('target').value);
+  if (A.headOf(s.body).bones !== model.bodyBones) { msg('source-msg', 'That animation has ' + A.headOf(s.body).bones + ' bones; this model\'s have ' + model.bodyBones + '. It was made for another skeleton.', 'bad'); return; }
+  adds.push({ number: n, body: s.body, weapon: model.kind === 'party' ? s.weapon : null, label: s.file + ' ' + hx(s.index) });
+  adds.sort((a, b) => a.number - b.number);
+  msg('source-msg', ''); refresh();
+};
+
+/* ---------- 3: build ---------- */
+function renderAdds() {
+  const tb = $('adds').tBodies[0]; tb.innerHTML = '';
+  adds.forEach((a, i) => {
+    const tr = document.createElement('tr');
+    tr.innerHTML = '<td class="mono">' + hx(a.number) + '</td><td class="mono">' + A.scriptBytes(a.number) + '</td><td>' + esc(a.label) + '</td><td>' + A.headOf(a.body).frames + '</td><td>' + (model && model.kind === 'party' ? (a.weapon ? A.headOf(a.weapon).frames + ' frames, at ' + hx(a.number + A.WEAPON_OFFSET) : '<span class="help">none: the weapon is hidden</span>') : '<span class="help">enemy: none</span>') + '</td>';
+    const td = document.createElement('td'); const b = document.createElement('button'); b.textContent = 'Remove'; b.onclick = () => { adds.splice(i, 1); refresh(); }; td.appendChild(b); tr.appendChild(td);
+    tb.appendChild(tr);
+  });
+  if (!adds.length) tb.innerHTML = '<tr><td colspan="6" class="help">Nothing added yet.</td></tr>';
+}
+function download(name, bytes) {
+  const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([bytes], { type: 'application/octet-stream' })); a.download = name;
+  document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 3000);
+}
+$('b-build').onclick = () => {
+  const r = A.build(model, adds);
+  if (r.problems.length) { msg('build-msg', 'Not built:<br>' + r.problems.map(esc).join('<br>'), 'bad'); return; }
+  download(modelNames.aa, r.aa);
+  setTimeout(() => download(modelNames.da, r.da), 400);
+  const list = adds.map(a => hx(a.number) + '  play with: ' + A.scriptBytes(a.number) + '   (' + a.label + ', ' + A.headOf(a.body).frames + ' frames)').join('\n');
+  setTimeout(() => download(modelNames.da + '_added.txt', new TextEncoder().encode(modelNames.aa + ' / ' + modelNames.da + ': ' + r.count + ' animations (was ' + model.count + ')\n\n' + list + '\n' + (r.notes.length ? '\nNotes:\n' + r.notes.join('\n') + '\n' : ''))), 800);
+  msg('build-msg', 'Built: ' + r.count + ' animations (was ' + model.count + '). Downloaded ' + esc(modelNames.aa) + ', ' + esc(modelNames.da) + ' and a list of the new numbers.' + (r.notes.length ? '<br>' + r.notes.map(esc).join('<br>') : ''), r.notes.length ? 'warn' : 'ok');
+};
+
+/* ---------- the table ---------- */
+function renderSlots() {
+  const tb = $('slots').tBodies[0]; tb.innerHTML = '';
+  if (!model) { tb.innerHTML = '<tr><td colspan="5" class="help">Load a model first.</td></tr>'; return; }
+  const party = model.kind === 'party', byNum = new Map(adds.map(a => [a.number, a]));
+  const weaponOf = new Map(); if (party) adds.forEach(a => weaponOf.set(a.number + A.WEAPON_OFFSET, a));
+  let last = model.count - 1; adds.forEach(a => { last = Math.max(last, a.number + (party ? A.WEAPON_OFFSET : 0)); });
+  for (let i = 0; i <= last; i++) {
+    let kind, frames = '', bones = '', bytes = '';
+    if (byNum.has(i)) { const a = byNum.get(i); kind = '<span class="tag new">new: ' + esc(a.label) + '</span>'; frames = A.headOf(a.body).frames; bones = A.headOf(a.body).bones; bytes = A.scriptBytes(i); }
+    else if (weaponOf.has(i)) { const a = weaponOf.get(i); kind = '<span class="tag new">new weapon track of ' + hx(a.number) + '</span>'; frames = a.weapon ? A.headOf(a.weapon).frames : 1; bones = 1; }
+    else if (i < model.count) {
+      const r = model.records[i], h = A.headOf(r); frames = h.frames; bones = h.bones;
+      if (party && i >= 0x2c && i < 0x34) kind = '<span class="tag pack">limit pack (placeholder in the file)</span>';
+      else if (A.isWeaponSlot(model, i)) kind = '<span class="tag weapon">weapon of ' + hx(i - A.WEAPON_OFFSET) + '</span>';
+      else if (A.isDummy(r)) { kind = '<span class="tag ph">placeholder</span>'; bytes = A.scriptBytes(i); }
+      else { kind = '<span class="tag body">body</span>'; bytes = A.scriptBytes(i); }
+    } else { kind = '<span class="tag ph">placeholder (will be added)</span>'; frames = 1; }
+    const tr = document.createElement('tr');
+    tr.innerHTML = '<td class="mono">' + hx(i) + '</td><td>' + kind + '</td><td>' + frames + '</td><td>' + bones + '</td><td class="mono">' + bytes + '</td>';
+    tb.appendChild(tr);
+  }
+}
+function refresh() {
+  renderSources(); renderTargets(); renderAdds(); renderSlots();
+  $('b-add').disabled = !model || picked === null || model.kind === 'other' || !$('target').options.length;
+  $('b-build').disabled = !model || !adds.length || model.kind === 'other';
+}
+refresh();
+</script>
+</body>
+</html>

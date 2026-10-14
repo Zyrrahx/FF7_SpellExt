@@ -1,0 +1,47 @@
+; Camera 195 (new): Yuria's sniper limit (3-2). Version 3: it no longer looks over her shoulder: it stands well back behind her, with her whole
+; body and the enemy both in view, and goes back to the battle's view from there. Version 2: it stays on her longer and further out (in version 1 only her head
+; could be seen as she reached over her shoulder, and it left her too soon); the swing behind her comes later.
+; Close on her at first, then out a little so her whole body is in view; as she takes the rifle and brings it
+; to her shoulder the camera swings round behind her, looking past her at the enemy; on the shot it goes back
+; to the battle's own view, the enemy in sight all the way.
+; The camera starts with her animation (frame 0 = she starts to holster):
+;   0-10 holsters   10-26 reaches over her shoulder   27 the rifle is in her hand   27-43 brings it to her shoulder
+;   43-61 settles on the sight   63 FIRES   66 the recoil's end   83-99 puts it back   113-128 draws the pistol
+; Offsets: x sideways (+ is her outside when she stands in the third place), y up when negative, z toward
+; the enemies when negative for her (so + is behind her).
+
+camera = 195
+
+[variant 0 1 2 position]
+dc                          ; (lock on)
+f0 0 350 -560 -650          ; jump to attacker: close in front of her, at head height
+f5 8
+f4
+e4 0 800 -430 -2200 12      ; 8-20: out: her whole body in view with room above for the raised arm
+f5 30
+f4                          ; held on her through the reach and the taking of the rifle (to 38)
+e4 0 1900 -620 100 10       ; 38-48: round her outside as the rifle comes down to her shoulder ...
+f5 10
+f4
+e4 0 900 -950 2700 12       ; 48-60: ... to well behind her and above: her whole body near, the enemy beyond
+f5 15
+f4                          ; there for the last of the aim (to 63)
+e2 26                       ; 63-89: the shot: back to the battle's own view
+f5 26
+f4
+ff
+
+[variant 0 1 2 focus]
+f9 0 0 -520 0               ; jump to attacker: her head and shoulders
+f5 8
+f4
+e4 0 0 -400 0 12            ; 8-20: her middle, a little high, as the view opens to her whole body
+f5 30
+f4                          ; on her to 38
+e4 0 0 -380 -1300 22        ; 38-60: to a point between her and the enemy, so both stay in view
+f5 37
+f4                          ; held between them through the shot and the first of the way back (to 75)
+e2 14                       ; 75-89: to the battle view's own aim
+f5 14
+f4
+ff

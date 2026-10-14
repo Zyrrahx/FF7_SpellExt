@@ -1,0 +1,46 @@
+; Camera 194 (new): Yuria's grenade limit. Version 2.
+; On Yuria until the grenade leaves her hand; then out wide, her near and the enemies beyond, for the flight,
+; the explosion and the hits; back to the battle's own view as she draws her pistol.
+; The camera starts with her animation (frame 0 = she starts to holster):
+;   0-14 holsters   17 the grenade is in her hand   17-28 brings it up   28-40 pulls the pin   58-66 winds up
+;   70 lets go (it flies 20 frames)   90 the explosion   110 the hits   100-118 draws the pistol
+; Offsets: x sideways (+ is her outside when she stands in the third place), y up when negative, z toward
+; the enemies when negative for her (so + is behind her).
+
+camera = 194
+
+[variant 0 1 2 position]
+df                          ; target = whole group
+dc                          ; (lock on)
+f0 0 550 -330 -1300         ; jump to attacker: in front of her and to her outside
+f5 28
+f4
+e4 0 380 -330 -900 12       ; 28-40: in closer for the pin
+f5 26
+f4
+e4 0 620 -420 -1500 10      ; 54-64: back a little, to hold her whole wind-up and throw
+f5 16
+f4
+e4 0 5200 -1300 2400 12     ; 70-82: the grenade is away: out wide to her side and behind, her near, the enemies beyond
+f5 30
+f4
+e2 18                       ; 100: back to the battle's own view as she draws
+f5 18
+f4
+ff
+
+[variant 0 1 2 focus]
+df                          ; target = whole group
+f9 0 0 -280 0               ; jump to attacker: her chest and hands (kept on her until she lets go)
+f5 54
+f4
+e4 0 0 -360 0 10            ; 54-64: a little higher, for the raised arm
+f5 16
+f4
+e4 0 0 -350 -1100 12        ; 70-82: a point between her and the enemies
+f5 30
+f4
+e2 18
+f5 18
+f4
+ff

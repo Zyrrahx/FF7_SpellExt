@@ -1,0 +1,33 @@
+; Camera 191 (new; no attack of the game's uses this number): Rapid Fire. Version 3 of the shot first tried on camera 4e.
+; In front of the attacker while she reloads, round behind her shoulder as she levels the pistol, and
+; behind her, easing back a little, while the shots go off.
+; Timing against Rapid Fire, counting from the start of the reload: reload 0-25, pistol levelled 26-33,
+; first shot 34, last shot 67.
+; x is sideways along the party's line: with her in the third place, -700 put the camera behind the
+; middle member (version 2). Small x keeps it behind HER whichever place she stands in.
+
+camera = 191
+
+[variant 0 1 2 position]
+df                          ; target = whole group        (as the game's own 4e begins)
+dc                          ; (lock on)                   (as the game's own 4e begins)
+f0 0 700 -300 -1400         ; jump to attacker  bone 0: in front of her
+f5 18                       ; set wait  frames 18
+f4                          ; wait
+e4 0 150 -450 2100 14       ; glide to attacker  bone 0: straight behind her, a little to the outside, there by frame 32
+f5 14                       ; set wait  frames 14
+f4                          ; wait
+e4 0 200 -550 2500 50       ; glide to attacker  bone 0: eases back and up a little during the shots
+f5 50                       ; set wait  frames 50
+f4                          ; wait
+ff                          ; end
+
+[variant 0 1 2 focus]
+df                          ; target = whole group
+f9 0 0 -500 0               ; jump to attacker  bone 0, y -500
+f5 18                       ; set wait  frames 18
+f4                          ; wait
+e5 0 0 -500 0 14            ; glide to target  bone 0, y -500, frames 14
+f5 14                       ; set wait  frames 14
+f4                          ; wait
+ff                          ; end

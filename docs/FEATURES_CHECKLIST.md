@@ -130,7 +130,9 @@ reported in `FF7_SpellExt.log` beside `ff7_en.exe`, with the file and line.
 - [ ] **More than 256 texts in one field**. *Played*
 - [ ] **Shop additions** (`FF7_SpellExt_Shops.ini`): up to 32 entries a shop, items and materia (`m98`); the buy list
       scrolls. *Played*
-- [ ] **Field patches** shipped as FFNx chunk files (`base/flevel.lgp/`), no archive changed. *Played*
+- [ ] **Field patches** shipped as FFNx chunk files (`field_game/flevel.lgp/`), no archive changed. *Played*
+- [ ] **A New Threat 2.0 variant of the field patches** (`field_newthreat/flevel.lgp/`), chosen by the mod's "New Threat
+      fields" tick instead of the plain game's. *Built (her joining scene so far)*
 - [ ] **New characters' entities added to any field at load**, so they can be seated anywhere. *Played*
 
 ## 10. Saving
@@ -157,6 +159,9 @@ reported in `FF7_SpellExt.log` beside `ff7_en.exe`, with the file and line.
 - [ ] **Patched community tools**: Currently direct edits to the flevel and scene.bin are required to reference items
       outside of the regular range of 511. This has been achieved already but I cannot share the tool edits without
       permission (edits were made to Scarlet and Makou Reactor as they are my favored tools for these kinds of edits).
+
+- [ ] **External Tools** (browser pages in `External Tools/`): CAMMY, a 3D battle camera editor; Skeleton Master,
+      extra animation slots for battle models. *CAMMY used; Skeleton Master built, not yet tried in the game*
 
 ## Known limits (not in SpellExt yet)
 - Materia beyond 254 kinds (left as it is by choice).

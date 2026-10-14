@@ -1,0 +1,38 @@
+; Camera 192 (new): Graceful Waters. Version 3.
+; Starts on Yuria, pulls out to face the whole party (every effect of this limit is on the party), holds
+; there, and from the Barrier effect on glides back to the battle's own view.
+; The camera starts with her animation (frame 0 = she starts to holster):
+;   0-10 holsters   10-33 the cast (hand thrown 28-33)   35 Clear Tranquil's water on the party
+;   78-88 left hand goes up   96 the recoil   97 Barrier   128-146 draws the pistol
+; "target" here is the limit's target, the party as a group (df), so the offsets of the second shot are
+; from the middle of the party: z negative is out in front of them (toward the enemies), y negative up.
+
+camera = 192
+
+[variant 0 1 2 position]
+df                          ; target = whole group
+dc                          ; (lock on)
+f0 0 420 -320 -1500         ; jump to attacker: in front of her and a little to her outside
+f5 12
+f4
+e5 0 900 -2600 -9000 20     ; 12-32: out to in front of the party, high enough to see over the enemies
+                            ;        (v2 was 900 -1500 -4200: only the middle member was in view)
+f5 85
+f4
+e2 36                       ; 97: Barrier; back to the battle's own view
+f5 36
+f4
+ff
+
+[variant 0 1 2 focus]
+df                          ; target = whole group
+f9 0 0 -250 0               ; jump to attacker: her face
+f5 12
+f4
+e5 0 0 -350 0 20            ; to the middle of the party
+f5 85
+f4
+e2 36                       ; to the battle's own view
+f5 36
+f4
+ff

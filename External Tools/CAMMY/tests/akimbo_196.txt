@@ -1,0 +1,42 @@
+; Camera 196 (new): Yuria's Akimbo limit (4-1). Version 1.
+; Her whole body from the front as she turns to the enemy and raises her pistol; down and in toward her hip as
+; her other hand goes for the second pistol; up and back as it comes round beside the first, to hold her in the
+; two-handed stance; then back to the battle's own view.
+; The camera starts with her animation (frame 0 = the limit's effect step):
+;   1-13 turns to face the enemy, raises her own pistol   3-12 her left hand goes to her left hip
+;   15 the second pistol leaves its holster   15-29 it comes up, out to her left and round   36 the stance
+; Offsets: x sideways (+ is her outside when she stands in the third place), y up when negative, z toward
+; the enemies when negative for her (so + is behind her).
+
+camera = 196
+
+[variant 0 1 2 position]
+dc                          ; (lock on)
+f0 0 500 -430 -1700         ; jump to attacker: in front of her and a little to her outside, her whole body in view
+f5 4
+f4
+e4 0 650 -280 -1050 10      ; 4-14: lower and closer, at the height of her hips, as her hand goes down for the pistol
+f5 12
+f4                          ; there for the draw (15)
+e4 0 380 -500 -1500 12      ; 16-28: up and out again as the pistol comes round: both arms and the stance in view
+f5 22
+f4                          ; held on the stance (to 38)
+e2 22                       ; 38-60: back to the battle's own view
+f5 22
+f4
+ff
+
+[variant 0 1 2 focus]
+f9 0 0 -400 0               ; jump to attacker: her chest
+f5 4
+f4
+e4 0 0 -260 0 10            ; 4-14: down to her hips and the hand at the holster
+f5 12
+f4
+e4 0 0 -460 -120 12         ; 16-28: up to her hands, a little ahead of her: the two pistols
+f5 22
+f4
+e2 22                       ; 38-60: to the battle view's own aim
+f5 22
+f4
+ff

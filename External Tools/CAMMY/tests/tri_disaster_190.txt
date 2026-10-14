@@ -1,0 +1,44 @@
+; Camera 190 (new; no attack of the game's uses this number): Tri Disaster. Version 4 (the animation ends at 120 again: no pistol spin).
+; Offsets from the attacker are x sideways along the party's line (+ is her outside when she stands in the
+; third place), y up when negative (0 is her waist; her face is about -260), z toward the enemies when
+; negative. Keep what must be seen within about 15 degrees of the line of sight.
+; Timing: the camera starts WITH her animation (frame 0 = she starts to holster), not with the aura before
+; it: in versions 1 and 2, timed for a start 25 frames earlier, the side view arrived after the ice.
+;   0-14 holsters   12-22 stance   24-32 arms up   41 fire   53 ice   75 lightning
+;   106 hand to the hip   114 the pistol leaves the holster   120 the end
+
+camera = 190
+
+[variant 0 1 2 position]
+df                          ; target = whole group
+dc                          ; (lock on)
+f0 0 250 -290 -1100         ; jump to attacker: in front of her
+f5 8
+f4
+e4 0 100 -280 -430 8        ; 1. quickly in to her face (there at 8), held while she holsters
+f5 13
+f4
+e4 0 5200 -1300 2400 12     ; 2. out to the side and back, 13-25: her near, the enemies beyond
+f5 12
+f4
+f5 75                       ; 3. hold, 25-100 (fire 41, ice 53, lightning 75 and its bolt)
+f4
+e2 20                       ; 4. glide to the battle's own view of the party and the enemies
+f5 20
+f4
+ff
+
+[variant 0 1 2 focus]
+df                          ; target = whole group
+f9 0 0 -260 0               ; jump to attacker: her face
+f5 13
+f4
+e4 0 0 -350 -1100 12        ; 2. to a point in front of her, toward the enemies
+f5 12
+f4
+f5 75                       ; 3. hold
+f4
+e2 20                       ; 4. to the battle's own view
+f5 20
+f4
+ff

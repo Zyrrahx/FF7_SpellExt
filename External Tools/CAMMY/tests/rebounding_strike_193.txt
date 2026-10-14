@@ -1,0 +1,44 @@
+; Camera 193 (new): Rebounding Strike. Version 4: after the beam strikes the camera stays where it is, by the
+; target, and turns to look back at her; then it glides slowly to the battle's own view, target and her in view.
+; The camera starts with her animation (frame 0 = she starts to holster):
+;   0-10 holsters   10-18 drops toward the crouch   18-22 the Somersault's wind-up   23-32 she leaps and goes over
+;   30 the beam leaves her, her leg coming over (it strikes about frame 38)   33-42 lands, crouched   42-52 rises
+;   66-85 draws
+; Offsets: x sideways (+ is her outside when she stands in the third place), y up when negative, z toward
+; the enemies when negative for her / toward the party's side when positive for the target.
+
+camera = 193
+
+[variant 0 1 2 position]
+dc                          ; (lock on)
+f0 0 650 -330 -1600         ; jump to attacker: in front of her and to her outside
+f5 15
+f4
+e4 0 1100 -650 -2500 9      ; 15-24: back and up, to hold the whole leap (she goes about 500 up and 450 forward)
+f5 16
+f4
+e5 0 1600 -650 1500 7       ; 31-38: round to the target's side as the beam strikes (38)
+f5 22
+f4                          ; stays there while the view turns to her (the focus, 43-53)
+e2 34                       ; 53-87: slowly back to the battle's own view
+f5 34
+f4
+ff
+
+[variant 0 1 2 focus]
+f9 0 0 -300 0               ; jump to attacker
+f5 15
+f4
+e4 0 0 -480 -250 9          ; a little above and ahead of her: where the leap goes
+f5 16
+f4
+e5 0 0 -350 0 7             ; the target
+f5 12
+f4
+e4 0 0 -300 -1200 10        ; 43-53: toward her, a little to the enemies' side of her so the target stays in view
+f5 19
+f4
+e2 25                       ; 62-87: to the battle view's own aim
+f5 25
+f4
+ff

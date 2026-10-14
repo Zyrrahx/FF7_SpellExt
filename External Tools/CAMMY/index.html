@@ -1,0 +1,677 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CAMMY - FF7 Camera Tool</title>
+<style>
+  :root { --bg:#14161b; --panel:#1d2027; --line:#2c313b; --text:#dde3ea; --dim:#8b95a3; --acc:#5ab0ff; --pos:#ffb347; --foc:#7be07b; --bad:#ff6b6b; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--text); font:13px/1.35 system-ui, sans-serif; }
+  #app { display:grid; grid-template-columns: 1fr 470px; grid-template-rows: 40px 1fr 92px; height:100%; }
+  header { grid-column: 1 / 3; display:flex; gap:6px; align-items:center; padding:0 10px; background:var(--panel); border-bottom:1px solid var(--line); }
+  header .title { font-weight:700; letter-spacing:.5px; margin-right:12px; }
+  header .title span { color:var(--acc); }
+  button, select, input { font:inherit; color:var(--text); background:#262a33; border:1px solid var(--line); border-radius:4px; }
+  button { padding:4px 9px; cursor:pointer; } button:hover { border-color:var(--acc); }
+  input[type=number] { width:74px; padding:2px 4px; } input[type=text] { padding:2px 4px; }
+  #view { position:relative; overflow:hidden; }
+  #view canvas { display:block; }
+  #preview-frame { position:absolute; right:10px; bottom:10px; border:2px solid var(--acc); pointer-events:none; }
+  #preview-label { position:absolute; right:14px; bottom:12px; font-size:11px; color:var(--acc); background:rgba(0,0,0,.5); padding:1px 5px; pointer-events:none; }
+  #legend { position:absolute; left:10px; top:10px; font-size:12px; background:rgba(0,0,0,.45); padding:6px 8px; border-radius:4px; pointer-events:none; }
+  #legend b.p { color:var(--pos); } #legend b.f { color:var(--foc); }
+  #side { grid-row: 2 / 4; grid-column: 2; background:var(--panel); border-left:1px solid var(--line); display:flex; flex-direction:column; min-height:0; }
+  .tabs { display:flex; border-bottom:1px solid var(--line); }
+  .tabs button { flex:1; border:0; border-radius:0; background:transparent; padding:8px; color:var(--dim); }
+  .tabs button.on { color:var(--text); border-bottom:2px solid var(--acc); }
+  .pane { display:none; overflow:auto; padding:10px; flex:1; min-height:0; }
+  .pane.on { display:block; }
+  h3 { margin:12px 0 6px; font-size:13px; } h3.p { color:var(--pos); } h3.f { color:var(--foc); }
+  .row { display:flex; flex-wrap:wrap; gap:4px; align-items:center; padding:5px 6px; margin-bottom:3px; border:1px solid var(--line); border-radius:4px; background:#20242c; }
+  .row.active { border-color:var(--acc); background:#1d2a3a; }
+  .row.sel { outline:1px dashed var(--dim); }
+  .row select.op { flex:1 1 210px; min-width:0; }
+  .row .args { display:flex; flex-wrap:wrap; gap:4px 8px; width:100%; }
+  .row .args label { display:flex; gap:3px; align-items:center; color:var(--dim); font-size:12px; }
+  .row .tools { display:flex; gap:2px; } .row .tools button { padding:1px 6px; }
+  .row .note { width:100%; color:var(--dim); font-size:11px; }
+  .row .at { font-size:11px; color:var(--dim); min-width:58px; text-align:right; }
+  .row .at.never { color:#a0705a; }
+  .row .drag { font-size:11px; color:var(--acc); }
+  .row:not(.sel) { cursor:pointer; }
+  table.ref { border-collapse:collapse; width:100%; font-size:12px; }
+  table.ref td { border-bottom:1px solid var(--line); padding:3px 4px; vertical-align:top; }
+  table.ref td:first-child { font-family:ui-monospace, monospace; color:var(--acc); }
+  .bar { display:flex; gap:6px; flex-wrap:wrap; margin:6px 0; }
+  .help { color:var(--dim); font-size:12px; }
+  .grid { display:grid; grid-template-columns: 110px 1fr; gap:6px 8px; align-items:center; }
+  textarea { width:100%; height:calc(100% - 40px); min-height:300px; background:#111318; color:var(--text); border:1px solid var(--line); border-radius:4px; font:12px/1.4 ui-monospace, monospace; padding:8px; }
+  #timeline { grid-column:1; display:flex; flex-direction:column; gap:4px; padding:8px 12px; background:var(--panel); border-top:1px solid var(--line); }
+  #timeline .top { display:flex; gap:8px; align-items:center; }
+  #scrub { flex:1; }
+  #events { position:relative; height:16px; }
+  #events span { position:absolute; top:0; font-size:10px; color:var(--dim); white-space:nowrap; }
+  #msg { margin-left:auto; color:var(--dim); max-width:50%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  #msg.bad { color:var(--bad); }
+  .problems { color:var(--bad); font-size:12px; }
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <div class="title">CAMMY <span>FF7 Camera Tool</span></div>
+    <button id="b-new" title="A new camera">New</button>
+    <button id="b-open" title="Open a SpellExt camera .txt">Open .txt</button>
+    <button id="b-camdat" title="Open the game's camdat0/1/2.bin and take one of its cameras">Open game camera</button>
+    <button id="b-save" title="Download the camera as a SpellExt .txt">Save .txt</button>
+    <button id="b-copy">Copy text</button>
+    <label style="margin-left:10px">Camera <input id="cam-number" type="text" size="5" title="Hex, 190 or higher"></label>
+    <label>Variant <select id="variant"><option>0</option><option>1</option><option>2</option></select></label>
+    <label title="Edits go to all three variants (the usual choice)"><input id="all-variants" type="checkbox" checked> edit all 3</label>
+    <input id="file-txt" type="file" accept=".txt" hidden>
+    <input id="file-bin" type="file" accept=".bin" hidden>
+  </header>
+
+  <div id="view">
+    <div id="legend"><b class="p">orange</b> camera path &nbsp; <b class="f">green</b> focus path<br>drag: orbit &middot; right-drag: pan &middot; wheel: zoom</div>
+    <div id="preview-frame"></div><div id="preview-label">in-game view (approximate)</div>
+  </div>
+
+  <div id="side">
+    <div class="tabs"><button data-tab="script" class="on">Script</button><button data-tab="field">Battlefield</button><button data-tab="text">Text</button><button data-tab="help">Help</button></div>
+    <div class="pane on" id="pane-script">
+      <div class="help">Each row is one command; the grey number is the frame it runs at. Click a row with x / y / z and drag the handle in the 3D view, or fly the view where you want the camera (or what it should look at) and press <b>Use view</b>. Ctrl+Z / Ctrl+Y undo and redo.</div>
+      <div class="bar">
+        <select id="template"><option value="">Start from a template...</option></select>
+        <button id="b-copy-variant" title="Make the other two variants the same as this one">Copy this variant to the others</button>
+      </div>
+      <div class="problems" id="problems"></div>
+      <h3 class="p">Position: where the camera is</h3>
+      <div id="list-position"></div>
+      <div class="bar" id="add-position"></div>
+      <h3 class="f">Focus: the point it looks at</h3>
+      <div id="list-focus"></div>
+      <div class="bar" id="add-focus"></div>
+    </div>
+    <div class="pane" id="pane-field">
+      <div class="help">The playback places actors here. Positions are in the battle's units (a character is about 1000 tall; up is negative y; the enemies stand at negative z). Party places are an estimate: adjust them if a shot lands wrong in the game.</div>
+      <h3>Who acts</h3>
+      <div class="grid">
+        <span>Attacker</span><select id="attacker"></select>
+        <span>Target</span><select id="target"></select>
+        <span>Whole-group side</span><select id="group-side"><option value="enemy">enemies</option><option value="party">party</option></select>
+      </div>
+      <h3>Party (x z per line, places 1 to 3)</h3>
+      <textarea id="party-pos" style="height:70px;min-height:0"></textarea>
+      <h3>Enemies (x z per line, up to 6)</h3>
+      <textarea id="enemy-pos" style="height:110px;min-height:0"></textarea>
+      <div class="bar"><button id="b-field-apply">Apply</button><button id="b-field-reset">Defaults</button></div>
+      <h3>Preset view (where e1 / e2 go)</h3>
+      <div class="grid">
+        <span>Camera</span><span><input id="pp-x" type="number"> <input id="pp-y" type="number"> <input id="pp-z" type="number"></span>
+        <span>Looks at</span><span><input id="pf-x" type="number"> <input id="pf-y" type="number"> <input id="pf-z" type="number"></span>
+        <span>Field of view</span><span><input id="fov" type="number" min="5" max="90"> degrees (vertical)</span>
+      </div>
+    </div>
+    <div class="pane" id="pane-text">
+      <div class="bar"><button id="b-text-apply">Apply text</button><span class="help">The file SpellExt reads. Edit it here and apply, or edit the rows.</span></div>
+      <textarea id="text" spellcheck="false"></textarea>
+    </div>
+    <div class="pane" id="pane-help">
+      <h3>What a camera is</h3>
+      <p class="help">Two scripts run side by side every frame: <b>position</b> (where the camera is) and <b>focus</b> (what it looks at). <b>Jump</b> puts it somewhere at once; <b>glide</b> moves it there over a number of frames; <b>ride / follow</b> keeps it on a moving bone. <b>set wait</b> + <b>wait</b> hold the script for that many frames while movements run. A script ends with <b>end</b>.</p>
+      <h3>Using it in the game</h3>
+      <p class="help">Save the .txt into <code>SpellExtConfig/cameras/</code> of the FF7 SpellExt mod, and name the camera in a spell or limit: <code>camera_single = 0x190</code> and <code>camera_multi = 0x190</code>. Cameras are read at each battle's start: change the file, start a new battle, and the change is there.</p>
+      <h3>Numbers</h3>
+      <p class="help">The game's own cameras are 0 to 18f (hex). Give yours 190 and up, one number per attack.</p>
+      <h3>How close is the preview?</h3>
+      <p class="help">It replays the commands as decoded from the game's interpreters. Not modelled: bones other than the root (placed at the root unless you give heights), the actors' facing, flags and the facing placements (f2 / f3). The game's three variants all run; how the game picks the one shown is not known, so keep them the same. Always check a new camera in a battle.</p>
+      <h3>Coordinates</h3>
+      <p class="help">x runs along the party's line, y is up and down (<b>up is negative</b>), z is forward and back (<b>negative is toward the enemies</b> for the party). A character is about 1000 tall; the face is about y -280. The game's view is narrow: keep what matters within about 15 degrees of the line of sight.</p>
+      <h3>Every command</h3>
+      <div id="reference"></div>
+    </div>
+  </div>
+
+  <div id="timeline">
+    <div class="top">
+      <button id="b-play">&#9654; Play</button>
+      <button id="b-start" title="Back to frame 0">&#9198;</button>
+      <label><input id="loop" type="checkbox" checked> loop</label>
+      <input id="scrub" type="range" min="0" max="100" value="0">
+      <span id="frame">frame 0 / 0</span>
+      <span id="msg"></span>
+    </div>
+    <div id="events"></div>
+  </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/build/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+<script src="cammy_core.js"></script>
+<script>
+'use strict';
+const C = window.CAMMY;
+const $ = id => document.getElementById(id);
+const S = 1 / 100;                                 // battle units -> scene units
+const toV = p => new THREE.Vector3(p.x * S, -p.y * S, p.z * S);
+const fromV = v => ({ x: Math.round(v.x / S), y: Math.round(-v.y / S), z: Math.round(v.z / S) });
+
+/* ---------------- state ---------------- */
+const DEFAULT_FIELD = { party: [[-700, 1300], [0, 1300], [700, 1300]], enemies: [[0, -3000]],
+  attacker: 2, target: 4, groupSide: 'enemy', presetPos: { x: 2500, y: -2400, z: 5600 }, presetFocus: { x: 0, y: -500, z: -1000 }, fov: 32 };
+let field = JSON.parse(JSON.stringify(DEFAULT_FIELD));
+let cam = C.blankCamera(C.FIRST_FREE);
+let variant = 0, sim = null, frame = 0, playing = false, selected = null, lastTick = 0;
+
+function store(key, value) { try { localStorage.setItem('cammy.' + key, JSON.stringify(value)); } catch (e) {} }
+function recall(key) { try { const v = localStorage.getItem('cammy.' + key); return v ? JSON.parse(v) : null; } catch (e) { return null; } }
+function say(text, bad) { const m = $('msg'); m.textContent = text; m.className = bad ? 'bad' : ''; m.title = text; }
+
+/* ---------------- world for the playback ---------------- */
+function actors() {
+  const list = [];
+  field.party.forEach((p, i) => list.push({ x: p[0], y: 0, z: p[1], side: 'party', name: 'party ' + (i + 1) }));
+  while (list.length < 4) list.push({ x: 0, y: 0, z: 0, side: 'none', name: 'unused', hidden: true });   // the game's actors 0-2 party, 4+ enemies
+  field.enemies.forEach((p, i) => list.push({ x: p[0], y: 0, z: p[1], side: 'enemy', name: 'enemy ' + (i + 1) }));
+  return list;
+}
+function world() {
+  const a = actors();
+  return { actors: a, attacker: field.attacker, target: field.target === 'group' ? 'group' : Number(field.target), groupSide: field.groupSide,
+    presetPos: field.presetPos, presetFocus: field.presetFocus, bones: {} };
+}
+function rerun() {
+  sim = C.simulate(cam, variant, world(), 900);
+  renderLists();                                   // the rows show the frames this playback found
+  const max = Math.max(1, sim.length + 10);
+  $('scrub').max = max;
+  if (frame > max) frame = 0;
+  drawEvents(max);
+  showFrame(frame);
+  drawPaths();
+  const probs = C.check(cam);
+  $('problems').innerHTML = probs.map(p => '&#9888; ' + p).join('<br>');
+  $('text').value = C.toText(cam);
+  store('camera', C.toText(cam));
+  updateGizmo();
+}
+
+/* ---------------- 3D scene ---------------- */
+const view = $('view');
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(window.devicePixelRatio || 1);
+view.appendChild(renderer.domElement);
+renderer.autoClear = false;
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x14161b);
+scene.add(new THREE.HemisphereLight(0xffffff, 0x334455, 1.0));
+const sun = new THREE.DirectionalLight(0xffffff, 0.6); sun.position.set(20, 40, 30); scene.add(sun);
+const grid = new THREE.GridHelper(120, 24, 0x3a4250, 0x262b34); scene.add(grid);
+const editCam = new THREE.PerspectiveCamera(50, 1, 0.1, 2000);
+editCam.position.set(45, 35, 70);
+const orbit = new THREE.OrbitControls(editCam, renderer.domElement);
+orbit.target.set(0, 5, -5); orbit.update();
+const gameCam = new THREE.PerspectiveCamera(field.fov, 4 / 3, 0.1, 2000);
+
+const actorGroup = new THREE.Group(); scene.add(actorGroup);
+function label(text, color) {
+  const c = document.createElement('canvas'); c.width = 256; c.height = 64;
+  const g = c.getContext('2d'); g.font = 'bold 30px system-ui'; g.fillStyle = color; g.textAlign = 'center'; g.fillText(text, 128, 42);
+  const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: new THREE.CanvasTexture(c), depthTest: false }));
+  sp.scale.set(8, 2, 1); return sp;
+}
+function drawActors() {
+  actorGroup.clear();
+  const list = actors();
+  list.forEach((a, i) => {
+    if (a.hidden) return;
+    const isAtt = i === field.attacker, isTgt = field.target !== 'group' && i === Number(field.target);
+    const color = a.side === 'party' ? 0x4a7bd0 : 0xc0504d;
+    const body = new THREE.Mesh(new THREE.CylinderGeometry(1.6, 2.2, 10, 16), new THREE.MeshStandardMaterial({ color, roughness: .7 }));
+    body.position.set(a.x * S, 5, a.z * S);
+    const head = new THREE.Mesh(new THREE.SphereGeometry(1.5, 16, 12), new THREE.MeshStandardMaterial({ color: 0xe8d3b8 }));
+    head.position.set(a.x * S, 11.5, a.z * S);
+    // facing: party looks toward the enemies (negative z), enemies toward the party
+    const nose = new THREE.Mesh(new THREE.ConeGeometry(.6, 2, 8), new THREE.MeshStandardMaterial({ color: 0xffffff }));
+    nose.position.set(a.x * S, 11.5, a.z * S + (a.side === 'party' ? -1.8 : 1.8));
+    nose.rotation.x = a.side === 'party' ? -Math.PI / 2 : Math.PI / 2;
+    actorGroup.add(body, head, nose);
+    const tag = label((isAtt ? 'ATTACKER ' : isTgt ? 'TARGET ' : '') + a.name, isAtt ? '#ffb347' : isTgt ? '#ff8080' : '#c8d0da');
+    tag.position.set(a.x * S, 16, a.z * S); actorGroup.add(tag);
+    if (isAtt || isTgt) {
+      const ring = new THREE.Mesh(new THREE.RingGeometry(3, 3.6, 32), new THREE.MeshBasicMaterial({ color: isAtt ? 0xffb347 : 0xff8080, side: THREE.DoubleSide }));
+      ring.rotation.x = -Math.PI / 2; ring.position.set(a.x * S, .05, a.z * S); actorGroup.add(ring);
+    }
+  });
+}
+
+const pathGroup = new THREE.Group(); scene.add(pathGroup);
+function drawPaths() {
+  pathGroup.clear();
+  if (!sim || !sim.frames.length) return;
+  const pts = k => sim.frames.map(f => toV(f[k]));
+  pathGroup.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts('pos')), new THREE.LineBasicMaterial({ color: 0xffb347 })));
+  pathGroup.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts('focus')), new THREE.LineBasicMaterial({ color: 0x7be07b })));
+}
+const camMarker = new THREE.Group();
+(function () {
+  const box = new THREE.Mesh(new THREE.BoxGeometry(2.4, 1.8, 2.6), new THREE.MeshStandardMaterial({ color: 0xffb347 }));
+  const lens = new THREE.Mesh(new THREE.CylinderGeometry(.6, .9, 1.4, 12), new THREE.MeshStandardMaterial({ color: 0x333333 }));
+  lens.rotation.x = Math.PI / 2; lens.position.z = -1.9;
+  camMarker.add(box, lens);
+})();
+scene.add(camMarker);
+const focusMarker = new THREE.Mesh(new THREE.SphereGeometry(.8, 16, 12), new THREE.MeshBasicMaterial({ color: 0x7be07b }));
+scene.add(focusMarker);
+const sight = new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3()]), new THREE.LineDashedMaterial({ color: 0x9fd3ff, dashSize: 1, gapSize: .6 }));
+scene.add(sight);
+
+function showFrame(f) {
+  if (!sim || !sim.frames.length) return;
+  frame = Math.max(0, Math.min(f, sim.frames.length - 1));
+  const fr = sim.frames[frame];
+  const p = toV(fr.pos), q = toV(fr.focus);
+  camMarker.position.copy(p); camMarker.lookAt(q);
+  focusMarker.position.copy(q);
+  sight.geometry.setFromPoints([p, q]); sight.computeLineDistances();
+  gameCam.position.copy(p); gameCam.lookAt(q);
+  frustCam.position.copy(p); frustCam.lookAt(q); frustCam.fov = Number(field.fov) || 32; frustCam.updateProjectionMatrix(); frustHelper.update();
+  $('scrub').value = frame;
+  $('frame').textContent = 'frame ' + frame + ' / ' + (sim.length);
+  document.querySelectorAll('.row.active').forEach(r => r.classList.remove('active'));
+  for (const k of C.KINDS) { const r = document.querySelector('#list-' + k + ' .row[data-i="' + fr.pc[k] + '"]'); if (r) r.classList.add('active'); }
+}
+
+function resize() {
+  const w = view.clientWidth, h = view.clientHeight;
+  renderer.setSize(w, h);
+  editCam.aspect = w / h; editCam.updateProjectionMatrix();
+  const pw = Math.round(Math.min(w * .34, 420)), ph = Math.round(pw * 3 / 4);
+  const fr = $('preview-frame'); fr.style.width = pw + 'px'; fr.style.height = ph + 'px';
+}
+window.addEventListener('resize', resize);
+function render(t) {
+  requestAnimationFrame(render);
+  if (playing && sim) {
+    if (!lastTick) lastTick = t;
+    const step = Math.floor((t - lastTick) / (1000 / 30));       // the battle runs its cameras per frame; 30 a second here
+    if (step > 0) { lastTick += step * (1000 / 30); let f = frame + step;
+      if (f > sim.length) { if ($('loop').checked) f = 0; else { f = sim.length; setPlaying(false); } }
+      showFrame(f); }
+  }
+  const w = view.clientWidth, h = view.clientHeight;
+  renderer.setViewport(0, 0, w, h); renderer.setScissorTest(false); renderer.clear();
+  camMarker.visible = focusMarker.visible = sight.visible = true;
+  renderer.render(scene, editCam);
+  const pw = Math.round(Math.min(w * .34, 420)), ph = Math.round(pw * 3 / 4);
+  renderer.setViewport(w - pw - 12, 12, pw, ph); renderer.setScissor(w - pw - 12, 12, pw, ph); renderer.setScissorTest(true);
+  renderer.clear();
+  const handleShown = handle.visible;
+  camMarker.visible = focusMarker.visible = sight.visible = false; pathGroup.visible = false; handle.visible = false; frustHelper.visible = false;
+  gameCam.fov = Number(field.fov) || 32; gameCam.aspect = 4 / 3; gameCam.updateProjectionMatrix();
+  renderer.render(scene, gameCam);
+  pathGroup.visible = true; frustHelper.visible = true; handle.visible = handleShown;
+  renderer.setScissorTest(false);
+}
+
+/* ---------------- the command lists ---------------- */
+const OPS = {}; for (const k of C.KINDS) OPS[k] = Object.keys(C.LAYOUT[k]).map(Number).sort((a, b) => a - b);
+function scripts() { return cam.variants[variant]; }
+/* undo / redo: whole-camera snapshots */
+const history = [], future = [];
+function snapshot() { return JSON.stringify({ cam, variant }); }
+function remember() { history.push(snapshot()); if (history.length > 200) history.shift(); future.length = 0; }
+function restore(s) { const o = JSON.parse(s); cam = o.cam; variant = o.variant; $('variant').value = variant; $('cam-number').value = cam.number === null ? '' : cam.number.toString(16); selected = null; renderLists(); rerun(); }
+function undo() { if (!history.length) return say('Nothing to undo.'); future.push(snapshot()); restore(history.pop()); say('Undone.'); }
+function redo() { if (!future.length) return say('Nothing to redo.'); history.push(snapshot()); restore(future.pop()); say('Redone.'); }
+
+function edit(fn, keepHistory) {
+  // fn edits the shown variant's scripts; with "edit all 3" the result is copied to the other variants
+  if (!keepHistory) remember();
+  fn(scripts());
+  if ($('all-variants').checked) syncVariants();
+  renderLists(); rerun();
+}
+function syncVariants() {
+  for (let v = 0; v < 3; v++) if (v !== variant) for (const k of C.KINDS)
+    cam.variants[v][k] = (cam.variants[variant][k] || []).map(c => ({ op: c.op, args: c.args.slice(), comment: c.comment, raw: c.raw }));
+}
+function anchorFor(kind, c) {
+  // the point a command's x / y / z is measured from, in battle units; null for a fixed point
+  const w = world(), a = w.actors;
+  const actorAt = (i, bone) => a[i] || { x: 0, y: 0, z: 0 };
+  const group = () => { const s = a.filter(x => x.side === w.groupSide); const p = { x: 0, y: 0, z: 0 }; s.forEach(q => { p.x += q.x; p.z += q.z; }); if (s.length) { p.x /= s.length; p.z /= s.length; } return p; };
+  const tgt = () => (w.target === 'group' ? group() : actorAt(w.target));
+  const att = () => actorAt(w.attacker);
+  const op = c.op;
+  if (kind === 'position') {
+    if ([0xf0, 0xe4, 0xe7].includes(op)) return att();
+    if ([0xf7, 0xe5, 0xe9, 0xd8].includes(op)) return tgt();
+    if ([0xef, 0xe3, 0xeb].includes(op)) return actorAt(c.args[0]);
+    if ([0xf9, 0xe6].includes(op)) return { x: 0, y: 0, z: 0 };
+  } else {
+    if ([0xf9, 0xe4, 0xe8].includes(op)) return att();
+    if ([0xf8, 0xe5, 0xea, 0xd8].includes(op)) return tgt();
+    if ([0xf0, 0xe3, 0xec].includes(op)) return actorAt(c.args[0]);
+    if ([0xfa, 0xe6].includes(op)) return { x: 0, y: 0, z: 0 };
+  }
+  return null;
+}
+function xyzIndex(kind, op) {
+  const names = C.argNames(kind, op); const i = names.indexOf('x');
+  return i >= 0 && names[i + 1] === 'y' && names[i + 2] === 'z' ? i : -1;
+}
+function renderLists() {
+  const focused = document.activeElement && document.activeElement.dataset ? document.activeElement.dataset.key : null;   // kept across the rebuild
+  for (const k of C.KINDS) {
+    const box = $('list-' + k); box.innerHTML = '';
+    (scripts()[k] || []).forEach((c, i) => {
+      const row = document.createElement('div'); row.className = 'row'; row.dataset.i = i;
+      if (selected && selected.kind === k && selected.i === i) row.classList.add('sel');
+      const sel = document.createElement('select'); sel.className = 'op';
+      const ops = OPS[k].slice(); if (!ops.includes(c.op)) ops.unshift(c.op);
+      ops.forEach(op => { const o = document.createElement('option'); o.value = op; o.textContent = C.hex2(op) + '  ' + C.cmdName(k, op); if (op === c.op) o.selected = true; sel.appendChild(o); });
+      sel.onchange = () => edit(sc => { const n = Number(sel.value); sc[k][i] = Object.assign(C.makeCmd(k, n, c.args), {}); });
+      const tools = document.createElement('div'); tools.className = 'tools';
+      const mk = (t, title, fn) => { const b = document.createElement('button'); b.textContent = t; b.title = title; b.onclick = e => { e.stopPropagation(); fn(); }; tools.appendChild(b); };
+      mk('↑', 'Move up', () => edit(sc => { if (i > 0) { const t = sc[k][i - 1]; sc[k][i - 1] = sc[k][i]; sc[k][i] = t; } }));
+      mk('↓', 'Move down', () => edit(sc => { if (i < sc[k].length - 1) { const t = sc[k][i + 1]; sc[k][i + 1] = sc[k][i]; sc[k][i] = t; } }));
+      mk('+', 'Insert a copy below', () => edit(sc => { sc[k].splice(i + 1, 0, { op: c.op, args: c.args.slice() }); }));
+      mk('✕', 'Delete', () => edit(sc => { sc[k].splice(i, 1); }));
+      const at = document.createElement('span'); at.className = 'at';
+      const started = sim && sim.starts ? sim.starts[k][i] : undefined;
+      if (started === undefined) { at.textContent = 'not reached'; at.classList.add('never'); at.title = 'Playback never gets to this command'; }
+      else { at.textContent = 'frame ' + started; at.title = 'This command first runs at frame ' + started; }
+      row.append(sel, at, tools);
+      const args = document.createElement('div'); args.className = 'args';
+      C.argNames(k, c.op).forEach((name, j) => {
+        const lab = document.createElement('label'); lab.textContent = name;
+        const inp = document.createElement('input'); inp.type = 'number'; inp.value = c.args[j]; inp.dataset.key = k + ':' + i + ':' + j;
+        inp.onchange = () => { const v = Math.round(Number(inp.value) || 0); setTimeout(() => edit(sc => { sc[k][i].args[j] = v; }), 0); };   // after the focus has moved (Tab)
+        lab.appendChild(inp); args.appendChild(lab);
+      });
+      const xi = xyzIndex(k, c.op);
+      if (xi >= 0 && anchorFor(k, c)) {
+        const d = document.createElement('span'); d.className = 'drag'; d.textContent = '\u2725 draggable'; d.title = 'Click this row, then drag the white ball in the 3D view';
+        at.after(d);
+        const b = document.createElement('button'); b.textContent = 'Use view';
+        b.title = k === 'position' ? 'Set x y z so the camera stands where the 3D view\'s camera is' : 'Set x y z so the focus is the point the 3D view orbits around';
+        b.onclick = e => { e.stopPropagation(); useView(k, i); };
+        args.appendChild(b);
+      }
+      if (args.children.length) row.appendChild(args);
+      if (c.op === 0xe1 || c.op === 0xe2) { const n = document.createElement('div'); n.className = 'note'; n.textContent = 'goes to the battle\'s idle view: in this preview, the preset set on the Battlefield tab'; row.appendChild(n); }
+      const boneI = C.argNames(k, c.op).indexOf('bone');
+      if (boneI >= 0 && c.args[boneI]) { const n = document.createElement('div'); n.className = 'note'; n.textContent = 'bone ' + c.args[boneI] + ' is placed at the actor\'s root in this preview'; row.appendChild(n); }
+      row.onclick = e => {
+        if (e.target.closest('input, select, button, textarea')) return;      // clicking a field only focuses it
+        selected = { kind: k, i };
+        document.querySelectorAll('.row.sel').forEach(r => r.classList.remove('sel'));
+        row.classList.add('sel');
+        updateGizmo();
+        if (!handle.visible) say(xyzIndex(k, c.op) >= 0 ? 'This command\'s point is not shown in this preview.' : 'This command has no point to drag (it waits, sets something, or goes to the preset view).');
+        else say('Drag the white ball in the 3D view (Shift: up and down).');
+      };
+      box.appendChild(row);
+    });
+    const add = $('add-' + k); add.innerHTML = '';
+    const quick = k === 'position'
+      ? [['Jump to attacker', 0xf0, [0, 700, -400, -1600]], ['Glide to attacker', 0xe4, [0, 150, -450, 2100, 15]], ['Glide to target', 0xe5, [0, 900, -600, 1800, 15]], ['Glide to preset view', 0xe2, [30]], ['Circle', 0xf8, [16, 2500, 0, 0, 0, 60]]]
+      : [['Look at attacker', 0xf9, [0, 0, -500, 0]], ['Glide to target', 0xe5, [0, 0, -500, 0, 15]], ['Follow attacker', 0xe8, [0, 0, -500, 0, 30]], ['Glide to preset point', 0xe2, [30]]];
+    quick.forEach(([t, op, a]) => {
+      const b = document.createElement('button'); b.textContent = '+ ' + t;
+      b.onclick = () => edit(sc => insertBeforeEnd(sc[k], { op, args: a.slice() }));
+      add.appendChild(b);
+    });
+    const hold = document.createElement('button'); hold.textContent = '+ Hold frames';
+    hold.title = 'set wait N + wait';
+    hold.onclick = () => { const n = parseInt(prompt('Hold for how many frames?', '15'), 10); if (n > 0) edit(sc => { insertBeforeEnd(sc[k], { op: 0xf5, args: [Math.min(255, n)] }); insertBeforeEnd(sc[k], { op: 0xf4, args: [] }); }); };
+    add.appendChild(hold);
+    if (!(scripts()[k] || []).some(c => c.op === 0xff)) { const e = document.createElement('button'); e.textContent = '+ end'; e.onclick = () => edit(sc => { sc[k] = sc[k] || []; sc[k].push({ op: 0xff, args: [] }); }); add.appendChild(e); }
+  }
+  if (focused) { const el = document.querySelector('input[data-key="' + focused + '"]'); if (el) { el.focus(); if (el.select) el.select(); } }
+}
+
+function insertBeforeEnd(list, cmd) {
+  // into the selected place if a row of this list is selected, else before the closing `end`
+  const k = list === scripts().position ? 'position' : 'focus';
+  if (selected && selected.kind === k && selected.i < list.length) { list.splice(selected.i + 1, 0, cmd); selected.i++; return; }
+  const e = list.findIndex(c => c.op === 0xff);
+  if (e >= 0) list.splice(e, 0, cmd); else list.push(cmd);
+}
+function useView(k, i) {
+  const c = scripts()[k][i], anchor = anchorFor(k, c), xi = xyzIndex(k, c.op);
+  if (!anchor || xi < 0) return;
+  const p = fromV(k === 'position' ? editCam.position : orbit.target);
+  edit(sc => { sc[k][i].args[xi] = p.x - anchor.x; sc[k][i].args[xi + 1] = p.y - (anchor.y || 0); sc[k][i].args[xi + 2] = p.z - anchor.z; });
+  say(k === 'position' ? 'Camera set to where the 3D view stands.' : 'Focus set to the point the 3D view turns around.');
+}
+
+/* ---------------- the drag handle and the view cone ---------------- */
+// A white ball on the selected row's point. Drag it along the ground; hold Shift to move it up and down.
+// Clicking the orange camera or the green focus marker selects the command that put it there.
+const handle = new THREE.Mesh(new THREE.SphereGeometry(1.3, 20, 14), new THREE.MeshBasicMaterial({ color: 0xffffff, depthTest: false, transparent: true, opacity: .9 }));
+handle.renderOrder = 10; handle.visible = false; scene.add(handle);
+let dragging = false, dragPlane = new THREE.Plane(), dragOffset = new THREE.Vector3(), dragVertical = false;
+const ray = new THREE.Raycaster(), mouse = new THREE.Vector2();
+function pick(e) {
+  const r = renderer.domElement.getBoundingClientRect();
+  mouse.set(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
+  ray.setFromCamera(mouse, editCam);
+}
+function selectFor(kind) {
+  // the command that placed the marker: the last command with x y z run at or before the shown frame
+  if (!sim || !sim.frames.length) return false;
+  const list = scripts()[kind] || [];
+  for (let i = list.length - 1; i >= 0; i--) {
+    const at = sim.starts[kind][i];
+    if (at !== undefined && at <= frame && xyzIndex(kind, list[i].op) >= 0 && anchorFor(kind, list[i])) { selected = { kind, i }; return true; }
+  }
+  return false;
+}
+view.addEventListener('pointerdown', e => {
+  if (e.button !== 0 || e.target !== renderer.domElement) return;
+  pick(e);
+  if (handle.visible && ray.intersectObject(handle).length) {
+    e.stopPropagation(); e.preventDefault();
+    remember(); dragging = true; orbit.enabled = false;
+    dragVertical = e.shiftKey;
+    const n = dragVertical ? new THREE.Vector3().subVectors(editCam.position, handle.position).setY(0).normalize() : new THREE.Vector3(0, 1, 0);
+    if (dragVertical && n.lengthSq() < 1e-6) n.set(0, 0, 1);
+    dragPlane.setFromNormalAndCoplanarPoint(n, handle.position);
+    const hit = new THREE.Vector3(); if (ray.ray.intersectPlane(dragPlane, hit)) dragOffset.subVectors(handle.position, hit); else dragOffset.set(0, 0, 0);
+    renderer.domElement.setPointerCapture && renderer.domElement.setPointerCapture(e.pointerId);
+    say(dragVertical ? 'Moving up and down.' : 'Moving along the ground (hold Shift for up and down).');
+    return;
+  }
+  const hits = ray.intersectObjects([camMarker, focusMarker], true);
+  if (hits.length) {
+    const kind = hits[0].object === focusMarker ? 'focus' : 'position';
+    if (selectFor(kind)) { e.stopPropagation(); renderLists(); showFrame(frame); updateGizmo(); say('Selected the ' + kind + ' command that put it there: drag the white ball.'); }
+  }
+}, true);
+window.addEventListener('pointermove', e => {
+  if (!dragging || !selected) return;
+  pick(e);
+  const hit = new THREE.Vector3(); if (!ray.ray.intersectPlane(dragPlane, hit)) return;
+  hit.add(dragOffset);
+  if (dragVertical) { hit.x = handle.position.x; hit.z = handle.position.z; } else hit.y = handle.position.y;
+  handle.position.copy(hit);
+  const k = selected.kind, i = selected.i, c = scripts()[k][i];
+  const anchor = anchorFor(k, c), xi = xyzIndex(k, c.op);
+  if (!anchor || xi < 0) return;
+  const p = fromV(handle.position);
+  c.args[xi] = p.x - anchor.x; c.args[xi + 1] = p.y - (anchor.y || 0); c.args[xi + 2] = p.z - anchor.z;
+  if ($('all-variants').checked) syncVariants();
+  sim = C.simulate(cam, variant, world(), 900);       // a light refresh while dragging
+  drawPaths(); showFrame(frame);
+  const row = document.querySelector('#list-' + k + ' .row[data-i="' + i + '"]');
+  if (row) row.querySelectorAll('.args input').forEach((inp, j) => { inp.value = c.args[j]; });
+});
+window.addEventListener('pointerup', () => {
+  if (!dragging) return;
+  dragging = false; orbit.enabled = true;
+  renderLists(); rerun(); say('Moved. Ctrl+Z undoes it.');
+});
+function updateGizmo() {
+  if (dragging) return;
+  const list = selected && scripts()[selected.kind];
+  const c = list && list[selected.i];
+  const anchor = c && anchorFor(selected.kind, c), xi = c ? xyzIndex(selected.kind, c.op) : -1;
+  if (!c || !anchor || xi < 0) { handle.visible = false; return; }
+  handle.position.copy(toV({ x: anchor.x + c.args[xi], y: (anchor.y || 0) + c.args[xi + 1], z: anchor.z + c.args[xi + 2] }));
+  handle.material.color.set(selected.kind === 'position' ? 0xffe0b0 : 0xd0ffd0);
+  handle.visible = true;
+}
+const frustCam = new THREE.PerspectiveCamera(32, 4 / 3, 0.6, 14);
+const frustHelper = new THREE.CameraHelper(frustCam); scene.add(frustHelper);
+
+/* ---------------- templates ---------------- */
+const P = (op, ...args) => ({ op, args });
+const HOLD = n => [P(0xf5, n), P(0xf4)];
+const TEMPLATES = {
+  'Over the shoulder (attacker, then the target)': {
+    position: [P(0xdf), P(0xf0, 0, 700, -300, -1400), ...HOLD(18), P(0xe4, 0, 150, -450, 2100, 14), ...HOLD(14), P(0xe4, 0, 200, -550, 2500, 40), ...HOLD(40), P(0xe2, 30), ...HOLD(30), P(0xff)],
+    focus: [P(0xdf), P(0xf9, 0, 0, -500, 0), ...HOLD(18), P(0xe5, 0, 0, -500, 0, 14), ...HOLD(54), P(0xe2, 30), ...HOLD(30), P(0xff)] },
+  'Orbit the target': {
+    position: [P(0xdf), P(0xf7, 0, 0, -1500, 3200), ...HOLD(2), P(0xf8, 24, 3200, 1024, 0, 0, 90), ...HOLD(90), P(0xe2, 30), ...HOLD(30), P(0xff)],
+    focus: [P(0xdf), P(0xf8, 0, 0, -500, 0), ...HOLD(92), P(0xe2, 30), ...HOLD(30), P(0xff)] },
+  'Push in on the attacker\'s face': {
+    position: [P(0xf0, 0, 0, -600, -3000), P(0xe4, 0, 0, -650, -900, 40), ...HOLD(60), P(0xe2, 30), ...HOLD(30), P(0xff)],
+    focus: [P(0xf9, 0, 0, -650, 0), ...HOLD(60), P(0xe2, 30), ...HOLD(30), P(0xff)] },
+  'Wide side shot (caster and enemies in view)': {
+    position: [P(0xdf), P(0xf0, 0, 350, -300, -1900), ...HOLD(10), P(0xe4, 0, 5200, -1300, 2400, 20), ...HOLD(80), P(0xe2, 26), ...HOLD(26), P(0xff)],
+    focus: [P(0xdf), P(0xf9, 0, 0, -400, 0), ...HOLD(10), P(0xe4, 0, 0, -350, -1100, 20), ...HOLD(80), P(0xe2, 26), ...HOLD(26), P(0xff)] },
+  'Cut from the attacker to the target': {
+    position: [P(0xdf), P(0xf0, 0, 700, -400, -1600), ...HOLD(24), P(0xf7, 0, 1500, -800, 2600), ...HOLD(30), P(0xe2, 24), ...HOLD(24), P(0xff)],
+    focus: [P(0xdf), P(0xf9, 0, 0, -500, 0), ...HOLD(24), P(0xf8, 0, 0, -500, 0), ...HOLD(30), P(0xe2, 24), ...HOLD(24), P(0xff)] }
+};
+Object.keys(TEMPLATES).forEach(name => $('template').add(new Option(name, name)));
+$('template').onchange = () => {
+  const name = $('template').value; $('template').value = '';
+  if (!name || !confirm('Replace both scripts with "' + name + '"? (Ctrl+Z undoes it.)')) return;
+  $('all-variants').checked = true;
+  edit(sc => { sc.position = TEMPLATES[name].position.map(c => ({ op: c.op, args: c.args.slice() })); sc.focus = TEMPLATES[name].focus.map(c => ({ op: c.op, args: c.args.slice() })); });
+  selected = null; updateGizmo(); showFrame(0);
+  say('Template "' + name + '": adjust the rows, or drag their handles.');
+};
+$('b-copy-variant').onclick = () => { remember(); syncVariants(); $('all-variants').checked = true; renderLists(); rerun(); say('Variant ' + variant + ' copied to the other two.'); };
+
+/* ---------------- the command reference ---------------- */
+(function () {
+  let h = '';
+  for (const k of C.KINDS) {
+    h += '<h3 class="' + (k === 'position' ? 'p' : 'f') + '">' + (k === 'position' ? 'Position' : 'Focus') + ' script</h3><table class="ref">';
+    Object.keys(C.LAYOUT[k]).map(Number).sort((a, b) => a - b).forEach(op => {
+      const names = C.argNames(k, op);
+      h += '<tr><td>' + C.hex2(op) + '</td><td>' + C.cmdName(k, op) + (names.length ? '<br><span class="help">' + names.join(', ') + '</span>' : '') + '</td></tr>';
+    });
+    h += '</table>';
+  }
+  h += '<p class="help">A name in (brackets) is a reading not yet confirmed in the game. The same command number can mean different things in the two scripts.</p>';
+  $('reference').innerHTML = h;
+})();
+
+/* ---------------- battlefield panel ---------------- */
+function fieldToForm() {
+  const att = $('attacker'), tgt = $('target'); att.innerHTML = ''; tgt.innerHTML = '';
+  actors().forEach((a, i) => { if (a.hidden) return;
+    att.add(new Option(a.name, i, false, i === field.attacker));
+    tgt.add(new Option(a.name, i, false, String(i) === String(field.target))); });
+  tgt.add(new Option('the whole group', 'group', false, field.target === 'group'));
+  $('group-side').value = field.groupSide;
+  $('party-pos').value = field.party.map(p => p.join(' ')).join('\n');
+  $('enemy-pos').value = field.enemies.map(p => p.join(' ')).join('\n');
+  ['x', 'y', 'z'].forEach(a => { $('pp-' + a).value = field.presetPos[a]; $('pf-' + a).value = field.presetFocus[a]; });
+  $('fov').value = field.fov;
+}
+function readPairs(text, max) {
+  return text.split('\n').map(l => l.trim().split(/[\s,]+/).map(Number)).filter(p => p.length >= 2 && p.every(n => !isNaN(n))).slice(0, max).map(p => [p[0], p[1]]);
+}
+function formToField() {
+  const party = readPairs($('party-pos').value, 3), enemies = readPairs($('enemy-pos').value, 6);
+  if (party.length) field.party = party; if (enemies.length) field.enemies = enemies;
+  field.attacker = Number($('attacker').value); const t = $('target').value; field.target = t === 'group' ? 'group' : Number(t);
+  field.groupSide = $('group-side').value;
+  ['x', 'y', 'z'].forEach(a => { field.presetPos[a] = Number($('pp-' + a).value) || 0; field.presetFocus[a] = Number($('pf-' + a).value) || 0; });
+  field.fov = Math.max(5, Math.min(90, Number($('fov').value) || 32));
+  store('field', field);
+  drawActors(); fieldToForm(); renderLists(); rerun();
+}
+['attacker', 'target', 'group-side', 'fov', 'pp-x', 'pp-y', 'pp-z', 'pf-x', 'pf-y', 'pf-z'].forEach(id => $(id).addEventListener('change', formToField));
+$('b-field-apply').onclick = formToField;
+$('b-field-reset').onclick = () => { field = JSON.parse(JSON.stringify(DEFAULT_FIELD)); fieldToForm(); formToField(); };
+
+/* ---------------- files ---------------- */
+function loadCamera(c, from, first) {
+  if (!first) remember();
+  for (let v = 0; v < 3; v++) for (const k of C.KINDS) if (!c.variants[v][k]) c.variants[v][k] = [{ op: 0xff, args: [] }];
+  cam = c; selected = null; frame = 0;
+  const allSame = C.KINDS.every(k => C.sameScript(cam.variants[0][k], cam.variants[1][k]) && C.sameScript(cam.variants[0][k], cam.variants[2][k]));
+  $('all-variants').checked = allSame;
+  $('cam-number').value = cam.number === null ? '' : cam.number.toString(16);
+  renderLists(); rerun();
+  say(from + (allSame ? '' : ' Its three variants differ: "edit all 3" is off.'));
+}
+$('b-new').onclick = () => { if (confirm('Start a new camera? Unsaved changes are lost.')) loadCamera(C.blankCamera(C.FIRST_FREE), 'A new camera.'); };
+$('b-open').onclick = () => $('file-txt').click();
+$('file-txt').onchange = e => { const f = e.target.files[0]; if (!f) return; const r = new FileReader();
+  r.onload = () => { try { loadCamera(C.parseText(String(r.result)), 'Opened ' + f.name + '.'); } catch (err) { say(f.name + ': ' + err.message, true); } };
+  r.readAsText(f); e.target.value = ''; };
+$('b-camdat').onclick = () => $('file-bin').click();
+$('file-bin').onchange = e => { const f = e.target.files[0]; if (!f) return; const r = new FileReader();
+  r.onload = () => { try {
+      const file = C.readCamdat(r.result);
+      const id = prompt(f.name + ' has cameras 0 to ' + (file.count - 1).toString(16) + ' (hex). Which one?', '4e');
+      if (id === null) return;
+      const c = file.camera(parseInt(id, 16));
+      c.number = C.FIRST_FREE;
+      c.header = ['started from camera ' + id + ' of the game\'s ' + f.name];
+      loadCamera(c, 'Camera ' + id + ' of ' + f.name + ' loaded, numbered 190: give it a number of its own before saving.');
+    } catch (err) { say(f.name + ': ' + err.message, true); } };
+  r.readAsArrayBuffer(f); e.target.value = ''; };
+$('b-save').onclick = () => {
+  const probs = C.check(cam);
+  if (probs.length && !confirm('This camera has problems SpellExt would refuse:\n\n' + probs.join('\n') + '\n\nSave anyway?')) return;
+  const name = 'camera_' + (cam.number || 0).toString(16) + '.txt';
+  const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([C.toText(cam).replace(/\n/g, '\r\n')], { type: 'text/plain' }));
+  a.download = name; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+  say('Saved ' + name + ': put it in SpellExtConfig/cameras/ of the mod.');
+};
+$('b-copy').onclick = () => { navigator.clipboard.writeText(C.toText(cam)).then(() => say('Copied the camera text.'), () => say('The browser refused to copy; use the Text tab.', true)); };
+$('b-text-apply').onclick = () => { try { loadCamera(C.parseText($('text').value), 'Text applied.'); } catch (err) { say(err.message, true); } };
+$('cam-number').onchange = () => { const n = parseInt($('cam-number').value, 16); if (!isNaN(n)) { cam.number = n; rerun(); } else say('The camera number is hex, like 190.', true); };
+$('variant').onchange = () => { variant = Number($('variant').value); selected = null; renderLists(); rerun(); };
+
+/* ---------------- timeline ---------------- */
+function setPlaying(on) { playing = on; lastTick = 0; $('b-play').innerHTML = on ? '&#10074;&#10074; Pause' : '&#9654; Play'; }
+$('b-play').onclick = () => setPlaying(!playing);
+$('b-start').onclick = () => { showFrame(0); };
+$('scrub').oninput = () => { setPlaying(false); showFrame(Number($('scrub').value)); };
+function drawEvents(max) {
+  const box = $('events'); box.innerHTML = '';
+  (sim.events || []).forEach(ev => { const s = document.createElement('span'); s.style.left = (ev.frame / max * 100) + '%'; s.textContent = '▲ ' + ev.text; box.appendChild(s); });
+}
+document.querySelectorAll('.tabs button').forEach(b => b.onclick = () => {
+  document.querySelectorAll('.tabs button').forEach(x => x.classList.toggle('on', x === b));
+  document.querySelectorAll('.pane').forEach(p => p.classList.toggle('on', p.id === 'pane-' + b.dataset.tab));
+});
+window.addEventListener('keydown', e => { if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT') return;
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z' && !e.shiftKey) { e.preventDefault(); undo(); return; }
+  if ((e.ctrlKey || e.metaKey) && (e.key.toLowerCase() === 'y' || (e.key.toLowerCase() === 'z' && e.shiftKey))) { e.preventDefault(); redo(); return; }
+  if (e.key === 'Escape') { selected = null; renderLists(); showFrame(frame); updateGizmo(); }
+  if (e.key === ' ') { e.preventDefault(); setPlaying(!playing); }
+  if (e.key === 'ArrowRight') showFrame(frame + 1); if (e.key === 'ArrowLeft') showFrame(frame - 1); });
+
+/* ---------------- start ---------------- */
+const savedField = recall('field'); if (savedField) field = Object.assign(JSON.parse(JSON.stringify(DEFAULT_FIELD)), savedField);
+fieldToForm(); drawActors(); resize();
+const savedCam = recall('camera');
+let start = null; if (savedCam) { try { start = C.parseText(savedCam); } catch (e) {} }
+loadCamera(start || C.blankCamera(C.FIRST_FREE), start ? 'Your last camera, restored.' : 'A new camera. Open a .txt or a game camera to start from one.', true);
+requestAnimationFrame(render);
+</script>
+</body>
+</html>
