@@ -15,6 +15,36 @@ game file on disk: everything happens in memory.
   by the unmodified game.
 - Fixes: MP costs above 255, damage caps, more than 256 texts in a field, and others.
 
+## Installing (7th Heaven)
+SpellExt runs as a 7th Heaven mod beside FFNx, on the Steam 2013 release of the game (`ff7_en.exe`).
+
+1. **Download** `FF7_SpellExt_PublicBeta.zip` from the
+   [Releases](https://github.com/Zyrrahx/FF7_SpellExt/releases) page. It holds the compiled `FF7_SpellExt.dll`, its
+   `mod.xml`, and the `SpellExtConfig` folder with the default `.ini` files and a readme for each.
+2. **Import the .zip into 7th Heaven** with its Import Mod option, choosing the `.zip` itself. 7th Heaven unpacks it
+   into a normal mod folder. Do not repack it as an `.iro`: the DLL and its `.ini` files must stay real files.
+3. **Tick the mod** in 7th Heaven's mod list and play. Only one SpellExt mod may be ticked at a time.
+4. **Close 7th Heaven normally** (its window's close button) after changing ticks: a forced stop loses the change.
+
+### Configuring
+Everything is set in the `.ini` files of the mod's `SpellExtConfig` folder, inside 7th Heaven's `mods` folder (for
+example `7th Heaven/mods/<the mod's name>/SpellExtConfig/`). Open them with any text editor; each kind has its readme
+in `SpellExtConfig/Readme/`. The files are read when the game starts.
+
+- Problems are reported in `FF7_SpellExt.log`, beside `ff7_en.exe`, with the file and line number.
+- `SpellExtConfig/FF7_SpellExt_Game.ini` holds the switches (`wide_items`, `wide_rows`, `box`, ...).
+
+### Saves
+- **Back up your saves first.** SpellExt keeps what the game's save cannot hold in a companion file per save, in
+  `FF7_SpellExt_Saves/` beside `ff7_en.exe`. Keep that folder together with the game's `save/` folder.
+- The game's own saves stay loadable without the mod; things that only exist with SpellExt (new items, the box) stay
+  in the companion files until the mod is used again.
+
+### Beta notes
+- Expect bugs; report them with `FF7_SpellExt.log`.
+- Built to sit beside other mods. Enhanced Stock UI is confirmed working; other UI mods may clash.
+- Mods that rename spells are overwritten by `FF7_SpellExt_SpellNames.ini`; leave that file out to keep theirs.
+
 ## Item numbers
 Each kind of thing has a fixed range (the old way, inside the game's own 0-511) and a high-numbered ("wide") range.
 
