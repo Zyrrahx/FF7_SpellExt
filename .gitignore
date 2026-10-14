@@ -1,0 +1,9 @@
+# Allow-list: git sees only what is listed here. Everything else in this folder (tools/work with its test copies of
+# save files, build output, the 7th Heaven mod folder with game-derived models and field patches) stays out.
+/*
+!/.gitignore
+!/README.md
+!/build.sh
+!/src/
+!/docs/
+/src/*.orig

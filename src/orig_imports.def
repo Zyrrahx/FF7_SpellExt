@@ -1,0 +1,6 @@
+; Import library for the renamed original driver, so it is a load-time
+; dependency of the wrapper. orig_new_dll_graphics_driver is our local name
+; for its new_dll_graphics_driver export.
+LIBRARY "AF3DN_orig.dll"
+EXPORTS
+  orig_new_dll_graphics_driver == new_dll_graphics_driver

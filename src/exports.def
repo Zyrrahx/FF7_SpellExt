@@ -1,0 +1,10 @@
+; Exports of the wrapper. The exe imports these six names from AF3DN.P.
+; The five registry helpers are forwarded straight to the original driver.
+LIBRARY "AF3DN.P"
+EXPORTS
+  dotemuRegCloseKey = AF3DN_orig.dotemuRegCloseKey
+  dotemuRegDeleteValueA = AF3DN_orig.dotemuRegDeleteValueA
+  dotemuRegOpenKeyExA = AF3DN_orig.dotemuRegOpenKeyExA
+  dotemuRegQueryValueExA = AF3DN_orig.dotemuRegQueryValueExA
+  dotemuRegSetValueExA = AF3DN_orig.dotemuRegSetValueExA
+  new_dll_graphics_driver
