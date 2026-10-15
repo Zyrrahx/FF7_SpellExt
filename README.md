@@ -13,6 +13,8 @@ Expect bugs and issues not everything has been tested.
   that live in the box or on a character.
 - New party members (up to 32 defined, four seated at a time) with their own limit breaks, battle models,
   portraits and battle cameras.
+- Effect copies: a spell can play its own copy of a game magic effect with files of your own (a recoloured Fire
+  beside the original), numbered from 0x100 (`FF7_SpellExt_Effects.ini`).
 - A companion file beside each save for everything the game's own save cannot hold; the game's save stays loadable
   by the unmodified game.
 - Fixes: MP costs above 255, damage caps, more than 256 texts in a field, and others.

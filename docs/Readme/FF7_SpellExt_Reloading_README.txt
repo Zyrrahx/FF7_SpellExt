@@ -22,7 +22,9 @@ Re-init .ini files
 
   What is read again
     spells and spell names, materia, weapons, armour, accessories, items,
-    the game file (damage limits), the character file, the limits file.
+    the game file (damage limits), the character file, the limits file,
+    the effects file (effect copies; new files in the mod's magic folder
+    still need a restart).
     The camera texts in SpellExtConfig\cameras are read again at the next
     battle. Animation packs are read by the game for every battle anyway.
 

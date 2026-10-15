@@ -59,6 +59,9 @@ Record fields (offset in the 28-byte attack record)
   camera_multi         0x0a  camera movement, multiple targets (2 bytes)
   target               0x0c  targeting flags (list, see below)
   animation            0x0d  attack effect: the kernel spell whose animation plays
+                             (0x100 and up: an effect copy from
+                             FF7_SpellExt_Effects.ini, a game effect with
+                             files of your own; see its readme)
   list                 -     magic (the default) or summon. A summon sits in
                              the Summon list instead of the Magic list and
                              has a limited number of uses per battle: one

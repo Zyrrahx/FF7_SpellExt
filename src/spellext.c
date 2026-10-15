@@ -270,6 +270,9 @@ struct spell {
     BYTE order_group;                   /* `order`: 1 restore, 2 attack, 3 indirect; 0 = worked out from the record */
     BYTE unused[3];
     DWORD fixed_damage;                 /* `fixed_damage`: every hit does exactly this much; 0 = not set */
+    WORD animation_copy;                /* `animation = 0x100` and up: an effect copy of the effects file (the record
+                                           holds its base's number); 0 = none */
+    WORD animation_all_copy;            /* the same for `animation_all` */
 };
 /* index_reaching needs every record 4-byte aligned. */
 typedef char spell_size_is_a_multiple_of_4[sizeof(struct spell) % 4 == 0 ? 1 : -1];
@@ -760,6 +763,7 @@ static int index_reaching(const BYTE *record)
 #define SUMMON_FADE_FRAMES      14
 
 static int summon_show_actor = -1;      /* actor whose next effect is an extended summon's */
+static void start_effect_copy(int actor_arg);  /* FUN_00427c22 with an effect copy's files ("Effect copies") */
 static int summon_intro_actor, summon_intro_frame;
 
 static void __cdecl summon_intro_task(void)
@@ -782,7 +786,7 @@ static void __cdecl summon_intro_task(void)
     *(BYTE *)ADDR_SUMMON_ACTIVE = 1;
     for (i = 0; i < 3; i++)
         *(BYTE *)(ADDR_ACTOR_SHOW_FLAGS + i * ACTOR_EFFECT_STRIDE) |= 2;
-    ((void (__cdecl *)(int))FN_START_EFFECT)(summon_intro_actor);
+    start_effect_copy(summon_intro_actor);  /* FUN_00427c22 (an extended summon may name an effect copy) */
     watcher = ((short (__cdecl *)(DWORD))FN_NEW_WATCHER_TASK)(FN_SUMMON_END_WATCHER);
     if (watcher >= 0) {
         short *data = (short *)(ADDR_WATCHER_TASK_DATA + watcher * 0x20);
@@ -881,6 +885,8 @@ static short *__cdecl show_hit_event_hook(int type)
     return event;
 }
 
+static void effect_copies_before_routine(int n);    /* ("Effect copies", after the spell file code) */
+
 static void __cdecl limit_seq_task(void)
 {
     short *task = (short *)(0x00bfb718u + *(const short *)0x00bf23b8u * 0x20);
@@ -912,6 +918,8 @@ static void __cdecl limit_seq_task(void)
             *mask = (WORD)(1 << target);    /* the effect looks at the action's target mask in places: this hit's alone */
         }
         copy_bytes((BYTE *)before, (const BYTE *)ADDR_EFFECT_TASK_FNS, sizeof before);
+        if (!(flags & SEQ_LIMIT))
+            effect_copies_before_routine(limit_seq.effect[hit]);   /* a magic effect: its own files, not a copy's left loaded */
         ((void (__cdecl *)(int, int))fn)((short)*mask, limit_seq.actor);
         for (k = 0; k < 100 && noted < 4; k++) {
             DWORD started = ((const DWORD *)ADDR_EFFECT_TASK_FNS)[k];
@@ -1083,7 +1091,11 @@ static int start_split_from(unsigned sources, unsigned targets)
 /* `animation_all`, per actor: the two effect numbers of the extended spell last set up for it */
 static struct { BYTE set, single, all; } cast_animation[10];
 
-static void prop_effect_step(int actor);    /* a limit's `prop` (see "A prop", with the limits further down) */
+/* Effect copies (`animation = 0x100` and up; see "Effect copies", after the spell file code): the copy
+   each actor's action wants, noted at its set-up, and the effect step that loads it */
+static void effect_copy_note(int *action, int spell);
+
+static void prop_effect_step(int actor);   /* a limit's `prop` (see "A prop", with the limits further down) */
 static void state_effect_step(int actor);   /* a limit's `state` (see "A state", after the prop) */
 
 /* The game's three calls of FUN_00427c22. */
@@ -1161,7 +1173,7 @@ static void __cdecl summon_effect_hook(int actor_arg)
         if (((short (__cdecl *)(DWORD))0x005bec50u)((DWORD)summon_intro_task) >= 0)
             return;
     }
-    ((void (__cdecl *)(int))FN_START_EFFECT)(actor_arg);
+    start_effect_copy(actor_arg);       /* FUN_00427c22, with an effect copy's files where the action wants one */
 }
 
 /* Replaces handler-table entry 0x0c (FUN_005c94d3), which loads the attack
@@ -1186,6 +1198,7 @@ static void __cdecl action_setup_hook(void)
         summon_show_actor = -1;
     if (action[ACT_ACTOR] >= 0 && action[ACT_ACTOR] < 10)
         cast_animation[action[ACT_ACTOR]].set = 0;
+    effect_copy_note(action, -1);       /* no effect copy, unless an extended spell's below names one */
     if (!record || action[ACT_COMMAND_TYPE] == 0x20) {
         ((void (__cdecl *)(void))FN_ACTION_SETUP)();
         note_limit_action(action[ACT_ACTOR], action[ACT_COMMAND_TYPE], id);
@@ -1252,6 +1265,11 @@ static void __cdecl action_setup_hook(void)
             if (targets & (targets - 1))
                 action[9] = spells[spell].animation_all;
         }
+        /* `animation = 0x100` and up: the record already holds the copy's BASE number (put there when
+           the spell file was read), so the game's own effect runs; the copy whose files it is to load
+           is noted for the actor here and used at the preload (e8) and the effect step (ec) */
+        if (spell >= 0 && (spells[spell].animation_copy || spells[spell].animation_all_copy))
+            effect_copy_note(action, spell);
     }
     log_line("action setup: attack ID %d, MP cost %d, effect %02x, strength %d, element %04x, slot %d, targets %04x",
              id, action[0xe], action[9], action[0x12], action[0x11], action[ACT_SLOT], action[6] & 0xffff);
@@ -8783,8 +8801,11 @@ static LONG limit_opens_logged;
 /* `effect_file = NAME:LOOSE` of a new character's limit: while that limit is the one being carried out, a
    request for the archive file NAME (an effect's model, say DYNAMITE.P) is answered with the loose file
    LOOSE (ZAEA). So a game effect can be run with a model of our own. Set when the limit is set up, cleared
-   when anybody's next limit is. The effect's files are loaded once and kept for the battle (Dynamite:
-   handle 00af1c30), so within one battle the first user's model is the one both would show. */
+   when anybody's next limit is. The effect's files (Dynamite: handle 00af1c30) stay loaded only until the
+   next action whose preload has a loader: read from the code, FUN_00427928 (the script's `e8`, through
+   FUN_004281b1 / FUN_004284a7) first frees every group with keep 0 (FUN_00429322, which FFNx's own
+   magic_thread_start also calls), and so do 00427b5c, 0043cc34, 005c0fb3, 005c149c and FUN_00427c22 when
+   007c10d8 is 0. So a second user shows the first one's model only when no such action came between. */
 static char effect_swap_from[32], effect_swap_to[32];
 static LONG effect_swap_logged;
 
@@ -9875,6 +9896,441 @@ static void apply_flag_changes(const struct spell_draft *draft, BYTE *record)
     }
 }
 
+/* ---- Effect copies: the part that reads only what it is given ------------------------------------
+   (The rest, and what an effect copy is, under "Effect copies" after the spell file code.) This part
+   touches neither the game's memory nor Windows, so tools/work/effects/test compiles it by itself,
+   with is_space .. next_word above: keep it so. */
+/* EFFECT COPIES PURE BEGIN */
+#define EFFECT_BASE_COUNT       0x36         /* magic effects 0x00-0x35: the ones a copy may be of */
+#define EFFECT_COPY_FIRST       0x100        /* the DLL's own effect numbers start here */
+#define EFFECT_COPY_LAST        0xffff
+#define EFFECT_COPY_MAX         64
+#define EFFECT_FILES_MAX        16           /* entries of a base's file list (the game's most is 12) */
+#define EFFECT_RENAMES_MAX      16           /* `file` lines of one copy */
+#define EFFECT_NAME_MAX         32           /* a file name and its 0 */
+#define EFFECT_LOADER_SIZE      0x90         /* the loader's bytes compared with the template */
+#define EFFECT_RUN_LOOK         0x60         /* how far into the run routine its call of the loader is looked for */
+#define EFFECT_ENTRY_SIZE       0x14         /* a file list entry: word flags, word, +4 name, +8 second name (or 0), ... */
+#define FN_EFFECT_GROUP_ARGS    0x0068a9e0u  /* FUN_0068a9e0(args): {keep 0, idle frames 0x5dc, folder} */
+#define FN_EFFECT_FOLDER        0x005dff37u  /* FUN_005dff37(folder, buffer): the folder's path */
+#define FN_EFFECT_LOAD_GROUP    0x0068aa06u  /* FUN_0068aa06(count, list, args, &handle, manager): loads the group if handle is 0 */
+#define EFFECT_DATA_FIRST       0x007ba000u  /* the exe's .data section: a list, a handle and a folder name are in it */
+#define EFFECT_DATA_END         0x00f51000u
+
+typedef void (*effect_problem_fn)(int line, const char *what);
+
+struct effect_rename { char from[EFFECT_NAME_MAX], to[EFFECT_NAME_MAX]; int line; };
+struct effect_copy {
+    DWORD number;                       /* 0x100 and up */
+    int base;                           /* the magic effect copied, 0x00-0x35; -1 = not given */
+    int line;                           /* of its section */
+    int usable;                         /* every check passed (all or nothing for a copy) */
+    int rename_count;
+    struct effect_rename rename[EFFECT_RENAMES_MAX];
+    DWORD ptrs[EFFECT_FILES_MAX][2];    /* the base list's two name pointers per entry while this copy loads */
+};
+/* What a magic effect's loader loads, read from its code by effect_template_read */
+struct effect_template { DWORD handle, list, folder; int count; };
+
+/* Fire's loader, 005b9810, as the exe has it (FUN_005b9810):
+       if (009adfd8 != 0 && handle == 0) { args = {0, 0x5dc, path of FOLDER}; FUN_0068aa06(count, list, args, &handle, *(009adfd8 + 0x4c)); }
+   42 of the 48 magic loaders are these same bytes; what differs (the handle, twice; the count; the list;
+   the folder; the distances of the three calls) is 0 here and listed in effect_template_wild. */
+static const BYTE effect_loader_template[EFFECT_LOADER_SIZE] = {
+    0x55,0x8b,0xec,0x81,0xec,0xe4,0x00,0x00,0x00,0x83,0x3d,0xd8,0xdf,0x9a,0x00,0x00,   /* push ebp ... cmp [009adfd8],0 */
+    0x74,0x7a,0x83,0x3d,0x00,0x00,0x00,0x00,0x00,0x75,0x71,0xc7,0x85,0x1c,0xff,0xff,   /* je; cmp [handle],0; jne; mov [ebp-e4], */
+    0xff,0x00,0x00,0x00,0x00,0xc7,0x45,0xfc,0x00,0x00,0x00,0x00,0xa1,0xd8,0xdf,0x9a,   /*   count; mov [ebp-4],list; mov eax,[009adfd8] */
+    0x00,0x8b,0x48,0x4c,0x89,0x4d,0xe8,0x8d,0x55,0xec,0x89,0x55,0xf8,0x8b,0x45,0xf8,
+    0x50,0xe8,0x00,0x00,0x00,0x00,0x83,0xc4,0x04,0x8b,0x4d,0xf8,0xc7,0x01,0x00,0x00,   /* call 0068a9e0; keep = 0 */
+    0x00,0x00,0x8d,0x95,0x20,0xff,0xff,0xff,0x52,0x68,0x00,0x00,0x00,0x00,0xe8,0x00,   /* push folder; call 005dff37 */
+    0x00,0x00,0x00,0x83,0xc4,0x08,0x8b,0x4d,0xf8,0x89,0x41,0x08,0x8b,0x55,0xe8,0x52,
+    0x68,0x00,0x00,0x00,0x00,0x8b,0x45,0xf8,0x50,0x8b,0x4d,0xfc,0x51,0x8b,0x95,0x1c,   /* push handle ... */
+    0xff,0xff,0xff,0x52,0xe8,0x00,0x00,0x00,0x00,0x83,0xc4,0x14,0x8b,0xe5,0x5d,0xc3,   /* call 0068aa06; ret */
+};
+static const BYTE effect_template_wild[][2] = {      /* offset, length: bytes that are each loader's own */
+    { 0x14, 4 }, { 0x21, 4 }, { 0x28, 4 }, { 0x42, 4 }, { 0x5a, 4 }, { 0x5f, 4 }, { 0x71, 4 }, { 0x85, 4 },
+};
+
+static DWORD effect_dword(const BYTE *p)
+{
+    return (DWORD)p[0] | (DWORD)p[1] << 8 | (DWORD)p[2] << 16 | (DWORD)p[3] << 24;
+}
+
+/* Reads a magic effect's loader: `code` is its first EFFECT_LOADER_SIZE bytes, `at` its address. NULL and
+   *out filled when it is the template; otherwise why not. */
+static const char *effect_template_read(const BYTE *code, DWORD at, struct effect_template *out)
+{
+    static const struct { BYTE offset; DWORD target; } calls[] = {
+        { 0x42, FN_EFFECT_GROUP_ARGS }, { 0x5f, FN_EFFECT_FOLDER }, { 0x85, FN_EFFECT_LOAD_GROUP },
+    };
+    unsigned i, k;
+
+    for (i = 0; i < EFFECT_LOADER_SIZE; i++) {
+        for (k = 0; k < sizeof effect_template_wild / sizeof effect_template_wild[0]; k++)
+            if (i >= effect_template_wild[k][0] && i < (unsigned)effect_template_wild[k][0] + effect_template_wild[k][1])
+                break;
+        if (k == sizeof effect_template_wild / sizeof effect_template_wild[0] && code[i] != effect_loader_template[i])
+            return "its code is not the loader pattern the effect copies are made for (another mod changed it, or the game made this one differently)";
+    }
+    for (i = 0; i < sizeof calls / sizeof calls[0]; i++)
+        if (at + calls[i].offset + 4 + effect_dword(code + calls[i].offset) != calls[i].target)
+            return "its calls do not go to the game's group routines (FUN_0068a9e0, FUN_005dff37, FUN_0068aa06): another DLL may have changed them";
+    out->handle = effect_dword(code + 0x14);
+    out->count = (int)effect_dword(code + 0x21);
+    out->list = effect_dword(code + 0x28);
+    out->folder = effect_dword(code + 0x5a);
+    if (effect_dword(code + 0x71) != out->handle)
+        return "it tests one handle and loads into another";
+    if (out->count < 1 || out->count > EFFECT_FILES_MAX)
+        return "its file list has more entries than an effect copy can take";
+    if (out->handle < EFFECT_DATA_FIRST || out->handle + 4 > EFFECT_DATA_END ||
+        out->list < EFFECT_DATA_FIRST || out->list + (DWORD)out->count * EFFECT_ENTRY_SIZE > EFFECT_DATA_END ||
+        out->folder < EFFECT_DATA_FIRST || out->folder >= EFFECT_DATA_END)
+        return "its handle, list or folder is not in the game's data";
+    return NULL;
+}
+
+/* The code at an address (EFFECT_RUN_LOOK bytes of it), or NULL where there is none to read. */
+typedef const BYTE *(*effect_code_fn)(DWORD address);
+
+/* One routine's calls, from its start to its first `pop ebp / ret` (5d c3, 5d c2) and at most
+   EFFECT_RUN_LOOK bytes: 1 if one of them is `loader`; *first is set to the first call's target. */
+static int effect_run_scan(const BYTE *code, DWORD at, DWORD loader, DWORD *first)
+{
+    int i;
+
+    for (i = 0; i < EFFECT_RUN_LOOK; i++) {
+        if (i + 1 < EFFECT_RUN_LOOK && code[i] == 0x5d && (code[i + 1] == 0xc3 || code[i + 1] == 0xc2))
+            return 0;
+        if (code[i] == 0xe8 && i + 5 <= EFFECT_RUN_LOOK) {
+            DWORD target = at + (DWORD)i + 5 + effect_dword(code + i + 1);
+
+            if (target == loader)
+                return 1;
+            if (!*first)
+                *first = target;
+        }
+    }
+    return 0;
+}
+
+/* Whether the run routine `run` calls `loader` itself, or through the first routine it calls (Toad, Sleepel
+   and Stop are a wrapper of 0x15 bytes around their body): then the effect's files are loaded at its start,
+   inside the effect step, and not later by a task. */
+static int effect_run_calls(effect_code_fn code_at, DWORD run, DWORD loader)
+{
+    const BYTE *code = code_at(run);
+    DWORD first = 0, unused = 0;
+
+    if (!code)
+        return 0;
+    if (effect_run_scan(code, run, loader, &first))
+        return 1;
+    return first && (code = code_at(first)) != NULL && effect_run_scan(code, first, loader, &unused);
+}
+
+static int effect_lower(int c)
+{
+    return c >= 'A' && c <= 'Z' ? c + 0x20 : c;
+}
+
+static int effect_same_name(const char *a, const char *b)
+{
+    for (; *a && effect_lower((BYTE)*a) == effect_lower((BYTE)*b); a++, b++)
+        ;
+    return effect_lower((BYTE)*a) == effect_lower((BYTE)*b);
+}
+
+/* The extension of a name, from its last dot ("" when none). */
+static const char *effect_extension(const char *name)
+{
+    const char *dot = NULL;
+
+    for (; *name; name++)
+        if (*name == '.')
+            dot = name;
+    return dot ? dot : name;
+}
+
+/* The file the game asks for under a list name: .TIM as .TEX, .SPT as .S, others as they are. */
+static void effect_asked_name(const char *name, char *out)
+{
+    const char *ext = effect_extension(name);
+    int n = (int)(ext - name), i;
+
+    for (i = 0; i < n; i++)
+        out[i] = name[i];
+    if (effect_same_name(ext, ".TIM"))
+        ext = ".TEX";
+    else if (effect_same_name(ext, ".SPT"))
+        ext = ".S";
+    for (i = 0; ext[i]; i++)
+        out[n + i] = ext[i];
+    out[n + i] = 0;
+}
+
+/* Whether a group is in use: an effect fetched one of its entries (+0x18 = that frame) less than 6 of the
+   group's frames (+0x1c) ago, as FUN_0068a1d5 judges it. A group never used yet has +0x18 still 0 (it is
+   allocated zeroed): not in use, whatever +0x1c says. */
+static int effect_group_in_use(int used_at, int frame)
+{
+    return used_at != 0 && frame - used_at < 6;
+}
+
+/* The names of a PNG standing in for the file `asked`, as resolve_loose_file looks for them: NAME.png, and for
+   a .TEX also STEM.png. Returns how many (1 or 2). */
+static int effect_png_names(const char *asked, char *first, char *second)
+{
+    const char *ext = effect_extension(asked);
+    int i, n = (int)(ext - asked);
+
+    for (i = 0; asked[i]; i++)
+        first[i] = asked[i];
+    first[i] = '.', first[i + 1] = 'p', first[i + 2] = 'n', first[i + 3] = 'g', first[i + 4] = 0;
+    if (!effect_same_name(ext, ".TEX"))
+        return 1;
+    for (i = 0; i < n; i++)
+        second[i] = asked[i];
+    second[n] = '.', second[n + 1] = 'p', second[n + 2] = 'n', second[n + 3] = 'g', second[n + 4] = 0;
+    return 2;
+}
+
+/* (31 characters, not 19: the game's FUN_006759d2, which copies a name into 20 bytes, is replaced by both the
+   stock driver and FFNx, so it never sees these names; checked in review round 2.) */
+/* Copies [start, end) as a file name: 1-31 characters, only letters, digits, _ and -, and dots (not the
+   first). 0 if it is not one. (The archive's lookup, which FFNx's own lgp_open_file also uses for a file it
+   does not find loose, indexes a table by the name's first two characters as c - 'a': anything else there
+   reads outside that table.) */
+static int effect_take_name(char *out, const char *start, const char *end)
+{
+    int n = 0;
+
+    if (start >= end || end - start >= EFFECT_NAME_MAX || *start == '.')
+        return 0;
+    for (; start < end; start++) {
+        char c = *start;
+
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.'))
+            return 0;
+        out[n++] = c;
+    }
+    out[n] = 0;
+    return 1;
+}
+
+/* Reads the effects file: sections `[effect 0x100]` with `copy = N` and `file = FROM:TO` lines. Every problem
+   goes to `problem` with its line; a copy with any problem is not usable (all or nothing). Returns how
+   many copies were read (usable or not). The names are checked against the base's list afterwards
+   (effect_copy_point). */
+static int effect_file_parse(char *text, DWORD size, struct effect_copy *copies, int capacity, effect_problem_fn problem)
+{
+    char *line, *end, *file_end = text + size;
+    int line_number = 0, count = 0, i, skipping = 0;
+    struct effect_copy *c = NULL;
+
+    for (line = text; line < file_end; line = end + 1) {
+        char *start = line, *stop, *equals, *key_end, *value, *p;
+        DWORD n = 0;
+
+        for (end = line; end < file_end && *end != '\n'; end++)
+            ;
+        line_number++;
+        for (stop = start; stop < end; stop++)
+            if ((*stop == ';' || *stop == '#') && (stop == start || is_space(stop[-1])))
+                break;
+        trim(&start, &stop);
+        if (start == stop)
+            continue;
+        if (*start == '[') {
+            char *word_end;
+
+            c = NULL;
+            skipping = 0;
+            p = start + 1;
+            if (stop[-1] != ']' || (word_end = next_word(&p, stop - 1)) == NULL || !word_is(p, word_end, "effect")) {
+                problem(line_number, "a section is [effect NUMBER], the copy's own number from 0x100 to 0xffff");
+                continue;
+            }
+            p = word_end;
+            while (p < stop - 1 && is_space(*p))
+                p++;
+            if (parse_number(&p, stop - 1, &n))
+                while (p < stop - 1 && is_space(*p))
+                    p++;
+            else
+                p = start;
+            if (p != stop - 1 || n < EFFECT_COPY_FIRST || n > EFFECT_COPY_LAST) {
+                problem(line_number, "a section is [effect NUMBER], the copy's own number from 0x100 to 0xffff");
+                continue;
+            }
+            for (i = 0; i < count && copies[i].number != n; i++)
+                ;
+            if (i < count) {
+                /* a number is unique: neither section is used (the first is not quietly kept) */
+                problem(line_number, "this effect number is already defined above: neither section is used");
+                copies[i].usable = 0;
+                skipping = 1;           /* its lines are passed over without a word each */
+                continue;
+            }
+            if (count == capacity) {
+                problem(line_number, "too many effect copies (64 at most): the section is skipped");
+                continue;
+            }
+            c = &copies[count++];
+            c->number = n;
+            c->base = -1;
+            c->line = line_number;
+            c->usable = 1;
+            c->rename_count = 0;
+            continue;
+        }
+        if (!c) {
+            if (!skipping)
+                problem(line_number, "this line is not inside an [effect NUMBER] section");
+            continue;
+        }
+        for (equals = start; equals < stop && *equals != '='; equals++)
+            ;
+        key_end = equals;
+        value = equals < stop ? equals + 1 : stop;
+        trim(&start, &key_end);
+        trim(&value, &stop);
+        if (equals == stop) {
+            problem(line_number, "expected key = value");
+            c->usable = 0;
+        } else if (word_is(start, key_end, "copy")) {
+            p = value;
+            if (!parse_number(&p, stop, &n) || p != stop || n >= EFFECT_BASE_COUNT) {
+                problem(line_number, "copy is a magic effect's number, 0x05 to 0x35 (enemy attacks, limits and summons are not copied yet)");
+                c->usable = 0;
+            } else if (n <= 0x04 || n == 0x19) {
+                problem(line_number, "effects 0x00-0x04 and 0x19 load no files of their own: there is nothing to copy");
+                c->usable = 0;
+            } else if (c->base >= 0 && c->base != (int)n) {
+                problem(line_number, "copy is given twice, with two different effects");
+                c->usable = 0;
+            } else
+                c->base = (int)n;
+        } else if (word_is(start, key_end, "file")) {
+            struct effect_rename *r = &c->rename[c->rename_count];
+            char *colon;
+
+            for (colon = value; colon < stop && *colon != ':'; colon++)
+                ;
+            if (c->rename_count == EFFECT_RENAMES_MAX) {
+                problem(line_number, "too many file lines in one copy (16 at most)");
+                c->usable = 0;
+                continue;
+            }
+            {
+                char *from_end = colon, *to = colon + 1, *to_end = stop;
+
+                trim(&value, &from_end);
+                if (colon < stop)
+                    trim(&to, &to_end);
+                if (colon == stop || !effect_take_name(r->from, value, from_end) || !effect_take_name(r->to, to, to_end)) {
+                    problem(line_number, "file is FROM:TO, two file names of 1 to 31 characters: letters, digits, _ and - (and the dot of the extension), like FIRE00.TIM:YFIRE00.TIM");
+                    c->usable = 0;
+                    continue;
+                }
+            }
+            if (!effect_same_name(effect_extension(r->from), effect_extension(r->to))) {
+                problem(line_number, "the new name must keep the extension of the one it replaces (.TIM, .SPT, .RSD): the game changes it when it asks for the file");
+                c->usable = 0;
+                continue;
+            }
+            if (effect_same_name(r->from, r->to)) {
+                problem(line_number, "the new name is the old one: nothing would change");
+                c->usable = 0;
+                continue;
+            }
+            for (i = 0; i < c->rename_count && !effect_same_name(c->rename[i].from, r->from); i++)
+                ;
+            if (i < c->rename_count) {
+                problem(line_number, "this file is renamed twice in the same copy");
+                c->usable = 0;
+                continue;
+            }
+            r->line = line_number;
+            c->rename_count++;
+        } else {
+            problem(line_number, "unknown key (a copy has copy = and file = lines)");
+            c->usable = 0;
+        }
+    }
+    for (i = 0; i < count; i++) {
+        if (copies[i].base < 0) {
+            problem(copies[i].line, "this copy has no copy = line (which effect it copies)");
+            copies[i].usable = 0;
+        } else if (!copies[i].rename_count) {
+            problem(copies[i].line, "this copy renames no file: it would be the effect itself (give file = FROM:TO lines)");
+            copies[i].usable = 0;
+        }
+    }
+    return count;
+}
+
+/* Works out the copy's name pointers from its base's list (`base`: the list's own two pointers per entry,
+   0 where an entry has no second name). Every renamed file must be one of the list's names: otherwise a
+   problem on its line and the copy is not usable. A name the list has several times is renamed everywhere. */
+static int effect_copy_point(struct effect_copy *c, const DWORD (*base)[2], int count, effect_problem_fn problem)
+{
+    int r, k, j, found;
+
+    for (k = 0; k < count; k++)
+        for (j = 0; j < 2; j++)
+            c->ptrs[k][j] = base[k][j];
+    for (r = 0; r < c->rename_count; r++) {
+        for (found = 0, k = 0; k < count; k++)
+            for (j = 0; j < 2; j++)
+                if (base[k][j] && effect_same_name((const char *)base[k][j], c->rename[r].from)) {
+                    c->ptrs[k][j] = (DWORD)c->rename[r].to;
+                    found = 1;
+                }
+        if (!found) {
+            problem(c->rename[r].line, "this file is not one of the files of the effect copied (the log lists them above)");
+            c->usable = 0;
+        }
+    }
+    return c->usable;
+}
+
+/* Whether the list's name pointers are `ptrs`; and putting them there. */
+static int effect_list_holds(const BYTE *list, int count, const DWORD (*ptrs)[2])
+{
+    int k;
+
+    for (k = 0; k < count; k++)
+        if (effect_dword(list + k * EFFECT_ENTRY_SIZE + 4) != ptrs[k][0] || effect_dword(list + k * EFFECT_ENTRY_SIZE + 8) != ptrs[k][1])
+            return 0;
+    return 1;
+}
+
+static void effect_list_put(BYTE *list, int count, const DWORD (*ptrs)[2])
+{
+    int k, j, b;
+
+    for (k = 0; k < count; k++)
+        for (j = 0; j < 2; j++)
+            for (b = 0; b < 4; b++)
+                list[k * EFFECT_ENTRY_SIZE + 4 + j * 4 + b] = (BYTE)(ptrs[k][j] >> (8 * b));
+}
+
+/* Which copy an action plays for an effect number: the copy noted for one target or for several (an index
+   into the copies, -1 none), if it is a copy of that very number; -1 (the effect's own files) otherwise. */
+static int effect_copy_choice(int single, int several, int is_several, int number, const struct effect_copy *copies, int count)
+{
+    int c = is_several ? several : single;
+
+    if (c < 0 || c >= count || !copies[c].usable || copies[c].base != number)
+        return -1;
+    return c;
+}
+/* EFFECT COPIES PURE END */
+
+static BOOL spell_file_reading;        /* load_spells is reading: `animation = 0x100` (an effect copy) is taken */
+static int effect_copy_base(DWORD number);   /* ("Effect copies", after the spell file code) */
+
 /* Applies one `key = value` line to the draft. Returns NULL, or what was
    wrong with it. */
 static const char *apply_key(struct spell_draft *draft, char *key, char *key_end, char *value, char *end)
@@ -9908,6 +10364,33 @@ static const char *apply_key(struct spell_draft *draft, char *key, char *key_end
             return "base must be a kernel attack ID from 0 to 0x7f";
         draft->base = (int)number;
         return NULL;
+    }
+    if (word_is(key, key_end, "animation") || word_is(key, key_end, "animation_all")) {
+        /* 0x100 and up: an effect copy of the effects file. The record gets the number of the effect it
+           copies (the game's effect runs) and the spell keeps the copy's, for the action's set-up */
+        BOOL all = word_is(key, key_end, "animation_all");
+        int base;
+
+        if (parse_number(&p, end, &number) && p == end && number >= EFFECT_COPY_FIRST) {
+            if (!spell_file_reading)
+                return "effect copies (0x100 and up) are for spells, not yet for limits";
+            if (number > EFFECT_COPY_LAST || (base = effect_copy_base(number)) < 0)
+                return "no usable effect copy of that number in FF7_SpellExt_Effects.ini (its problems are in the log above): the spell keeps the animation it had";
+            if (all) {
+                draft->spell.has_animation_all = 1;
+                draft->spell.animation_all = (BYTE)base;
+                draft->spell.animation_all_copy = (WORD)number;
+            } else {
+                set_bytes(draft, REC_EFFECT, 1, (DWORD)base);
+                draft->spell.animation_copy = (WORD)number;
+            }
+            return NULL;
+        }
+        p = value;                      /* an effect's own number (or none): read as before, below */
+        if (all)
+            draft->spell.animation_all_copy = 0;
+        else
+            draft->spell.animation_copy = 0;
     }
     if (word_is(key, key_end, "mp")) {
         /* A word in the record, but a spell slot holds the cost in one byte. */
@@ -10352,6 +10835,7 @@ static void load_spells(void)
         return;
     }
 
+    spell_file_reading = TRUE;
     draft.id = -1;
     for (line = text; line < file_end; line = end + 1) {
         char *start = line, *stop, *equals;
@@ -10407,11 +10891,576 @@ static void load_spells(void)
         }
     }
     finish_spell(&draft);
+    spell_file_reading = FALSE;
     VirtualFree(text, 0, MEM_RELEASE);
     log_line("spell file: %d spells loaded, %d line(s) with problems", spell_count, errors);
     if (spell_count)
         log_line("first spell: ID %d, record reached through index %08lx", spells[0].id,
                  (DWORD)index_reaching(spells[0].record));
+}
+
+/* ---- Effect copies --------------------------------------------------------------------------------
+   A magic effect played with some files of the mod's own in place of its own (a recoloured Fire), as an
+   effect with a number of its own, 0x100 and up, that a spell names as its `animation`. Defined in
+   FF7_SpellExt_Effects.ini (the part that reads it: "Effect copies: the part that reads only what it is
+   given", before apply_key):
+       [effect 0x100]
+       copy = 0x1b                           the magic effect copied (0x05-0x35)
+       file = FIRE00.TIM:YFIRE00.TIM         one of its files, and the name asked for in its place
+   Nothing of the game's code is changed for it but one call (the script's preload, chained). What it rests
+   on, read from the code (tools/work/fire_trace):
+   - A magic effect is run by 008fe4b0[number](targets, actor), from FUN_00427c22 (the script's `ec`, the
+     effect step, which this DLL already takes: summon_effect_hook). The number is the actor's 00be119a, a
+     byte: the record's 0x0d through action[9]. So a copy's number never reaches the game: the record holds
+     the BASE's number and the copy is noted for the actor at the action's set-up.
+   - The effect's files are loaded by its loader, 007c1208[007c17a0[number]], twice: the script's `e8`
+     preloads them (FUN_004281b1, called at 00423ec3 -> FUN_004284a7 -> FUN_00427928, which frees every
+     group with keep 0 (FUN_00429322) and runs the loader in a thread of its own; FFNx replaces
+     FUN_00427928 with one that frees the same way and runs the loader at once), and the run routine calls
+     the loader again at its start, which loads nothing while the handle is not 0.
+   - 42 of the 48 loaders are one piece of code (effect_loader_template): they hand FUN_0068aa06 a COUNT, a
+     LIST of 0x14-byte entries with two name pointers each (+4, +8), a FOLDER and the address of a HANDLE.
+     The names are asked for as they stand (.TIM as .TEX, .SPT as .S), so a renamed entry is answered like
+     any other file: under FFNx from <game>\direct\magic\<name> (a mod's magic folder, which is also what
+     FFNx makes its texture-replacement name from), under the stock driver by open_file_hook from the
+     config folder's files. The lists are in the exe's writable data; neither FFNx nor its data reads them.
+   So, while an action wants a copy: at the preload and at the effect step the copy's name pointers are put
+   in the base's list for the call, and the list's own are put back after it. The handle stays the game's;
+   which set of files a loaded group holds is noted by the handle's value when this DLL saw it loaded. When
+   the effect step finds the other set loaded (no preload in between), that one group is freed with the
+   game's own routine (FUN_0068a81c, as FUN_00429322 frees it) and the run routine then loads the right set.
+   A copy's files do not outlive their action: at every preload (`e8`), whether or not it has a loader to
+   run (a limit with no effect of its own has none, and frees nothing), a group holding a copy's files is
+   freed, as the game frees every group at a preload that has one; and again just before limit_seq_task
+   (a limit's spell_effects) starts a magic effect's routine itself, as an e8 just after a copy's cast may
+   have found its group still drawn (effect_free_group leaves a group used in the last 6 frames). So a
+   routine started without the effect step finds the effect's own files, or none and loads them.
+   Not in this stage: copies of enemy attacks, limits and summons' own effects; two copies of one effect in
+   one action (which no key can ask for yet). */
+#define EFFECT_FILE_NAME        "FF7_SpellExt_Effects.ini"
+#define ADDR_EFFECT_LOADERS     0x007c1208u  /* the loaders, by index (358 of them, up to 007c17a0) */
+#define EFFECT_LOADER_COUNT     358
+#define ADDR_EFFECT_LOADER_INDEX 0x007c17a0u /* a short per magic effect: its loader's index */
+#define SITE_EFFECT_PRELOAD     0x00423ec3u  /* `e8` in the script interpreter: mov cl,[ebp+8] / push ecx / call / add esp,4 */
+#define FN_EFFECT_PRELOAD       0x004281b1u  /* FUN_004281b1(actor): the action's effect's files, loaded ahead */
+#define FN_FREE_GROUP           0x0068a81cu  /* FUN_0068a81c(slot, group, manager): frees a group, its handle set to 0 */
+#define ADDR_EFFECT_3D          0x009adfd8u  /* the battle's 3D data; +0x4c its group manager */
+#define ADDR_LOAD_THREAD        0x009adf0cu  /* FUN_00427928's loading thread; 0 = none (under FFNx always 0) */
+#define ADDR_PRELOAD_ON         0x007c10d8u  /* FUN_004281b1 preloads only when this is not 0 */
+static const BYTE effect_free_group_start[] = { 0x55, 0x8b, 0xec, 0x83, 0x7d, 0x10, 0x00, 0x74, 0x4a };   /* FUN_0068a81c's first bytes */
+#define ADDR_EFFECT_SEVERAL     0x00bf2e1cu  /* byte: the record played has several results */
+#define EFFECT_CODE_FIRST       0x00401000u  /* the exe's .text */
+#define EFFECT_CODE_END         0x007b6000u
+#define EFFECT_NAMES_FIRST      0x007b6000u  /* .rdata and .data: where the lists' names are */
+#define EFFECT_LOGS             60           /* lines of the copies at work, per run of the game */
+
+static struct effect_base {
+    BYTE looked, ok, copies;
+    const char *why;                    /* why its copies are refused */
+    DWORD loader, run;
+    struct effect_template t;
+    DWORD own[EFFECT_FILES_MAX][2];     /* the list's own name pointers, as read at the first look */
+    DWORD loaded_value;                 /* the handle's value after the last load this DLL saw; 0 = none */
+    int loaded_set;                     /* what that load was: -1 the effect's own files, else a copy */
+} effect_bases[EFFECT_BASE_COUNT];
+static struct effect_copy effect_copies[EFFECT_COPY_MAX];
+static int effect_copy_count, effect_copies_usable, effect_file_problems;
+static LONG effect_preload_live, effect_logs;
+static DWORD effect_preload_next = FN_EFFECT_PRELOAD;
+static struct { short single, several, now; } effect_copy_cast[10];    /* copy indexes per actor, -1 none */
+static int effect_pending_base = -1, effect_pending_set;  /* a preload still running in the game's thread with a copy's names */
+static int effect_swapped_base = -1;    /* the base whose list holds a copy's names now */
+
+/* `animation = 0x100` of the spell file: the copy's index, and the effect it is a copy of (-1: none usable). */
+static int effect_copy_index(DWORD number)
+{
+    int i;
+
+    for (i = 0; i < effect_copy_count; i++)
+        if (effect_copies[i].number == number)
+            return effect_copies[i].usable ? i : -1;
+    return -1;
+}
+
+static int effect_copy_base(DWORD number)
+{
+    int i = effect_copy_index(number);
+
+    return i < 0 ? -1 : effect_copies[i].base;
+}
+
+/* A name in the game's data: a short plain string. */
+static BOOL effect_name_ok(DWORD p)
+{
+    int i;
+
+    if (p < EFFECT_NAMES_FIRST || p + EFFECT_NAME_MAX > EFFECT_DATA_END)
+        return FALSE;
+    for (i = 0; i < EFFECT_NAME_MAX; i++)
+        if (!((const char *)p)[i])
+            return i > 0;
+        else if ((BYTE)((const char *)p)[i] < ' ' || (BYTE)((const char *)p)[i] >= 0x7f)
+            return FALSE;
+    return FALSE;
+}
+
+/* The game's code at an address, for effect_run_calls. */
+static const BYTE *effect_code_at(DWORD address)
+{
+    return address >= EFFECT_CODE_FIRST && address + EFFECT_RUN_LOOK <= EFFECT_CODE_END ? (const BYTE *)address : NULL;
+}
+
+/* Reads magic effect n's loader once: where its files are, or why it cannot be copied (logged once, with the
+   effect's file list, which is what a modder copies). */
+static struct effect_base *effect_read_base(int n)
+{
+    struct effect_base *b = &effect_bases[n];
+    short index;
+    int k, j, m;
+
+    if (b->looked)
+        return b->ok ? b : NULL;
+    b->looked = 1;
+    index = ((const short *)ADDR_EFFECT_LOADER_INDEX)[n];
+    b->run = ((const DWORD *)ADDR_MAGIC_EFFECTS)[n];
+    b->loader = index >= 0 && index < EFFECT_LOADER_COUNT ? ((const DWORD *)ADDR_EFFECT_LOADERS)[index] : 0;
+    if (!b->loader)
+        b->why = "it has no loader: it loads no files";
+    else if (b->loader < EFFECT_CODE_FIRST || b->loader + EFFECT_LOADER_SIZE > EFFECT_CODE_END ||
+             b->run < EFFECT_CODE_FIRST || b->run + EFFECT_RUN_LOOK > EFFECT_CODE_END)
+        b->why = "its loader or its routine is not in the game's code";
+    else if ((b->why = effect_template_read((const BYTE *)b->loader, b->loader, &b->t)) == NULL &&
+             !effect_run_calls(effect_code_at, b->run, b->loader))
+        b->why = "its routine does not call its loader at its start (its files are loaded later, by a task)";
+    for (m = 0; !b->why && m < EFFECT_BASE_COUNT; m++) {
+        short other = ((const short *)ADDR_EFFECT_LOADER_INDEX)[m];
+
+        if (m != n && other >= 0 && other < EFFECT_LOADER_COUNT && ((const DWORD *)ADDR_EFFECT_LOADERS)[other] == b->loader)
+            b->why = "it shares its loader, and so its files and handle, with another effect";
+    }
+    for (k = 0; !b->why && k < b->t.count; k++)
+        for (j = 0; j < 2; j++) {
+            b->own[k][j] = *(const DWORD *)(b->t.list + k * EFFECT_ENTRY_SIZE + 4 + j * 4);
+            if (b->own[k][j] && !effect_name_ok(b->own[k][j]))
+                b->why = "its file list's names are not plain names in the game's data (another mod changed the list?)";
+        }
+    if (b->why) {
+        log_line("effect copies: effect %02x cannot be copied: %s (loader %08lx)", n, b->why, b->loader);
+        return NULL;
+    }
+    {
+        char text[EFFECT_FILES_MAX * 2 * (EFFECT_NAME_MAX + 2) + 8], folder[40];
+        int at = 0;
+
+        for (k = 0; k < 39 && effect_name_ok(b->t.folder) && ((const char *)b->t.folder)[k]; k++)
+            folder[k] = ((const char *)b->t.folder)[k];
+        folder[k] = 0;
+        for (k = 0; k < b->t.count; k++)
+            for (j = 0; j < 2; j++)
+                if (b->own[k][j]) {
+                    lstrcpyA(text + at, (const char *)b->own[k][j]);
+                    at += lstrlenA(text + at);
+                    text[at++] = ' ';
+                }
+        text[at ? at - 1 : 0] = 0;
+        log_line("effect copies: effect %02x (loader %08lx, folder %s, handle %08lx, list %08lx, %d entries) loads: %s",
+                 n, b->loader, folder, b->t.handle, b->t.list, b->t.count, text);
+    }
+    b->ok = 1;
+    return b;
+}
+
+static void effect_problem(int line, const char *what)
+{
+    log_line("effects file line %d: %s", line, what);
+    effect_file_problems++;
+}
+
+/* Puts a list's own names back, whatever was put in it. */
+static void effect_names_restore(void)
+{
+    struct effect_base *b;
+
+    if (effect_swapped_base < 0)
+        return;
+    b = &effect_bases[effect_swapped_base];
+    effect_list_put((BYTE *)b->t.list, b->t.count, (const DWORD (*)[2])b->own);
+    effect_swapped_base = -1;
+}
+
+/* Copy `set` (-1: the effect's own files) is to be loaded: its names in the base's list, if the list holds
+   its own names now; FALSE (and nothing changed) otherwise. */
+static BOOL effect_names_put(int number, struct effect_base *b, int set)
+{
+    if (!effect_list_holds((const BYTE *)b->t.list, b->t.count, (const DWORD (*)[2])b->own)) {
+        if (InterlockedIncrement(&effect_logs) <= EFFECT_LOGS)
+            log_line("effect copies: effect %02x's file list does not hold its own names (another mod changed it?): left as it is",
+                     number);
+        return FALSE;
+    }
+    if (set >= 0) {
+        effect_list_put((BYTE *)b->t.list, b->t.count, (const DWORD (*)[2])effect_copies[set].ptrs);
+        effect_swapped_base = number;
+    }
+    return TRUE;
+}
+
+/* What the base's group holds: -2 nothing is loaded, -1 the effect's own files, else that copy. A handle this
+   DLL did not see loaded is the game's own load, with the list's own names. */
+static int effect_loaded_set(struct effect_base *b)
+{
+    DWORD v = *(const DWORD *)b->t.handle;
+
+    if (!v) {
+        b->loaded_value = 0;
+        return -2;
+    }
+    return v == b->loaded_value ? b->loaded_set : -1;
+}
+
+static void effect_note_loaded(int number, struct effect_base *b, int set, int actor, const char *where)
+{
+    DWORD v = *(const DWORD *)b->t.handle;
+
+    b->loaded_value = v;
+    b->loaded_set = v ? set : -1;
+    if (set >= 0 && InterlockedIncrement(&effect_logs) <= EFFECT_LOGS)
+        log_line("effect copies: %s of actor %d: effect %02x %s copy %04lx's files (group %08lx)", where, actor, number,
+                 v ? "holds" : "did NOT load (handle 0):", effect_copies[set].number, v);
+}
+
+/* A preload that ran in the game's thread (the stock driver) with a copy's names: once the thread is done,
+   the names go back and what it loaded is noted. */
+static void effect_settle(void)
+{
+    if (effect_pending_base < 0 || *(volatile const DWORD *)ADDR_LOAD_THREAD)
+        return;
+    effect_names_restore();
+    effect_note_loaded(effect_pending_base, &effect_bases[effect_pending_base], effect_pending_set, -1, "the preload's thread");
+    effect_pending_base = -1;
+}
+
+/* The base effect the actor is about to load or run, if it has copies, and which set it wants (*set: -1 its
+   own files, else a copy). At the effect step (`step`) the copy is chosen again from the targets the record
+   really has, as animation_all is (summon_effect_hook); at the preload it is the one chosen at set-up. */
+static struct effect_base *effect_for_actor(int actor, BOOL step, int *set)
+{
+    static LONG several_logged;
+    struct effect_base *b;
+    int number;
+
+    *set = -1;
+    if (!effect_preload_live || !effect_copies_usable || actor >= 10 ||
+        *(const BYTE *)(ADDR_ACTOR_COMMAND_TYPE + actor * ACTOR_EFFECT_STRIDE) != 2)
+        return NULL;
+    number = *(const BYTE *)(ADDR_ACTOR_NUMBER + actor * ACTOR_EFFECT_STRIDE);
+    if (number >= EFFECT_BASE_COUNT)
+        return NULL;
+    b = &effect_bases[number];
+    if (!b->ok || !b->copies)
+        return NULL;
+    if (*(const BYTE *)ADDR_EFFECT_SEVERAL &&
+        (number == 0x1d || number == 0x20 || number == 0x23 || number == 0x29 || number == 0x2c)) {
+        /* FUN_004281b1 and FUN_00427c22 give these five another routine and loader when the record has
+           several results */
+        if (!InterlockedExchange(&several_logged, 1))
+            log_line("effect copies: effect %02x on several targets is another routine of the game's, with files of its own: its copies are not used then",
+                     number);
+        return NULL;
+    }
+    if (step) {
+        unsigned shown = *(const WORD *)ADDR_EFFECT_TARGETS;
+
+        *set = effect_copy_choice(effect_copy_cast[actor].single, effect_copy_cast[actor].several, (shown & (shown - 1)) != 0,
+                                  number, effect_copies, effect_copy_count);
+    } else
+        *set = effect_copy_choice(effect_copy_cast[actor].now, effect_copy_cast[actor].now, 0, number, effect_copies,
+                                  effect_copy_count);
+    return b;
+}
+
+/* Frees the base's group, the way FUN_00429322 frees every group: found in the battle's group manager, and
+   only a group with keep 0 whose handle is this one, and that no effect has used in the last 6 frames. */
+static BOOL effect_free_group(int number, struct effect_base *b)
+{
+    DWORD group = *(const DWORD *)b->t.handle, manager = 0, *table;
+    int i, slots;
+
+    if (*(const DWORD *)ADDR_EFFECT_3D)
+        manager = *(const DWORD *)(*(const DWORD *)ADDR_EFFECT_3D + 0x4c);
+    if (!group || !manager)
+        return FALSE;
+    if (*(const DWORD *)(group + 0x10) != 0 || *(const DWORD *)(group + 0x20) != b->t.handle) {
+        if (InterlockedIncrement(&effect_logs) <= EFFECT_LOGS)
+            log_line("effect copies: effect %02x's group %08lx is not one the game frees (keep %ld, handle at %08lx): left loaded", number,
+                     group, *(const long *)(group + 0x10), *(const DWORD *)(group + 0x20));
+        return FALSE;
+    }
+    if (effect_group_in_use(*(const int *)(group + 0x18), *(const int *)(group + 0x1c))) {
+        /* an effect is drawing it (FUN_0068a1d5 counts the group's frames in +0x1c, FUN_0068a155 / FUN_0068a195
+           note the frame of each use in +0x18) */
+        if (InterlockedIncrement(&effect_logs) <= EFFECT_LOGS)
+            log_line("effect copies: effect %02x's group %08lx is in use (last used %d frame(s) ago): left loaded", number, group,
+                     *(const int *)(group + 0x1c) - *(const int *)(group + 0x18));
+        return FALSE;
+    }
+    slots = *(const int *)(manager + 4);
+    table = *(DWORD **)(manager + 8);
+    for (i = 0; table && i < slots && i < 0x10000; i++)
+        if (table[i] == group) {
+            ((void (__cdecl *)(int, DWORD, DWORD))FN_FREE_GROUP)(i, group, manager);
+            if (*(const DWORD *)b->t.handle) {
+                if (InterlockedIncrement(&effect_logs) <= EFFECT_LOGS)
+                    log_line("effect copies: effect %02x's group %08lx was freed but its handle was not cleared: cleared", number, group);
+                *(DWORD *)b->t.handle = 0;
+            }
+            b->loaded_value = 0;
+            return TRUE;
+        }
+    if (InterlockedIncrement(&effect_logs) <= EFFECT_LOGS)
+        log_line("effect copies: effect %02x's group %08lx is not in the battle's group manager %08lx: left loaded", number, group, manager);
+    return FALSE;
+}
+
+/* Before this DLL starts magic effect n's routine itself, without the effect step (limit_seq_task: a limit's
+   spell_effects): a copy's files still loaded for it are freed, so the routine loads the effect's own. */
+static void effect_copies_before_routine(int n)
+{
+    BOOL freed;
+
+    if (n < 0 || n >= EFFECT_BASE_COUNT || !effect_copies_usable || effect_pending_base >= 0 || *(volatile const DWORD *)ADDR_LOAD_THREAD ||
+        !effect_bases[n].ok || !effect_bases[n].copies || effect_loaded_set(&effect_bases[n]) < 0)
+        return;
+    freed = effect_free_group(n, &effect_bases[n]);
+    if (InterlockedIncrement(&effect_logs) <= EFFECT_LOGS)
+        log_line("effect copies: a limit's spell effect %02x: a copy's files were still loaded: %s", n, freed ? "freed" : "left loaded");
+}
+
+/* The chained call of the script's preload (`e8`). */
+static void __cdecl effect_preload_hook(int actor_arg)
+{
+    int actor = (BYTE)actor_arg, set;
+    struct effect_base *b;
+
+    effect_settle();
+    /* a copy's files end with the action that wanted them (see the top of "Effect copies"): freed here,
+       at every preload, before anything else looks at them */
+    if (effect_pending_base < 0 && effect_copies_usable && !*(volatile const DWORD *)ADDR_LOAD_THREAD) {
+        int n;
+
+        for (n = 0; n < EFFECT_BASE_COUNT; n++)
+            if (effect_bases[n].ok && effect_bases[n].copies && effect_loaded_set(&effect_bases[n]) >= 0) {
+                BOOL freed = effect_free_group(n, &effect_bases[n]);
+
+                if (InterlockedIncrement(&effect_logs) <= EFFECT_LOGS)
+                    log_line("effect copies: preload of actor %d: effect %02x still held a copy's files from an earlier action: %s", actor, n,
+                             freed ? "freed" : "left loaded");
+            }
+    }
+    /* only a preload that will load (FUN_004281b1: 007c10d8 set; FUN_00427928: no thread of its still
+       running, or it loads nothing) is followed: it first frees the group, then loads with the names
+       found in the list, so what it loads is known */
+    b = effect_pending_base < 0 && *(const DWORD *)ADDR_PRELOAD_ON && !*(volatile const DWORD *)ADDR_LOAD_THREAD ?
+        effect_for_actor(actor, FALSE, &set) : NULL;
+    if (!b || !effect_names_put(*(const BYTE *)(ADDR_ACTOR_NUMBER + actor * ACTOR_EFFECT_STRIDE), b, set)) {
+        ((void (__cdecl *)(int))effect_preload_next)(actor_arg);
+        return;
+    }
+    ((void (__cdecl *)(int))effect_preload_next)(actor_arg);
+    if (*(volatile const DWORD *)ADDR_LOAD_THREAD) {
+        /* the stock driver: the loader runs in the game's thread and reads the names while it does */
+        effect_pending_base = *(const BYTE *)(ADDR_ACTOR_NUMBER + actor * ACTOR_EFFECT_STRIDE);
+        effect_pending_set = set;
+        return;
+    }
+    effect_names_restore();
+    effect_note_loaded(*(const BYTE *)(ADDR_ACTOR_NUMBER + actor * ACTOR_EFFECT_STRIDE), b, set, actor, "preload");
+}
+
+/* The effect step, FUN_00427c22, from summon_effect_hook and summon_intro_task. */
+static void start_effect_copy(int actor_arg)
+{
+    int actor = (BYTE)actor_arg, set = -1, number = 0;
+    struct effect_base *b;
+
+    effect_settle();
+    b = effect_pending_base < 0 ? effect_for_actor(actor, TRUE, &set) : NULL;
+    if (b) {
+        int loaded = effect_loaded_set(b);
+
+        number = *(const BYTE *)(ADDR_ACTOR_NUMBER + actor * ACTOR_EFFECT_STRIDE);
+        if (loaded != -2 && loaded != set) {
+            if (InterlockedIncrement(&effect_logs) <= EFFECT_LOGS)
+                log_line("effect copies: effect step of actor %d: effect %02x has %s loaded and wants %s: that group is freed", actor, number,
+                         loaded < 0 ? "its own files" : "a copy's files", set < 0 ? "its own" : "a copy's");
+            if (!effect_free_group(number, b))
+                b = NULL;
+        }
+    }
+    if (!b || !effect_names_put(number, b, set)) {
+        ((void (__cdecl *)(int))FN_START_EFFECT)(actor_arg);
+        return;
+    }
+    ((void (__cdecl *)(int))FN_START_EFFECT)(actor_arg);
+    effect_names_restore();
+    effect_note_loaded(number, b, set, actor, "effect step");
+}
+
+/* At an action's set-up (action_setup_hook): the copies its spell names, -1 (spell) for none. */
+static void effect_copy_note(int *action, int spell)
+{
+    int actor = action[ACT_ACTOR], one = -1, several;
+    unsigned targets = (unsigned)action[6] & 0xffff;
+
+    if (actor < 0 || actor >= 10)
+        return;
+    effect_copy_cast[actor].single = effect_copy_cast[actor].several = effect_copy_cast[actor].now = -1;
+    if (spell < 0)
+        return;
+    if (spells[spell].animation_copy)
+        one = effect_copy_index(spells[spell].animation_copy);
+    several = !spells[spell].has_animation_all ? one :
+              spells[spell].animation_all_copy ? effect_copy_index(spells[spell].animation_all_copy) : -1;
+    effect_copy_cast[actor].single = (short)one;
+    effect_copy_cast[actor].several = (short)several;
+    effect_copy_cast[actor].now = (short)((targets & (targets - 1)) ? several : one);
+    if (InterlockedIncrement(&effect_logs) <= EFFECT_LOGS)
+        log_line("effect copies: actor %d's spell %d: effect %02lx, copy %04x on one target, %04x on several (0 = its own files)%s", actor,
+                 spells[spell].id, (DWORD)action[9], one >= 0 ? (unsigned)effect_copies[one].number : 0u,
+                 several >= 0 ? (unsigned)effect_copies[several].number : 0u,
+                 effect_preload_live ? "" : "; effect copies are OFF (see the start of the log)");
+}
+
+/* A battle starts: nothing of the last one's loads is known any more (the engine freed every group). */
+static void effect_copies_battle_start(void)
+{
+    int i;
+
+    effect_names_restore();
+    effect_pending_base = -1;
+    for (i = 0; i < EFFECT_BASE_COUNT; i++)
+        effect_bases[i].loaded_value = 0;
+    for (i = 0; i < 10; i++)
+        effect_copy_cast[i].single = effect_copy_cast[i].several = effect_copy_cast[i].now = -1;
+}
+
+/* Reads FF7_SpellExt_Effects.ini (before the spell file, which names the copies: at start-up and on
+   "Re-init .ini files"). */
+static void load_effect_copies(void)
+{
+    char *text;
+    DWORD size = 0;
+    int i;
+
+    effect_copies_battle_start();       /* every list holds its own names, nothing is noted */
+    effect_copy_count = effect_copies_usable = effect_file_problems = 0;
+    for (i = 0; i < EFFECT_BASE_COUNT; i++)
+        effect_bases[i].copies = 0;
+    text = read_whole_file(EFFECT_FILE_NAME, &size);
+    if (!text) {
+        log_line("effects file: none (no effect copies)");
+        return;
+    }
+    effect_copy_count = effect_file_parse(text, size, effect_copies, EFFECT_COPY_MAX, effect_problem);
+    VirtualFree(text, 0, MEM_RELEASE);
+    for (i = 0; i < effect_copy_count; i++) {
+        struct effect_copy *c = &effect_copies[i];
+        struct effect_base *b;
+        char line[EFFECT_RENAMES_MAX * (2 * EFFECT_NAME_MAX + 4) + 8];
+        int r, at = 0;
+
+        if (!c->usable)
+            continue;
+        if ((b = effect_read_base(c->base)) == NULL) {
+            char why[300];
+
+            wsprintfA(why, "effect %02x cannot be copied: %s", c->base, effect_bases[c->base].why);
+            effect_problem(c->line, why);
+            c->usable = 0;
+            continue;
+        }
+        if (!effect_copy_point(c, (const DWORD (*)[2])b->own, b->t.count, effect_problem))
+            continue;
+        b->copies++;
+        effect_copies_usable++;
+        for (r = 0; r < c->rename_count; r++)
+            at += wsprintfA(line + at, "%s%s -> %s", r ? ", " : "", c->rename[r].from, c->rename[r].to);
+        log_line("effect copy %04lx: effect %02x with %s", c->number, c->base, line);
+    }
+    log_line("effects file: %d effect copies, %d usable, %d line(s) with problems", effect_copy_count, effect_copies_usable,
+             effect_file_problems);
+}
+
+static BOOL driver_reads_files_itself(void);    /* (with the new characters' model code) */
+
+/* After the hooks are in (the loose files are indexed by then): every file a usable copy renames must be
+   there, where its driver will look; a copy with one missing is not used (its spells play the effect with
+   its own files), as a missing file would be asked of the archive. Under FFNx a .TEX is read by FFNx
+   itself, from <game>\direct\magic (a mod's magic folder); the rest pass this DLL's loose files too. */
+static void effect_copies_check_files(void)
+{
+    BOOL ffnx = driver_reads_files_itself();
+    int i, r;
+
+    for (i = 0; i < effect_copy_count; i++) {
+        struct effect_copy *c = &effect_copies[i];
+
+        for (r = 0; c->usable && r < c->rename_count; r++) {
+            char asked[EFFECT_NAME_MAX + 4], path[MAX_PATH + 200], png[2][EFFECT_NAME_MAX + 8];
+            int length, pngs;
+            BOOL loose, found;
+
+            effect_asked_name(c->rename[r].to, asked);
+            length = lstrlenA(asked);
+            /* or a PNG standing in for it, as resolve_loose_file finds one (NAME.TEX.png, STEM.png) */
+            pngs = effect_png_names(asked, png[0], png[1]);
+            loose = find_loose_file(asked, path) || find_loose_entry(png[0]) != NULL || (pngs > 1 && find_loose_entry(png[1]) != NULL);
+            found = ffnx ? supplied_in_direct_folder(3, asked) || (loose && lstrcmpiA(asked + (length > 4 ? length - 4 : 0), ".tex"))
+                         : loose;
+            if (!found) {
+                log_line("effects file line %d: effect copy %04lx: the file %s is not found %s: the copy is not used (its spells play effect %02x with its own files)",
+                         c->rename[r].line, c->number, asked,
+                         ffnx ? "in <game>\\direct\\magic (the mod's magic folder; under FFNx a .TEX must be there)" : "in SpellExtConfig\\files",
+                         c->base);
+                c->usable = 0;
+                effect_bases[c->base].copies--;
+                effect_copies_usable--;
+            }
+        }
+    }
+}
+
+/* Once there is a usable copy: the preload is chained, if the effect step is this DLL's (the extended
+   summons' three hooks of FUN_00427c22) and the preload's call is the game's code. All or nothing. */
+static void effect_copies_install(void)
+{
+    static const BYTE before[] = { 0x8a, 0x4d, 0x08, 0x51 }, after[] = { 0x83, 0xc4, 0x04 };
+    static const DWORD steps[] = { 0x00424323u, 0x004277e5u, 0x0042daf4u };
+    unsigned k;
+
+    if (effect_preload_live || !effect_copies_usable)
+        return;
+    for (k = 0; k < sizeof steps / sizeof steps[0]; k++)
+        if (*(const BYTE *)steps[k] != 0xe8 || steps[k] + 5 + *(const DWORD *)(steps[k] + 1) != (DWORD)summon_effect_hook) {
+            log_line("effect copies: OFF: the effect step's call at %08lx is not this DLL's (the extended summons' hooks are not in)", steps[k]);
+            return;
+        }
+    if (!bytes_are(FN_FREE_GROUP, effect_free_group_start, sizeof effect_free_group_start)) {
+        log_line("effect copies: OFF: FUN_0068a81c (frees a group) does not start with the game's bytes (another DLL changed it?)");
+        return;
+    }
+    if (!bytes_are(SITE_EFFECT_PRELOAD - 4, before, sizeof before) || !bytes_are(SITE_EFFECT_PRELOAD + 5, after, sizeof after) ||
+        *(const BYTE *)SITE_EFFECT_PRELOAD != 0xe8) {
+        log_line("effect copies: OFF: the code around %08lx is not the game's (mov cl,[ebp+8] / push ecx / call / add esp,4)", SITE_EFFECT_PRELOAD);
+        return;
+    }
+    if (!patch_call_chained(SITE_EFFECT_PRELOAD, FN_EFFECT_PRELOAD, effect_preload_hook, &effect_preload_next)) {
+        log_line("effect copies: OFF: the preload's call at %08lx could not be hooked", SITE_EFFECT_PRELOAD);
+        return;
+    }
+    effect_preload_live = 1;
+    log_line("effect copies: ON: the preload at %08lx goes on to %08lx (%s); the effect step through the extended summons' hooks",
+             SITE_EFFECT_PRELOAD, effect_preload_next, effect_preload_next == FN_EFFECT_PRELOAD ? "the game's" : "another DLL's, chained");
 }
 
 /* ---- Materia table --------------------------------------------------------- */
@@ -17367,6 +18416,7 @@ static void __cdecl battle_start_party_hook(void)
     ((void (__cdecl *)(void))FN_BATTLE_START_PARTY)();
     forget_followup_scripts();
     effect_swap_off();          /* a swap left from the last battle's last limit */
+    effect_copies_battle_start();   /* effect copies: nothing of the last battle's loads is known */
     prop_battle_start();        /* props: no group handle, armed prop or task is carried over */
     state_battle_start();       /* states: nobody is in one when a battle starts */
     pause_battle_start();
@@ -30582,7 +31632,10 @@ static void reload_config(void)
     character_names_scanned = 0;                        /* the character file's names, for `equip` lists */
     load_spell_names();
     load_game_settings();
+    load_effect_copies();       /* (before the spell file: a spell's `animation = 0x100` is looked up in it) */
     load_spells();
+    effect_copies_check_files();    /* (a copy whose files are missing is dropped) */
+    effect_copies_install();    /* (a copy defined for the first time: its one hook, if not in yet) */
     refresh_materia_table();
     refresh_weapon_table();
     load_materia();
@@ -34763,8 +35816,11 @@ static int __cdecl kernel_loader_hook(void)
     load_game_settings();
     wide_refill("a kernel load");   /* (the switch) the kernel's starting stock is in the block: the BLOCK is taken; nothing unless the switch is on */
     wide_kernel_loaded(call);       /* (the wide list, shadow) the stock the kernel load left is the starting stock; reads only */
+    load_effect_copies();           /* (before the spell file: a spell's `animation = 0x100` is looked up in it) */
     load_spells();
     install_hooks();
+    effect_copies_check_files();    /* (after install_hooks, which indexes the loose files: a copy whose files are missing is dropped) */
+    effect_copies_install();        /* (after install_hooks: the effect step must be this DLL's) */
     refresh_materia_table();
     move_materia_table();
     refresh_weapon_table();

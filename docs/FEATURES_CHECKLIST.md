@@ -28,6 +28,9 @@ reported in `FF7_SpellExt.log` beside `ff7_en.exe`, with the file and line.
 - [ ] **Renaming the game's spells** (`FF7_SpellExt_SpellNames.ini`). Note: overwrites names other mods give. *Played*
 - [ ] **A chained split beam**: a beam that splits leaves each enemy as the split before it hit. *Built*
 - [ ] **A limit made of spell effects**. *Built*
+- [ ] **Effect copies** (`FF7_SpellExt_Effects.ini`, numbers 0x100 and up): a spell plays its own copy of a game
+      magic effect with files of your own (a recoloured Fire, say), beside the original in the same battle; 38 of the
+      54 magic effects can be copied. *Built (in the game: not yet seen)*
 - [ ] **More Enemy Skills than the game's set**. *Played*
 
 ## 2. Materia
