@@ -77,6 +77,17 @@ Check External Weapons / Armour / Accessories
   accessories it starts with Abs (absorb), Nul (nullify) or Hlf (halve).
   Bonus is a stat bonus (Str +10); a piece with several has a further line
   for each. Scrolls like the other tables.
+  The table lists the pieces of the fixed range first ([320]-[383] weapons,
+  [384]-[415] armour, [416]-[447] accessories), then every WIDE piece the
+  file defines (weapons [10000]-[15999], armour [16000]-[21999], accessories
+  [22000]-[27999]: see FF7_SpellExt_Box_README.txt), in number order, with
+  the same columns. A wide piece is listed whenever its section was read
+  (box = on or auto), whether or not wide gear is at work in this run (the
+  log's "wide gear:" lines say that). The table holds 4,096 lines; with
+  more pieces than fit, the pieces from there on are left out, the last
+  line says "... N more (the table holds 4096 lines)" and the bottom line
+  says "(X pieces, N more)". (300 pieces with three bonus lines each use
+  under a third of it.)
 
 Check External Items
   The items of the item file, and the limit items of the limits file:
@@ -86,6 +97,13 @@ Check External Items
   Pow is the item's strength figure. Element and Status show the first one
   and "+n" if there are more. Restores is what it restores when used from
   the Item menu (HP 500, MP all, HP + MP). Scrolls like the other tables.
+  The items of the fixed range ([105]-[127], [448]-[511]) come first, then
+  every WIDE item the item file defines ([1024]-[9999]: see
+  FF7_SpellExt_WideItems_README.txt), in number order, read from its
+  definition. A wide item is listed whether or not wide items are admitted
+  in this run (with wide_items = off the sections are still read; the log's
+  "wide items:" line says whether they can enter the item list). The table
+  has room for every number, so nothing is ever left out.
 
 Check External Characters
   Lists EVERY character of the character file, eleven to a page:

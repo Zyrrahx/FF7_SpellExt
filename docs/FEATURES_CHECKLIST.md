@@ -152,7 +152,8 @@ reported in `FF7_SpellExt.log` beside `ff7_en.exe`, with the file and line.
 - [ ] **Everything in plain text files**, one folder, a readme each; examples in `docs/ExampleConfig/`.
 - [ ] **Re-read the files without restarting**, from the SpellExt screen of the main menu. *Played*
 - [ ] **The SpellExt screen**: characters, shops, materia, spells and more, checked in the game (with `debug = true`).
-      *Played*
+      *Played*. The weapon, armour, accessory and item tables also list the wide pieces (10000+, 16000+, 22000+,
+      1024+) after the fixed ones. *Built*
 - [ ] **A log** naming the file and line of every mistake. *Played*
 - [ ] **Testing aids**: `give_on_load`, `items_on_load`, `test_drop`, `test_steal`, `test_stitm`, `test_fill_rows`.
       *Played*

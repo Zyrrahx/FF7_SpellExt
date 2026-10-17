@@ -14785,9 +14785,13 @@ int __cdecl name_code_step(int window, int cost)
     }
     letter = (short *)(ADDR_TEXT_NAME_LETTER + (DWORD)window * 2);
     place = (short *)(ADDR_TEXT_PLACE + (DWORD)window * 0x30);
-    /* (the game has neither the test for no name nor the two for the buffer's ends: a text that
-       would run over the 256 bytes loses the rest of the name here, not the next window's text) */
-    if (!name || *letter < 0 || *letter >= 9 || name[*letter] == 0xff || *place < 0 || *place > 0xfe) {
+    /* (the game has neither the test for no name nor any for the buffer's end. A long text runs on
+       past its window's 256 bytes into the next windows' buffers: the game's own names ea-f2 are
+       written there unchecked, e.g. New Threat's SP Upgrade list, whose last lines fall past
+       byte 255 of window 1. A name of ours is written as far as the game's would be, but never
+       past the end of the four windows' buffers (0x400 bytes from window 0's).) */
+    if (!name || *letter < 0 || *letter >= 9 || name[*letter] == 0xff || *place < 0
+        || window * 0x100 + *place > 0x3ff) {
         *source += length;
         *letter = 0;
         return 1;
@@ -32048,8 +32052,19 @@ static const struct {
       { "Name", "ID", "Special", "Element", "Bonus" }, { 0x10, 0xb4, 0xe6, 0x19a, 0x226 }, 5 },
 };
 static int gear_view_kind;              /* 0 weapons, 1 armour, 2 accessories */
-static struct { BYTE index, nth; } gear_view_lines[NEW_WEAPON_COUNT * 4];
-static int gear_view_count, gear_view_items;
+
+/* GEAR VIEW PURE BEGIN  (the table's builder: tested natively by tools/work/gearview/test) */
+/* A line of the table: the piece's item ID (a fixed piece: 320-447; a wide piece: its number,
+   10000-27999) and which of its lines it is (0: the piece's own; n: its nth further stat bonus). The
+   table lists the fixed pieces of the kind by ID, then every DEFINED wide piece of the kind by
+   number. The lines are a fixed array: when they run out the pieces from there on are not listed,
+   the last line is the marker GEAR_VIEW_MORE ("... N more") and gear_view_more counts them. */
+#define GEAR_VIEW_LINES         (NEW_WEAPON_COUNT * 4 + 3840)     /* 4096: the 256 the fixed pieces can need, then 3840 for wide pieces (960 with three further bonus lines each; 3840 with one line each) */
+#define GEAR_VIEW_MORE          0xffffu
+struct gear_view_line { WORD id; BYTE nth; };
+static struct gear_view_line gear_view_lines[GEAR_VIEW_LINES];
+static int gear_view_count, gear_view_items, gear_view_more;     /* lines; pieces listed; pieces not listed */
+/* GEAR VIEW PURE END */
 
 static const BYTE *gear_view_name(int kind, int i)
 {
@@ -32078,23 +32093,79 @@ static BOOL gear_view_bonus(int kind, const BYTE *record, int nth, char *out)
     return FALSE;
 }
 
-static const char *menu_gear(int kind)
+/* GEAR VIEW PURE BEGIN */
+/* Adds a piece's lines to the table (its own, then one for each further stat bonus): FALSE, with
+   nothing added, when they would not all fit with the last line kept for the marker. */
+static BOOL gear_view_add(int kind, int id, const BYTE *record)
 {
-    int total = kind == 0 ? NEW_WEAPON_COUNT : kind == 1 ? NEW_ARMOUR_COUNT : NEW_ACCESSORY_COUNT, i, nth;
+    int nth, lines = 1;
     char bonus[32];
 
+    while (gear_view_bonus(kind, record, lines, bonus))
+        lines++;
+    if (gear_view_count + lines > GEAR_VIEW_LINES - 1)
+        return FALSE;
+    for (nth = 0; nth < lines; nth++) {
+        gear_view_lines[gear_view_count].id = (WORD)id;
+        gear_view_lines[gear_view_count++].nth = (BYTE)nth;
+    }
+    gear_view_items++;
+    return TRUE;
+}
+
+/* The table of a kind: the fixed pieces that are defined (by ID), then every defined wide piece of
+   the kind (by number: the band is walked, wide_gear() says which are defined). Once a piece does
+   not fit, it and every piece after it are counted in gear_view_more and the marker line is last,
+   so the listed pieces are always an unbroken run in order. */
+static void gear_view_build(int kind)
+{
+    int total = kind == 0 ? NEW_WEAPON_COUNT : kind == 1 ? NEW_ARMOUR_COUNT : NEW_ACCESSORY_COUNT;
+    int first_item = kind == 0 ? NEW_WEAPON_FIRST_ITEM : kind == 1 ? NEW_ARMOUR_FIRST_ITEM : NEW_ACCESSORY_FIRST_ITEM;
+    int first_wide = WIDE_GEAR_FIRST + kind * GEAR_WIDE_BAND, i, number;
+    BOOL full = FALSE;
+
     gear_view_kind = kind;
-    gear_view_count = gear_view_items = 0;
-    for (i = 0; i < total; i++) {
-        if (gear_view_name(kind, i)[0] == 0xff)
-            continue;
-        gear_view_items++;
-        for (nth = 0; gear_view_count < (int)(sizeof gear_view_lines / sizeof gear_view_lines[0])
-                      && (nth == 0 || gear_view_bonus(kind, gear_view_record(kind, i), nth, bonus)); nth++) {
-            gear_view_lines[gear_view_count].index = (BYTE)i;
-            gear_view_lines[gear_view_count++].nth = (BYTE)nth;
+    gear_view_count = gear_view_items = gear_view_more = 0;
+    for (i = 0; i < total; i++)
+        if (gear_view_name(kind, i)[0] != 0xff && (full || !gear_view_add(kind, first_item + i, gear_view_record(kind, i)))) {
+            full = TRUE;
+            gear_view_more++;
+        }
+    for (number = first_wide; number < first_wide + GEAR_WIDE_BAND; number++) {
+        const struct wide_gear *g = wide_gear(number);
+
+        if (g && (full || !gear_view_add(kind, number, g->record))) {
+            full = TRUE;
+            gear_view_more++;
         }
     }
+    if (gear_view_more) {
+        gear_view_lines[gear_view_count].id = GEAR_VIEW_MORE;
+        gear_view_lines[gear_view_count++].nth = 0;
+    }
+}
+/* GEAR VIEW PURE END */
+
+/* The record and the name of a line's piece: a fixed piece's from the DLL's tables, a wide piece's
+   from its definition (NULL and "Missing weapon N" if nothing defines it any more). */
+static const BYTE *gear_view_piece(int kind, int id, const BYTE **name)
+{
+    int i;
+
+    if (id >= WIDE_GEAR_FIRST) {
+        const struct wide_gear *g = wide_gear(id);
+
+        *name = gear_wide_text(id, FALSE);
+        return g ? g->record : NULL;
+    }
+    i = id - (kind == 0 ? NEW_WEAPON_FIRST_ITEM : kind == 1 ? NEW_ARMOUR_FIRST_ITEM : NEW_ACCESSORY_FIRST_ITEM);
+    *name = gear_view_name(kind, i);
+    return gear_view_record(kind, i);
+}
+
+static const char *menu_gear(int kind)
+{
+    gear_view_build(kind);
     menu_view = 3;
     spell_view_top = 0;
     return NULL;
@@ -32140,12 +32211,26 @@ static void draw_gear_view(void)
     for (k = 0; k < gear_views[kind].columns; k++)
         menu_text_ascii(column[k], y, gear_views[kind].heading[k], 5);
     for (row = 0; row < SPELL_VIEW_ROWS && spell_view_top + row < gear_view_count; row++) {
-        int i = gear_view_lines[spell_view_top + row].index, nth = gear_view_lines[spell_view_top + row].nth;
-        const BYTE *record = gear_view_record(kind, i), *name = gear_view_name(kind, i);
-        WORD element = *(const WORD *)(record + (kind == 0 ? 0x10 : kind == 1 ? 0x14 : 0x06));
-        int effect = kind == 0 ? 0xff : record[kind == 1 ? 0x01 : 0x04], first = -1, more = 0;
+        int id = gear_view_lines[spell_view_top + row].id, nth = gear_view_lines[spell_view_top + row].nth;
+        const BYTE *record, *name;
+        WORD element;
+        int effect, first = -1, more = 0;
 
         y = 0x33 + 0x26 + row * VIEW_ROW_PITCH;
+        if (id == (int)GEAR_VIEW_MORE) {        /* the lines ran out: the pieces from here on are not listed */
+            wsprintfA(text, "... %d more (the table holds %d lines)", gear_view_more, GEAR_VIEW_LINES);
+            menu_text_ascii(column[0], y, text, 0);
+            continue;
+        }
+        record = gear_view_piece(kind, id, &name);
+        if (!record) {                          /* a wide piece whose definition went between the build and the draw: name and ID only */
+            menu_text(column[0], y, name, 0);
+            wsprintfA(text, "%d", id);
+            menu_text_ascii(column[1], y, text, 0);
+            continue;
+        }
+        element = *(const WORD *)(record + (kind == 0 ? 0x10 : kind == 1 ? 0x14 : 0x06));
+        effect = kind == 0 ? 0xff : record[kind == 1 ? 0x01 : 0x04];
         if (gear_view_bonus(kind, record, nth, text))
             menu_text_ascii(bonus_column, y, text, 7);
         else
@@ -32156,7 +32241,7 @@ static void draw_gear_view(void)
             continue;
         }
         menu_text(column[0], y, name, 7);
-        wsprintfA(text, "%d", (kind == 0 ? NEW_WEAPON_FIRST_ITEM : kind == 1 ? NEW_ARMOUR_FIRST_ITEM : NEW_ACCESSORY_FIRST_ITEM) + i);
+        wsprintfA(text, "%d", id);
         menu_text_ascii(column[1], y, text, 7);
         if (kind == 2) {
             if (record[0x05] < 7)
@@ -32190,19 +32275,25 @@ static void draw_gear_view(void)
     }
     if (!gear_view_count)
         lstrcpyA(spell_view_line, gear_views[kind].none);
+    else if (gear_view_more)        /* (spell_view_line holds 80: this form is at most 73 with four-digit counts) */
+        wsprintfA(spell_view_line, "%d - %d of %d (%d pieces, %d more)  Up/Down  Page  Cancel: back",
+                  spell_view_top + 1, spell_view_top + row, gear_view_count, gear_view_items, gear_view_more);
     else
         wsprintfA(spell_view_line, "Lines %d - %d of %d (%d pieces)    Up/Down  Page  Cancel: back",
                   spell_view_top + 1, spell_view_top + row, gear_view_count, gear_view_items);
 }
 
 /* "Check External Items": the items of the item file (IDs 105-127 and 448-511), and the limit item of
-   the limits file if there is one. One line each. */
-static WORD item_view_ids[NEW_ITEM_COUNT + 1];
+   the limits file if there is one; then every defined wide item (1024-9999) by number. One line each.
+   The array has a place for every number that can be listed, so no cap is needed. */
+/* ITEM VIEW PURE BEGIN  (the table's builder: tested natively by tools/work/gearview/test) */
+#define ITEM_VIEW_LINES         (NEW_ITEM_COUNT + 1 + WIDE_ITEM_BAND)
+static WORD item_view_ids[ITEM_VIEW_LINES];
 static int item_view_count;
 
-static const char *menu_items(void)
+static void item_view_build(void)
 {
-    int n;
+    int n, number;
 
     item_view_count = 0;
     for (n = 0; n < NEW_ITEM_COUNT; n++) {
@@ -32211,6 +32302,15 @@ static const char *menu_items(void)
         if (is_limit_item(id) || (item_defined[n] && item_names[n][0] != 0xff))
             item_view_ids[item_view_count++] = (WORD)id;
     }
+    for (number = WIDE_ITEM_FIRST; number <= WIDE_ITEM_LAST && item_view_count < ITEM_VIEW_LINES; number++)
+        if (wide_item(number))
+            item_view_ids[item_view_count++] = (WORD)number;
+}
+/* ITEM VIEW PURE END */
+
+static const char *menu_items(void)
+{
+    item_view_build();
     menu_view = 4;
     spell_view_top = 0;
     return NULL;
@@ -32233,22 +32333,29 @@ static void draw_item_view(void)
         menu_text_ascii(column[k], y, heading[k], 5);
     for (row = 0; row < SPELL_VIEW_ROWS && spell_view_top + row < item_view_count; row++) {
         int id = item_view_ids[spell_view_top + row], n = new_item_slot(id), first = -1, more = 0;
-        const BYTE *record = item_record(id);
-        DWORD status = *(const DWORD *)(record + 0x14);
-        WORD element = *(const WORD *)(record + 0x18);
+        const struct wide_item *w = id >= WIDE_ITEM_FIRST ? wide_item(id) : NULL;    /* a wide item: its definition is read, not the tables */
+        const BYTE *record;
+        DWORD status;
+        WORD element;
+        int menu_hp, menu_mp;
 
         y = 0x33 + 0x26 + row * VIEW_ROW_PITCH;
         wsprintfA(text, "%d", id);
         menu_text_ascii(column[1], y, text, 7);
-        if (is_limit_item(id)) {
+        if (id < ITEM_COUNT_EXTENDED && is_limit_item(id)) {
             menu_text(column[0], y, limit_item_text(id, 0), 7);
             wsprintfA(text, "Teaches character %d its last limit", character_file_id(limit_item_owner_of(id)));
             menu_text_ascii(column[2], y, text, 6);
             continue;
         }
-        if (n < 0)
+        if (n < 0 && !w)
             continue;
-        menu_text(column[0], y, item_names[n], 7);
+        record = w ? w->record : item_record(id);
+        status = *(const DWORD *)(record + 0x14);
+        element = *(const WORD *)(record + 0x18);
+        menu_hp = w ? w->menu_hp : item_menu_hp[n];
+        menu_mp = w ? w->menu_mp : item_menu_mp[n];
+        menu_text(column[0], y, w ? w->name : item_names[n], 7);
         wsprintfA(text, "%u", (unsigned)record[0x0f]);
         menu_text_ascii(column[2], y, text, 7);
         for (k = 0; k < 16 && element != 0xffff; k++)
@@ -32281,19 +32388,19 @@ static void draw_item_view(void)
         else
             lstrcpyA(text, statuses[first]);
         menu_text_ascii(column[4], y, text, first < 0 ? 0 : 7);
-        if (item_menu_hp[n] && item_menu_mp[n])
+        if (menu_hp && menu_mp)
             lstrcpyA(text, "HP + MP");
-        else if (item_menu_hp[n] || item_menu_mp[n]) {
-            int amount = item_menu_hp[n] ? item_menu_hp[n] : item_menu_mp[n];
+        else if (menu_hp || menu_mp) {
+            int amount = menu_hp ? menu_hp : menu_mp;
 
             if (amount >= 10000)
-                wsprintfA(text, "%s all", item_menu_hp[n] ? "HP" : "MP");
+                wsprintfA(text, "%s all", menu_hp ? "HP" : "MP");
             else
-                wsprintfA(text, "%s %d", item_menu_hp[n] ? "HP" : "MP", amount);
+                wsprintfA(text, "%s %d", menu_hp ? "HP" : "MP", amount);
         } else
             lstrcpyA(text, "-");
         menu_text_ascii(column[5], y, text, text[0] == '-' ? 0 : 7);
-        wsprintfA(text, "%lu", price_table[id]);
+        wsprintfA(text, "%lu", w ? w->price : price_table[id]);
         menu_text_ascii(column[6], y, text, 7);
     }
     if (!item_view_count)
