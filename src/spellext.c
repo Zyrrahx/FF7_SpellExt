@@ -9904,7 +9904,7 @@ static void apply_flag_changes(const struct spell_draft *draft, BYTE *record)
 #define EFFECT_BASE_COUNT       0x36         /* magic effects 0x00-0x35: the ones a copy may be of */
 #define EFFECT_COPY_FIRST       0x100        /* the DLL's own effect numbers start here */
 #define EFFECT_COPY_LAST        0xffff
-#define EFFECT_COPY_MAX         64
+#define EFFECT_COPY_MAX         256          /* [effect N] sections, copies and native effects together (64 before stage 3a) */
 #define EFFECT_FILES_MAX        16           /* entries of a base's file list (the game's most is 12) */
 #define EFFECT_RENAMES_MAX      16           /* `file` lines of one copy */
 #define EFFECT_NAME_MAX         32           /* a file name and its 0 */
@@ -9928,7 +9928,13 @@ struct effect_copy {
     int rename_count;
     struct effect_rename rename[EFFECT_RENAMES_MAX];
     DWORD ptrs[EFFECT_FILES_MAX][2];    /* the base list's two name pointers per entry while this copy loads */
+    /* A native effect (`play =`, see "Native effects" after the effect copies): not a copy, the DLL draws it */
+    int play;                           /* 0 = a copy; EFFECT_PLAY_SCRIPT = the DLL plays a script */
+    int play_base;                      /* the record's effect while it plays (`base =`); -1 = not given */
+    int play_base_line;
+    char play_name[EFFECT_NAME_MAX];    /* play = NAME: SpellExtConfig\effects\NAME.txt */
 };
+#define EFFECT_PLAY_SCRIPT      1            /* play = NAME: the script effects\NAME.txt (stage 1) */
 /* What a magic effect's loader loads, read from its code by effect_template_read */
 struct effect_template { DWORD handle, list, folder; int count; };
 
@@ -10147,8 +10153,13 @@ static int effect_file_parse(char *text, DWORD size, struct effect_copy *copies,
             c = NULL;
             skipping = 0;
             p = start + 1;
+            if (stop[-1] == ']' && (word_end = next_word(&p, stop - 1)) != NULL && word_is(p, word_end, "sound")) {
+                skipping = 1;           /* a sound handle: sound_file_parse reads it and says its problems */
+                continue;
+            }
+            p = start + 1;
             if (stop[-1] != ']' || (word_end = next_word(&p, stop - 1)) == NULL || !word_is(p, word_end, "effect")) {
-                problem(line_number, "a section is [effect NUMBER], the copy's own number from 0x100 to 0xffff");
+                problem(line_number, "a section is [effect NUMBER], the copy's own number from 0x100 to 0xffff (or [sound NUMBER], a sound handle)");
                 continue;
             }
             p = word_end;
@@ -10173,7 +10184,7 @@ static int effect_file_parse(char *text, DWORD size, struct effect_copy *copies,
                 continue;
             }
             if (count == capacity) {
-                problem(line_number, "too many effect copies (64 at most): the section is skipped");
+                problem(line_number, "too many effect sections, copies and native effects together (256 at most): the section is skipped");
                 continue;
             }
             c = &copies[count++];
@@ -10182,6 +10193,10 @@ static int effect_file_parse(char *text, DWORD size, struct effect_copy *copies,
             c->line = line_number;
             c->usable = 1;
             c->rename_count = 0;
+            c->play = 0;
+            c->play_base = -1;
+            c->play_base_line = 0;
+            c->play_name[0] = 0;
             continue;
         }
         if (!c) {
@@ -10253,13 +10268,44 @@ static int effect_file_parse(char *text, DWORD size, struct effect_copy *copies,
             }
             r->line = line_number;
             c->rename_count++;
+        } else if (word_is(start, key_end, "play")) {
+            /* a native effect: the script the DLL plays, SpellExtConfig\effects\NAME.txt (read afterwards) */
+            for (p = value; p < stop && *p != '.'; p++)
+                ;
+            if (p < stop || !effect_take_name(c->play_name, value, stop)) {
+                problem(line_number, "play is the name of a script in SpellExtConfig\\effects, without its .txt: 1 to 31 letters, digits, _ and - (play = stage0_test)");
+                c->usable = 0;
+            } else
+                c->play = EFFECT_PLAY_SCRIPT;
+        } else if (word_is(start, key_end, "base")) {
+            p = value;
+            if (!parse_number(&p, stop, &n) || p != stop || !(n <= 0x04 || n == 0x19)) {
+                problem(line_number, "base is the effect the record holds while a native effect plays: one that loads no files, 0x00-0x04 or 0x19");
+                c->usable = 0;
+            } else if (c->play_base >= 0 && c->play_base != (int)n) {
+                problem(line_number, "base is given twice, with two different effects");
+                c->usable = 0;
+            } else {
+                c->play_base = (int)n;
+                c->play_base_line = line_number;
+            }
         } else {
-            problem(line_number, "unknown key (a copy has copy = and file = lines)");
+            problem(line_number, "unknown key (a copy has copy = and file = lines; a native effect play = and base =)");
             c->usable = 0;
         }
     }
     for (i = 0; i < count; i++) {
-        if (copies[i].base < 0) {
+        if (copies[i].play) {
+            if (copies[i].base >= 0 || copies[i].rename_count) {
+                problem(copies[i].line, "a native effect (play =) takes no copy = or file = lines: it is not a copy of the game's");
+                copies[i].usable = 0;
+            }
+            if (copies[i].play_base < 0)
+                copies[i].play_base = 0x00;     /* Cure's number: it loads no files at the preload */
+        } else if (copies[i].play_base >= 0) {
+            problem(copies[i].play_base_line, "base = is for a native effect (play =); a copy names its effect with copy =");
+            copies[i].usable = 0;
+        } else if (copies[i].base < 0) {
             problem(copies[i].line, "this copy has no copy = line (which effect it copies)");
             copies[i].usable = 0;
         } else if (!copies[i].rename_count) {
@@ -10322,10 +10368,2418 @@ static int effect_copy_choice(int single, int several, int is_several, int numbe
 {
     int c = is_several ? several : single;
 
-    if (c < 0 || c >= count || !copies[c].usable || copies[c].base != number)
+    if (c < 0 || c >= count || !copies[c].usable || copies[c].play || copies[c].base != number)
         return -1;
     return c;
 }
+
+/* The same for a native effect (`play =`): the index of the one the action plays for an effect number (the
+   record's, which holds the native effect's `base`), -1 none. */
+static int effect_native_choice(int single, int several, int is_several, int number, const struct effect_copy *copies, int count)
+{
+    int c = is_several ? several : single;
+
+    if (c < 0 || c >= count || !copies[c].usable || !copies[c].play || copies[c].play_base != number)
+        return -1;
+    return c;
+}
+
+/* A native effect's clock, one call of its task at a time (see "Native effects"). The task is called once per
+   battle update while the battle is not paused (the game's list runner); under FFNx at 30 or 60 fps also on the
+   frames between, with the pause flag set for them: it then draws but does not advance (as the prop). What
+   the call is to do, as NATIVE_DO_* bits; `page` the frame whose picture is drawn (and whose sounds and hits
+   are due when NATIVE_DO_EVENTS is set). The task ends at `length` frames, or after `watchdog` calls whatever
+   the frames say, or as soon as its files are gone; the caller then queues every hit not yet shown, so each
+   target's result is always shown, exactly once (k->hit_done is the mask of the targets already hit). */
+#define NATIVE_DO_EVENTS        0x01         /* an advancing call: the sounds and hits of frame `page` */
+#define NATIVE_DO_DRAW          0x04
+#define NATIVE_DO_END           0x08
+#define NATIVE_END_LENGTH       0x10         /* why it ends: its length */
+#define NATIVE_END_WATCHDOG     0x20         /* too many calls */
+#define NATIVE_END_GROUP        0x40         /* its files were freed */
+#define NATIVE_WATCHDOG_CALLS   450          /* calls at least: 30 seconds at 15 updates a second (the prop's wait) */
+struct native_clock { int frame, calls, page, hit_done; };
+
+/* The watchdog of an effect of `length` frames: 450 calls, or four calls a frame (FFNx at 60 fps) and 60 more. */
+static int native_watchdog(int length)
+{
+    return length * 4 + 60 > NATIVE_WATCHDOG_CALLS ? length * 4 + 60 : NATIVE_WATCHDOG_CALLS;
+}
+
+static int native_clock_step(struct native_clock *k, int paused, int group_ok, int length, int watchdog)
+{
+    int todo = 0;
+
+    if (++k->calls > watchdog || !group_ok || k->frame >= length)
+        return NATIVE_DO_END | (!group_ok ? NATIVE_END_GROUP : k->frame >= length ? NATIVE_END_LENGTH : NATIVE_END_WATCHDOG);
+    if (!paused)
+        todo |= NATIVE_DO_EVENTS;
+    todo |= NATIVE_DO_DRAW;
+    k->page = k->frame;
+    if (!paused && ++k->frame >= length)
+        todo |= NATIVE_DO_END | NATIVE_END_LENGTH;
+    return todo;
+}
+
+/* ---- Native effect scripts (stage 1): the reader and the timeline -----------------------------------
+   `play = NAME` reads SpellExtConfig\effects\NAME.txt (format: Readme\FF7_SpellExt_EffectsPlayer_README.txt
+   and the comment at "Native effects" below). Read into a struct nfx_script and items in a shared pool; a
+   script with any refused line is not used at all (its spells play their base effect). */
+#define NFX_FILES_MAX           16           /* file entries of one effect's group (8, then 12 before the limits stage; the
+                                                refusal texts say 16) */
+#define NFX_ITEMS_MAX           2048         /* timeline lines of one script (512 before the limits stage) */
+#define NFX_POOL_ITEMS          65536        /* timeline lines of all scripts together (a static pool, int indices; 4096 before stage 3a) */
+#define NFX_LINES_MAX           12000        /* lines of one script file (4000 before the limits stage) */
+#define NFX_TEXT_MAX            0x80000      /* bytes of one script file: 512 KB (128 KB before the limits stage) */
+#define NFX_LENGTH_MAX          480          /* frames: 32 s at the battle's 15 updates a second (240 before the limits stage) */
+#define NFX_EACH_MAX            60           /* frames between one target and the next */
+#define NFX_TEX_MAX             4            /* texture pages a sprite sheet may name (the .S format's) */
+#define NFX_BONE_MAX            54           /* bone places 0..54: 00be1d24 + entry*12, below the bone matrices at 00be1fbc */
+#define NFX_SCALE_MAX           700          /* percent: 7.0 x 4096 still fits the matrix's shorts */
+#define NFX_ROT_MAX             3600         /* degrees, either way */
+#define NFX_OFFSET_MAX          8192         /* x, y, depth */
+#define NFX_PAGE_MAX            255
+#define NFX_PALETTE_MAX         255          /* palette rows a script may name (each is checked against its .TEX's at the cast) */
+#define NFX_SOUND_MAX           751          /* FUN_00745606 indexes its table (0x2ef entries) by id - 1 */
+#define NFX_DRAWS_MAX           128          /* sprite draws one update may make (runtime; each a sheet page of quads,
+                                                FUN_005d1ffb; 64 before the limits stage) */
+#define NFX_MODEL_DRAWS_MAX     64           /* model instances one update may add (runtime; apart from the sprites; 32 before
+                                                the limits stage) */
+#define NFX_TURN_MAX            36000        /* a model's turn about each axis, degrees, either way (100 turns) */
+#define NFX_FADE_MAX            255          /* stage 3b: a model's fade, 255 its own colours .. 0 fully the colour (alpha = fade) */
+#define NFX_UV_MAX              255          /* stage 3b: a model's texture offset, 256ths of the texture, each way */
+#define NFX_BONE_RANDOM         (-1)         /* bone=random: a bone place chosen once per target */
+#define NFX_BONE_GROUND         (-2)         /* stage 3b: bone=ground: on the floor (y 0) under the actor's place (00be12de) */
+#define NFX_PROBLEMS_SAID       20           /* log lines of one script's problems */
+#define NFX_SPRITE              1
+#define NFX_HIT                 2
+#define NFX_SOUND               3
+#define NFX_MODEL               4            /* stage 3a: a 3-D model (.RSD), one instance per target a frame (FUN_005d1ba4) */
+#define NFX_STAGE               5            /* (stage fx 1) the battle stage hidden or darkened while the line is on (stage_fx_step) */
+#define NFX_STAGE_HIDE          0x01         /* a stage line's `entry`: hide= given (the mask in page.a) */
+#define NFX_STAGE_DARK          0x02         /* a stage line's `entry`: dark= given (the darkness in fade, the tint in r, g, b) */
+#define NFX_HIDE_ALL            7            /* 00bfcb64 bits 0-2: no part of the stage is drawn (FUN_0042e52e) */
+#define NFX_HIDE_FAR            4            /* 00bfcb64 bit 2: the far layer (parts 2-4) only; stage kind 2 tests bit 0 only */
+#define NFX_DARK_MAX            4096         /* 00c05ecc: 0 the stage as it is .. 0x1000 fully the tint (alpha 255 - v / 16) */
+#define NFX_FILL                6            /* (stage fx 2) a full-screen quad each update while the line is on (fill or flash) */
+#define NFX_SHAKE               7            /* (stage fx 2) the camera jolted in the screen's axes while the line is on */
+#define NFX_FILL_ADD            1            /* a fill line's `entry` & 3: blend=add (the colour added: FUN_005bd436) */
+#define NFX_FILL_ALPHA          2            /* blend=alpha: the colour laid over at alpha / 255 (one quad in polygon set [5]: stage_fx_over) */
+#define NFX_FILL_SUBTRACT       3            /* blend=subtract: approximated by a black alpha fill of the colour's mean */
+#define NFX_FILL_FLASH          0x04         /* a fill line's `entry`: written as flash (FF8's ramp: in= frames up, out= frames down) */
+#define NFX_FILL_ALPHA_DEFAULT  128          /* blend=alpha's alpha when none is given: FF8's average blend, half and half */
+#define NFX_FILLS_MAX           16           /* fill and flash lines one update draws (runtime; one quad each) */
+#define NFX_SHAKE_MAX           1024         /* a shake's amplitude on each axis, battle units */
+#define NFX_SHAKE_PERIOD_MAX    60           /* frames of one up-and-down of a shake (even, 2 the default: up one frame, down the next) */
+#define NFX_G_ALPHA             0x10         /* (stage fx 2) a fill line's alpha= was given */
+#define NFX_G_BLEND             0x20         /* a fill line's blend= was given */
+#define NFX_G_AXIS              0x40         /* a shake line's x=, y= or z= was given */
+#define NFX_FILL_BACK           0x08         /* (stage fx 3) a fill line's `entry`: layer=back, the opaque backdrop behind the
+                                                actors (Shadow Flare's own strips, FUN_0057747e), not a quad in front */
+#define NFX_ACTORS              8            /* (stage fx 3) the actors hidden, darkened or tinted while the line is on
+                                                (stage_fx_actors_step) */
+#define NFX_ACTORS_HIDE         0x01         /* an actors line's `entry`: hide (00be119d bit 2: the body, weapon and shadow not
+                                                drawn; the scripts run on). (target hide) who=caster, allies (never a target
+                                                among them) and bystanders: any frames; who=targets, opponents, others and
+                                                all: the line ends before the script's first hit (the reader's rule) */
+#define NFX_ACTORS_FADE         0x02         /* fade= given: 00be118c, the amount the body goes toward its colour (in `fade`) */
+#define NFX_ACTORS_TINT         0x04         /* tint= given: 00be11a0..a2 (in r, g, b), with amount= in `fade` (4096 by default) */
+#define NFX_ACTORS_AMOUNT       0x08         /* amount= given (only with tint=) */
+#define NFX_ACTORS_MOVE         0x10         /* (actor move) the word move: the actors' place (00be12de/e0/e2) offset from their
+                                                own by x=, y=, z= (in x, y, z), along the battle's axes. Like hide, a line that
+                                                can name a target ends before the script's first hit (the reader's rule) */
+#define NFX_ACTORS_TURN         0x20         /* (actor move) the word turn: degrees added to the actors' own turn (00be12d6/d8/da)
+                                                by turn=X,Y,Z (in turn[]); the same rule */
+#define NFX_ACTORS_AXIS         0x40         /* x=, y= or z= given (only with move) */
+#define NFX_ACTORS_TURNS        0x80         /* turn= given (only with turn) */
+#define NFX_ACTOR_AMOUNT_MAX    4096         /* 00be118c: 0 the body as it is .. 0x1000 fully its colour (alpha 255 - v / 16) */
+#define NFX_WHO_TARGETS         0            /* an actors line's who= (in page.a): the cast's targets (the default) */
+#define NFX_WHO_CASTER          1            /* the caster */
+#define NFX_WHO_ALLIES          2            /* the caster's side, the caster included */
+#define NFX_WHO_OPPONENTS       3            /* the other side (who=enemies too) */
+#define NFX_WHO_OTHERS          4            /* everyone but the caster */
+#define NFX_WHO_ALL             5            /* everyone */
+#define NFX_WHO_BYSTANDERS      6            /* (target hide) everyone but the caster and the cast's targets, both sides */
+#define NFX_G_WHO               0x80         /* an actors line's who= was given */
+#define NFX_AT_TARGET           0
+#define NFX_AT_CASTER           1
+#define NFX_AT_CENTRE           2            /* (centre anchor) one draw in the middle of the cast's targets (native_centre_place) */
+#define NFX_CENTRE_PASS         10           /* the draw loops' pass after the ten actors': an at=centre line's one draw */
+#define NFX_AT_SCREEN           3            /* (screen anchor) one draw a frame at a place in the camera's own space (x right,
+                                                y down, z away): the current matrix written directly, no bone, no camera read */
+#define NFX_SCREEN_PASS         11           /* the draw loops' pass after the centre's: an at=screen line's one draw */
+#define NFX_SCREEN_MAX          32767        /* at=screen: x and y -32767..32767, z 1..32767 (an item's ranges are shorts) */
+#define NFX_AT_ARENA            4            /* (arena anchor) one draw a frame at a fixed place in the battle's world: x, y, z from
+                                                the world's origin, the point the formation lays the party (FUN_0042ae73, its
+                                                tables at 007c2298 / 007c23b0) and the enemies (FUN_0042b8d2, the scene's rows)
+                                                out around; the world's own axes for every cast (FF8 keeps its
+                                                shower so, whoever casts: native_arena_place); no bone, no target */
+#define NFX_ARENA_PASS          12           /* the draw loops' pass after the screen's: an at=arena line's one draw */
+#define NFX_ARENA_MAX           32767        /* at=arena: x, y and z -32767..32767 (a sprite's place is three shorts) */
+#define NFX_G_BONE              0x01         /* an item's `given`: bone= was given (refused with at=screen) */
+#define NFX_G_Z                 0x02         /* z= was given (a sprite: only with at=screen, where it is the depth) */
+#define NFX_G_DEPTH             0x04         /* a sprite's depth= was given (refused with at=screen) */
+#define NFX_G_WORLD             0x08         /* a model's face=world was given (refused with at=screen: its axes are the screen's) */
+#define NFX_PAGE_LERP           0            /* page = N or A>B */
+#define NFX_PAGE_LOOP           1            /* page = loop: the item's own frame, round the sheet's pages */
+#define NFX_F_DEPTH_MODEL       0x01         /* depth = the target model's height (Fire's) */
+#define NFX_F_MATRIX            0x02         /* rot, x, y or an uneven scale: the DLL's own matrix */
+#define NFX_F_NOFRAME           0x04         /* no frame given: placed when the length is known */
+#define NFX_F_PALETTE           0x08         /* palette= given: the page word picks the row (bit 0x8000); else the sheet's own */
+#define NFX_F_HANDLE            0x10         /* a sound line names a [sound N] handle: `sound` is its number, never a table index */
+#define NFX_F_COLOUR            0x20         /* stage 3b: a model line's colour= given (r, g, b): the colour it fades toward */
+#define NFX_F_FACE              0x40         /* stage 3b: a model line's face=camera: its matrix in the screen's axes at the place */
+#define NFX_F_ZOOM_FIXED        0x80         /* (screen anchor) zoom=fixed on an at=screen line: drawn the size it has at the
+                                                battle's own H whatever H a camera plays (nfx_screen_zoom) */
+#define NFX_SCREEN_H_HOME       512          /* (screen anchor) the battle's own H (00c05f7c: FUN_00429ac0 sets 0x200), zoom=fixed's */
+#define NFX_BLEND_AVERAGE       0            /* the table entry's flags & 7 */
+#define NFX_BLEND_ADD           1
+#define NFX_BLEND_SUBTRACT      2
+#define NFX_BLEND_QUARTER       3
+#define NFX_BLEND_SOLID         4            /* a model only: drawn in the first (solid) pass */
+#define NFX_SPRITE_FLAGS        0x2a38u      /* a sprite entry's flags but the blend: Fire's 2a39 (008fe0a8) & ~7 */
+#define NFX_MODEL_FLAGS         0x00b0u      /* a model entry's flags but the blend: Blizzaga's BRIZAG_1 entry 00b1 (008af438) & ~7:
+                                                0x80 light data, 0x20 the matrix handed over is finished, 0x10 instances a frame */
+#define NFX_MODEL_SCALE         1            /* a model entry's second word (vertices x 1 at load; the size is the line's matrix) */
+
+/* refusal 1: the script is not used; 0: a note (a reserved key or command, ignored) */
+typedef void (*nfx_say_fn)(int line, int refusal, const char *what);
+
+struct nfx_range { short a, b; };    /* from a at the item's first frame to b at its last (a == b: fixed) */
+struct nfx_wide { int a, b; };       /* the same, for a model's turns (past a short) */
+struct nfx_item {
+    BYTE kind, entry, at, page_mode;
+    signed char bone;                   /* NFX_BONE_RANDOM, NFX_BONE_GROUND, or a bone place 0..54 */
+    BYTE flags, sound_kind, given;      /* given: NFX_G_* keys the line names (the screen anchor's refusals) */
+    short from, to, each, line;
+    WORD sound;
+    struct nfx_range page, x, y, depth, sx, sy, rot, r, g, b, pal;
+    struct nfx_range z, sz;             /* a model: its third offset and third scale (x, y, sx, sy are its first two) */
+    struct nfx_wide turn[3];            /* a model: degrees about X, then Y, then Z */
+    struct nfx_range fade, u, v;        /* a model (stage 3b): its fade (255 none), its texture offset (256ths); r, g, b and
+                                           pal as a sprite's, read only with NFX_F_COLOUR / NFX_F_PALETTE */
+};
+struct nfx_file {
+    char name[EFFECT_NAME_MAX], second[EFFECT_NAME_MAX];    /* .TIM, and .SPT (or ""); or a model's .RSD */
+    int blend, tex_count, line;
+    int model;                          /* NAME.RSD: a model entry (NFX_MODEL_FLAGS), drawn by `model` lines */
+    int tex_default;                    /* tex was not given: the list is the default, this file then the next ones */
+    BYTE tex[NFX_TEX_MAX];              /* the files whose textures the sheet's texture pages are, in order */
+};
+struct nfx_script {
+    char folder[EFFECT_NAME_MAX];
+    int usable, problems, notes;
+    int file_count, length, first, count, sprite_files;    /* sprite_files: a bit per file a sprite draws */
+    int model_files;                    /* a bit per file a model line draws */
+    int centre;                         /* (centre anchor) its at=centre lines: native_load checks FUN_005bfec9 for them */
+    int stage;                          /* (stage fx 1) its stage lines */
+    int screen;                         /* (screen anchor) its at=screen lines */
+    int arena;                          /* (arena anchor) its at=arena lines */
+    int fill, shake;                    /* (stage fx 2) its fill and flash lines, its shake lines */
+    int actors;                         /* (stage fx 3) its actors lines (a backdrop, layer=back, is a fill line) */
+    struct nfx_file file[NFX_FILES_MAX];
+};
+/* the refusal texts name the limit (16 files, numbers 0 to 15); a file is a bit of sprite_files, model_files and the
+   runtime's WORD native_list_models (and of `models` in native_load), so 16 is also the most there is room for */
+typedef char nfx_files_max_check[NFX_FILES_MAX == 16 && NFX_FILES_MAX <= 16 ? 1 : -1];
+/* (the limits stage) the other refusal texts spell out their numbers too (2048 timeline lines, frames 0 to 479 and
+   length 1 to 480, 12000 lines, 512 KB), and what holds them: an item's from, to and line are shorts; a model's turn
+   is interpolated as (b - a) x (f - from) with |b - a| <= 72000 within an int (nfx_lerp_wide) */
+typedef char nfx_limits_check[NFX_ITEMS_MAX == 2048 && NFX_LENGTH_MAX == 480 && NFX_LINES_MAX == 12000 &&
+                              NFX_TEXT_MAX == 0x80000 && NFX_LINES_MAX <= 32767 && NFX_LENGTH_MAX <= 32767 &&
+                              72000LL * NFX_LENGTH_MAX <= 0x7fffffffLL ? 1 : -1];
+
+/* [p, end) is a whole signed number (decimal or 0x). */
+static int nfx_int(const char *p, const char *end, int *out)
+{
+    char *q = (char *)p;
+    int negative = 0;
+    DWORD n = 0;
+
+    if (q < end && (*q == '-' || *q == '+'))
+        negative = *q++ == '-';
+    if (!parse_number(&q, end, &n) || q != end || n > 0x7fffffu)
+        return 0;
+    *out = negative ? -(int)n : (int)n;
+    return 1;
+}
+
+/* Comma-separated numbers: how many (1..max), or -1. */
+static int nfx_numbers(const char *p, const char *end, int *out, int max)
+{
+    int n = 0;
+
+    for (;;) {
+        const char *c = p;
+
+        while (c < end && *c != ',')
+            c++;
+        if (n == max || !nfx_int(p, c, &out[n]))
+            return -1;
+        n++;
+        if (c == end)
+            return n;
+        p = c + 1;
+    }
+}
+
+/* A value, or two joined by '>' (from the item's first frame to its last), of 1..max numbers each, the same
+   count on both sides: the count, or -1. b = a when there is no '>'. */
+static int nfx_values(const char *p, const char *end, int max, int *a, int *b)
+{
+    const char *gt = p;
+    int n, m, i;
+
+    while (gt < end && *gt != '>')
+        gt++;
+    if ((n = nfx_numbers(p, gt, a, max)) < 0)
+        return -1;
+    if (gt == end) {
+        for (i = 0; i < n; i++)
+            b[i] = a[i];
+        return n;
+    }
+    m = nfx_numbers(gt + 1, end, b, max);
+    return m == n ? n : -1;
+}
+
+/* A model key's numbers (stage 3a): up to max, written either as one list FROM>TO, the same count on both sides
+   (scale=50,200,50>100,100,100: nfx_values), or as one value per number, any of them FROM>TO by itself
+   (turn=0,0>720,0: X 0, Y 0>720, Z 0). The list form is taken when it gives all max numbers; otherwise the
+   form with a value per number, when that reads. The two never read one text differently: a single '>' inside
+   the second of three numbers leaves two numbers on each side of the list form, and that is never max (3).
+   The count, or -1. */
+static int nfx_components(const char *p, const char *end, int max, int *a, int *b)
+{
+    int listed = nfx_values(p, end, max, a, b), n = 0, i, one_a[3], one_b[3];
+
+    if (listed == max || max > 3)
+        return listed;
+    for (;;) {
+        const char *c = p;
+
+        while (c < end && *c != ',')
+            c++;
+        if (n == max || nfx_values(p, c, 1, &one_a[n], &one_b[n]) != 1)
+            return listed;      /* (a and b as the list form left them) */
+        n++;
+        if (c == end)
+            break;
+        p = c + 1;
+    }
+    for (i = 0; i < n; i++)
+        a[i] = one_a[i], b[i] = one_b[i];
+    return n;
+}
+
+/* Every number of a and b within [low, high]. */
+static int nfx_within(const int *a, const int *b, int n, int low, int high)
+{
+    int i;
+
+    for (i = 0; i < n; i++)
+        if (a[i] < low || a[i] > high || b[i] < low || b[i] > high)
+            return 0;
+    return 1;
+}
+
+static struct nfx_range nfx_pair(int a, int b)
+{
+    struct nfx_range r;
+
+    r.a = (short)a;
+    r.b = (short)b;
+    return r;
+}
+
+/* (screen anchor) both ends of r within -limit..limit */
+static int nfx_within_pair(struct nfx_range r, int limit)
+{
+    return r.a >= -limit && r.a <= limit && r.b >= -limit && r.b <= limit;
+}
+
+/* A folder as the game's loaders give one (MAGIC/FIRE): letters, digits, _ - and /, 1 to 31 characters. */
+static int nfx_take_folder(char *out, const char *start, const char *end)
+{
+    int n = 0;
+
+    if (start >= end || end - start >= EFFECT_NAME_MAX || *start == '/')
+        return 0;
+    for (; start < end; start++) {
+        char c = *start;
+
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '/'))
+            return 0;
+        out[n++] = c;
+    }
+    out[n] = 0;
+    return 1;
+}
+
+/* A `file N = NAME.TIM [SHEET.SPT] [blend=..] [tex=..]` line's value, or (stage 3a) `file N = NAME.RSD
+   [blend=..]`, a model: its textures are the ones its RSD names. NULL, or why not. */
+static const char *nfx_file_line(struct nfx_file *f, char *p, char *end)
+{
+    char *word_end;
+    int words = 0;
+
+    f->second[0] = 0;
+    f->blend = NFX_BLEND_ADD;
+    f->tex_count = 0;
+    f->tex_default = 0;
+    f->model = 0;
+    for (;;) {
+        while (p < end && is_space(*p))
+            p++;
+        if (p == end)
+            break;
+        for (word_end = p; word_end < end && !is_space(*word_end); word_end++)
+            ;
+        if (word_end - p > 6 && word_is(p, p + 6, "blend=")) {
+            if (word_is(p + 6, word_end, "add"))
+                f->blend = NFX_BLEND_ADD;
+            else if (word_is(p + 6, word_end, "average"))
+                f->blend = NFX_BLEND_AVERAGE;
+            else if (word_is(p + 6, word_end, "subtract"))
+                f->blend = NFX_BLEND_SUBTRACT;
+            else if (word_is(p + 6, word_end, "quarter"))
+                f->blend = NFX_BLEND_QUARTER;
+            else if (word_is(p + 6, word_end, "solid"))
+                f->blend = NFX_BLEND_SOLID;     /* a model only: checked when the whole line is read */
+            else
+                return "blend is add, average, subtract or quarter (the engine's four blended kinds), or solid for a model (.RSD)";
+        } else if (word_end - p > 4 && word_is(p, p + 4, "tex=")) {
+            int list[NFX_TEX_MAX + 1], n = nfx_numbers(p + 4, word_end, list, NFX_TEX_MAX + 1), i;
+
+            if (n < 1 || n > NFX_TEX_MAX)
+                return "tex is a list of 1 to 4 file numbers, the files whose textures the sheet's texture pages use, in order (tex=0,1)";
+            for (i = 0; i < n; i++) {
+                if (list[i] < 0 || list[i] >= NFX_FILES_MAX)
+                    return "tex names a file number, 0 to 15";
+                f->tex[i] = (BYTE)list[i];
+            }
+            f->tex_count = n;
+        } else if (words == 0) {
+            if (!effect_take_name(f->name, p, word_end))
+                return "a file is NAME.TIM: 1 to 31 characters, letters, digits, _ and - and the dot of the extension";
+            if (effect_same_name(effect_extension(f->name), ".P"))
+                return "a model is named by its .RSD (file N = NAME.RSD): the game reads the .P its RSD names";
+            if (effect_same_name(effect_extension(f->name), ".RSD"))
+                f->model = 1;
+            else if (!effect_same_name(effect_extension(f->name), ".TIM"))
+                return "the first name of a file line is its texture, NAME.TIM (the game asks for NAME.TEX; a PNG may stand in for it), or a model, NAME.RSD";
+            words++;
+        } else if (words == 1 && f->model) {
+            return "a model's file line names its .RSD alone (its textures are the ones the RSD names), then optionally blend=";
+        } else if (words == 1) {
+            if (!effect_take_name(f->second, p, word_end) || !effect_same_name(effect_extension(f->second), ".SPT"))
+                return "the second name of a file line is its sprite sheet, NAME.SPT (the game asks for NAME.S)";
+            words++;
+        } else
+            return "a file line is NAME.TIM, then optionally SHEET.SPT, blend= and tex=";
+        p = word_end;
+    }
+    if (!words)
+        return "a file line names its texture: file N = NAME.TIM [SHEET.SPT]";
+    if (f->model && f->tex_count)
+        return "tex= is for a sprite sheet: a model's textures are the ones its RSD names";
+    if (f->tex_count && !f->second[0])
+        return "tex= is for a file with a sprite sheet (.SPT)";
+    if (f->blend == NFX_BLEND_SOLID && !f->model)
+        return "blend=solid is for a model (.RSD): a sprite is add, average, subtract or quarter";
+    return NULL;
+}
+
+/* ---- Sound handles (stage 1): `[sound N]` sections of the effects file --------------------------------
+   A handle is a sound of the mod's own: N is FFNx's sound id AND its file, <game>\sfx\N.ogg (a mod's
+   base\sfx\N.ogg under 7th Heaven). FFNx (use_external_sfx) has replaced the game's channel player
+   FUN_00745160(pan, id, channel) by its own, which makes the file name from the id with no bound. On the way it
+   makes ONE unchecked read of the game's 751-entry sound table: ff7_should_sfx_loop(id) =
+   sfx_fmt_header[id-1].loop, the dword at 00de0e8c + (id-1)*0x1c (FFNx sfx.cpp; the table 00de0e84, 0x1c a
+   sound). For N in 53848-58089 that dword lies in the exe's .rsrc section (00f51000-00f6e000), which is
+   read-only and holds the file's bytes: a handle is usable only where it reads 0 (2,767 of those numbers, whose size dword before it is also at most 0x20000).
+   The DLL checks the place (a readable, not writable section of the exe, inside its image; the page not
+   writable now) and the value at Re-init and again at each play. A handle plays through FUN_00745160 on its
+   channel (1-4) only, never through FUN_00745606 (kind 0x20), which reads the table and a pointer in it.
+       [sound 56780]
+       name = ff8_fire_0        optional: letters, digits and _, not starting with a digit, 1 to 23
+       channel = 4            optional, 1-4 (default 4): the channel it plays on (and cuts)
+       volume = 100           reserved for stage 3: a note, ignored
+   Scripts say `sound 56780` or `sound ff8_fire_0`; the game's own sounds 1-751 are played as before. */
+#define SOUND_HANDLE_MAX        256          /* [sound N] sections (64 before stage 3a) */
+#define SOUND_NAME_MAX          24           /* a name and its 0 */
+#define SOUND_GAME_LAST         751          /* the game's own sounds (= NFX_SOUND_MAX): never a handle */
+#define SOUND_POOL_FIRST        53848        /* the numbers whose loop dword lies in the exe's .rsrc */
+#define SOUND_POOL_LAST         58089
+#define SOUND_CHANNEL_DEFAULT   4
+#define SOUND_LOOP_DWORDS       0x00de0e8cu  /* sfx_fmt_header[0].loop: 00de0e84 + 8 (FFNx ff7_should_sfx_loop reads [id-1]) */
+#define SOUND_ENTRY_SIZE        0x1c
+#define SOUND_SIZE_BEFORE_LOOP  8            /* the entry's size dword is 8 bytes before its loop dword */
+#define SOUND_SIZE_SMALL        0x20000u     /* the stock 00745160 sends a larger size to 00745606 (review fix 1) */
+#define SOUND_RUNS_SAID         6            /* the usable runs a refusal names */
+#define SOUND_SCN_READ          0x40000000u  /* IMAGE_SCN_MEM_READ */
+#define SOUND_SCN_WRITE         0x80000000u  /* IMAGE_SCN_MEM_WRITE */
+
+struct sound_handle {
+    WORD id;                            /* SOUND_POOL_FIRST..SOUND_POOL_LAST */
+    BYTE channel, usable;               /* channel 1-4 */
+    int line;                           /* of its section */
+    char name[SOUND_NAME_MAX];          /* "" = none */
+};
+/* A section of the exe as its header gives it: [start, end) virtual addresses, the characteristics */
+struct sound_section { DWORD start, end, flags; };
+
+/* The handles scripts resolve against while they are read (load_effect_copies sets them first). */
+static const struct sound_handle *nfx_handles;
+static int nfx_handle_count;
+
+/* The address FFNx reads for sound id's loop flag. */
+static DWORD sound_loop_address(int id)
+{
+    return SOUND_LOOP_DWORDS + (DWORD)(id - 1) * SOUND_ENTRY_SIZE;
+}
+
+/* NULL if sound id's loop dword, and its entry's size dword 8 bytes before it, lie wholly inside one section of the
+   exe that is readable and not writable, and inside the image ([image_start, image_end)); else why not. */
+static const char *sound_loop_place(int id, const struct sound_section *s, int count, DWORD image_start, DWORD image_end)
+{
+    DWORD at;
+    int i;
+
+    if (id < SOUND_POOL_FIRST || id > SOUND_POOL_LAST)
+        return "its number is not in 53848-58089";
+    at = sound_loop_address(id);
+    if (at - SOUND_SIZE_BEFORE_LOOP < image_start || at + 4 > image_end)
+        return "the dword FFNx reads for it is outside the game's image";
+    for (i = 0; i < count; i++)
+        if (at - SOUND_SIZE_BEFORE_LOOP >= s[i].start && at + 4 <= s[i].end) {
+            if (s[i].flags & SOUND_SCN_WRITE)
+                return "the dword FFNx reads for it is in a writable section of the exe";
+            if (!(s[i].flags & SOUND_SCN_READ))
+                return "the dword FFNx reads for it is in a section of the exe that cannot be read";
+            return NULL;
+        }
+    return "the dword FFNx reads for it is in no single section of the exe";
+}
+
+/* NULL if an entry's values make the handle safe: the loop dword 0 (FFNx would loop it for ever otherwise) and
+   the size dword at most 0x20000 (the game's own 00745160, should another module pass calls through to it, reads
+   that size unchecked first and sends a larger one to 00745606, which dereferences a pointer of the entry). */
+static const char *sound_entry_values(DWORD size, DWORD loop)
+{
+    if (loop)
+        return "is not 0: FFNx would loop the sound for ever";
+    if (size > SOUND_SIZE_SMALL)
+        return "has a size over 0x20000 before it: the game's own player would hand it to 00745606";
+    return NULL;
+}
+
+/* The longest runs of usable numbers in the pool (usable(id) != 0), longest first, as "56780-57181, ...", at most
+   `most`; the count of usable numbers. */
+static int sound_pool_runs(int (*usable)(int id), char *out, int out_size, int most)
+{
+    int best[SOUND_RUNS_SAID][2], n = 0, total = 0, id, start = -1, i, k, at = 0;
+
+    if (most > SOUND_RUNS_SAID)
+        most = SOUND_RUNS_SAID;
+    for (id = SOUND_POOL_FIRST; id <= SOUND_POOL_LAST + 1; id++) {
+        int ok = id <= SOUND_POOL_LAST && usable(id);
+
+        total += ok;
+        if (ok && start < 0)
+            start = id;
+        if (!ok && start >= 0) {
+            int length = id - start;
+
+            for (i = 0; i < n && best[i][1] - best[i][0] >= length; i++)
+                ;
+            if (i < most) {
+                for (k = (n < most ? n : most - 1); k > i; k--)
+                    best[k][0] = best[k - 1][0], best[k][1] = best[k - 1][1];
+                best[i][0] = start, best[i][1] = id;
+                if (n < most)
+                    n++;
+            }
+            start = -1;
+        }
+    }
+    if (out_size > 0)
+        out[0] = 0;
+    for (i = 0; i < n; i++) {
+        char part[32];
+        int len = 0, a = best[i][0], b = best[i][1] - 1, d, j;
+        char digits[12];
+
+        /* "a-b" (or "a"), with ", " before all but the first: no printf in the pure part */
+        if (i)
+            part[len++] = ',', part[len++] = ' ';
+        for (j = 0; j < 2; j++) {
+            int v = j ? b : a;
+
+            if (j && a == b)
+                break;
+            if (j)
+                part[len++] = '-';
+            d = 0;
+            do digits[d++] = (char)('0' + v % 10); while ((v /= 10) > 0);
+            while (d)
+                part[len++] = digits[--d];
+        }
+        if (at + len >= out_size)
+            break;
+        for (j = 0; j < len; j++)
+            out[at++] = part[j];
+        out[at] = 0;
+    }
+    return total;
+}
+
+/* What the first bytes of the game's channel player say: 1 a jump out of the game's image (FFNx's player, which
+   plays a handle's file), 0 the game's own code (55 8b ec: silent for an id above 751), -1 anything else (a jump
+   inside the image, or other bytes: someone else's patch). *target gets a jump's destination. */
+static int sound_player_state(const BYTE *entry, DWORD at, DWORD image_start, DWORD image_end, DWORD *target)
+{
+    *target = 0;
+    if (entry[0] == 0xe9) {
+        *target = at + 5 + effect_dword(entry + 1);
+        return *target >= image_start && *target < image_end ? -1 : 1;
+    }
+    return entry[0] == 0x55 && entry[1] == 0x8b && entry[2] == 0xec ? 0 : -1;
+}
+
+/* A handle's name: [A-Za-z_][A-Za-z0-9_]*, 1 to 23 characters. 0 if [start, end) is not one. */
+static int sound_take_name(char *out, const char *start, const char *end)
+{
+    int n = 0;
+
+    if (start >= end || end - start >= SOUND_NAME_MAX || (*start >= '0' && *start <= '9'))
+        return 0;
+    for (; start < end; start++) {
+        char c = *start;
+
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'))
+            return 0;
+        out[n++] = c;
+    }
+    out[n] = 0;
+    return 1;
+}
+
+/* The usable handle numbered id / named [start, end) among those scripts resolve against: its index, or -1. */
+static int sound_handle_by_id(int id)
+{
+    int i;
+
+    for (i = 0; i < nfx_handle_count; i++)
+        if (nfx_handles[i].usable && nfx_handles[i].id == id)
+            return i;
+    return -1;
+}
+
+static int sound_handle_by_name(const char *start, const char *end)
+{
+    char name[SOUND_NAME_MAX];
+    int i;
+
+    if (!sound_take_name(name, start, end))
+        return -1;
+    for (i = 0; i < nfx_handle_count; i++)
+        if (nfx_handles[i].usable && nfx_handles[i].name[0] && effect_same_name(nfx_handles[i].name, name))
+            return i;
+    return -1;
+}
+
+/* Reads the `[sound N]` sections of the effects file (effect_file_parse passes over them; this passes over
+   every other section and line, which that one judges). Refusals (refusal 1: the handle is not usable) and
+   notes go to `say` with their line. Returns how many handles were read (usable or not); the place of each
+   number's loop dword is checked afterwards against the running exe (sound_loop_place). */
+static int sound_file_parse(char *text, DWORD size, struct sound_handle *h, int capacity, nfx_say_fn say)
+{
+    char *line, *end, *file_end = text + size;
+    int line_number = 0, count = 0, i, k;
+    struct sound_handle *c = NULL;
+
+    for (line = text; line < file_end; line = end + 1) {
+        char *start = line, *stop, *equals, *key_end, *value, *p, *word_end;
+        DWORD n = 0;
+
+        for (end = line; end < file_end && *end != '\n'; end++)
+            ;
+        line_number++;
+        for (stop = start; stop < end; stop++)
+            if ((*stop == ';' || *stop == '#') && (stop == start || is_space(stop[-1])))
+                break;
+        trim(&start, &stop);
+        if (start == stop)
+            continue;
+        if (*start == '[') {
+            c = NULL;
+            p = start + 1;
+            if (stop[-1] != ']' || (word_end = next_word(&p, stop - 1)) == NULL || !word_is(p, word_end, "sound"))
+                continue;               /* not a sound section: effect_file_parse's */
+            p = word_end;
+            while (p < stop - 1 && is_space(*p))
+                p++;
+            if (stop - 1 - p <= 7 && parse_number(&p, stop - 1, &n))
+                while (p < stop - 1 && is_space(*p))
+                    p++;
+            else
+                p = start;
+            if (p != stop - 1) {
+                say(line_number, 1, "a sound section is [sound NUMBER]: the number is the sound's file, sfx\\NUMBER.ogg, 53848 to 58089");
+                continue;
+            }
+            if (n <= SOUND_GAME_LAST) {
+                say(line_number, 1, "sounds 1-751 are the game's own: a script plays them by number (sound 9) without a section");
+                continue;
+            }
+            if (n < SOUND_POOL_FIRST || n > SOUND_POOL_LAST) {
+                say(line_number, 1, "a sound handle's number is 53848 to 58089 (where FFNx's one unchecked read of the game's sound table lands in read-only data); the log names the usable runs");
+                continue;
+            }
+            for (i = 0; i < count && h[i].id != n; i++)
+                ;
+            if (i < count) {
+                say(line_number, 1, "this sound number is already defined above: neither section is used");
+                h[i].usable = 0;
+                continue;
+            }
+            if (count == capacity) {
+                say(line_number, 1, "too many sound handles (256 at most): the section is skipped");
+                continue;
+            }
+            c = &h[count++];
+            c->id = (WORD)n;
+            c->channel = SOUND_CHANNEL_DEFAULT;
+            c->usable = 1;
+            c->line = line_number;
+            c->name[0] = 0;
+            continue;
+        }
+        if (!c)
+            continue;                   /* a line of another section, or of none: effect_file_parse's */
+        for (equals = start; equals < stop && *equals != '='; equals++)
+            ;
+        key_end = equals;
+        value = equals < stop ? equals + 1 : stop;
+        trim(&start, &key_end);
+        trim(&value, &stop);
+        if (equals == stop) {
+            say(line_number, 1, "expected key = value (a sound section has name =, channel =)");
+            c->usable = 0;
+        } else if (word_is(start, key_end, "name")) {
+            if (c->name[0] || !sound_take_name(c->name, value, stop)) {
+                say(line_number, 1, c->name[0] ? "name is given twice"
+                                               : "a sound's name is 1 to 23 letters, digits and _, not starting with a digit (name = ff8_fire_0)");
+                c->usable = 0;
+            }
+        } else if (word_is(start, key_end, "channel")) {
+            int v;
+
+            if (!nfx_int(value, stop, &v) || v < 1 || v > 4) {
+                say(line_number, 1, "channel is 1 to 4 (default 4): the channel the sound plays on, which stops what played there before");
+                c->usable = 0;
+            } else
+                c->channel = (BYTE)v;
+        } else if (word_is(start, key_end, "volume")) {
+            say(line_number, 0, "volume is reserved for a later stage (3): ignored; the sound plays at FFNx's volume (the game's SFX slider)");
+        } else {
+            say(line_number, 1, "unknown key (a sound section has name = and channel =)");
+            c->usable = 0;
+        }
+    }
+    /* a name is unique: neither handle that has it is used */
+    for (i = 0; i < count; i++)
+        for (k = i + 1; k < count; k++)
+            if (h[i].name[0] && effect_same_name(h[i].name, h[k].name)) {
+                if (h[k].usable || h[i].usable)
+                    say(h[k].line, 1, "this sound's name is already the name of the one above: neither is used");
+                h[i].usable = h[k].usable = 0;
+            }
+    return count;
+}
+
+/* How a sound line is played: through FUN_005bfff3 with its kind (the game's sounds 1-751, as before), or
+   through the channel player FUN_00745160 on the handle's channel (a handle: never FUN_00745606). */
+#define NFX_PLAY_GAME           1
+#define NFX_PLAY_HANDLE         2
+static int nfx_sound_route(const struct nfx_item *it)
+{
+    if (it->kind != NFX_SOUND)
+        return 0;
+    if (it->flags & NFX_F_HANDLE)
+        return NFX_PLAY_HANDLE;
+    return it->sound >= 1 && it->sound <= SOUND_GAME_LAST ? NFX_PLAY_GAME : 0;
+}
+
+/* (screen anchor) refusal texts the key reader and the line's last checks share */
+static const char nfx_model_offset_text[] =
+    "x, y and z move a model in the battle's world units from its bone (y negative: up), -8192 to 8192, or FROM>TO; with face=camera, x right and y down on the screen's plane and z along the line of sight (negative: toward the camera); with at=screen, x and y -32767 to 32767 and z 1 to 32767 in the camera's own space; with at=arena, x, y and z -32767 to 32767 from the arena's centre";
+static const char nfx_sprite_offset_text[] =
+    "x and y are offsets on the screen's plane (x right, y down), -8192 to 8192, or FROM>TO (with at=screen: -32767 to 32767, the place in the camera's own space; with at=arena: -32767 to 32767, the place in the arena)";
+static const char nfx_screen_z_text[] =
+    "with at=screen, z is required: the distance from the camera along its line of sight, 1 to 32767 (or FROM>TO; below 250 the game's near plane cuts it off)";
+static const char nfx_zoom_text[] =
+    "zoom is camera (the default: the line grows and shrinks as the camera zooms) or fixed (with at=screen: it keeps the size it has at the battle's own H, 512, as FF8 keeps a layer with its own H)";
+
+/* (screen anchor) zoom= on a sprite or model line: 1 read (or not this key), 0 a bad value */
+static int nfx_zoom_key(struct nfx_item *it, const char *value, const char *end)
+{
+    if (word_is(value, end, "fixed"))
+        it->flags |= NFX_F_ZOOM_FIXED;
+    else if (word_is(value, end, "camera"))
+        it->flags &= ~NFX_F_ZOOM_FIXED;
+    else
+        return 0;
+    return 1;
+}
+
+/* A sprite, hit or sound line's keys (everything after the command and its number). NULL, or why not. */
+static const char *nfx_item_key(struct nfx_item *it, char *key, char *key_end, char *value, char *end, nfx_say_fn say, int line,
+                                int *notes)
+{
+    int a[3], b[3], n;
+
+    if (it->kind == NFX_STAGE) {
+        /* (stage fx 1) the stage belongs to the cast, not to a target: no at=, bone= or each= */
+        if (word_is(key, key_end, "hide")) {
+            if (word_is(value, end, "all"))
+                it->page = nfx_pair(NFX_HIDE_ALL, NFX_HIDE_ALL);
+            else if (word_is(value, end, "far"))
+                it->page = nfx_pair(NFX_HIDE_FAR, NFX_HIDE_FAR);
+            else if (word_is(value, end, "none"))
+                it->page = nfx_pair(0, 0);
+            else
+                return "hide is all (no part of the stage is drawn), far (its far layer only, as Typhoon does) or none (the stage drawn as the game has it)";
+            it->entry |= NFX_STAGE_HIDE;
+        } else if (word_is(key, key_end, "dark")) {
+            if (nfx_values(value, end, 1, a, b) != 1 || !nfx_within(a, b, 1, 0, NFX_DARK_MAX))
+                return "dark is 0 to 4096 (0 the stage as it is, 4096 fully the colour= tint, default black), or FROM>TO over the line's frames (dark=0>4096)";
+            it->fade = nfx_pair(a[0], b[0]);
+            it->entry |= NFX_STAGE_DARK;
+        } else if (word_is(key, key_end, "colour") || word_is(key, key_end, "color")) {
+            if (nfx_values(value, end, 3, a, b) != 3 || !nfx_within(a, b, 3, 0, 255))
+                return "colour is R,G,B, 0 to 255 each: the tint dark= takes the stage toward (default 0,0,0, black), or R,G,B>R,G,B";
+            it->r = nfx_pair(a[0], b[0]);
+            it->g = nfx_pair(a[1], b[1]);
+            it->b = nfx_pair(a[2], b[2]);
+            it->flags |= NFX_F_COLOUR;
+        } else
+            return "a stage line takes hide= (all, far or none), dark= and colour= (with dark=): it belongs to the cast, so no at=, bone= or each=";
+        return NULL;
+    }
+    if (it->kind == NFX_FILL) {
+        /* (stage fx 2) a fill or a flash covers the whole screen: it belongs to the cast, not to a target */
+        int flash = (it->entry & NFX_FILL_FLASH) != 0;
+
+        if (word_is(key, key_end, "colour") || word_is(key, key_end, "color")) {
+            if (nfx_values(value, end, 3, a, b) != 3 || !nfx_within(a, b, 3, 0, 255))
+                return "colour is R,G,B, 0 to 255 each, or R,G,B>R,G,B over the line's frames";
+            it->r = nfx_pair(a[0], b[0]);
+            it->g = nfx_pair(a[1], b[1]);
+            it->b = nfx_pair(a[2], b[2]);
+            it->flags |= NFX_F_COLOUR;
+        } else if (!flash && word_is(key, key_end, "alpha")) {
+            if (nfx_values(value, end, 1, a, b) != 1 || !nfx_within(a, b, 1, 0, 255))
+                return "alpha is 0 to 255 (0 nothing, 255 fully the colour, black by default), or FROM>TO over the line's frames";
+            it->fade = nfx_pair(a[0], b[0]);
+            it->given |= NFX_G_ALPHA;
+        } else if (!flash && word_is(key, key_end, "blend")) {
+            if (word_is(value, end, "add"))
+                it->entry = (BYTE)((it->entry & ~3) | NFX_FILL_ADD);
+            else if (word_is(value, end, "alpha") || word_is(value, end, "average"))
+                it->entry = (BYTE)((it->entry & ~3) | NFX_FILL_ALPHA);
+            else if (word_is(value, end, "subtract"))
+                it->entry = (BYTE)((it->entry & ~3) | NFX_FILL_SUBTRACT);
+            else
+                return "blend is add (the colour added to the picture), alpha (the colour laid over it at alpha=, 128 by default; also average) or subtract (approximated: the picture darkened by the colour's mean)";
+            it->given |= NFX_G_BLEND;
+        } else if (flash && (word_is(key, key_end, "in") || word_is(key, key_end, "out"))) {
+            if (nfx_values(value, end, 1, a, b) != 1 || a[0] != b[0] || a[0] < 0 || a[0] >= NFX_LENGTH_MAX)
+                return "in and out are the frames the flash takes to rise from nothing and to fall back, 0 to 479 (FF8's attack and decay)";
+            if (word_is(key, key_end, "in"))
+                it->page.a = (short)a[0];
+            else
+                it->page.b = (short)a[0];
+        } else if (!flash && word_is(key, key_end, "layer")) {
+            /* (stage fx 3) layer=back: the opaque backdrop behind the actors (FUN_0057747e); front: the quad, as before */
+            if (word_is(value, end, "back"))
+                it->entry |= NFX_FILL_BACK;
+            else if (word_is(value, end, "front"))
+                it->entry &= ~NFX_FILL_BACK;
+            else
+                return "layer is front (the default: the quad in front of everything) or back (an opaque colour behind the actors, at the far plane, as Shadow Flare's backdrop)";
+        } else
+            return flash ? "a flash line takes colour= (R,G,B), in= and out=: it covers the screen, so no at=, bone= or each="
+                         : "a fill line takes colour= (R,G,B), alpha= and blend= (add, alpha or subtract), and layer=back: it covers the screen, so no at=, bone= or each=";
+        return NULL;
+    }
+    if (it->kind == NFX_ACTORS) {
+        /* (stage fx 3) the actors' look belongs to the cast; who= says whose (relative to the caster) */
+        if (word_is(key, key_end, "fade")) {
+            if (nfx_values(value, end, 1, a, b) != 1 || !nfx_within(a, b, 1, 0, NFX_ACTOR_AMOUNT_MAX))
+                return "fade is 0 to 4096 (0 the body as it is, 4096 fully black: FF7 darkens a body, it never makes it see-through), or FROM>TO over the line's frames (fade=0>4096)";
+            it->fade = nfx_pair(a[0], b[0]);
+            it->entry |= NFX_ACTORS_FADE;
+        } else if (word_is(key, key_end, "tint")) {
+            if (nfx_values(value, end, 3, a, b) != 3 || !nfx_within(a, b, 3, 0, 255))
+                return "tint is R,G,B, 0 to 255 each: the colour the body goes toward by amount= (4096 by default), or R,G,B>R,G,B over the line's frames";
+            it->r = nfx_pair(a[0], b[0]);
+            it->g = nfx_pair(a[1], b[1]);
+            it->b = nfx_pair(a[2], b[2]);
+            it->entry |= NFX_ACTORS_TINT;
+        } else if (word_is(key, key_end, "amount")) {
+            if (nfx_values(value, end, 1, a, b) != 1 || !nfx_within(a, b, 1, 0, NFX_ACTOR_AMOUNT_MAX))
+                return "amount is how far the body goes toward the tint, 0 to 4096 (4096 fully the colour), or FROM>TO over the line's frames";
+            it->fade = nfx_pair(a[0], b[0]);
+            it->entry |= NFX_ACTORS_AMOUNT;
+        } else if (word_is(key, key_end, "who")) {
+            if (word_is(value, end, "targets") || word_is(value, end, "target"))
+                it->page = nfx_pair(NFX_WHO_TARGETS, NFX_WHO_TARGETS);
+            else if (word_is(value, end, "caster"))
+                it->page = nfx_pair(NFX_WHO_CASTER, NFX_WHO_CASTER);
+            else if (word_is(value, end, "allies"))
+                it->page = nfx_pair(NFX_WHO_ALLIES, NFX_WHO_ALLIES);
+            else if (word_is(value, end, "opponents") || word_is(value, end, "enemies"))
+                it->page = nfx_pair(NFX_WHO_OPPONENTS, NFX_WHO_OPPONENTS);
+            else if (word_is(value, end, "others"))
+                it->page = nfx_pair(NFX_WHO_OTHERS, NFX_WHO_OTHERS);
+            else if (word_is(value, end, "all"))
+                it->page = nfx_pair(NFX_WHO_ALL, NFX_WHO_ALL);
+            else if (word_is(value, end, "bystanders"))
+                it->page = nfx_pair(NFX_WHO_BYSTANDERS, NFX_WHO_BYSTANDERS);    /* (target hide) */
+            else
+                return "who is targets (the cast's targets, the default), caster, allies (the caster's side, the caster too), opponents (or enemies: the caster's other side), others (all but the caster), all, or bystanders (all but the caster and the targets)";
+            it->given |= NFX_G_WHO;
+        } else if (word_is(key, key_end, "x") || word_is(key, key_end, "y") || word_is(key, key_end, "z")) {
+            /* (actor move) the offset from each actor's own place, the battle's units along its axes (y negative is up) */
+            if (nfx_values(value, end, 1, a, b) != 1 || !nfx_within(a, b, 1, -NFX_OFFSET_MAX, NFX_OFFSET_MAX))
+                return "x, y and z are how far an actors move takes each actor from its own place along the battle's axes (y negative is up), -8192 to 8192 battle units, or FROM>TO over the line's frames (y=0>-1024 lifts it)";
+            if (word_is(key, key_end, "x"))
+                it->x = nfx_pair(a[0], b[0]);
+            else if (word_is(key, key_end, "y"))
+                it->y = nfx_pair(a[0], b[0]);
+            else
+                it->z = nfx_pair(a[0], b[0]);
+            it->entry |= NFX_ACTORS_AXIS;
+        } else if (word_is(key, key_end, "turn")) {
+            /* (actor move) degrees added to each actor's own turn about the world's X, Y (its facing) and Z */
+            if (nfx_components(value, end, 3, a, b) != 3 || !nfx_within(a, b, 3, -NFX_TURN_MAX, NFX_TURN_MAX))
+                return "turn is X,Y,Z: degrees added to each actor's own turn about the world's X, then Y (its facing), then Z axis, -36000 to 36000 each; any of them FROM>TO (turn=0,0>360,0: one turn about the vertical), or X,Y,Z>X,Y,Z";
+            for (n = 0; n < 3; n++)
+                it->turn[n].a = a[n], it->turn[n].b = b[n];
+            it->entry |= NFX_ACTORS_TURNS;
+        } else
+            return "an actors line takes hide, fade=, tint=, amount= (with tint=), move with x=, y=, z=, turn with turn=, and who=: it names actors by who=, so no at=, bone= or each=";
+        return NULL;
+    }
+    if (it->kind == NFX_SHAKE) {
+        /* (stage fx 2) the camera's jolt belongs to the cast */
+        if (word_is(key, key_end, "x") || word_is(key, key_end, "y") || word_is(key, key_end, "z")) {
+            if (nfx_values(value, end, 1, a, b) != 1 || !nfx_within(a, b, 1, 0, NFX_SHAKE_MAX))
+                return "x, y and z are how far the picture jolts each way along the screen's axes (x right, y down, z along the line of sight), 0 to 1024 battle units, or FROM>TO (y=200>0 dies away)";
+            if (word_is(key, key_end, "x"))
+                it->x = nfx_pair(a[0], b[0]);
+            else if (word_is(key, key_end, "y"))
+                it->y = nfx_pair(a[0], b[0]);
+            else
+                it->z = nfx_pair(a[0], b[0]);
+            it->given |= NFX_G_AXIS;
+        } else if (word_is(key, key_end, "period")) {
+            if (nfx_values(value, end, 1, a, b) != 1 || a[0] != b[0] || a[0] < 2 || a[0] > NFX_SHAKE_PERIOD_MAX || (a[0] & 1))
+                return "period is the frames of one jolt up and back down, an even number 2 to 60 (2: up one frame, down the next)";
+            it->page = nfx_pair(a[0], a[0]);
+        } else
+            return "a shake line takes x=, y=, z= and period=: it moves the whole picture, so no at=, bone= or each=";
+        return NULL;
+    }
+    if (word_is(key, key_end, "each")) {
+        if (nfx_values(value, end, 1, a, b) != 1 || a[0] != b[0] || a[0] < 0 || a[0] > NFX_EACH_MAX)
+            return "each is the frames between one target's turn and the next's, 0 to 60";
+        it->each = (short)a[0];
+        return NULL;
+    }
+    if (it->kind == NFX_SOUND) {
+        if (word_is(key, key_end, "pan")) {
+            if (word_is(value, end, "targets") || word_is(value, end, "target"))
+                it->at = NFX_AT_TARGET;
+            else if (word_is(value, end, "caster"))
+                it->at = NFX_AT_CASTER;
+            else
+                return "pan is targets (their centre; with each=, each target in turn) or caster";
+            return NULL;
+        }
+        if (word_is(key, key_end, "kind")) {
+            if (it->flags & NFX_F_HANDLE)
+                return "a [sound] handle plays on its own channel (channel = in its section): no kind=";
+            if (nfx_values(value, end, 1, a, b) != 1 || a[0] != b[0] || !(a[0] == 0x20 || (a[0] >= 0x28 && a[0] <= 0x2b)))
+                return "kind is 0x20 (an effect's plain sound, the default) or 0x28-0x2b (the four channels the game's effects also use)";
+            it->sound_kind = (BYTE)a[0];
+            return NULL;
+        }
+        return "a sound line takes pan=, kind= and each=";
+    }
+    if (it->kind == NFX_HIT)
+        return "a hit line takes each= only";
+    if (it->kind == NFX_MODEL) {
+        /* stage 3a: placed in the battle's world (not the screen's plane), turned on three axes, sized on three */
+        if (word_is(key, key_end, "at")) {
+            if (word_is(value, end, "target") || word_is(value, end, "targets"))
+                it->at = NFX_AT_TARGET;
+            else if (word_is(value, end, "caster"))
+                it->at = NFX_AT_CASTER;
+            else if (word_is(value, end, "centre") || word_is(value, end, "center"))
+                it->at = NFX_AT_CENTRE;
+            else if (word_is(value, end, "screen"))
+                it->at = NFX_AT_SCREEN;
+            else if (word_is(value, end, "arena"))
+                it->at = NFX_AT_ARENA;
+            else if (word_is(value, end, "point"))
+                return "at=point (a place in the arena) is called at=arena: at is target, caster, centre, screen or arena";
+            else
+                return "at is target (each target: one model each), caster, centre (one model in the middle of the targets), screen (one model at x, y, z in the camera's own space) or arena (one model at x, y, z in the arena)";
+        } else if (word_is(key, key_end, "bone")) {
+            it->given |= NFX_G_BONE;
+            if (word_is(value, end, "random"))
+                it->bone = NFX_BONE_RANDOM;
+            else if (word_is(value, end, "ground"))
+                it->bone = NFX_BONE_GROUND;
+            else if (nfx_values(value, end, 1, a, b) == 1 && a[0] == b[0] && a[0] >= 0 && a[0] <= NFX_BONE_MAX)
+                it->bone = (signed char)a[0];
+            else
+                return "bone is a bone place, 0 to 54 (0: the model's root, inside its body; past the model's last bone: its last), ground (the floor under the actor), or random (chosen once per target)";
+        } else if (word_is(key, key_end, "x") || word_is(key, key_end, "y") || word_is(key, key_end, "z")) {
+            /* (screen anchor) read within at=screen's range whatever the key order; nfx_timeline_line holds any other
+               anchor to -8192..8192 with this same text once the line is read */
+            if (nfx_values(value, end, 1, a, b) != 1 || !nfx_within(a, b, 1, -NFX_SCREEN_MAX, NFX_SCREEN_MAX))
+                return nfx_model_offset_text;
+            if (*key == 'x' || *key == 'X')
+                it->x = nfx_pair(a[0], b[0]);
+            else if (*key == 'y' || *key == 'Y')
+                it->y = nfx_pair(a[0], b[0]);
+            else {
+                it->z = nfx_pair(a[0], b[0]);
+                it->given |= NFX_G_Z;
+            }
+        } else if (word_is(key, key_end, "turn")) {
+            if (nfx_components(value, end, 3, a, b) != 3 || !nfx_within(a, b, 3, -NFX_TURN_MAX, NFX_TURN_MAX))
+                return "turn is X,Y,Z: degrees about the world's X, then Y (the vertical), then Z axis, -36000 to 36000 each; any of them FROM>TO (turn=0,0>720,0: two turns about the vertical), or X,Y,Z>X,Y,Z";
+            for (n = 0; n < 3; n++)
+                it->turn[n].a = a[n], it->turn[n].b = b[n];
+        } else if (word_is(key, key_end, "scale")) {
+            n = nfx_components(value, end, 3, a, b);
+            if ((n != 1 && n != 3) || !nfx_within(a, b, n, 0, NFX_SCALE_MAX))
+                return "scale is in percent, 0 to 700: one number for all three axes, or X,Y,Z; FROM>TO to change over the line's frames (scale=50>150, scale=100,50,100, scale=100,50,100>200,50,200, scale=100,50>150,100: Y alone from 50 to 150)";
+            if (n == 1)
+                a[1] = a[2] = a[0], b[1] = b[2] = b[0];
+            it->sx = nfx_pair(a[0], b[0]);
+            it->sy = nfx_pair(a[1], b[1]);
+            it->sz = nfx_pair(a[2], b[2]);
+        } else if (word_is(key, key_end, "fade")) {
+            /* stage 3b: the instance's alpha (FUN_005d1ba4 with flag 0x80: alpha = 255 - transparency / 16) */
+            if (nfx_values(value, end, 1, a, b) != 1 || !nfx_within(a, b, 1, 0, NFX_FADE_MAX))
+                return "fade is 0 to 255: 255 the model's own colours, 0 fully the colour= (default black: on an additive model, a fade-out); FROM>TO over the line's frames (fade=255>0)";
+            it->fade = nfx_pair(a[0], b[0]);
+        } else if (word_is(key, key_end, "colour") || word_is(key, key_end, "color")) {
+            if (nfx_components(value, end, 3, a, b) != 3 || !nfx_within(a, b, 3, 0, 255))
+                return "colour is R,G,B, 0 to 255 each: the colour a model fades toward as fade= goes from 255 to 0; any of them FROM>TO, or R,G,B>R,G,B";
+            it->r = nfx_pair(a[0], b[0]);
+            it->g = nfx_pair(a[1], b[1]);
+            it->b = nfx_pair(a[2], b[2]);
+            it->flags |= NFX_F_COLOUR;
+        } else if (word_is(key, key_end, "uv")) {
+            if (nfx_components(value, end, 2, a, b) != 2 || !nfx_within(a, b, 2, 0, NFX_UV_MAX))
+                return "uv is U,V: the texture moved by 256ths of its width and height, 0 to 255 each (round the texture, wrapping); any of them FROM>TO (uv=0>192,0), or U,V>U,V";
+            it->u = nfx_pair(a[0], b[0]);
+            it->v = nfx_pair(a[1], b[1]);
+        } else if (word_is(key, key_end, "palette")) {
+            /* whole rows of the RSD's first texture (TEX[0]); checked against its .TEX's count at the cast */
+            if (nfx_values(value, end, 1, a, b) != 1 || !nfx_within(a, b, 1, 0, NFX_PALETTE_MAX))
+                return "palette is a palette row of the model's first texture (TEX[0] of its RSD; 0-255, each must be below its .TEX's palette count), or FIRST>LAST stepping over the line's frames";
+            it->pal = nfx_pair(a[0], b[0]);
+            it->flags |= NFX_F_PALETTE;
+        } else if (word_is(key, key_end, "face")) {
+            if (word_is(value, end, "camera"))
+                it->flags |= NFX_F_FACE;
+            else if (word_is(value, end, "world")) {
+                it->flags &= ~NFX_F_FACE;
+                it->given |= NFX_G_WORLD;
+            } else
+                return "face is camera (the model's axes are the screen's: x right, y down, z away; turn= about those) or world (the default; not with at=screen)";
+        } else if (word_is(key, key_end, "zoom")) {
+            if (!nfx_zoom_key(it, value, end))
+                return nfx_zoom_text;
+        } else
+            return "a model line takes at= bone= x= y= z= turn= scale= fade= colour= uv= palette= face= each= (and zoom= with at=screen)";
+        return NULL;
+    }
+    /* a sprite */
+    if (word_is(key, key_end, "at")) {
+        if (word_is(value, end, "target") || word_is(value, end, "targets"))
+            it->at = NFX_AT_TARGET;
+        else if (word_is(value, end, "caster"))
+            it->at = NFX_AT_CASTER;
+        else if (word_is(value, end, "centre") || word_is(value, end, "center"))
+            it->at = NFX_AT_CENTRE;
+        else if (word_is(value, end, "screen"))
+            it->at = NFX_AT_SCREEN;
+        else if (word_is(value, end, "arena"))
+            it->at = NFX_AT_ARENA;
+        else if (word_is(value, end, "point"))
+            return "at=point (a place in the arena) is called at=arena: at is target, caster, centre, screen or arena";
+        else
+            return "at is target (each target: one sprite each), caster, centre (one sprite in the middle of the targets), screen (one sprite at x, y, z in the camera's own space) or arena (one sprite at x, y, z in the arena)";
+    } else if (word_is(key, key_end, "bone")) {
+        it->given |= NFX_G_BONE;
+        if (word_is(value, end, "random"))
+            it->bone = NFX_BONE_RANDOM;
+        else if (word_is(value, end, "ground"))
+            it->bone = NFX_BONE_GROUND;
+        else if (nfx_values(value, end, 1, a, b) == 1 && a[0] == b[0] && a[0] >= 0 && a[0] <= NFX_BONE_MAX)
+            it->bone = (signed char)a[0];
+        else
+            return "bone is a bone place, 0 to 54 (0: the model's root, inside its body; past the model's last bone: its last), ground (the floor under the actor), or random (chosen once per target)";
+    } else if (word_is(key, key_end, "page")) {
+        if (word_is(value, end, "loop"))
+            it->page_mode = NFX_PAGE_LOOP;
+        else if (nfx_values(value, end, 1, a, b) == 1 && nfx_within(a, b, 1, 0, NFX_PAGE_MAX)) {
+            it->page_mode = NFX_PAGE_LERP;
+            it->page = nfx_pair(a[0], b[0]);
+        } else
+            return "page is a page of the sheet (0-255), FIRST>LAST stepping over the line's frames, or loop (one page a frame, round the sheet)";
+    } else if (word_is(key, key_end, "x") || word_is(key, key_end, "y")) {
+        /* (screen anchor) at=screen's range here; other anchors are held to -8192..8192 when the line is read */
+        if (nfx_values(value, end, 1, a, b) != 1 || !nfx_within(a, b, 1, -NFX_SCREEN_MAX, NFX_SCREEN_MAX))
+            return nfx_sprite_offset_text;
+        if (*key == 'x' || *key == 'X')
+            it->x = nfx_pair(a[0], b[0]);
+        else
+            it->y = nfx_pair(a[0], b[0]);
+        if (a[0] || b[0])
+            it->flags |= NFX_F_MATRIX;
+    } else if (word_is(key, key_end, "z")) {
+        /* (screen anchor) a sprite's z= is its distance from the camera with at=screen (held in depth); (arena anchor) with
+           at=arena its place's z (held in depth too); refused otherwise */
+        if (nfx_values(value, end, 1, a, b) != 1 || !nfx_within(a, b, 1, -NFX_SCREEN_MAX, NFX_SCREEN_MAX))
+            return nfx_screen_z_text;
+        it->flags &= ~NFX_F_DEPTH_MODEL;
+        it->depth = nfx_pair(a[0], b[0]);
+        it->given |= NFX_G_Z;
+    } else if (word_is(key, key_end, "depth")) {
+        it->given |= NFX_G_DEPTH;
+        if (word_is(value, end, "model"))
+            it->flags |= NFX_F_DEPTH_MODEL;
+        else if (nfx_values(value, end, 1, a, b) == 1 && nfx_within(a, b, 1, -NFX_OFFSET_MAX, NFX_OFFSET_MAX)) {
+            it->flags &= ~NFX_F_DEPTH_MODEL;
+            it->depth = nfx_pair(a[0], b[0]);
+        } else
+            return "depth moves the sprite along the line of sight (negative: toward the camera), -8192 to 8192, FROM>TO, or model (the target's height, as Fire)";
+    } else if (word_is(key, key_end, "scale")) {
+        n = nfx_values(value, end, 2, a, b);
+        if (n < 1 || !nfx_within(a, b, n, 0, NFX_SCALE_MAX))
+            return "scale is in percent, 0 to 700: one number, or WIDTH,HEIGHT; FROM>TO to change over the line's frames (scale=50>150, scale=100,50)";
+        if (n == 1)
+            a[1] = a[0], b[1] = b[0];
+        it->sx = nfx_pair(a[0], b[0]);
+        it->sy = nfx_pair(a[1], b[1]);
+        if (a[0] != a[1] || b[0] != b[1])
+            it->flags |= NFX_F_MATRIX;
+    } else if (word_is(key, key_end, "rot") || word_is(key, key_end, "rotation")) {
+        if (nfx_values(value, end, 1, a, b) != 1 || !nfx_within(a, b, 1, -NFX_ROT_MAX, NFX_ROT_MAX))
+            return "rot is a turn in the screen's plane in degrees, -3600 to 3600, or FROM>TO (rot=0>360: one turn over the line)";
+        it->rot = nfx_pair(a[0], b[0]);
+        if (a[0] || b[0])
+            it->flags |= NFX_F_MATRIX;
+    } else if (word_is(key, key_end, "colour") || word_is(key, key_end, "color")) {
+        if (nfx_values(value, end, 3, a, b) != 3 || !nfx_within(a, b, 3, 0, 255))
+            return "colour is R,G,B, 0 to 255 each (255,255,255: the picture as it is), or R,G,B>R,G,B; on an additive sprite, toward 0,0,0 is a fade";
+        it->r = nfx_pair(a[0], b[0]);
+        it->g = nfx_pair(a[1], b[1]);
+        it->b = nfx_pair(a[2], b[2]);
+    } else if (word_is(key, key_end, "palette")) {
+        /* whole rows (FROM>TO steps, as page does); checked against the .TEX's own palette count at the cast */
+        if (nfx_values(value, end, 1, a, b) != 1 || !nfx_within(a, b, 1, 0, NFX_PALETTE_MAX))
+            return "palette is a palette row of the texture (0-255; each must be below its .TEX's palette count), or FIRST>LAST stepping over the line's frames; without it the sheet's own rows";
+        it->pal = nfx_pair(a[0], b[0]);
+        it->flags |= NFX_F_PALETTE;
+    } else if (word_is(key, key_end, "alpha") || word_is(key, key_end, "fade")) {
+        ++*notes;
+        say(line, 0, "alpha is reserved: the sprite call takes no alpha (it comes from the texture's own state); ignored. For an additive sprite, colour toward 0,0,0 fades it");
+    } else if (word_is(key, key_end, "zoom")) {
+        if (!nfx_zoom_key(it, value, end))
+            return nfx_zoom_text;
+    } else
+        return "a sprite line takes at= bone= page= palette= x= y= depth= scale= rot= colour= each= (and z= with at=screen or at=arena, zoom= with at=screen)";
+    return NULL;
+}
+
+/* A timeline line, from its first word: [FRAME[-LAST]] COMMAND [NUMBER] [key=value ...]. NULL, or why not.
+   *ignored is set for a reserved command (a note, the line is passed over). */
+static const char *nfx_timeline_line(struct nfx_item *it, char *p, char *end, nfx_say_fn say, int line, int *ignored, int *notes)
+{
+    char *word_end;
+    int a, b;
+
+    *ignored = 0;
+    for (word_end = p; word_end < end && !is_space(*word_end); word_end++)
+        ;
+    it->flags = 0;
+    it->from = it->to = 0;
+    if (*p >= '0' && *p <= '9') {
+        char *dash = p;
+
+        while (dash < word_end && *dash != '-')
+            dash++;
+        if (!nfx_int(p, dash, &a) || (dash < word_end ? !nfx_int(dash + 1, word_end, &b) : (b = a, 0)) || a < 0 || b < a ||
+            b >= NFX_LENGTH_MAX)
+            return "a timeline line starts with its frame, or FIRST-LAST (0 to 479, LAST not before FIRST), then the command";
+        it->from = (short)a;
+        it->to = (short)b;
+        for (p = word_end; p < end && is_space(*p); p++)
+            ;
+        for (word_end = p; word_end < end && !is_space(*word_end); word_end++)
+            ;
+    } else
+        it->flags = NFX_F_NOFRAME;
+    it->each = 0;
+    it->given = 0;
+    it->entry = 0;
+    it->at = NFX_AT_TARGET;
+    it->bone = 1;
+    it->page_mode = NFX_PAGE_LOOP;
+    it->page = nfx_pair(0, 0);
+    it->x = it->y = it->depth = nfx_pair(0, 0);
+    it->sx = it->sy = nfx_pair(100, 100);
+    it->rot = nfx_pair(0, 0);
+    it->r = it->g = it->b = nfx_pair(255, 255);
+    it->pal = nfx_pair(0, 0);
+    it->z = nfx_pair(0, 0);
+    it->sz = nfx_pair(100, 100);
+    it->turn[0].a = it->turn[0].b = it->turn[1].a = it->turn[1].b = it->turn[2].a = it->turn[2].b = 0;
+    it->fade = nfx_pair(NFX_FADE_MAX, NFX_FADE_MAX);
+    it->u = it->v = nfx_pair(0, 0);
+    it->flags |= NFX_F_DEPTH_MODEL;
+    it->sound = 0;
+    it->sound_kind = 0x20;
+    it->line = (short)line;
+    if (word_is(p, word_end, "sprite"))
+        it->kind = NFX_SPRITE;
+    else if (word_is(p, word_end, "hit"))
+        it->kind = NFX_HIT;
+    else if (word_is(p, word_end, "sound"))
+        it->kind = NFX_SOUND;
+    else if (word_is(p, word_end, "model"))
+        it->kind = NFX_MODEL;
+    else if (word_is(p, word_end, "stage")) {
+        it->kind = NFX_STAGE;           /* (stage fx 1) hide 0 and dark 0 toward black until its keys say otherwise */
+        it->flags &= NFX_F_NOFRAME;
+        it->page = it->fade = nfx_pair(0, 0);
+        it->r = it->g = it->b = nfx_pair(0, 0);
+    } else if (word_is(p, word_end, "fill") || word_is(p, word_end, "flash")) {
+        it->kind = NFX_FILL;            /* (stage fx 2) blend add, colour 0,0,0, alpha none until its keys say otherwise */
+        it->flags &= NFX_F_NOFRAME;
+        it->entry = (BYTE)(NFX_FILL_ADD | (word_is(p, word_end, "flash") ? NFX_FILL_FLASH : 0));
+        it->page = nfx_pair(0, 0);      /* a flash's in= and out= */
+        it->fade = nfx_pair(NFX_FILL_ALPHA_DEFAULT, NFX_FILL_ALPHA_DEFAULT);
+        it->r = it->g = it->b = nfx_pair(0, 0);
+    } else if (word_is(p, word_end, "shake")) {
+        it->kind = NFX_SHAKE;           /* (stage fx 2) no jolt on any axis, period 2, until its keys say otherwise */
+        it->flags &= NFX_F_NOFRAME;
+        it->page = nfx_pair(2, 2);
+    } else if (word_is(p, word_end, "actors")) {
+        it->kind = NFX_ACTORS;          /* (stage fx 3) who=targets, amount 4096, tint 0,0,0 until its keys say otherwise */
+        it->flags &= NFX_F_NOFRAME;
+        it->page = nfx_pair(NFX_WHO_TARGETS, NFX_WHO_TARGETS);
+        it->fade = nfx_pair(NFX_ACTOR_AMOUNT_MAX, NFX_ACTOR_AMOUNT_MAX);
+        it->r = it->g = it->b = nfx_pair(0, 0);
+    } else if (word_is(p, word_end, "fade") || word_is(p, word_end, "camera")) {
+        say(line, 0, "fade and camera are reserved for a later stage: line ignored");
+        ++*notes;
+        *ignored = 1;
+        return NULL;
+    } else
+        return p == word_end ? "a frame needs a command after it: sprite, model, hit, sound, stage, fill, flash, shake or actors"
+                             : "unknown command: a timeline line is sprite, model, hit, sound, stage, fill, flash, shake or actors (fade and camera are reserved)";
+    if (it->kind != NFX_SPRITE && it->kind != NFX_MODEL && it->kind != NFX_STAGE && it->kind != NFX_FILL && it->kind != NFX_SHAKE &&
+        it->kind != NFX_ACTORS && it->from != it->to)
+        return "a hit or a sound happens at one frame: give FRAME, not FIRST-LAST";
+    for (p = word_end; p < end && is_space(*p); p++)
+        ;
+    for (word_end = p; word_end < end && !is_space(*word_end); word_end++)
+        ;
+    if (it->kind == NFX_SPRITE || it->kind == NFX_MODEL || it->kind == NFX_SOUND) {
+        char *q = p;
+        int has_equals = 0;
+
+        while (q < word_end && *q != '=')
+            q++;
+        has_equals = q < word_end;
+        if (it->kind == NFX_SOUND && p < word_end && !has_equals && !(*p >= '0' && *p <= '9') && *p != '+' && *p != '-') {
+            /* sound NAME: a [sound N] handle of the effects file */
+            int h = sound_handle_by_name(p, word_end);
+
+            if (h < 0)
+                return "sound NAME names a [sound N] handle of the effects file: none usable has this name (see the effects file's lines in the log)";
+            it->sound = nfx_handles[h].id;
+            it->flags |= NFX_F_HANDLE;
+        } else if (p == word_end || has_equals || !nfx_int(p, word_end, &a))
+            return it->kind == NFX_SPRITE ? "sprite is followed by the number of the file whose sheet it draws (sprite 0)"
+                 : it->kind == NFX_MODEL  ? "model is followed by the number of the file whose model (.RSD) it draws (model 0)"
+                                          : "sound is followed by the sound's number (sound 9), or a [sound N] handle's number or name";
+        else if (it->kind == NFX_SPRITE || it->kind == NFX_MODEL) {
+            if (a < 0 || a >= NFX_FILES_MAX)
+                return it->kind == NFX_SPRITE ? "sprite is followed by a file number, 0 to 15" : "model is followed by a file number, 0 to 15";
+            it->entry = (BYTE)a;
+        } else if (a >= 1 && a <= NFX_SOUND_MAX)
+            it->sound = (WORD)a;        /* the game's own sound: as before */
+        else if (a > NFX_SOUND_MAX && sound_handle_by_id(a) >= 0) {
+            it->sound = (WORD)a;
+            it->flags |= NFX_F_HANDLE;
+        } else
+            return a > NFX_SOUND_MAX ? "a sound above 751 must be a [sound N] handle of the effects file: this number is none usable (see the effects file's lines in the log)"
+                                     : "a sound's number is 1 to 751 (the game's sound effects), or a [sound N] handle";
+        p = word_end;
+    }
+    for (;;) {
+        char *equals;
+        const char *why;
+
+        while (p < end && is_space(*p))
+            p++;
+        if (p == end)
+            break;
+        for (word_end = p; word_end < end && !is_space(*word_end); word_end++)
+            ;
+        for (equals = p; equals < word_end && *equals != '='; equals++)
+            ;
+        if (it->kind == NFX_ACTORS && word_is(p, word_end, "hide")) {
+            it->entry |= NFX_ACTORS_HIDE;   /* (stage fx 3) the one word without a value */
+            p = word_end;
+            continue;
+        }
+        if (it->kind == NFX_ACTORS && (word_is(p, word_end, "move") || word_is(p, word_end, "turn"))) {
+            it->entry |= word_is(p, word_end, "move") ? NFX_ACTORS_MOVE : NFX_ACTORS_TURN;   /* (actor move) the words without a value */
+            p = word_end;
+            continue;
+        }
+        if (equals == word_end || equals == p || equals + 1 == word_end)
+            return "after the command come key=value words with no spaces inside (scale=50>150)";
+        if ((why = nfx_item_key(it, p, equals, equals + 1, word_end, say, line, notes)) != NULL)
+            return why;
+        p = word_end;
+    }
+    if (it->each && it->at == NFX_AT_CASTER)
+        return it->kind == NFX_SOUND ? "each= on a sound pans it on each target in turn: not with pan=caster"
+                                     : "each= is for at=target (each target in turn): not with at=caster";
+    if (it->at == NFX_AT_CENTRE && it->each)
+        return "each= is for at=target (each target in turn): not with at=centre (one draw for all the targets)";
+    if (it->at == NFX_AT_CENTRE && it->bone == NFX_BONE_RANDOM)
+        return "bone=random is chosen per target: not with at=centre (bone=ground, or a bone place: the targets' mean height at it)";
+    if ((it->kind == NFX_SPRITE || it->kind == NFX_MODEL) && it->at == NFX_AT_ARENA) {
+        /* (arena anchor) one draw at a fixed place in the arena: x, y, z are the place (read within +-32767 by the keys),
+           so no actor's bone, no turn for each=, no depth along the line of sight; a sprite's z= is held in depth */
+        if (it->each)
+            return "each= is for at=target (each target in turn): not with at=arena (one draw, at a fixed place in the arena)";
+        if (it->given & NFX_G_BONE)
+            return "bone= is a place on an actor: not with at=arena (x, y and z place it in the arena: y 0 is the floor, negative up)";
+        if (it->given & NFX_G_DEPTH)
+            return "depth= is not used with at=arena: z= is the sprite's place in the arena (x, y, z)";
+        if (it->flags & NFX_F_ZOOM_FIXED)
+            return "zoom=fixed is for at=screen (a layer fixed to the camera): a line in the arena is seen through the camera's zoom";
+        if (it->kind == NFX_SPRITE) {
+            /* x and y are the place, not offsets on the screen's plane: the DLL's own matrix only for rot or an uneven scale */
+            it->flags &= ~(NFX_F_DEPTH_MODEL | NFX_F_MATRIX);
+            if (it->sx.a != it->sy.a || it->sx.b != it->sy.b || it->rot.a || it->rot.b)
+                it->flags |= NFX_F_MATRIX;
+        }
+    }
+    if ((it->kind == NFX_SPRITE || it->kind == NFX_MODEL) && it->at != NFX_AT_SCREEN && it->at != NFX_AT_ARENA) {
+        /* (screen anchor) the keys read x, y (and a model's z) within at=screen's range: any other anchor keeps the old one */
+        if (!nfx_within_pair(it->x, NFX_OFFSET_MAX) || !nfx_within_pair(it->y, NFX_OFFSET_MAX) ||
+            (it->kind == NFX_MODEL && !nfx_within_pair(it->z, NFX_OFFSET_MAX)))
+            return it->kind == NFX_MODEL ? nfx_model_offset_text : nfx_sprite_offset_text;
+        if (it->kind == NFX_SPRITE && (it->given & NFX_G_Z))
+            return "z= on a sprite is its distance from the camera with at=screen, or its place with at=arena: at a target, the caster or the centre, depth= moves it along the line of sight";
+        if (it->flags & NFX_F_ZOOM_FIXED)
+            return "zoom=fixed is for at=screen (a layer fixed to the camera): a line at a target, the caster or the centre is seen through the camera's zoom";
+    }
+    if (it->at == NFX_AT_SCREEN) {
+        /* (screen anchor) one draw at a place in the camera's own space: no target, no bone, no turn for each= */
+        if (it->each)
+            return "each= is for at=target (each target in turn): not with at=screen (one draw, fixed to the camera)";
+        if (it->given & NFX_G_BONE)
+            return "bone= is a place on an actor: not with at=screen (x, y and z place it in the camera's own space)";
+        if (it->given & NFX_G_DEPTH)
+            return "depth= is not used with at=screen: z= is the sprite's distance from the camera";
+        if (it->given & NFX_G_WORLD)
+            return "face=world is not with at=screen: a screen model's axes are the screen's (x right, y down, z away), as face=camera";
+        if (!(it->given & NFX_G_Z) || (it->kind == NFX_MODEL ? it->z.a < 1 || it->z.b < 1 : it->depth.a < 1 || it->depth.b < 1))
+            return nfx_screen_z_text;       /* (a sprite holds its z in depth) */
+    }
+    if (it->kind == NFX_STAGE && !(it->entry & (NFX_STAGE_HIDE | NFX_STAGE_DARK)))
+        return "a stage line says what it does: hide=all|far|none, dark=A>B, or both";
+    if (it->kind == NFX_STAGE && (it->flags & NFX_F_COLOUR) && !(it->entry & NFX_STAGE_DARK))
+        return "colour= on a stage line is the tint dark= takes the stage toward: give dark= with it";
+    if (it->kind == NFX_FILL && (it->entry & NFX_FILL_BACK)) {
+        /* (stage fx 3) the backdrop is one opaque colour: no blend, no alpha */
+        if (it->given & (NFX_G_ALPHA | NFX_G_BLEND))
+            return "layer=back is an opaque colour behind the actors: it takes colour= alone (no alpha= or blend=)";
+        if (!(it->flags & NFX_F_COLOUR))
+            return "layer=back needs colour=R,G,B: the colour behind the actors (hide the stage with a stage line to see it everywhere)";
+    }
+    if (it->kind == NFX_ACTORS) {
+        /* (stage fx 3) what the line does. (target hide) A hide names its actors by who= (given: the default, targets, is
+           never meant by leaving it out); one that can name a target (who=targets, opponents, others, all) must end
+           before the script's first hit, which is known only when the whole script is read (nfx_read_script's last
+           pass): a target may die at its hit, and the game's death then owns the actor (00be119d bit 7 cleared, bit 2
+           set by opcode b8) */
+        /* (actor move) the words and their keys go together */
+        if ((it->entry & NFX_ACTORS_AXIS) && !(it->entry & NFX_ACTORS_MOVE))
+            return "x=, y= and z= are how far an actors move takes the actors: give the word move with them (actors move y=0>-1024)";
+        if ((it->entry & NFX_ACTORS_MOVE) && !(it->entry & NFX_ACTORS_AXIS))
+            return "an actors move says how far: x=, y= or z= (battle units from each actor's own place; y negative is up)";
+        if ((it->entry & NFX_ACTORS_TURNS) && !(it->entry & NFX_ACTORS_TURN))
+            return "turn= on an actors line is how far the actors turn: give the word turn with it (actors turn turn=0,0>360,0)";
+        if ((it->entry & NFX_ACTORS_TURN) && !(it->entry & NFX_ACTORS_TURNS))
+            return "an actors turn says how far: turn=X,Y,Z (degrees added about the world's X, Y and Z axes)";
+        if (!(it->entry & (NFX_ACTORS_HIDE | NFX_ACTORS_FADE | NFX_ACTORS_TINT | NFX_ACTORS_MOVE | NFX_ACTORS_TURN)))
+            return "an actors line says what it does: hide, fade=A>B, tint=R,G,B (with amount=A>B), move (with x=, y=, z=) or turn (with turn=X,Y,Z)";
+        if ((it->entry & NFX_ACTORS_FADE) && (it->entry & (NFX_ACTORS_TINT | NFX_ACTORS_AMOUNT)))
+            return "fade= darkens toward black by itself; with tint= the amount toward the colour is amount=: give fade= or tint= (with amount=), not both";
+        if ((it->entry & NFX_ACTORS_AMOUNT) && !(it->entry & NFX_ACTORS_TINT))
+            return "amount= is how far toward tint=: give tint=R,G,B with it (fade= alone darkens toward black)";
+        if ((it->entry & NFX_ACTORS_HIDE) && !(it->given & NFX_G_WHO))
+            return "hide says whose bodies by who=: caster, allies or bystanders (all but the caster and the targets) for any frames; targets, opponents, others or all only before the first hit";
+    }
+    if (it->kind == NFX_FILL) {
+        /* (stage fx 2) alpha= alone is blend=alpha (black by default); add and subtract need a colour and take no alpha */
+        if ((it->given & NFX_G_ALPHA) && !(it->given & NFX_G_BLEND))
+            it->entry = (BYTE)((it->entry & ~3) | NFX_FILL_ALPHA);
+        if ((it->given & NFX_G_ALPHA) && (it->entry & 3) != NFX_FILL_ALPHA)
+            return "alpha= is for blend=alpha (the colour laid over the picture): blend=add and blend=subtract take the colour alone";
+        if ((it->entry & 3) != NFX_FILL_ALPHA && !(it->flags & NFX_F_COLOUR))
+            return it->entry & NFX_FILL_FLASH ? "a flash line needs colour=R,G,B (FF8's grey flash: colour=255,255,255)"
+                                              : "a fill line says what it lays over the picture: colour=R,G,B (added, or subtracted with blend=subtract), or alpha=A (black over it)";
+    }
+    if (it->kind == NFX_SHAKE && !(it->given & NFX_G_AXIS))
+        return "a shake line says how far the picture jolts: x=, y= or z= (0 to 1024 battle units, along the screen's axes)";
+    return NULL;
+}
+
+/* (target hide) Whether a hide line with this who= can name one of the cast's targets: targets, opponents (a cast
+   on the other side), others and all can; caster and allies never hide a target (nfx_actors_at leaves one out) and
+   bystanders are by definition not targets. */
+static int nfx_hide_names_targets(int who)
+{
+    return who == NFX_WHO_TARGETS || who == NFX_WHO_OPPONENTS || who == NFX_WHO_OTHERS || who == NFX_WHO_ALL;
+}
+
+/* Reads a script. Its items go into pool[used..]; returns the new count used (the old one if the script is
+   refused: s->usable is then 0). Every problem goes to `say` with its line. */
+static int nfx_parse(char *text, DWORD size, struct nfx_script *s, struct nfx_item *pool, int used, int capacity, nfx_say_fn say)
+{
+    char *line, *end, *file_end = text + size;
+    int line_number = 0, i, length_line = 0, hits = 0, ignored;
+
+    s->usable = 1;
+    s->problems = s->notes = 0;
+    s->file_count = s->length = s->count = s->sprite_files = s->model_files = s->centre = s->stage = s->screen = 0;
+    s->fill = s->shake = 0;
+    s->actors = 0;                      /* (stage fx 3) */
+    s->arena = 0;                       /* (arena anchor) */
+    s->first = used;
+    for (i = 0; "MAGIC/FIRE"[i]; i++)        /* stage 0's folder (it matters only for a name the archive holds in several) */
+        s->folder[i] = "MAGIC/FIRE"[i];
+    s->folder[i] = 0;
+#define NFX_REFUSE(at, why) do { say((at), 1, (why)); s->problems++; s->usable = 0; } while (0)
+    if (size > NFX_TEXT_MAX) {
+        NFX_REFUSE(0, "the script is larger than 512 KB: not read");
+        return used;
+    }
+    if (size >= 3 && (BYTE)text[0] == 0xef && (BYTE)text[1] == 0xbb && (BYTE)text[2] == 0xbf) {
+        text += 3, size -= 3;           /* a UTF-8 byte-order mark, as some editors write one */
+        file_end = text + size;
+    }
+    for (line = text; line < file_end; line = end + 1) {
+        char *start = line, *stop, *word_end;
+
+        for (end = line; end < file_end && *end != '\n'; end++)
+            ;
+        if (++line_number > NFX_LINES_MAX) {
+            NFX_REFUSE(line_number, "the script has more than 12000 lines: the rest is not read");
+            break;
+        }
+        for (stop = start; stop < end; stop++)
+            if ((*stop == ';' || *stop == '#') && (stop == start || is_space(stop[-1])))
+                break;
+        trim(&start, &stop);
+        if (start == stop)
+            continue;
+        for (word_end = start; word_end < stop && !is_space(*word_end) && *word_end != '='; word_end++)
+            ;
+        if (word_is(start, word_end, "folder") || word_is(start, word_end, "length") || word_is(start, word_end, "file")) {
+            char *equals = word_end, *value, *key_end;
+
+            while (equals < stop && *equals != '=')
+                equals++;
+            if (equals == stop) {
+                NFX_REFUSE(line_number, "expected key = value (folder, length, file N)");
+                continue;
+            }
+            key_end = equals;
+            value = equals + 1;
+            trim(&start, &key_end);
+            trim(&value, &stop);
+            if (word_is(start, word_end, "folder")) {
+                if (!nfx_take_folder(s->folder, value, stop))
+                    NFX_REFUSE(line_number, "folder is the archive's folder the game looks in for a name it holds several times, as its loaders give it (MAGIC/FIRE): letters, digits, _ - and /");
+            } else if (word_is(start, word_end, "length")) {
+                int n;
+
+                if (s->length || !nfx_int(value, stop, &n) || n < 1 || n > NFX_LENGTH_MAX)
+                    NFX_REFUSE(line_number, s->length ? "length is given twice" : "length is the effect's frames, 1 to 480 (15 a second); it always ends then");
+                else
+                    s->length = n, length_line = line_number;
+            } else {
+                char *p = word_end;
+                int n;
+                const char *why;
+
+                while (p < key_end && is_space(*p))
+                    p++;
+                if (!nfx_int(p, key_end, &n) || n != s->file_count) {
+                    NFX_REFUSE(line_number, "files are numbered in order from 0: file 0 = ..., file 1 = ...");
+                    continue;
+                }
+                if (s->file_count == NFX_FILES_MAX) {
+                    NFX_REFUSE(line_number, "an effect has at most 16 files");
+                    continue;
+                }
+                if ((why = nfx_file_line(&s->file[n], value, stop)) != NULL) {
+                    NFX_REFUSE(line_number, why);
+                    continue;
+                }
+                s->file[n].line = line_number;
+                s->file_count++;
+            }
+            continue;
+        }
+        {
+            struct nfx_item it;
+            const char *why = nfx_timeline_line(&it, start, stop, say, line_number, &ignored, &s->notes);
+
+            if (why) {
+                NFX_REFUSE(line_number, why);
+                continue;
+            }
+            if (ignored)
+                continue;
+            if (s->count == NFX_ITEMS_MAX || used + s->count >= capacity) {
+                NFX_REFUSE(line_number, s->count == NFX_ITEMS_MAX ? "more than 2048 timeline lines in one script"
+                                                                  : "the scripts together have more than 65536 timeline lines");
+                continue;
+            }
+            pool[used + s->count++] = it;
+        }
+    }
+    /* what can only be judged with the whole file read */
+    for (i = 0; i < s->file_count; i++) {
+        struct nfx_file *f = &s->file[i];
+        int k;
+
+        if (f->second[0] && !f->tex_count) {      /* default: this file, then the next ones (at the cast, no more
+                                                     than the sheet has texture pages: nfx_tex_checked), up to the
+                                                     first model (stage 3a: a model entry is never a sheet's texture) */
+            for (k = i; k < s->file_count && f->tex_count < NFX_TEX_MAX && !s->file[k].model; k++)
+                f->tex[f->tex_count++] = (BYTE)k;
+            f->tex_default = 1;
+        }
+        for (k = 0; k < f->tex_count; k++)
+            if (f->tex[k] >= s->file_count || s->file[f->tex[k]].model) {
+                NFX_REFUSE(f->line, f->tex[k] >= s->file_count ? "tex names a file number that is not given"
+                                                                : "tex names a model (.RSD): a sheet's textures are .TIM files");
+                break;
+            }
+    }
+    if (!s->length) {
+        int last = -1;
+
+        for (i = 0; i < s->count; i++)
+            if (!(pool[used + i].flags & NFX_F_NOFRAME) && pool[used + i].to > last)
+                last = pool[used + i].to;
+        if (last < 0) {
+            if (s->usable)
+                NFX_REFUSE(line_number, "give length = FRAMES (no line names a frame)");
+        } else
+            s->length = last + 1;
+    }
+    if (s->length) {
+        for (i = 0; i < s->count; i++) {
+            struct nfx_item *it = &pool[used + i];
+
+            if (it->flags & NFX_F_NOFRAME) {
+                it->from = it->kind == NFX_HIT ? (short)(s->length / 3) : 0;
+                it->to = it->kind == NFX_SPRITE || it->kind == NFX_MODEL || it->kind == NFX_STAGE || it->kind == NFX_FILL || it->kind == NFX_SHAKE ||
+                         it->kind == NFX_ACTORS
+                         ? (short)(s->length - 1) : it->from;
+            } else if (it->to >= s->length)
+                NFX_REFUSE(it->line, "this frame is past the effect's length (frames run from 0 to length - 1)");
+            if (it->kind == NFX_SPRITE) {
+                if (it->entry >= s->file_count || !s->file[it->entry].second[0])
+                    NFX_REFUSE(it->line, "sprite names a file that is not given, or has no sprite sheet (.SPT)");
+                else
+                    s->sprite_files |= 1 << it->entry;
+            }
+            if (it->kind == NFX_MODEL) {
+                if (it->entry >= s->file_count || !s->file[it->entry].model)
+                    NFX_REFUSE(it->line, "model names a file that is not given, or is not a model (file N = NAME.RSD)");
+                else
+                    s->model_files |= 1 << it->entry;
+            }
+            hits += it->kind == NFX_HIT;
+            s->centre += it->at == NFX_AT_CENTRE && (it->kind == NFX_SPRITE || it->kind == NFX_MODEL);
+            s->stage += it->kind == NFX_STAGE;
+            s->fill += it->kind == NFX_FILL;    /* (stage fx 2) */
+            s->shake += it->kind == NFX_SHAKE;
+            s->actors += it->kind == NFX_ACTORS;    /* (stage fx 3) */
+            if (it->kind == NFX_FILL && (it->entry & NFX_FILL_FLASH) && it->page.a + it->page.b > it->to - it->from + 1)
+                NFX_REFUSE(it->line, "a flash's in= and out= together are more frames than the line has (FIRST-LAST: in frames up, the rest held, out frames down)");
+            s->screen += it->at == NFX_AT_SCREEN && (it->kind == NFX_SPRITE || it->kind == NFX_MODEL);
+            s->arena += it->at == NFX_AT_ARENA && (it->kind == NFX_SPRITE || it->kind == NFX_MODEL);
+        }
+        if (!s->file_count && s->usable)
+            NFX_REFUSE(length_line ? length_line : 1, "the effect has no file line (file 0 = NAME.TIM SHEET.SPT, or NAME.RSD)");
+        if (!hits && s->usable) {
+            /* no hit line: every target is hit a third of the way in */
+            if (s->count == NFX_ITEMS_MAX || used + s->count >= capacity)
+                NFX_REFUSE(line_number, "no room for the hit this script leaves out");
+            else {
+                struct nfx_item *it = &pool[used + s->count++];
+                BYTE *z = (BYTE *)it;
+                unsigned k;
+
+                for (k = 0; k < sizeof *it; k++)
+                    z[k] = 0;
+                it->kind = NFX_HIT;
+                it->from = it->to = (short)(s->length / 3);
+            }
+        }
+        if (s->usable) {
+            /* (target hide) a hide that can name a target ends before the first hit: H, the earliest hit line's frame
+               (each= only delays the later targets: nfx_hits_due hits ordinal 0 at `from`), the reader's own default
+               hit included. Written at H - 1 at the latest, the body is drawn again on frame H (the player shows an
+               actors line one frame after its frame), the frame the hit is queued on. */
+            int first_hit = NFX_LENGTH_MAX;
+
+            for (i = 0; i < s->count; i++)
+                if (pool[used + i].kind == NFX_HIT && pool[used + i].from < first_hit)
+                    first_hit = pool[used + i].from;
+            for (i = 0; i < s->count; i++) {
+                const struct nfx_item *it = &pool[used + i];
+
+                if (it->kind == NFX_ACTORS && (it->entry & NFX_ACTORS_HIDE) && nfx_hide_names_targets(it->page.a) && it->to >= first_hit)
+                    NFX_REFUSE(it->line, "hide who=targets (or opponents, others, all) must end before the script's first hit frame (the first hit line's, or a third of the length without one): a target is drawn when it is struck and when it dies; for the rest of the effect hide who=bystanders (all but the caster and the targets)");
+                else if (it->kind == NFX_ACTORS && (it->entry & (NFX_ACTORS_MOVE | NFX_ACTORS_TURN)) && nfx_hide_names_targets(it->page.a) &&
+                         it->to >= first_hit)
+                    /* (actor move) the same rule: a target is back on its own place and turn (put back on the frame
+                       after the line's last, at H at the latest, the frame its hit is queued on) before its reaction
+                       and its death run from there */
+                    NFX_REFUSE(it->line, "move and turn who=targets (or opponents, others, all) must end before the script's first hit frame (the first hit line's, or a third of the length without one): a target is back on its own place when it is struck and when it dies; for the rest of the effect move who=caster, allies (never a target among them) or bystanders");
+            }
+        }
+    }
+#undef NFX_REFUSE
+    if (!s->usable) {
+        s->count = 0;
+        return used;
+    }
+    return used + s->count;
+}
+
+/* A loaded sprite sheet (FUN_0068a195's record: +0 the .S data, page count at +4; +4 a table of 8 bytes a page,
+   {page header (its word +2 = quads), quads (0x14 bytes, texture page short at +0xc)}; +0xc its texture pages
+   (1-4), +0x10.. their tpage words). With two or more, FUN_005d1ffb looks each quad's page up among them with
+   no bound (`while (sheet[3]) { if (quad page == sheet[4+i]) break; i++; }`, FFNx's copy the same): a quad naming
+   another page reads past the sheet without end. 0 if every quad's page is one of them; else 1 + the first page
+   that has one (or 1 + pages when the sheet's own counts are out of range). */
+static int nfx_sheet_bad_page(const DWORD *sheet)
+{
+    long tpages = (long)sheet[3];
+    int pages, p, q, k;
+
+    if (tpages < 1 || tpages > NFX_TEX_MAX || !sheet[0] || !sheet[1])
+        return 1;
+    if (tpages == 1)
+        return 0;                       /* one texture page: no lookup (the context's drawable is used) */
+    pages = *(const int *)(sheet[0] + 4);
+    if (pages < 0 || pages > 4096)
+        return 1;
+    for (p = 0; p < pages; p++) {
+        const DWORD *entry = (const DWORD *)(sheet[1] + (DWORD)p * 8);
+        const BYTE *quad = (const BYTE *)entry[1];
+        int quads;
+
+        if (!entry[0] || (!quad && *(const WORD *)(entry[0] + 2)))
+            return 1 + p;
+        quads = *(const WORD *)(entry[0] + 2);
+        for (q = 0; q < quads; q++, quad += 0x14) {
+            short tpage = *(const short *)(quad + 0xc);
+
+            for (k = 0; k < tpages && (int)sheet[4 + k] != (int)tpage; k++)
+                ;
+            if (k == tpages)
+                return 1 + p;
+        }
+    }
+    return 0;
+}
+
+/* A value at the item's frame f (from..to), straight from a to b. */
+static int nfx_lerp(struct nfx_range v, int from, int to, int f)
+{
+    if (to <= from || v.a == v.b)
+        return v.a;
+    return v.a + (v.b - v.a) * (f - from) / (to - from);
+}
+
+/* How many of the mask's targets come before target t (its turn for each=). */
+static int nfx_ordinal(int mask, int t)
+{
+    int n = 0, k;
+
+    for (k = 0; k < t; k++)
+        n += (mask >> k) & 1;
+    return n;
+}
+
+/* The item's own frame for a target whose turn is `turn` (each= delays it), -1 if it is not on at frame f. */
+static int nfx_item_frame(const struct nfx_item *it, int f, int turn)
+{
+    int own = f - turn * it->each;
+
+    return own >= it->from && own <= it->to ? own : -1;
+}
+
+/* (centre anchor) A sprite or model line's turn (for each=) on pass t of the draw loops (0-9 an actor,
+   NFX_CENTRE_PASS the centre's one draw, NFX_SCREEN_PASS the screen's, NFX_ARENA_PASS the arena's), or -1: the line
+   draws nothing on that pass. at=target: each target of the mask, its ordinal; at=caster: the caster, turn 0;
+   at=centre: the centre pass only, turn 0 (each= is refused); (screen anchor) at=screen: the screen pass only, turn 0,
+   whatever the mask; (arena anchor) at=arena: the arena pass only, turn 0, whatever the mask. */
+static int nfx_pass_turn(const struct nfx_item *it, int t, int mask, int caster)
+{
+    if (it->at == NFX_AT_ARENA)
+        return t == NFX_ARENA_PASS ? 0 : -1;
+    if (it->at == NFX_AT_SCREEN)
+        return t == NFX_SCREEN_PASS ? 0 : -1;
+    if (it->at == NFX_AT_CENTRE)
+        return t == NFX_CENTRE_PASS ? 0 : -1;
+    if (t < 0 || t >= 10)
+        return -1;
+    if (it->at == NFX_AT_CASTER)
+        return t == caster ? 0 : -1;
+    return mask >> t & 1 ? nfx_ordinal(mask, t) : -1;
+}
+
+/* (centre anchor) The mean of n values (n > 0), rounded toward zero as the game's own halves are. */
+static int nfx_mean(int sum, int n)
+{
+    return n > 0 ? sum / n : 0;
+}
+
+/* The targets the hits of frame f fall on (each at most once: `done` are already hit). */
+static int nfx_hits_due(const struct nfx_item *items, int count, int f, int mask, int done)
+{
+    int i, t, due = 0;
+
+    for (i = 0; i < count; i++)
+        if (items[i].kind == NFX_HIT)
+            for (t = 0; t < 10; t++)
+                if ((mask >> t & 1) && !((done | due) >> t & 1) && items[i].from + nfx_ordinal(mask, t) * items[i].each == f)
+                    due |= 1 << t;
+    return due;
+}
+
+/* The sounds a sound line plays at frame f: the actors each is panned on (as a mask), into out; how many. */
+static int nfx_sound_masks(const struct nfx_item *it, int f, int mask, int caster, int *out)
+{
+    int t, n = 0;
+
+    if (it->kind != NFX_SOUND)
+        return 0;
+    if (it->at == NFX_AT_CASTER || !it->each) {
+        if (it->from == f)
+            out[n++] = it->at == NFX_AT_CASTER ? 1 << caster : mask;
+        return n;
+    }
+    for (t = 0; t < 10; t++)
+        if ((mask >> t & 1) && it->from + nfx_ordinal(mask, t) * it->each == f)
+            out[n++] = 1 << t;
+    return n;
+}
+
+/* (stage fx 1) What the stage lines ask for at frame f: of the lines on at f (from..to), in the script's order, the
+   last with hide= gives the mask and the last with dark= the darkness and tint, each FROM>TO over its own frames.
+   hide_on / dark_on 0: no line asks at f (the game's own values). */
+struct nfx_stage_state { int hide_on, hide, dark_on, dark, r, g, b; };
+static void nfx_stage_at(const struct nfx_item *items, int count, int f, struct nfx_stage_state *st)
+{
+    int i;
+
+    st->hide_on = st->hide = st->dark_on = st->dark = st->r = st->g = st->b = 0;
+    for (i = 0; i < count; i++) {
+        const struct nfx_item *it = &items[i];
+
+        if (it->kind != NFX_STAGE || f < it->from || f > it->to)
+            continue;
+        if (it->entry & NFX_STAGE_HIDE) {
+            st->hide_on = 1;
+            st->hide = it->page.a & NFX_HIDE_ALL;
+        }
+        if (it->entry & NFX_STAGE_DARK) {
+            st->dark_on = 1;
+            st->dark = nfx_lerp(it->fade, it->from, it->to, f);
+            st->r = nfx_lerp(it->r, it->from, it->to, f);
+            st->g = nfx_lerp(it->g, it->from, it->to, f);
+            st->b = nfx_lerp(it->b, it->from, it->to, f);
+        }
+    }
+}
+
+/* (stage fx 2) What a fill or flash line draws at frame f (from..to): `alpha` and `over` the quad laid over the picture
+   (polygon set [5]: the colour `over` at alpha / 255, 0 none; black is FUN_005bd456's, another colour stage_fx_over's)
+   and `add` the colour added (FUN_005bd436, polygon set [1], 0,0,0 none). One of the two, never both. 0: nothing at f.
+   - blend=add: the colour added (the white-outs' quad: mode 1, the engine's additive polygon set);
+   - blend=alpha: picture x (1 - A/255) + colour x A/255, exactly, as ONE quad of the colour at A in set [5] (drawn
+     SRC_ALPHA, INV_SRC_ALPHA); not black then an added colour, since the engine draws every set [1] quad of a frame
+     before every set [5] quad whatever order they were asked in (phase 1 then phase 2 of FUN_0066c19e);
+   - blend=subtract: picture - colour cannot be drawn (the quad's two modes add, or lay a colour over): approximated by
+     black at the colour's mean, picture x (1 - mean/255): exact on white, lighter than FF8's on a dark picture;
+   - flash: FF8's FUN_00571300 to the letter, per channel: at i = f - from of n = to - from + 1 frames, with `in`
+     frames up and `out` down, c / in x i while i < in (0 at the first frame), c held, then c - c / out x k for the
+     k-th of the last `out` frames (c at the first of them); in= 0 and out= 0 hold the colour throughout. */
+struct nfx_fill_draw { int alpha, over[3], add[3]; };
+static int nfx_fill_at(const struct nfx_item *it, int f, struct nfx_fill_draw *d)
+{
+    int c[3], k, i, n, mean;
+
+    d->alpha = d->over[0] = d->over[1] = d->over[2] = d->add[0] = d->add[1] = d->add[2] = 0;
+    if (it->kind != NFX_FILL || (it->entry & NFX_FILL_BACK) || f < it->from || f > it->to)
+        return 0;                       /* ((stage fx 3) a layer=back line is no quad: nfx_back_at) */
+    c[0] = nfx_lerp(it->r, it->from, it->to, f);
+    c[1] = nfx_lerp(it->g, it->from, it->to, f);
+    c[2] = nfx_lerp(it->b, it->from, it->to, f);
+    if (it->entry & NFX_FILL_FLASH) {
+        i = f - it->from;
+        n = it->to - it->from + 1;
+        for (k = 0; k < 3; k++) {
+            if (i < it->page.a)
+                d->add[k] = c[k] / it->page.a * i;
+            else if (i >= n - it->page.b)
+                d->add[k] = c[k] - c[k] / it->page.b * (i - (n - it->page.b));
+            else
+                d->add[k] = c[k];
+        }
+    } else if ((it->entry & 3) == NFX_FILL_ALPHA) {
+        d->alpha = nfx_lerp(it->fade, it->from, it->to, f);
+        if (d->alpha > 0)
+            for (k = 0; k < 3; k++)
+                d->over[k] = c[k];
+    } else if ((it->entry & 3) == NFX_FILL_SUBTRACT) {
+        mean = (c[0] + c[1] + c[2]) / 3;
+        d->alpha = mean;
+    } else
+        for (k = 0; k < 3; k++)
+            d->add[k] = c[k];
+    return d->alpha > 0 || d->add[0] > 0 || d->add[1] > 0 || d->add[2] > 0;
+}
+
+/* (stage fx 2) The jolt the shake lines ask for at frame f, in the screen's axes (x right, y down, z away from the eye):
+   of the lines on at f, the last in the script decides; each axis's amplitude FROM>TO over its frames, + in the first
+   half of each period counted from the line's first frame and - in the second (period 2: + then - every other
+   frame). 0: no line on at f (v 0, 0, 0: the game's own). */
+static int nfx_shake_at(const struct nfx_item *items, int count, int f, int v[3])
+{
+    int i, sign, on = 0;
+
+    v[0] = v[1] = v[2] = 0;
+    for (i = 0; i < count; i++) {
+        const struct nfx_item *it = &items[i];
+
+        if (it->kind != NFX_SHAKE || f < it->from || f > it->to)
+            continue;
+        sign = (f - it->from) % it->page.a < it->page.a / 2 ? 1 : -1;
+        v[0] = sign * nfx_lerp(it->x, it->from, it->to, f);
+        v[1] = sign * nfx_lerp(it->y, it->from, it->to, f);
+        v[2] = sign * nfx_lerp(it->z, it->from, it->to, f);
+        on = 1;
+    }
+    return on;
+}
+
+/* (stage fx 3) The backdrop at frame f: of the fill lines with layer=back on at f, the last in the script decides;
+   rgb its colour FROM>TO over its frames. 0: none on at f. */
+static int nfx_back_at(const struct nfx_item *items, int count, int f, int rgb[3])
+{
+    int i, on = 0;
+
+    rgb[0] = rgb[1] = rgb[2] = 0;
+    for (i = 0; i < count; i++) {
+        const struct nfx_item *it = &items[i];
+
+        if (it->kind != NFX_FILL || !(it->entry & NFX_FILL_BACK) || f < it->from || f > it->to)
+            continue;
+        rgb[0] = nfx_lerp(it->r, it->from, it->to, f);
+        rgb[1] = nfx_lerp(it->g, it->from, it->to, f);
+        rgb[2] = nfx_lerp(it->b, it->from, it->to, f);
+        on = 1;
+    }
+    return on;
+}
+
+/* (stage fx 3) Is actor t (0-9) one of `who`, for the cast by `caster` (0-9) on the targets `mask`? The sides are the
+   party (0-2) and the enemies (4-9); actor 3 (the summons' and effects' own slot) is never anyone's. */
+static int nfx_who_has(int who, int caster, int mask, int t)
+{
+    int side = t < 3, caster_side = caster < 3;
+
+    if (t < 0 || t > 9 || t == 3)
+        return 0;
+    switch (who) {
+    case NFX_WHO_CASTER:    return t == caster;
+    case NFX_WHO_ALLIES:    return side == caster_side;
+    case NFX_WHO_OPPONENTS: return side != caster_side;
+    case NFX_WHO_OTHERS:    return t != caster;
+    case NFX_WHO_ALL:       return 1;
+    case NFX_WHO_BYSTANDERS: return t != caster && !(mask >> t & 1);   /* (target hide) */
+    default:                return (mask >> t & 1) != 0;
+    }
+}
+
+/* (stage fx 3) What the actors lines ask for at frame f, per actor 0-9, for the cast by `caster` on `mask`. Of the
+   lines on at f, in the script's order:
+   - hide: 1 if a hide line on at f names the actor; a who=caster or who=allies line never hides a target (a cast on
+     its own side: hide_target instead, for the log). (target hide) who=bystanders names no target; who=targets,
+     opponents, others and all hide whom they name, targets included: the reader ends such a line before the first
+     hit (nfx_parse), so a target is never hidden when it is struck;
+   - look_on: the last line with fade= or tint= naming the actor gives `amount` (00be118c, FROM>TO over its frames),
+     and with tint= the colour (tint_on 1, r, g, b); fade= alone leaves the actor's own colour (tint_on 0).
+   look_on 0: no line asks at f (the game's own look). hide_target: a who=caster or who=allies hide line names the
+   actor, but it is a target of the cast (not hidden by that line; for the log).
+   (actor move)
+   - move: the last line with move naming the actor gives its offset dx, dy, dz from its own place (x=, y=, z=, FROM>TO
+     over the line's frames); turn: the last line with turn gives tx, ty, tz, the degrees of turn= in the game's
+     4096ths (nfx_turn_units). As hide: who=caster and who=allies never move or turn a target (move_target instead,
+     for the log); who=targets, opponents, others and all move whom they name, ended by the reader before the first
+     hit. move 0 / turn 0: no line asks at f (the actor's own place / turn). */
+struct nfx_actor_state { int hide, hide_target, look_on, amount, tint_on, r, g, b; int move, turn, move_target, d[3], u[3]; };
+
+/* (actor move) A turn= range (degrees, FROM>TO over the line's frames from..to) at frame f in the game's angle unit
+   (4096 a turn, 512 / 45 a degree), the whole turns left out (the angle is a short the draw converts, so only the angle
+   modulo a turn shows), rounded toward zero. Exact at the line's first and last frames; in between the straight line
+   of degrees x span, not the whole degrees nfx_lerp_wide gives: |a x span| + |(b - a) x (f - from)| <= 36000 x 479 +
+   72000 x 479 fits an int, and what is left of a turn (|d| < 360 x 479) times 512 too. */
+static int nfx_turn_units(struct nfx_wide v, int from, int to, int f)
+{
+    int span = to - from, d;
+
+    if (span <= 0 || v.a == v.b)
+        span = 1, d = v.a;
+    else
+        d = v.a * span + (v.b - v.a) * (f - from);
+    d %= 360 * span;
+    return d * 512 / (45 * span);
+}
+static void nfx_actors_at(const struct nfx_item *items, int count, int f, int caster, int mask, struct nfx_actor_state st[10])
+{
+    int i, t;
+
+    for (t = 0; t < 10; t++) {
+        st[t].hide = st[t].hide_target = st[t].look_on = st[t].amount = st[t].tint_on = st[t].r = st[t].g = st[t].b = 0;
+        st[t].move = st[t].turn = st[t].move_target = 0;     /* (actor move) */
+        st[t].d[0] = st[t].d[1] = st[t].d[2] = st[t].u[0] = st[t].u[1] = st[t].u[2] = 0;
+    }
+    for (i = 0; i < count; i++) {
+        const struct nfx_item *it = &items[i];
+
+        if (it->kind != NFX_ACTORS || f < it->from || f > it->to)
+            continue;
+        for (t = 0; t < 10; t++) {
+            if (!nfx_who_has(it->page.a, caster, mask, t))
+                continue;
+            if (it->entry & NFX_ACTORS_HIDE) {
+                if ((it->page.a == NFX_WHO_CASTER || it->page.a == NFX_WHO_ALLIES) && (mask >> t & 1))
+                    st[t].hide_target = 1;
+                else
+                    st[t].hide = 1;
+            }
+            if (it->entry & (NFX_ACTORS_MOVE | NFX_ACTORS_TURN)) {    /* (actor move) */
+                if ((it->page.a == NFX_WHO_CASTER || it->page.a == NFX_WHO_ALLIES) && (mask >> t & 1))
+                    st[t].move_target = 1;
+                else {
+                    if (it->entry & NFX_ACTORS_MOVE) {
+                        st[t].move = 1;
+                        st[t].d[0] = nfx_lerp(it->x, it->from, it->to, f);
+                        st[t].d[1] = nfx_lerp(it->y, it->from, it->to, f);
+                        st[t].d[2] = nfx_lerp(it->z, it->from, it->to, f);
+                    }
+                    if (it->entry & NFX_ACTORS_TURN) {
+                        st[t].turn = 1;
+                        st[t].u[0] = nfx_turn_units(it->turn[0], it->from, it->to, f);
+                        st[t].u[1] = nfx_turn_units(it->turn[1], it->from, it->to, f);
+                        st[t].u[2] = nfx_turn_units(it->turn[2], it->from, it->to, f);
+                    }
+                }
+            }
+            if (it->entry & (NFX_ACTORS_FADE | NFX_ACTORS_TINT)) {
+                st[t].look_on = 1;
+                st[t].amount = nfx_lerp(it->fade, it->from, it->to, f);
+                st[t].tint_on = (it->entry & NFX_ACTORS_TINT) != 0;
+                st[t].r = st[t].tint_on ? nfx_lerp(it->r, it->from, it->to, f) : 0;
+                st[t].g = st[t].tint_on ? nfx_lerp(it->g, it->from, it->to, f) : 0;
+                st[t].b = st[t].tint_on ? nfx_lerp(it->b, it->from, it->to, f) : 0;
+            }
+        }
+    }
+}
+
+/* (stage fx 2) A jolt v in the screen's axes as the world offset s the camera's build adds (FUN_00430b7b ->
+   FUN_00662ecc: the camera's translation becomes R s + T, so every point moves by R s on the screen): s = R^T v, R the
+   look-at at 00bf2130 (9 shorts, rows the screen's x, y and z axes in the world, 4096 = 1.0: FUN_005c68b7, the
+   camera player's camera_ff8_eye_from_lookat reads it so), each rounded to the nearest. v within +-NFX_SHAKE_MAX (the
+   reader's bound, kept here too): 3 x 32768 x 1024 fits an int, and |s| <= 3 x 8 x 1024 fits a short. */
+static void nfx_shake_world(const short r[9], const int v[3], short s[3])
+{
+    int i, k, u[3];
+
+    for (k = 0; k < 3; k++)
+        u[k] = v[k] > NFX_SHAKE_MAX ? NFX_SHAKE_MAX : v[k] < -NFX_SHAKE_MAX ? -NFX_SHAKE_MAX : v[k];
+    for (i = 0; i < 3; i++) {
+        int w = r[i] * u[0] + r[3 + i] * u[1] + r[6 + i] * u[2];
+
+        s[i] = (short)(w >= 0 ? (w + 2048) / 4096 : -((-w + 2048) / 4096));
+    }
+}
+
+/* sin of a whole number of degrees, 4096 = 1.0 (no floating point in the DLL). */
+static int nfx_sin(int degrees)
+{
+    static const short quarter[91] = {
+        0, 71, 143, 214, 286, 357, 428, 499, 570, 641, 711, 782, 852, 921, 991, 1060, 1129, 1198, 1266, 1334,
+        1401, 1468, 1534, 1600, 1666, 1731, 1796, 1860, 1923, 1986, 2048, 2110, 2171, 2231, 2290, 2349, 2408, 2465,
+        2522, 2578, 2633, 2687, 2741, 2793, 2845, 2896, 2946, 2996, 3044, 3091, 3138, 3183, 3228, 3271, 3314, 3355,
+        3396, 3435, 3474, 3511, 3547, 3582, 3617, 3650, 3681, 3712, 3742, 3770, 3798, 3824, 3849, 3873, 3896, 3917,
+        3937, 3956, 3974, 3991, 4006, 4021, 4034, 4046, 4056, 4065, 4074, 4080, 4086, 4090, 4094, 4095, 4096,
+    };
+    int d = degrees % 360;
+
+    if (d < 0)
+        d += 360;
+    return d <= 90 ? quarter[d] : d <= 180 ? quarter[180 - d] : d <= 270 ? -quarter[d - 180] : -quarter[360 - d];
+}
+
+/* The 3x3 part of a sprite's matrix (9 shorts, rows, 4096 = 1.0): scaled by sx, sy percent, then turned by
+   `degrees` in the screen's plane (the quad's corners are (x, y, 0), so the third column never matters). */
+static void nfx_matrix(short *m, int sx, int sy, int degrees)
+{
+    int s = nfx_sin(degrees), c = nfx_sin(degrees + 90);
+    int x = sx * 4096 / 100, y = sy * 4096 / 100;
+
+    m[0] = (short)(x * c / 4096);
+    m[1] = (short)(-(y * s / 4096));
+    m[2] = 0;
+    m[3] = (short)(x * s / 4096);
+    m[4] = (short)(y * c / 4096);
+    m[5] = 0;
+    m[6] = 0;
+    m[7] = 0;
+    m[8] = (short)(sx > sy ? x : y);
+}
+
+/* ---- Models (stage 3a): the matrix of a `model` line ----
+   The engine's fixed-point matrix (FUN_00663673 / FUN_00663707, the form FUN_00661e85 multiplies) is the
+   PlayStation's: 9 shorts m[3 * row + column], 4096 = 1.0, acting on a COLUMN (x, y, z): p' = m p + t, with the
+   translation t three ints at byte 0x12. (Read from FUN_00661465, which FUN_00661e85 uses in a battle, where
+   battle_enter (0041b300) sets the engine's +0x48 to 1: float[4r + c] = short[3r + c] / 4096, t in floats
+   3, 7, 11, and FUN_0066c984 the plain product, so FUN_00661e85(camera, model, out) = camera x model: the
+   model's matrix applies first.) A model line's matrix (model to the battle's world) is
+       R = Rz x Ry x Rx x S        t = the bone's place + (x, y, z)
+   a vertex is sized (S, per axis), then turned about the world's X axis, then Y, then Z (Rx = 1 0 0 / 0 c -s /
+   0 s c, Ry = c 0 s / 0 1 0 / -s 0 c, Rz = c -s 0 / s c 0 / 0 0 1 for p' = m p: the transposes of the row
+   matrices FUN_0067be13 / be71 / bece make for the prop, so a turn goes the same way as prop_turn), then moved.
+   The battle's axes are the world's: y is DOWN (up is -y), units as the bone places (FUN_005d2e00).
+   Scale per axis <= 700 % keeps every short within range (|R| <= 4096 x 7 + rounding). */
+static int nfx_round_4096(int v)
+{
+    return (v + (v >= 0 ? 2048 : -2048)) / 4096;
+}
+
+static void nfx_mat3(const int *a, const int *b, int *out)
+{
+    int r, c;
+
+    for (r = 0; r < 3; r++)
+        for (c = 0; c < 3; c++)
+            out[3 * r + c] = nfx_round_4096(a[3 * r] * b[c] + a[3 * r + 1] * b[3 + c] + a[3 * r + 2] * b[6 + c]);
+}
+
+/* The nine shorts of R = Rz x Ry x Rx x S: turn[] in degrees about X, Y, Z; scale[] in percent per axis. */
+static void nfx_model_matrix(short *m, const int *turn, const int *scale)
+{
+    int sx = nfx_sin(turn[0]), cx = nfx_sin(turn[0] + 90), sy = nfx_sin(turn[1]), cy = nfx_sin(turn[1] + 90);
+    int sz = nfx_sin(turn[2]), cz = nfx_sin(turn[2] + 90), i;
+    int rx[9], ry[9], rz[9], yx[9], r[9];
+
+    rx[0] = 4096, rx[1] = 0, rx[2] = 0, rx[3] = 0, rx[4] = cx, rx[5] = -sx, rx[6] = 0, rx[7] = sx, rx[8] = cx;
+    ry[0] = cy, ry[1] = 0, ry[2] = sy, ry[3] = 0, ry[4] = 4096, ry[5] = 0, ry[6] = -sy, ry[7] = 0, ry[8] = cy;
+    rz[0] = cz, rz[1] = -sz, rz[2] = 0, rz[3] = sz, rz[4] = cz, rz[5] = 0, rz[6] = 0, rz[7] = 0, rz[8] = 4096;
+    nfx_mat3(ry, rx, yx);
+    nfx_mat3(rz, yx, r);
+    for (i = 0; i < 9; i++) {
+        int s = scale[i % 3] < 0 ? 0 : scale[i % 3] > NFX_SCALE_MAX ? NFX_SCALE_MAX : scale[i % 3];
+        int v = r[i] * s;               /* column i % 3 sized by that axis's scale (S applies first) */
+
+        v = (v + (v >= 0 ? 50 : -50)) / 100;
+        m[i] = (short)(v > 32767 ? 32767 : v < -32768 ? -32768 : v);
+    }
+}
+
+/* What a model line draws at its own frame `own`. Stage 3b: fade (255 none), colour (r, g, b; read with NFX_F_COLOUR),
+   the texture offset u, v (256ths) and the palette row (-1: none given). */
+struct nfx_model_draw { int x, y, z, turn[3], scale[3], fade, r, g, b, u, v, palette; };
+static int nfx_lerp_wide(struct nfx_wide v, int from, int to, int f)
+{
+    if (to <= from || v.a == v.b)
+        return v.a;
+    return v.a + (v.b - v.a) * (f - from) / (to - from);    /* (|b - a| <= 72000, frames < 480: within an int; no
+                                                               64-bit division, the DLL has no libgcc) */
+}
+
+static void nfx_model_at(const struct nfx_item *it, int own, struct nfx_model_draw *d)
+{
+    int from = it->from, to = it->to, k;
+
+    d->x = nfx_lerp(it->x, from, to, own);
+    d->y = nfx_lerp(it->y, from, to, own);
+    d->z = nfx_lerp(it->z, from, to, own);
+    for (k = 0; k < 3; k++)
+        d->turn[k] = nfx_lerp_wide(it->turn[k], from, to, own);
+    d->scale[0] = nfx_lerp(it->sx, from, to, own);
+    d->scale[1] = nfx_lerp(it->sy, from, to, own);
+    d->scale[2] = nfx_lerp(it->sz, from, to, own);
+    d->fade = nfx_lerp(it->fade, from, to, own);
+    d->r = nfx_lerp(it->r, from, to, own);
+    d->g = nfx_lerp(it->g, from, to, own);
+    d->b = nfx_lerp(it->b, from, to, own);
+    d->u = nfx_lerp(it->u, from, to, own);
+    d->v = nfx_lerp(it->v, from, to, own);
+    d->palette = it->flags & NFX_F_PALETTE ? nfx_lerp(it->pal, from, to, own) : -1;
+}
+
+/* Stage 3b: FUN_005d1ba4's context for a model instance (read from FUN_005d1ba4 and FFNx's copy,
+   battle_animate_material_texture):
+     [0] the model record;
+     [1] flags: 0x80 the alpha from the transparency (FUN_00429343: 255 - t / 16), and with a colour 0x10, which on
+         the stock driver chooses the mixing state 0xb (as FFNx's 9) instead of the tint 0xd (FFNx never reads it:
+         under FFNx a colour mixes either way, the prop's 0x90);
+     [2] the UV word (u | v << 8, 0 = the original texture coordinates) | the transparency << 16, (255 - fade) << 4
+         (fade 255: t 0, alpha 255; fade 0: t 4080, alpha 0);
+     [3] the kind 0x20 (masked off by the routine) | the palette word << 16: row << 6 picks the row of the set's
+         first textured state (FUN_005d1aaa(0, set)) for the instance, 0 changes nothing. The row is set on the
+         texture set when the instance is drawn (FUN_0068b239) and stays there, so a line of a file another line
+         gives palette= to draws an explicit row (its own, else 0: row << 6 | 1, which the routine's >> 6 reads as
+         the row and which is never 0; `pinned`). With none of these keys the context is stage 3a's to the bit:
+         {record, 0x80, 0, 0x20}. */
+static void nfx_model_context(const struct nfx_model_draw *d, int coloured, int pinned, DWORD record, DWORD *ctx)
+{
+    int fade = d->fade < 0 ? 0 : d->fade > NFX_FADE_MAX ? NFX_FADE_MAX : d->fade;
+    int u = d->u < 0 ? 0 : d->u > NFX_UV_MAX ? NFX_UV_MAX : d->u, v = d->v < 0 ? 0 : d->v > NFX_UV_MAX ? NFX_UV_MAX : d->v;
+    int row = d->palette > NFX_PALETTE_MAX ? NFX_PALETTE_MAX : d->palette;
+    DWORD palette_word = 0;
+
+    if (row >= 0 || pinned)
+        palette_word = (DWORD)(row < 0 ? 0 : row) << 6 | 1u;
+    ctx[0] = record;
+    ctx[1] = coloured ? 0x90u : 0x80u;
+    ctx[2] = (DWORD)(u | v << 8) | (DWORD)((NFX_FADE_MAX - fade) << 4) << 16;
+    ctx[3] = 0x20u | palette_word << 16;
+}
+
+/* 0 if every model line drawing file `entry` asks only for palette rows below `palettes` (its TEX[0]'s); else 1 +
+   the index of the first that asks for more. */
+static int nfx_model_palette_bad(const struct nfx_item *items, int count, int entry, int palettes)
+{
+    int i;
+
+    for (i = 0; i < count; i++)
+        if (items[i].kind == NFX_MODEL && items[i].entry == entry && (items[i].flags & NFX_F_PALETTE) &&
+            (items[i].pal.a >= palettes || items[i].pal.b >= palettes))
+            return 1 + i;
+    return 0;
+}
+
+/* Stage 3b (the review's fix 1): a model's states (p_hundred, 100 bytes each, `groups` of them): the texture set of the
+   first with a texture set and texture index 0 (TEX[0]'s, the one FUN_005d1aaa(0, set) gives FUN_005d1ba4 and
+   FUN_0068b239 sets the row on), or 0; *several 1 if a state uses another texture (TEX[1] and up). palette= is then
+   refused: when the row changes, FUN_0068b239 tells the driver, and FFNx's common_palette_changed binds TEX[0]'s
+   texture set (common.cpp:2026-2046), so the model's other groups would be drawn with TEX[0]'s picture. */
+#define NFX_HUNDRED_SIZE        100
+#define NFX_HUNDRED_TEXINDEX    0x10         /* a p_hundred's texture index (the RSD's TEX[n]) */
+#define NFX_HUNDRED_TEXSET      0x14         /* its texture set, 0 if none */
+static DWORD nfx_model_tex0(const BYTE *hundreds, int groups, int *several)
+{
+    DWORD texset = 0;
+    int g;
+
+    *several = 0;
+    for (g = 0; g < groups; g++) {
+        DWORD ts = *(const DWORD *)(hundreds + g * NFX_HUNDRED_SIZE + NFX_HUNDRED_TEXSET);
+        int ti = *(const int *)(hundreds + g * NFX_HUNDRED_SIZE + NFX_HUNDRED_TEXINDEX);
+
+        if (ts && ti == 0 && !texset)
+            texset = ts;
+        else if (ts && ti != 0)
+            *several = 1;
+    }
+    return texset;
+}
+
+/* Stage 3b: the .P a model's RSD names, from its text: the value of its `PLY=` line (the game's reader,
+   FUN_00694156, takes the value after the '=' of that line, the RSD's first after the header) with the extension
+   changed to .P, as FUN_00694942 asks for it (108.RSD names 101.PLY, eletri1.rsd ELETRY1.PLY). 1 and the name in
+   out (EFFECT_NAME_MAX), or 0 if the text has no PLY line with a usable name. */
+static int nfx_rsd_ply(const char *text, int size, char *out)
+{
+    int i = 0;
+
+    while (i < size) {
+        int start, stop, n, k;
+
+        while (i < size && (text[i] == ' ' || text[i] == '\t'))
+            i++;
+        start = i;
+        while (i < size && text[i] != '\n' && text[i] != '\r')
+            i++;
+        stop = i;
+        while (i < size && (text[i] == '\n' || text[i] == '\r'))
+            i++;
+        if (stop - start < 5 || !((text[start] == 'P' || text[start] == 'p') && (text[start + 1] == 'L' || text[start + 1] == 'l') &&
+                                  (text[start + 2] == 'Y' || text[start + 2] == 'y') && text[start + 3] == '='))
+            continue;
+        start += 4;
+        while (stop > start && (text[stop - 1] == ' ' || text[stop - 1] == '\t'))
+            stop--;
+        for (k = stop; k > start && text[k - 1] != '.'; k--)
+            ;
+        n = k > start ? k - 1 - start : stop - start;      /* the stem, before the last dot */
+        if (n < 1 || n + 3 > EFFECT_NAME_MAX)
+            return 0;
+        for (k = 0; k < n; k++) {
+            char c = text[start + k];
+
+            if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.'))
+                return 0;
+            out[k] = c;
+        }
+        out[n] = '.', out[n + 1] = 'P', out[n + 2] = 0;
+        return 1;
+    }
+    return 0;
+}
+
+/* The .P the file check looks for beside a model's RSD: NAME.RSD -> NAME.P (what the RSD's PLY line names in the
+   game's own models and the prop's: PLY=NAME.PLY, read as NAME.P). out holds EFFECT_NAME_MAX. */
+static void nfx_model_p_name(const char *rsd, char *out)
+{
+    const char *ext = effect_extension(rsd);
+    int n = (int)(ext - rsd), i;
+
+    for (i = 0; i < n && i < EFFECT_NAME_MAX - 3; i++)
+        out[i] = rsd[i];
+    out[i] = '.', out[i + 1] = 'P', out[i + 2] = 0;
+}
+
+/* FUN_005d1ffb's colour word from R, G, B as they show (0-255): the routine doubles bytes below 0x80 and takes
+   0x80 and up as 0xff, so 0x80 is the picture as it is; the high byte is Fire's own (008fe0d8: 80 80 80 2c). */
+static DWORD nfx_colour(int r, int g, int b)
+{
+    int c[3], i;
+
+    c[0] = r, c[1] = g, c[2] = b;
+    for (i = 0; i < 3; i++)
+        c[i] = c[i] >= 255 ? 0x80 : c[i] < 0 ? 0 : c[i] >> 1;
+    return 0x2c000000u | (DWORD)c[2] << 16 | (DWORD)c[1] << 8 | (DWORD)c[0];
+}
+
+/* What a sprite line draws at its own frame `own`, with a sheet of `pages` pages. palette -1: the sheet's own
+   rows (each quad's palette word less the .TEX's base row, as the game's effects draw). */
+struct nfx_draw { int page, x, y, depth, sx, sy, rot, palette; DWORD colour; };
+static void nfx_sprite_at(const struct nfx_item *it, int own, int pages, struct nfx_draw *d)
+{
+    int from = it->from, to = it->to;
+
+    if (it->page_mode == NFX_PAGE_LOOP)
+        d->page = pages > 0 ? (own - from) % pages : 0;
+    else
+        d->page = nfx_lerp(it->page, from, to, own);
+    if (pages > 0 && d->page >= pages)
+        d->page = pages - 1;
+    d->x = nfx_lerp(it->x, from, to, own);
+    d->y = nfx_lerp(it->y, from, to, own);
+    d->depth = nfx_lerp(it->depth, from, to, own);
+    d->sx = nfx_lerp(it->sx, from, to, own);
+    d->sy = nfx_lerp(it->sy, from, to, own);
+    d->rot = nfx_lerp(it->rot, from, to, own);
+    d->palette = it->flags & NFX_F_PALETTE ? nfx_lerp(it->pal, from, to, own) : -1;
+    d->colour = nfx_colour(nfx_lerp(it->r, from, to, own), nfx_lerp(it->g, from, to, own), nfx_lerp(it->b, from, to, own));
+}
+
+/* (screen anchor) The current matrix of an at=screen line, in the engine's form (9 shorts, then 3 ints at +0x12;
+   0x20 bytes): the model-to-VIEW matrix FUN_00663673 / FUN_00663707 take (FUN_005d2b44 leaves the same kind: the
+   camera 00bfcb30 times the place, its rotation part a plain scale). The rotation is the line's own in the screen's
+   axes (a model's turn and scale as face=camera's nfx_model_matrix, a sprite's scale and rot as nfx_matrix); the
+   translation is (x, y, z) itself: x right, y down, z away from the eye, in the battle's units. Nothing of the
+   game's is read: the layer does not move when the camera moves. */
+static void nfx_put_int(BYTE *p, int v)
+{
+    DWORD u = (DWORD)v;
+
+    p[0] = (BYTE)u, p[1] = (BYTE)(u >> 8), p[2] = (BYTE)(u >> 16), p[3] = (BYTE)(u >> 24);
+}
+
+static void nfx_screen_place(BYTE *m, int x, int y, int z)
+{
+    nfx_put_int(m + 0x12, x);
+    nfx_put_int(m + 0x16, y);
+    nfx_put_int(m + 0x1a, z);
+    m[0x1e] = m[0x1f] = 0;
+}
+
+static void nfx_screen_model(BYTE *m, const struct nfx_model_draw *d)
+{
+    short r[9];
+    int k;
+
+    nfx_model_matrix(r, d->turn, d->scale);
+    for (k = 0; k < 9; k++)
+        m[2 * k] = (BYTE)r[k], m[2 * k + 1] = (BYTE)((WORD)r[k] >> 8);
+    nfx_screen_place(m, d->x, d->y, d->z);
+}
+
+static void nfx_screen_sprite(BYTE *m, const struct nfx_draw *d)
+{
+    short r[9];
+    int k;
+
+    nfx_matrix(r, d->sx, d->sy, d->rot);
+    for (k = 0; k < 9; k++)
+        m[2 * k] = (BYTE)r[k], m[2 * k + 1] = (BYTE)((WORD)r[k] >> 8);
+    nfx_screen_place(m, d->x, d->y, d->depth);      /* (a sprite holds its z in depth) */
+}
+
+/* (screen anchor) zoom=fixed: an at=screen matrix m (as nfx_screen_model / nfx_screen_sprite wrote it) drawn the size
+   it has at the battle's own H (NFX_SCREEN_H_HOME) while the battle's H is h. The game projects x and y as H x / z (the
+   field of view is made from the H at 00c05f7c each frame: FUN_0042d808 -> FUN_00661a1c), so the rows that give the
+   view's x and y (shorts 0-5) and the place's x and y (ints at +0x12, +0x16) are multiplied by 512 / h: the picture
+   is the same at any h, and z (row 2, +0x1a) is untouched, so the layer keeps its depth. A short that would pass 32767
+   holds the factor at 32767 / the largest (the layer then shows smaller than at 512, about the screen's centre): the
+   return is 1 then, else 0. h outside 16..32767 (not the battle's) or 512: unchanged. Int only (no libgcc): |short| x
+   32767 and |x| <= 32767 x 512 stay within an int. */
+static int nfx_screen_zoom(BYTE *m, int h)
+{
+    int k, v, most = 0, num = NFX_SCREEN_H_HOME, den = h, held = 0;
+
+    if (h < 16 || h > 32767 || h == NFX_SCREEN_H_HOME)
+        return 0;
+    for (k = 0; k < 6; k++) {
+        v = (short)(m[2 * k] | m[2 * k + 1] << 8);
+        if (v < 0)
+            v = -v;
+        if (v > most)
+            most = v;
+    }
+    if (most * NFX_SCREEN_H_HOME > 32767 * h)
+        num = 32767, den = most, held = 1;
+    for (k = 0; k < 6; k++) {
+        v = (short)(m[2 * k] | m[2 * k + 1] << 8);
+        v = (v * num + (v >= 0 ? den / 2 : -(den / 2))) / den;
+        v = v > 32767 ? 32767 : v < -32767 ? -32767 : v;
+        m[2 * k] = (BYTE)v, m[2 * k + 1] = (BYTE)((WORD)v >> 8);
+    }
+    for (k = 0x12; k <= 0x16; k += 4) {
+        v = (int)(m[k] | m[k + 1] << 8 | m[k + 2] << 16 | (DWORD)m[k + 3] << 24);
+        if (v > 32767 || v < -32767)    /* (the reader holds x and y to +-32767; any other value is left) */
+            continue;
+        nfx_put_int(m + k, (v * num + (v >= 0 ? den / 2 : -(den / 2))) / den);
+    }
+    return held;
+}
+
+/* FUN_005d1ffb's page word (context +0xc): the low word the page; with bit 0x8000 the routine takes the palette
+   row from the high word >> 6 for every quad (its draw node +0x80), else each quad's own palette word >> 6 less
+   the .TEX's base row (header +0xe0). palette -1: the sheet's own (bit clear, as before stage 2a). */
+static DWORD nfx_page_word(int page, int palette)
+{
+    DWORD word = (DWORD)(page < 0 ? 0 : page);     /* exactly the word stage 1 passed */
+
+    if (palette >= 0)
+        word = (word & 0x7fffu) | 0x8000u | (DWORD)((palette > NFX_PALETTE_MAX ? NFX_PALETTE_MAX : palette) << 6) << 16;
+    return word;
+}
+
+/* 0 if every sprite line drawing file `entry` asks only for palette rows below `palettes` (the fewest of the
+   .TEX files its sheet draws with); else 1 + the index of the first that asks for more. */
+static int nfx_palette_bad(const struct nfx_item *items, int count, int entry, int palettes)
+{
+    int i;
+
+    for (i = 0; i < count; i++)
+        if (items[i].kind == NFX_SPRITE && items[i].entry == entry && (items[i].flags & NFX_F_PALETTE) &&
+            (items[i].pal.a >= palettes || items[i].pal.b >= palettes))
+            return 1 + i;
+    return 0;
+}
+
+/* How many entries of file f's texture list native_load looks at, for a sheet of `pages` texture pages (the
+   cast has refused a sheet with more pages than entries). The sheet draws with the first `pages` entries alone
+   (native_draw sets sheet[8 + j] for those), so:
+   - palette rows (palette 1) are checked against those textures only, whatever the list;
+   - the default list ("this file, then the next ones") ends at the page count: the later files are no texture
+     of this sheet, so neither their drawable nor their palette count is asked for (stage 2b);
+   - an explicit tex= list keeps stage 1's check that every file it names has a drawable (palette 0). */
+static int nfx_tex_checked(const struct nfx_file *f, long pages, int palette)
+{
+    int n = f->tex_count;
+
+    if (pages >= 0 && pages < n && (palette || f->tex_default))
+        n = (int)pages;
+    return n;
+}
+
+/* The palette rows a loaded .TEX really holds, from its header: the count (+0x30; below 1: one row), but no
+   more than its palette data holds when it has a palette (+0x4c use_palette; +0x58 colours in all / +0x34
+   colours a row): FFNx reads row R's colours at R * entries into a buffer of only +0x58 colours. -2 for a count
+   past 0x10000 (no texture has that many). */
+static long nfx_tex_rows(long count, DWORD use_palette, long entries, long size)
+{
+    long rows = count < 1 ? 1 : count;
+
+    if (count > 0x10000)
+        return -2;
+    if (use_palette && entries > 0 && size >= 0 && size / entries < rows)
+        rows = size / entries < 1 ? 1 : size / entries;
+    return rows;
+}
+
+/* The script `play = stage0_test` plays when SpellExtConfig\effects\stage0_test.txt is not there: stage 0's
+   timeline (it was hard-wired), as the shipped example file has it. */
+static const char nfx_stage0_text[] =
+    "folder = MAGIC/FIRE\n"
+    "file 0 = FIRE00.TIM FI_A01.SPT blend=add\n"
+    "file 1 = FIRE01.TIM blend=add\n"
+    "length = 30\n"
+    "0    sound 9 pan=targets\n"
+    "0-29 sprite 0 at=target bone=1 page=loop\n"
+    "10   hit\n";
 /* EFFECT COPIES PURE END */
 
 static BOOL spell_file_reading;        /* load_spells is reading: `animation = 0x100` (an effect copy) is taken */
@@ -10955,7 +13409,8 @@ static const BYTE effect_free_group_start[] = { 0x55, 0x8b, 0xec, 0x83, 0x7d, 0x
 #define EFFECT_LOGS             60           /* lines of the copies at work, per run of the game */
 
 static struct effect_base {
-    BYTE looked, ok, copies;
+    BYTE looked, ok;
+    int copies;                         /* usable copies of it (an int: 256 copies of one base would wrap a BYTE to 0) */
     const char *why;                    /* why its copies are refused */
     DWORD loader, run;
     struct effect_template t;
@@ -10965,6 +13420,7 @@ static struct effect_base {
 } effect_bases[EFFECT_BASE_COUNT];
 static struct effect_copy effect_copies[EFFECT_COPY_MAX];
 static int effect_copy_count, effect_copies_usable, effect_file_problems;
+static int effect_natives_usable;       /* usable native effects (`play =`): not counted in effect_copies_usable */
 static LONG effect_preload_live, effect_logs;
 static DWORD effect_preload_next = FN_EFFECT_PRELOAD;
 static struct { short single, several, now; } effect_copy_cast[10];    /* copy indexes per actor, -1 none */
@@ -10986,7 +13442,7 @@ static int effect_copy_base(DWORD number)
 {
     int i = effect_copy_index(number);
 
-    return i < 0 ? -1 : effect_copies[i].base;
+    return i < 0 ? -1 : effect_copies[i].play ? effect_copies[i].play_base : effect_copies[i].base;
 }
 
 /* A name in the game's data: a short plain string. */
@@ -11277,12 +13733,19 @@ static void __cdecl effect_preload_hook(int actor_arg)
     effect_note_loaded(*(const BYTE *)(ADDR_ACTOR_NUMBER + actor * ACTOR_EFFECT_STRIDE), b, set, actor, "preload");
 }
 
+static BOOL native_effect_step(int actor_arg);  /* ("Native effects", below) */
+static void native_script_read(int i);         /* (the same) */
+static void native_scripts_forget(void);
+static void native_scripts_check_files(void);
+
 /* The effect step, FUN_00427c22, from summon_effect_hook and summon_intro_task. */
 static void start_effect_copy(int actor_arg)
 {
     int actor = (BYTE)actor_arg, set = -1, number = 0;
     struct effect_base *b;
 
+    if (native_effect_step(actor_arg))  /* a native effect: the DLL's task plays it, not the game's routine */
+        return;
     effect_settle();
     b = effect_pending_base < 0 ? effect_for_actor(actor, TRUE, &set) : NULL;
     if (b) {
@@ -11325,10 +13788,12 @@ static void effect_copy_note(int *action, int spell)
     effect_copy_cast[actor].several = (short)several;
     effect_copy_cast[actor].now = (short)((targets & (targets - 1)) ? several : one);
     if (InterlockedIncrement(&effect_logs) <= EFFECT_LOGS)
-        log_line("effect copies: actor %d's spell %d: effect %02lx, copy %04x on one target, %04x on several (0 = its own files)%s", actor,
-                 spells[spell].id, (DWORD)action[9], one >= 0 ? (unsigned)effect_copies[one].number : 0u,
+        log_line("effect copies: actor %d's spell %d: effect %02lx, %s %04x on one target, %s %04x on several (0 = its own files)%s", actor,
+                 spells[spell].id, (DWORD)action[9], one >= 0 && effect_copies[one].play ? "native effect" : "copy",
+                 one >= 0 ? (unsigned)effect_copies[one].number : 0u,
+                 several >= 0 && effect_copies[several].play ? "native effect" : "copy",
                  several >= 0 ? (unsigned)effect_copies[several].number : 0u,
-                 effect_preload_live ? "" : "; effect copies are OFF (see the start of the log)");
+                 effect_preload_live || (one >= 0 && effect_copies[one].play) ? "" : "; effect copies are OFF (see the start of the log)");
 }
 
 /* A battle starts: nothing of the last one's loads is known any more (the engine freed every group). */
@@ -11344,6 +13809,198 @@ static void effect_copies_battle_start(void)
         effect_copy_cast[i].single = effect_copy_cast[i].several = effect_copy_cast[i].now = -1;
 }
 
+/* ---- Sound handles (stage 1): the runtime (the reader and checks are "Sound handles" in the pure part) ----
+   Nothing is patched and nothing of the game's is written: the DLL reads the exe's headers, one dword per
+   handle, and the first bytes of the channel player, and calls that player as FUN_005bfff3 does for kinds
+   0x28-0x2b. FUN_00745606 is never called for a handle. */
+#define FN_SOUND_CHANNEL_PLAYER 0x00745160u  /* FUN_00745160(pan, id, channel), cdecl; FFNx: ff7_sfx_play_on_channel (a jump, E9) */
+static struct sound_handle sound_handles[SOUND_HANDLE_MAX];
+static int sound_handle_count, sound_handles_usable;
+static BYTE sound_refusal_said[SOUND_HANDLE_MAX];   /* a refused play said for this handle (once a reading) */
+static LONG sound_player_said;          /* the player's refusal said (once a reading) */
+static char sound_runs[160];            /* the usable runs, for a refusal; "" until first needed */
+static BOOL native_say(void);           /* ("Native effects", below) */
+
+/* The exe's sections as its headers in memory give them, and its image; how many (0: unreadable). */
+static int sound_exe_sections(struct sound_section *s, int most, DWORD *image_start, DWORD *image_end)
+{
+    const BYTE *base = (const BYTE *)GetModuleHandleA(NULL);
+    const IMAGE_NT_HEADERS *nt;
+    const IMAGE_SECTION_HEADER *h;
+    int i, n;
+
+    if (!base || IsBadReadPtr(base, 0x40) || *(const WORD *)base != 0x5a4d || *(const DWORD *)(base + 0x3c) > 0x1000)
+        return 0;
+    nt = (const IMAGE_NT_HEADERS *)(base + *(const DWORD *)(base + 0x3c));
+    if (IsBadReadPtr(nt, sizeof *nt) || nt->Signature != IMAGE_NT_SIGNATURE)
+        return 0;
+    h = IMAGE_FIRST_SECTION(nt);
+    n = nt->FileHeader.NumberOfSections;
+    if (n > most || IsBadReadPtr(h, (UINT_PTR)n * sizeof *h))
+        return 0;
+    *image_start = (DWORD)base;
+    *image_end = (DWORD)base + nt->OptionalHeader.SizeOfImage;
+    for (i = 0; i < n; i++) {
+        s[i].start = (DWORD)base + h[i].VirtualAddress;
+        s[i].end = s[i].start + h[i].Misc.VirtualSize;
+        s[i].flags = h[i].Characteristics;
+    }
+    return n;
+}
+
+/* 1 if handle number id may be played now: its loop dword in a read-only section of the exe (sound_loop_place),
+   readable, and 0. Otherwise 0 and why (`why` 160 bytes or more). *protect (if not NULL) gets its page's
+   protection now (logged once a reading: the section's header says read-only; the value is what is relied on). */
+static int sound_id_check(int id, char *why, DWORD *protect)
+{
+    struct sound_section s[32];
+    DWORD start = 0, end = 0, at = sound_loop_address(id), value, size;
+    MEMORY_BASIC_INFORMATION info;
+    int n = sound_exe_sections(s, 32, &start, &end);
+    const char *place;
+
+    if (!n) {
+        lstrcpyA(why, "the game's own headers could not be read");
+        return 0;
+    }
+    if ((place = sound_loop_place(id, s, n, start, end)) != NULL) {
+        lstrcpynA(why, place, 160);
+        return 0;
+    }
+    if (!VirtualQuery((const void *)at, &info, sizeof info) || info.State != MEM_COMMIT || (info.Protect & (PAGE_GUARD | PAGE_NOACCESS)) ||
+        IsBadReadPtr((const void *)(at - SOUND_SIZE_BEFORE_LOOP), SOUND_SIZE_BEFORE_LOOP + 4)) {
+        wsprintfA(why, "the dword FFNx reads for it (%08lx) cannot be read now", at);
+        return 0;
+    }
+    if (protect)
+        *protect = info.Protect;
+    value = *(const DWORD *)at;
+    size = *(const DWORD *)(at - SOUND_SIZE_BEFORE_LOOP);
+    if ((place = sound_entry_values(size, value)) != NULL) {
+        wsprintfA(why, "its table entry (loop dword %08lx = %08lx, size %08lx) %s", at, value, size, place);
+        return 0;
+    }
+    return 1;
+}
+
+static int sound_id_usable(int id)
+{
+    char why[200];
+
+    return sound_id_check(id, why, NULL);
+}
+
+/* The usable runs of the pool, worked out once a reading (they are the exe's constant bytes). */
+static const char *sound_usable_runs(void)
+{
+    if (!sound_runs[0]) {
+        int total = sound_pool_runs(sound_id_usable, sound_runs, sizeof sound_runs, SOUND_RUNS_SAID);
+
+        if (!sound_runs[0])
+            lstrcpyA(sound_runs, "none");
+        log_line("sound handles: %d usable numbers in 53848-58089; the longest runs: %s", total, sound_runs);
+    }
+    return sound_runs;
+}
+
+static void sound_say(int line, int refusal, const char *what)
+{
+    log_line("effects file line %d: %s%s", line, refusal ? "" : "(note) ", what);
+    if (refusal)
+        effect_file_problems++;
+}
+
+/* Reads the [sound N] sections (load_effect_copies, before the scripts, which name them). text NULL: none. */
+static void sound_handles_read(char *text, DWORD size)
+{
+    char why[200];
+    DWORD target, protect = 0;
+    int i, problems = effect_file_problems;
+
+    sound_handle_count = sound_handles_usable = 0;
+    nfx_handles = sound_handles;
+    nfx_handle_count = 0;
+    sound_runs[0] = 0;
+    InterlockedExchange(&sound_player_said, 0);
+    for (i = 0; i < SOUND_HANDLE_MAX; i++)
+        sound_refusal_said[i] = 0;
+    if (!text)
+        return;
+    sound_handle_count = sound_file_parse(text, size, sound_handles, SOUND_HANDLE_MAX, sound_say);
+    if (effect_file_problems != problems)
+        sound_usable_runs();            /* a section was refused: the numbers to pick from, said once */
+    for (i = 0; i < sound_handle_count; i++) {
+        struct sound_handle *h = &sound_handles[i];
+
+        if (!h->usable)
+            continue;
+        if (!sound_id_check(h->id, why, &protect)) {
+            log_line("effects file line %d: sound %u cannot be used: %s. Pick one of %s", h->line, (unsigned)h->id, why, sound_usable_runs());
+            effect_file_problems++;
+            h->usable = 0;
+            continue;
+        }
+        sound_handles_usable++;
+        log_line("sound handle %u%s%s: channel %d, file sfx\\%u.ogg", (unsigned)h->id, h->name[0] ? " = " : "", h->name, h->channel,
+                 (unsigned)h->id);
+    }
+    nfx_handle_count = sound_handle_count;
+    if (sound_handle_count) {
+        struct sound_section s[32];
+        DWORD start = 0, end = 0;
+        int state = sound_exe_sections(s, 32, &start, &end) ?
+                    sound_player_state((const BYTE *)FN_SOUND_CHANNEL_PLAYER, FN_SOUND_CHANNEL_PLAYER, start, end, &target) : -1;
+
+        log_line("sound handles: %d, %d usable (the last handle's dword page protection now %02lx); the channel player %08lx is now %s (checked again at each play)",
+                 sound_handle_count, sound_handles_usable, protect, FN_SOUND_CHANNEL_PLAYER,
+                 state > 0 ? "a jump out of the game (FFNx's): handles play" : state == 0 ? "the game's own: handles play only under FFNx with use_external_sfx"
+                                                                          : "neither the game's nor a jump out of it: handles do not play");
+    }
+}
+
+/* Plays handle number id (a script's sound line) panned at pan. Refused (nothing played, the effect goes on)
+   when the channel player is not a jump out of the game's image to code, or the handle's dword fails now. */
+static void sound_handle_play(int id, int pan)
+{
+    const BYTE *entry = (const BYTE *)FN_SOUND_CHANNEL_PLAYER;
+    struct sound_section s[32];
+    DWORD start = 0, end = 0, target = 0;
+    MEMORY_BASIC_INFORMATION info;
+    char why[200];
+    int i;
+
+    for (i = 0; i < sound_handle_count && !(sound_handles[i].usable && sound_handles[i].id == id); i++)
+        ;
+    if (i == sound_handle_count) {
+        if (native_say())
+            log_line("sound handle %d: not defined in this reading of the effects file: not played", id);
+        return;
+    }
+    if (!sound_exe_sections(s, 32, &start, &end) || sound_player_state(entry, FN_SOUND_CHANNEL_PLAYER, start, end, &target) <= 0 ||
+        !VirtualQuery((const void *)target, &info, sizeof info) || info.State != MEM_COMMIT || (info.Protect & PAGE_GUARD) ||
+        !(info.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))) {
+        if (!InterlockedExchange(&sound_player_said, 1))
+            log_line("sound handles: not played: the channel player %08lx starts %02x %02x %02x %02x %02x, not a jump out of the game to code (FFNx's, with use_external_sfx = true): handles need FFNx's external sounds; the rest of the effect plays",
+                     FN_SOUND_CHANNEL_PLAYER, entry[0], entry[1], entry[2], entry[3], entry[4]);
+        return;
+    }
+    if (!sound_id_check(id, why, NULL)) {
+        if (!sound_refusal_said[i]) {
+            sound_refusal_said[i] = 1;
+            log_line("sound handle %d: not played: %s; the rest of the effect plays", id, why);
+        }
+        return;
+    }
+    if (pan < 0)
+        pan = 0;
+    if (pan > 127)
+        pan = 127;
+    if (native_say())
+        log_line("sound handle %d%s%s: channel %d, pan %d (%08lx -> %08lx)", id, sound_handles[i].name[0] ? " = " : "", sound_handles[i].name,
+                 sound_handles[i].channel, pan, FN_SOUND_CHANNEL_PLAYER, target);
+    ((void (__cdecl *)(int, int, int))FN_SOUND_CHANNEL_PLAYER)(pan, id, sound_handles[i].channel);
+}
+
 /* Reads FF7_SpellExt_Effects.ini (before the spell file, which names the copies: at start-up and on
    "Re-init .ini files"). */
 static void load_effect_copies(void)
@@ -11353,10 +14010,12 @@ static void load_effect_copies(void)
     int i;
 
     effect_copies_battle_start();       /* every list holds its own names, nothing is noted */
-    effect_copy_count = effect_copies_usable = effect_file_problems = 0;
+    native_scripts_forget();            /* no native task or group of the last reading is used again */
+    effect_copy_count = effect_copies_usable = effect_file_problems = effect_natives_usable = 0;
     for (i = 0; i < EFFECT_BASE_COUNT; i++)
         effect_bases[i].copies = 0;
     text = read_whole_file(EFFECT_FILE_NAME, &size);
+    sound_handles_read(text, size);     /* (before the scripts, which name the handles; none without the file) */
     if (!text) {
         log_line("effects file: none (no effect copies)");
         return;
@@ -11371,6 +14030,12 @@ static void load_effect_copies(void)
 
         if (!c->usable)
             continue;
+        if (c->play) {
+            /* a native effect: its script, SpellExtConfig\effects\NAME.txt (see "Native effects") */
+            native_script_read(i);
+            effect_natives_usable += c->usable;
+            continue;
+        }
         if ((b = effect_read_base(c->base)) == NULL) {
             char why[300];
 
@@ -11387,8 +14052,8 @@ static void load_effect_copies(void)
             at += wsprintfA(line + at, "%s%s -> %s", r ? ", " : "", c->rename[r].from, c->rename[r].to);
         log_line("effect copy %04lx: effect %02x with %s", c->number, c->base, line);
     }
-    log_line("effects file: %d effect copies, %d usable, %d line(s) with problems", effect_copy_count, effect_copies_usable,
-             effect_file_problems);
+    log_line("effects file: %d effect copies, %d usable, %d native effect(s) usable, %d sound handle(s) usable, %d line(s) with problems",
+             effect_copy_count, effect_copies_usable, effect_natives_usable, sound_handles_usable, effect_file_problems);
 }
 
 static BOOL driver_reads_files_itself(void);    /* (with the new characters' model code) */
@@ -11428,6 +14093,7 @@ static void effect_copies_check_files(void)
             }
         }
     }
+    native_scripts_check_files();       /* and a native effect's script's files */
 }
 
 /* Once there is a usable copy: the preload is chained, if the effect step is this DLL's (the extended
@@ -11461,6 +14127,1420 @@ static void effect_copies_install(void)
     effect_preload_live = 1;
     log_line("effect copies: ON: the preload at %08lx goes on to %08lx (%s); the effect step through the extended summons' hooks",
              SITE_EFFECT_PRELOAD, effect_preload_next, effect_preload_next == FN_EFFECT_PRELOAD ? "the game's" : "another DLL's, chained");
+}
+
+/* ---- Native effects (stage 0: the task; stage 1: scripts) ------------------------------------------
+   An effect number of the effects file that the DLL plays itself, with no routine of the game's:
+       [effect 0x200]
+       play = stage0_test        the script SpellExtConfig\effects\stage0_test.txt (built in when that file
+                                 is not there: stage 0's timeline, nfx_stage0_text)
+       base = 0x00               the effect the RECORD holds meanwhile: one with no loader (0x00-0x04, 0x19;
+                                 default 0x00), so the script's preload (`e8`) loads and frees nothing for it
+   and a spell names it as its `animation` like a copy (the record gets `base`, the spell keeps the number:
+   apply_key, effect_copy_note). The cast's aura, animation, camera, banner and damage do not depend on the
+   effect number (FF7FF8Fusion/Notes/FF7_Effect_Port_Plan.md 3.2). No new hook: at the effect step (`ec`, the
+   three calls of FUN_00427c22, which are summon_effect_hook's; every magic cast ends in start_effect_copy) the
+   actor's noted native effect starts this DLL's task in the list of 100 instead of the game's routine. The
+   script's `9e` waits for that list to be empty, so the task always ends: at its length, as soon as its files
+   are gone, or after native_watchdog(length) calls (native_clock_step). Any refusal before the task is started
+   (no task slot, no group, a routine not as expected, a sheet not as the script says) lets the game's routine
+   for `base` run instead (Cure's number by default: its picture, the cast's own results), with one line in the
+   log. A script with any refused line is not used at all (the same fallback, decided when it is read).
+
+   A script (Readme\FF7_SpellExt_EffectsPlayer_README.txt has it all; read by nfx_parse):
+       folder = MAGIC/FIRE                          the archive folder for a name it holds several times
+       file 0 = FIRE00.TIM FI_A01.SPT blend=add     the group: a texture and its sprite sheet; blend per file
+       file 1 = FIRE01.TIM                          a second texture page of sheet 0 (tex=0,1 by default)
+       length = 30                                  frames (15 a second); it ends then whatever is pending
+       0      sound 9 pan=targets                   FUN_005bfff3(kind 0x20, FUN_005c0132(mask), 9)
+       0-29   sprite 0 at=target bone=1 page=loop   one quad page a frame at each target (FUN_005d1ffb)
+       10     hit                                   FUN_005c0158(target) once for each target
+   What each command does in the engine:
+   - the files: one group of this DLL's own (a list of 0x14-byte entries, flags 2a38 | blend, scale 0x19, as
+     Fire's list at 008fe0a8; own handle per effect), loaded with FUN_0068aa06 into the battle's manager, keep 0:
+     the game frees it at the next preload that has a loader, as its own effects', and writes 0 in the handle
+     then (FUN_0068983d); a free handle is loaded afresh at the next cast. The list is written only while its
+     handle is 0 (FUN_0068983d reads its flags again when it frees the group).
+   - sprite: per frame and per target (or the caster), FUN_005d2e00(actor, bone place, short[3]) for the place,
+     FUN_005d2b44(place, scale, depth) for a billboard matrix (camera x place, the rotation part a plain scale;
+     depth moves it along the line of sight; Fire passes -height), then FUN_005d1ffb({sheet, drawable, colour,
+     page}, *(00be1128) + 0x70, 0xc, value): every quad of that page, the current matrix copied into each. The
+     sheet's texture pages are its words +0x10.. and the drawables it takes for them +0x20.. (sheet[8+k]), set
+     each frame from the files `tex` names, as Fire sets FIRE00 and FIRE01. Colour: the routine takes R, G, B
+     bytes per call (0x80 = as the picture is). With rot, x, y or an uneven scale, the 3x3 part is the DLL's own
+     (nfx_matrix) and the translation FUN_005d2b44's plus x, y: set with FUN_00663673 / FUN_00663707, the
+     routines FUN_005d2b44 itself ends with. Alpha cannot be given per call (the routine takes the vertex alpha
+     from the texture's state), so `alpha` is reserved. Palette (stage 2a): with bit 0x8000 of the page word
+     the routine writes the row in its high word >> 6 into every quad's draw node (+0x80); without it each
+     quad's own palette word >> 6 less the .TEX's base row (header +0xe0: Fire's quads pick rows 2 and 3 of
+     FIRE00's four). When the node is drawn, FUN_00671742 hands the row to FUN_0068b239, which sets it on the
+     texture set (+0x88; a row past the count becomes 0) and tells the driver (palette_changed): FFNx keeps one
+     texture per row, so the row is honoured per draw. `palette=` rows are checked at the cast against the
+     header's palette count (+0x30) of every .TEX the sheet draws with: past it, not played.
+   - hit: FUN_005c0158(target) (event 4: the result and the reaction), once per target: the clock keeps the mask
+     of those hit; whoever is not hit when the effect ends is hit then.
+   - sound: FUN_005bfff3(kind, pan, id), pan = FUN_005c0132(a mask of actors: the targets, one target, or the
+     caster).
+   - model (stage 3a; FF7FF8Fusion/Notes/EffectPlayer_Stage3_Models_Plan.md): a file NAME.RSD is a model entry
+     of the same group, {0x00b0 | blend, 1, NAME.RSD, 0, 0, 0}, the form of Blizzaga's BRIZAG_1 entry (00b1 at
+     008af438) with the scale word 1 (the size is the line's matrix); the game's own effects mix sprite and model
+     entries in one group (Holy's: 2a39 hikari + 00b1 light_1). Per frame and per target (or the caster), after
+     the frame's sprites: FUN_0068a115(entry, group) for its model record (a model entry only: FUN_0068a155/195
+     only ever see sprite entries), FUN_005d2e00 for the bone's place, the model's matrix R | place + offset
+     (nfx_model_matrix), camera x that with FUN_00661e85(00bfcb30, model, out) as Dynamite's thrown stick does
+     (FUN_004b56da), set as the current matrix (FUN_00663673, FUN_00663707), the current colour none
+     (FUN_0066335f(0, 0, 0): the value the frame gives the task lists), then FUN_005d1ba4({record, 0x80, 0,
+     0x20}, 0, 0xc, 0), the prop's call to the bit: one instance at the current matrix, drawn later in the frame
+     by the group manager. 64 models an update (32 before the limits stage). Nothing is restored after it but
+     the colour (left as the frame set it): the current matrix is scratch every effect sets before it draws, as
+     the sprites' is.
+   - stage 3b (FF7FF8Fusion/Notes/EffectPlayer_Stage3b_Models.md): the context carries fade= as the
+     transparency, uv= as the UV word and palette= as the palette word (nfx_model_context); colour= is the
+     current colour (FUN_0066335f(r, g, b), put back to 0, 0, 0 after the pass). When the instance is drawn the
+     game's FUN_0068d2b8 (FFNx calls it for every instance) rewrites the group's live vertices from the
+     originals: rgb = original x alpha (no colour) or original x alpha + colour x (1 - alpha), the UVs + the
+     offset with a wrap, and the palette row on TEX[0]'s texture set. face=camera: FUN_005d2b44's place (camera x
+     place, z along the line of sight) with the line's own 3x3 in the screen's axes, x and y added on the
+     screen's plane, as the sprites' NFX_F_MATRIX. bone=ground (sprites and models): the actor's place x, z
+     (00be12de, 00be12e2) at y 0, the floor (native_place).
+   - at=centre (sprites and models; FF7FF8Fusion/Notes/FF8_ALL_Centre_Anchor.md): ONE draw a frame for the line,
+     not one per target, after the ten actors' passes (NFX_CENTRE_PASS): x and z FUN_005bfec9(mask of the targets
+     with a model, short[3]), the box-centre of their places, the place their sounds pan from and the one Comet2
+     puts itself at for several targets; y 0 with bone=ground, else the mean y of their bone-N places
+     (FUN_005d2e00); depth=model the mean of their heights (native_centre_place). Then the same billboard / world
+     matrix code as for a target. each= and bone=random are refused with it (when the script is read).
+   - at=screen (sprites and models; FF7FF8Fusion/Notes/At_Screen_Anchor.md): ONE draw a frame for the line, after the
+     centre's pass (NFX_SCREEN_PASS), at x, y, z in the CAMERA's own space (x right, y down, z away from the eye,
+     battle units): the current matrix is written directly, its rotation the line's own in the screen's axes and its
+     translation (x, y, z) (nfx_screen_model / nfx_screen_sprite), set with FUN_00663673 / FUN_00663707 as every
+     draw here; FUN_005d2b44 is not called and nothing of the game's is read, so the layer stays where it is on the
+     screen whatever the camera does (FF8's camera-attached layers: Meteor's planet, stars, dark plane). It draws
+     whether or not a target has a model. bone=, each=, depth= and face=world are refused with it; z is required.
+     zoom=fixed (only with at=screen) keeps the layer the size it has at the battle's own H (512) while a camera
+     plays another H (FF8's layers that carry their own H: Meteor's): nfx_screen_zoom stretches the matrix's x and y
+     rows and place by 512 / H (00c05f7c, read only), z untouched.
+   - at=arena (sprites and models; FF7FF8Fusion/Notes/Stage_FX_Stage4.md): ONE draw a frame for the line, after the
+     screen's pass (NFX_ARENA_PASS), at a fixed place in the battle's world: x, y, z from the world's origin (y 0 the
+     floor, negative up) in the world's own axes for every cast, never turned with the caster or its side: FF8 keeps
+     its Meteor shower so whoever casts (an emulator capture with an enemy caster), as the at=target lines' offsets
+     and the camera's group frame are kept here. FF8's enemies always stand at -z, as FF7's do in a normal battle; in
+     a back attack none of the three is turned. Then the same billboard / world matrix code as at a target with that
+     place and no offset. It draws whether or not a target has a model. bone=, each=, depth= and zoom=fixed are
+     refused with it; a sprite's z= is its place's z. (FF8's Meteor rock shower.)
+   - stage (stage fx 1; FF7FF8Fusion/Notes/Stage_FX_Stage1.md): `FRAMES stage hide=all|far|none` and `FRAMES stage
+     dark=A>B [colour=R,G,B]` belong to the cast (no at=, bone=, each=; once a frame whatever the targets). Of the
+     lines on at a frame the last with hide= and the last with dark= decide (nfx_stage_at). The task writes the
+     stage's mask 00bfcb64 (all 7, far 4) and its darkness 00c05ecc (0-4096) toward the tint 00c05ec8/9/a (default
+     black) each call but its last, and puts the game's values back at every end ("STAGE FX", stage_fx_step /
+     stage_fx_stop); nothing is called or patched.
+   - fill, flash, shake (stage fx 2; FF7FF8Fusion/Notes/Stage_FX_Stage2.md): `FRAMES fill colour=R,G,B [blend=add]`,
+     `FRAMES fill alpha=A`, `FRAMES fill blend=alpha [colour=R,G,B] [alpha=A]`, `FRAMES fill blend=subtract
+     colour=R,G,B`, `FRAMES flash colour=R,G,B [in=N] [out=M]` and `FRAMES shake [x=N] [y=N] [z=N] [period=P]` belong to
+     the cast too (no at=, bone=, each=). A fill or flash is the game's full-screen quad, asked for by the task each call
+     that draws (FUN_005bd436 adds the colour; FUN_005bd456, or stage_fx_over for a colour, lays it over the picture at
+     an alpha; nfx_fill_at); the engine draws every added quad of a frame before every laid-over one; a shake
+     writes the camera's offset 00bfcb56/58/5a, the screen's jolt turned into the world by the look-at
+     (nfx_shake_at, nfx_shake_world), and puts the game's back at every end (stage_fx_shake_step / _release). */
+#define NATIVE_LOGS             40           /* log lines of native effects per battle */
+#define FN_NATIVE_LOAD_GROUP    0x0068aa06u  /* FUN_0068aa06(count, list, args, &handle, manager) */
+#define FN_NATIVE_FOLDER        0x005dff37u  /* FUN_005dff37(folder, buffer): "<base>/<folder>" into buffer, returned */
+#define FN_NATIVE_DRAWABLE      0x0068a155u  /* FUN_0068a155(entry, group): its drawable; marks the group used */
+#define FN_NATIVE_SHEET         0x0068a195u  /* FUN_0068a195(entry, group): its sprite sheet; marks the group used */
+#define FN_NATIVE_BONE_PLACE    0x005d2e00u  /* FUN_005d2e00(actor, entry, short out[3]): 00be1d24 + entry*12, floats */
+#define FN_NATIVE_BILLBOARD     0x005d2b44u  /* FUN_005d2b44(place, scale, toward camera): the current matrix; returns it (00c06a30) */
+#define FN_NATIVE_SET_ROTATION  0x00663673u  /* FUN_00663673(matrix): its 9 shorts become the current rotation */
+#define FN_NATIVE_SET_PLACE     0x00663707u  /* FUN_00663707(matrix): its 3 ints at +0x12 become the current translation */
+#define FN_NATIVE_DRAW_SPRITE   0x005d1ffbu  /* FUN_005d1ffb(context, *(00be1128) + 0x70, 0xc, value): one page of quads at the current matrix */
+#define FN_NATIVE_SHOW_HIT      0x005c0158u  /* FUN_005c0158(target): event 4 */
+#define FN_NATIVE_SOUND         0x005bfff3u  /* FUN_005bfff3(kind, pan, sound): THREE arguments */
+#define FN_NATIVE_PAN           0x005c0132u  /* FUN_005c0132(actors mask): the pan of their centre */
+#define FN_NATIVE_CENTRE        0x005bfec9u  /* (centre anchor) FUN_005bfec9(mask, short out[3]), cdecl: out = the box-centre of
+                                                the mask's places (00be12de, 00be12e2), y 0; FUN_005c0132 calls it first */
+#define FN_NATIVE_NEW_TASK      0x005bec50u  /* FUN_005bec50(routine): a task in the list of 100; slot or -1 */
+#define FN_NATIVE_MODEL_RECORD  0x0068a115u  /* FUN_0068a115(entry, group): a model entry's record; marks the group used */
+#define FN_NATIVE_ADD_INSTANCE  0x005d1ba4u  /* FUN_005d1ba4(context, -, 0xc, handed back): one model instance at the current matrix */
+#define FN_NATIVE_CAMERA_TIMES  0x00661e85u  /* FUN_00661e85(a, b, out): out = a x b, the engine's fixed-point form; out is neither */
+#define FN_NATIVE_COLOUR        0x0066335fu  /* FUN_0066335f(r, g, b): the current colour */
+#define ADDR_NATIVE_CAMERA      0x00bfcb30u  /* the effects' camera matrix, fixed-point form (what Dynamite's stick multiplies by) */
+#define NATIVE_DRAWABLE_HUNDRED 0x0c         /* a drawable's p_hundred; its +0x14 the texture set (as FUN_005d1ffb reads them) */
+#define NATIVE_TEXSET_HEADER    0x84         /* a texture set's .TEX header (FUN_0068b239, FUN_005d1ffb; FFNx ff7.h ff7_texture_set) */
+#define NATIVE_TEXSET_PALETTE   0x8c         /* a texture set's palette record, or 0; its +0xc the rows FUN_0068b239 bounds by */
+#define NATIVE_TEX_PALETTES     0x30         /* a .TEX header's palette count (the file's own header, read as it is) */
+#define NATIVE_TEX_ENTRIES      0x34         /* its colours a row (palette_entries) */
+#define NATIVE_TEX_USE_PALETTE  0x4c         /* tex_format.use_palette */
+#define NATIVE_TEX_COLOURS      0x58         /* tex_format.palette_size: the colours its palette data holds, all rows */
+#define ADDR_NATIVE_3D          0x009adfd8u  /* the battle's 3D data; +0x4c its group manager */
+#define ADDR_NATIVE_PAUSED      0x00dc0e6cu  /* effects paused (and FFNx's frames between, at 30/60 fps) */
+#define ADDR_NATIVE_DRAWING     0x0090c9f0u  /* FUN_0066c3bf: 0 on an update that is not drawn */
+#define ADDR_NATIVE_SPT_ARG     0x00be1128u  /* Fire hands FUN_005d1ffb *(00be1128) + 0x70, 0xc */
+#define ADDR_NATIVE_TASK_DATA   0x00bfb718u  /* the list of 100's data, 0x20 bytes a task; word 0 = 0xffff ends it */
+#define ADDR_NATIVE_TASK_FNS    0x00bf2858u  /* the list of 100's routines, 0 = free */
+#define ADDR_NATIVE_TASK_INDEX  0x00bf23b8u  /* short: the task being run */
+#define ADDR_NATIVE_STEP_FLAG   0x00bf23bcu  /* byte: FUN_00427c22 sets it to 0 first thing (00427c3b: c6 05 bc 23 bf 00 00) */
+#define ADDR_NATIVE_MODEL       0x00be1d20u  /* per actor: its battle model, 0 = none */
+#define ADDR_NATIVE_BONES       0x00be1188u  /* per actor, short: its bones */
+#define ADDR_NATIVE_HEIGHT      0x00be118au  /* per actor, short: its model's height (Fire: -height) */
+#define ADDR_NATIVE_PLACE_X     0x00be12deu  /* per actor, short: its place x (the model's +0x24 when drawn: 0042f3e8) */
+#define ADDR_NATIVE_PLACE_Z     0x00be12e2u  /* per actor, short: its place z (the model's +0x2c); its y (00be12e0) is not
+                                                read: the floor is y 0 (the game's shadow, 0042f3e8, at y -4 or -10 always) */
+#define NATIVE_SET_GROUPS       0x10         /* a polygon set's group count (FFNx ff7_polygon_set numgroups) */
+#define NATIVE_SET_HUNDREDS     0x34         /* its p_hundred array, 100 bytes each (hundred_data; FUN_005d1aaa walks it) */
+#define NATIVE_SPRITE_SCALE     0x19         /* Fire's entries' second word */
+#define NATIVE_MAGIC_LGP        "data\\battle\\magic.lgp"
+
+struct native_entry { WORD flags, scale; char *name, *second; DWORD more[2]; };     /* 0x14 bytes, as the game's */
+typedef char native_entry_size_check[sizeof(struct native_entry) == 0x14 ? 1 : -1];
+static struct nfx_item nfx_pool[NFX_POOL_ITEMS];
+static int nfx_pool_used;
+static struct nfx_script nfx_scripts[EFFECT_COPY_MAX];             /* by the effect's index in effect_copies */
+static struct native_entry native_lists[EFFECT_COPY_MAX][NFX_FILES_MAX];
+static DWORD native_handles[EFFECT_COPY_MAX];   /* the groups; the engine writes 0 in one when it frees its group */
+static DWORD native_managers[EFFECT_COPY_MAX];  /* the manager each was loaded into */
+static DWORD native_ctx[4];             /* FUN_005d1ffb's: sheet, drawable, colour, page */
+static DWORD native_spt_value;          /* FUN_005d1ffb hands back its fourth argument (Fire keeps it in 00be0e20) */
+static BYTE native_matrix[0x20];        /* the game's matrix form: 9 shorts, then 3 ints at +0x12 */
+static WORD native_serial;
+static LONG native_logs;
+static int native_generation;           /* the scripts' reading: a task of an older one ends itself */
+static DWORD native_random;
+static int native_routines_state;       /* 0 not looked at, 1 as expected, -1 not: native effects are not played */
+static int native_model_state;          /* the same for the routines only model lines call (a script without one never asks) */
+static int native_centre_state;         /* (centre anchor) the same for FUN_005bfec9, asked only for a script with at=centre */
+static DWORD native_model_ctx[4];       /* FUN_005d1ba4's: model record, flags, uv | transparency << 16, kind | palette << 16 */
+static BYTE native_model_local[0x20];   /* a model line's matrix to the world, then camera x it: the game's form */
+static BYTE native_model_out[0x20];
+static BYTE native_orphaned[EFFECT_COPY_MAX];   /* a group of an older reading may still read this effect's list */
+static WORD native_list_models[EFFECT_COPY_MAX];        /* the list's entries written as models, a bit each */
+static int native_list_count[EFFECT_COPY_MAX];  /* its entries written since the battle started (the most) */
+static struct {
+    BYTE running, draw_said, limit_said, model_said, model_limit_said, centre_said, screen_said, zoom_said;
+    BYTE arena_said;                    /* (arena anchor) the first at=arena draw logged */
+    WORD serial;                        /* which task this is: an older one ends itself */
+    int actor, mask, drawn, undrawn, effect, generation, length, watchdog;
+    DWORD number;
+    struct native_clock clock;
+    signed char bones[NFX_ITEMS_MAX][10];   /* bone=random: the place chosen for each target, -1 not yet */
+} native_play;
+
+static BOOL native_say(void)
+{
+    return InterlockedIncrement(&native_logs) <= NATIVE_LOGS;
+}
+
+/* The first bytes of the routines called, as the exe has them (read from ff7_en.exe). One that starts with a
+   jump is another module's whole replacement (FFNx's at 30/60 fps for FUN_005bec50 and FUN_005d1ffb): that one
+   is called, at the same address. Anything else: no native effects. */
+static BOOL native_routines_ok(void)
+{
+    static const struct { DWORD at; BYTE bytes[6]; } routines[] = {
+        { FN_NATIVE_LOAD_GROUP,   { 0x55, 0x8b, 0xec, 0x83, 0xec, 0x24 } },
+        { FN_NATIVE_FOLDER,       { 0x55, 0x8b, 0xec, 0x83, 0x7d, 0x08 } },
+        { FN_NATIVE_DRAWABLE,     { 0x55, 0x8b, 0xec, 0x51, 0xc7, 0x45 } },
+        { FN_NATIVE_SHEET,        { 0x55, 0x8b, 0xec, 0x51, 0xc7, 0x45 } },
+        { FN_NATIVE_BONE_PLACE,   { 0x55, 0x8b, 0xec, 0x8b, 0x45, 0x08 } },
+        { FN_NATIVE_BILLBOARD,    { 0x55, 0x8b, 0xec, 0x83, 0xec, 0x14 } },
+        { FN_NATIVE_SET_ROTATION, { 0x55, 0x8b, 0xec, 0xa1, 0xf0, 0xaa } },
+        { FN_NATIVE_SET_PLACE,    { 0x55, 0x8b, 0xec, 0xa1, 0xf0, 0xaa } },
+        { FN_NATIVE_DRAW_SPRITE,  { 0x55, 0x8b, 0xec, 0x81, 0xec, 0xb0 } },
+        { FN_NATIVE_SHOW_HIT,     { 0x55, 0x8b, 0xec, 0x51, 0x0f, 0xbf } },
+        { FN_NATIVE_SOUND,        { 0x55, 0x8b, 0xec, 0x83, 0xec, 0x10 } },
+        { FN_NATIVE_PAN,          { 0x55, 0x8b, 0xec, 0x83, 0xec, 0x08 } },
+        { FN_NATIVE_NEW_TASK,     { 0x55, 0x8b, 0xec, 0x51, 0x66, 0xc7 } },
+    };
+    int i, k;
+
+    if (native_routines_state)
+        return native_routines_state > 0;
+    native_routines_state = 1;
+    for (i = 0; i < (int)(sizeof routines / sizeof routines[0]); i++) {
+        const BYTE *at = (const BYTE *)routines[i].at;
+
+        if (at[0] == 0xe9) {
+            log_line("native effects: %08lx starts with a jump to %08lx (another module's version of the routine): that one is called",
+                     routines[i].at, routines[i].at + 5 + *(const DWORD *)(at + 1));
+            continue;
+        }
+        for (k = 0; k < 6; k++)
+            if (at[k] != routines[i].bytes[k]) {
+                log_line("native effects: OFF: %08lx does not start as expected (byte %d is %02x); their spells play their base effect",
+                         routines[i].at, k, at[k]);
+                native_routines_state = -1;
+                break;
+            }
+    }
+    return native_routines_state > 0;
+}
+
+/* The routines a model line calls beyond the sprites' (stage 3a), first bytes as the exe has them (ten: the six
+   common to many routines would prove little). Asked only by an effect whose script has a model line; another
+   effect is not touched by the answer. FFNx replaces FUN_005d1ba4 whole at 30/60 fps (a jump): that one is called,
+   as for the prop. */
+static BOOL native_model_routines_ok(DWORD number)
+{
+    static const struct { DWORD at; BYTE bytes[10]; } routines[] = {
+        { FN_NATIVE_MODEL_RECORD, { 0x55, 0x8b, 0xec, 0x51, 0xc7, 0x45, 0xfc, 0x00, 0x00, 0x00 } },
+        { FN_NATIVE_ADD_INSTANCE, { 0x55, 0x8b, 0xec, 0x83, 0xec, 0x48, 0xe8, 0x10, 0xa8, 0x09 } },
+        { FN_NATIVE_CAMERA_TIMES, { 0x55, 0x8b, 0xec, 0x81, 0xec, 0xc0, 0x00, 0x00, 0x00, 0xa1 } },
+        { FN_NATIVE_COLOUR,       { 0x55, 0x8b, 0xec, 0xa1, 0xf0, 0xaa, 0x90, 0x00, 0x8a, 0x4d } },
+    };
+    int i, k;
+
+    if (native_model_state)
+        return native_model_state > 0;
+    native_model_state = 1;
+    for (i = 0; i < (int)(sizeof routines / sizeof routines[0]); i++) {
+        const BYTE *at = (const BYTE *)routines[i].at;
+
+        if (at[0] == 0xe9 && routines[i].at == FN_NATIVE_ADD_INSTANCE) {
+            log_line("native effects: %08lx starts with a jump to %08lx (another module's version of the routine): that one is called",
+                     routines[i].at, routines[i].at + 5 + *(const DWORD *)(at + 1));
+            continue;
+        }
+        for (k = 0; k < 10; k++)
+            if (at[k] != routines[i].bytes[k]) {
+                log_line("native effects: models OFF: %08lx does not start as expected (byte %d is %02x); an effect with a model line plays its base effect (first: %04lx)",
+                         routines[i].at, k, at[k], number);
+                native_model_state = -1;
+                break;
+            }
+    }
+    return native_model_state > 0;
+}
+
+/* (centre anchor) FUN_005bfec9's first bytes as the exe has them (55 8b ec 83 ec 18, then c7 45 e8 ff 7f 00 00: its
+   first minimum, 0x7fff). Asked only by an effect whose script has an at=centre line: another effect is not touched
+   by the answer. FFNx does not replace it (a plain leaf routine; ff7_data.h names neither it nor FUN_005c0132). */
+static BOOL native_centre_routine_ok(DWORD number)
+{
+    static const BYTE bytes[13] = { 0x55, 0x8b, 0xec, 0x83, 0xec, 0x18, 0xc7, 0x45, 0xe8, 0xff, 0x7f, 0x00, 0x00 };
+    const BYTE *at = (const BYTE *)FN_NATIVE_CENTRE;
+    int k;
+
+    if (native_centre_state)
+        return native_centre_state > 0;
+    native_centre_state = 1;
+    for (k = 0; k < (int)sizeof bytes; k++)
+        if (at[k] != bytes[k]) {
+            log_line("native effects: at=centre OFF: %08lx does not start as expected (byte %d is %02x); an effect with an at=centre line plays its base effect (first: %04lx)",
+                     FN_NATIVE_CENTRE, k, at[k], number);
+            native_centre_state = -1;
+            break;
+        }
+    return native_centre_state > 0;
+}
+
+/* The battle's group manager now, 0 if none. */
+static DWORD native_battle_manager(void)
+{
+    DWORD b3d = *(const DWORD *)ADDR_NATIVE_3D;
+
+    if (!b3d || IsBadReadPtr((const void *)(b3d + 0x4c), 4))
+        return 0;
+    return *(const DWORD *)(b3d + 0x4c);
+}
+
+/* Effect e's group, if it is loaded in this battle's manager: else 0. */
+static DWORD native_group_now(int e)
+{
+    DWORD manager = native_battle_manager();
+
+    return native_handles[e] && manager && manager == native_managers[e] ? native_handles[e] : 0;
+}
+
+/* The palette rows of a drawable's loaded .TEX (nfx_tex_rows: the header's count, held to what its palette data
+   holds), the fewer of that and the texture set's palette record's when it has one (FUN_0068b239 bounds by
+   that). -1 if not readable, -2 if the header's count is impossible. */
+static int native_texset_palettes(DWORD set);
+
+static int native_tex_palettes(DWORD drawable)
+{
+    DWORD hundred;
+
+    if (!drawable || IsBadReadPtr((const void *)(drawable + NATIVE_DRAWABLE_HUNDRED), 4) ||
+        !(hundred = *(const DWORD *)(drawable + NATIVE_DRAWABLE_HUNDRED)) || IsBadReadPtr((const void *)(hundred + 0x14), 4))
+        return -1;
+    return native_texset_palettes(*(const DWORD *)(hundred + 0x14));
+}
+
+/* (native_tex_palettes, from the texture set on; stage 3b: also a model's, from its first textured state) */
+static int native_texset_palettes(DWORD set)
+{
+    DWORD header, palette;
+    long rows, record;
+
+    if (!set || IsBadReadPtr((const void *)set, NATIVE_TEXSET_PALETTE + 4) ||
+        !(header = *(const DWORD *)(set + NATIVE_TEXSET_HEADER)) || IsBadReadPtr((const void *)(header + NATIVE_TEX_PALETTES), 0x2c))
+        return -1;                      /* (header +0x30 .. +0x5b: the count, colours a row, use_palette +0x4c, all colours +0x58) */
+    rows = nfx_tex_rows(*(const long *)(header + NATIVE_TEX_PALETTES), *(const DWORD *)(header + NATIVE_TEX_USE_PALETTE),
+                        *(const long *)(header + NATIVE_TEX_ENTRIES), *(const long *)(header + NATIVE_TEX_COLOURS));
+    if (rows < 0)
+        return (int)rows;
+    palette = *(const DWORD *)(set + NATIVE_TEXSET_PALETTE);
+    if (palette && !IsBadReadPtr((const void *)(palette + 0xc), 4) && (record = *(const long *)(palette + 0xc)) >= 1 && record < rows)
+        rows = record;
+    return (int)rows;
+}
+
+/* Loads effect e's group if it is not (Fire's loader, 005b9810, with this DLL's list and handle). TRUE if every
+   sheet a sprite line draws is there, with as many texture files as it names texture pages, and every palette=
+   row is below the palette count of each .TEX that sheet draws with (its first `pages` texture files: stage 2b). */
+static BOOL native_load(int e, int actor)
+{
+    struct nfx_script *s = &nfx_scripts[e];
+    DWORD manager = native_battle_manager();
+    int k, j;
+
+    if (*(volatile const DWORD *)ADDR_LOAD_THREAD) {
+        /* the stock driver's loading thread (FUN_00427928) is still running a preload: no group is loaded or
+           looked at meanwhile, as for the effect copies */
+        if (native_say())
+            log_line("native effect: actor %d: the game's loading thread is still running: not played", actor);
+        return FALSE;
+    }
+    if (!manager || IsBadReadPtr((const void *)manager, 0x2c)) {
+        if (native_say())
+            log_line("native effect: actor %d: the battle has no group manager (%08lx): not played", actor, manager);
+        return FALSE;
+    }
+    if (native_handles[e] && native_managers[e] != manager) {
+        if (native_say())
+            log_line("native effect: the group handle %08lx is of another manager (%08lx, the battle's is %08lx): dropped, loaded afresh",
+                     native_handles[e], native_managers[e], manager);
+        native_handles[e] = 0;
+    }
+    if (s->model_files && !native_model_routines_ok(effect_copies[e].number))
+        return FALSE;                   /* (said once) */
+    if (s->centre && !native_centre_routine_ok(effect_copies[e].number))
+        return FALSE;                   /* (said once) */
+    if (!native_handles[e]) {
+        char path[512];
+        DWORD args[3];
+        WORD models = 0;
+
+        for (k = 0; k < s->file_count; k++)
+            models |= (WORD)(s->file[k].model ? 1u << k : 0u);
+        if (native_orphaned[e] && ((models ^ native_list_models[e]) & ((1u << (s->file_count < native_list_count[e] ? s->file_count
+                                                                                                                     : native_list_count[e])) - 1u))) {
+            /* the scripts were read again while a group of this list was loaded: that group may still be in the
+               manager until the game frees it (its next preload with a loader, or the battle's end), and
+               FUN_0068983d frees each entry by the kind its flags in THIS list give (0x800 sprite, else model) */
+            if (native_say())
+                log_line("native effect %04lx: a file changed between sprite and model since the scripts were read again, and the last reading's group may still be loaded: not played until the next battle",
+                         effect_copies[e].number);
+            return FALSE;
+        }
+        for (k = 0; k < s->file_count; k++) {
+            native_lists[e][k].flags = (WORD)((s->file[k].model ? NFX_MODEL_FLAGS : NFX_SPRITE_FLAGS) | (DWORD)s->file[k].blend);
+            native_lists[e][k].scale = s->file[k].model ? NFX_MODEL_SCALE : NATIVE_SPRITE_SCALE;
+            native_lists[e][k].name = s->file[k].name;
+            native_lists[e][k].second = s->file[k].second[0] ? s->file[k].second : NULL;
+            native_lists[e][k].more[0] = native_lists[e][k].more[1] = 0;
+        }
+        native_list_models[e] = models;
+        if (s->file_count > native_list_count[e])
+            native_list_count[e] = s->file_count;
+        args[0] = 0;                    /* keep 0: freed by the game at a preload with a loader, as its own effects' */
+        args[1] = 0x5dc;                /* as FUN_0068a9e0 sets it */
+        args[2] = ((DWORD (__cdecl *)(const char *, char *))FN_NATIVE_FOLDER)(s->folder, path);
+        native_managers[e] = manager;
+        ((void (__cdecl *)(int, void *, DWORD *, DWORD *, DWORD))FN_NATIVE_LOAD_GROUP)(s->file_count, native_lists[e], args,
+                                                                                       &native_handles[e], manager);
+        if (native_say())
+            log_line("native effect %04lx: group of %d file(s) from effects\\%s.txt (%s, folder %s) %s %08lx; the manager holds %lu of %lu groups",
+                     effect_copies[e].number, s->file_count, effect_copies[e].play_name, s->file[0].name, s->folder,
+                     native_handles[e] ? "loaded as" : "NOT loaded (manager full, or no memory):", native_handles[e],
+                     ((const DWORD *)manager)[0], ((const DWORD *)manager)[1]);
+        if (!native_handles[e])
+            return FALSE;
+        for (k = 0; k < s->file_count; k++) {
+            /* a model's load, as prop_load prints it (the three numbers that showed the prop's first load right) */
+            DWORD m;
+            const DWORD *set;
+
+            if (!s->file[k].model || !native_say())
+                continue;
+            m = ((DWORD (__cdecl *)(int, DWORD))FN_NATIVE_MODEL_RECORD)(k, native_handles[e]);
+            set = m && !IsBadReadPtr((const void *)m, 12) ? (const DWORD *)((const DWORD *)m)[1] : NULL;
+            if (set && !IsBadReadPtr(set, 0x60))
+                log_line("native effect %04lx: file %d (%s): model record %08lx, polygon set %08lx, %lu group(s), instanced %lu, matrix mode %lu",
+                         effect_copies[e].number, k, s->file[k].name, m, (DWORD)set, set[0x10 / 4], set[0x14 / 4], set[0x1c / 4]);
+            else
+                log_line("native effect %04lx: file %d (%s): model record %08lx, no readable polygon set", effect_copies[e].number, k,
+                         s->file[k].name, m);
+        }
+    }
+    for (k = 0; k < s->file_count; k++) {
+        DWORD m;
+
+        if (!(s->model_files >> k & 1))
+            continue;
+        /* "loaded": the record and its polygon set (no .P, or a texture missing: no record; no RSD: an empty one) */
+        m = ((DWORD (__cdecl *)(int, DWORD))FN_NATIVE_MODEL_RECORD)(k, native_handles[e]);
+        if (!m || IsBadReadPtr((const void *)m, 8) || !*(const DWORD *)(m + 4)) {
+            if (native_say())
+                log_line("native effect %04lx: file %d (%s): no model (%s): not played", effect_copies[e].number, k, s->file[k].name,
+                         !m || IsBadReadPtr((const void *)m, 8) ? "the .P or a texture the RSD names was not found or not readable"
+                                                                : "the RSD was not found or not readable, or no polygon set was made");
+            return FALSE;
+        }
+        if (nfx_model_palette_bad(nfx_pool + s->first, s->count, k, 0)) {
+            /* stage 3b: a line of this model gives palette= (any row: against a count of 0 every row is "bad"). Its
+               rows are TEX[0]'s, the texture set of the polygon set's first state with a texture and texture index 0
+               (the one FUN_005d1aaa(0, set) gives FUN_005d1ba4, and FUN_0068b239 sets the row on): there must be one
+               (an untextured model has none, and the routine would hand FUN_0068b239 no state), and each row asked
+               for must be below its count */
+            DWORD set = *(const DWORD *)(m + 4), hundreds, texset = 0;
+            const struct nfx_item *items = nfx_pool + s->first;
+            int groups, rows = -1, bad, several = 0;
+
+            if (!IsBadReadPtr((const void *)set, NATIVE_SET_HUNDREDS + 4) && (groups = *(const int *)(set + NATIVE_SET_GROUPS)) > 0 &&
+                groups <= 4096 && (hundreds = *(const DWORD *)(set + NATIVE_SET_HUNDREDS)) != 0 &&
+                !IsBadReadPtr((const void *)hundreds, (UINT_PTR)groups * NFX_HUNDRED_SIZE))
+                texset = nfx_model_tex0((const BYTE *)hundreds, groups, &several);
+            if (several) {
+                if (native_say())
+                    log_line("native effect %04lx: file %d (%s): palette= needs a model with one texture (its RSD names more; "
+                             "FFNx would draw the others with TEX[0]'s picture when the row changes): not played",
+                             effect_copies[e].number, k, s->file[k].name);
+                return FALSE;
+            }
+            if (texset)
+                rows = native_texset_palettes(texset);
+            if (rows < 0 || (bad = nfx_model_palette_bad(items, s->count, k, rows)) != 0) {
+                if (native_say()) {
+                    if (rows < 0)
+                        log_line("native effect %04lx: file %d (%s): %s, so palette= cannot be checked: not played", effect_copies[e].number, k,
+                                 s->file[k].name, !texset ? "the model has no texture 0 (TEX[0]) on any of its states"
+                                                 : rows == -2 ? "its first texture's .TEX header has an impossible palette count (over 65536)"
+                                                              : "its first texture's .TEX header cannot be read");
+                    else
+                        log_line("native effect %04lx: effects\\%s.txt line %d asks for palette row %d, but the first texture of file %d (%s) has %d palette row(s) (0-%d): not played",
+                                 effect_copies[e].number, effect_copies[e].play_name, items[bad - 1].line,
+                                 items[bad - 1].pal.a > items[bad - 1].pal.b ? items[bad - 1].pal.a : items[bad - 1].pal.b, k,
+                                 s->file[k].name, rows, rows - 1);
+                }
+                return FALSE;
+            }
+        }
+    }
+    for (k = 0; k < s->file_count; k++) {
+        DWORD sheet, drawable;
+        long pages;
+
+        if (!(s->sprite_files >> k & 1))
+            continue;
+        sheet = ((DWORD (__cdecl *)(int, DWORD))FN_NATIVE_SHEET)(k, native_handles[e]);
+        drawable = ((DWORD (__cdecl *)(int, DWORD))FN_NATIVE_DRAWABLE)(k, native_handles[e]);
+        pages = sheet && !IsBadReadPtr((const void *)sheet, 0x30) ? ((const long *)sheet)[3] : -1;
+        if (!sheet || !drawable || pages < 1 || pages > NFX_TEX_MAX || pages > s->file[k].tex_count) {
+            if (native_say())
+                log_line("native effect %04lx: file %d (%s + %s) has %s (sheet %08lx, drawable %08lx, %ld texture page(s), %d texture file(s) given by tex=): not played",
+                         effect_copies[e].number, k, s->file[k].name, s->file[k].second,
+                         !sheet || !drawable ? "no sprite sheet or drawable: the .TEX or .S was not read" : "more texture pages than texture files",
+                         sheet, drawable, pages, s->file[k].tex_count);
+            return FALSE;
+        }
+        if ((j = nfx_sheet_bad_page((const DWORD *)sheet)) != 0) {
+            /* (the shipped scripts use the game's own sheets, which pass) */
+            if (native_say())
+                log_line("native effect %04lx: file %d (%s): page %d of the sheet has a quad on a texture page the sheet does not list (or its counts are out of range): not played",
+                         effect_copies[e].number, k, s->file[k].second, j - 1);
+            return FALSE;
+        }
+        for (j = 0; j < nfx_tex_checked(&s->file[k], pages, 0); j++) {
+            const struct nfx_item *items = nfx_pool + s->first;
+            DWORD tex_drawable = ((DWORD (__cdecl *)(int, DWORD))FN_NATIVE_DRAWABLE)(s->file[k].tex[j], native_handles[e]);
+            int rows, bad;
+
+            if (!tex_drawable) {
+                if (native_say())
+                    log_line("native effect %04lx: file %d (%s), a texture of sheet %d, has no drawable: not played", effect_copies[e].number,
+                             s->file[k].tex[j], s->file[s->file[k].tex[j]].name, k);
+                return FALSE;
+            }
+            if (j >= nfx_tex_checked(&s->file[k], pages, 1))
+                continue;               /* named by tex= but not drawn with (the sheet has fewer pages): no palette */
+            if (!nfx_palette_bad(items, s->count, k, 1))
+                continue;               /* no palette= on this sheet (or only row 0, which every texture has) */
+            rows = native_tex_palettes(tex_drawable);
+            if (rows < 0 || (bad = nfx_palette_bad(items, s->count, k, rows)) != 0) {
+                if (native_say()) {
+                    if (rows < 0)
+                        log_line("native effect %04lx: file %d (%s), a texture of sheet %d: its .TEX header %s, so palette= cannot be checked: not played",
+                                 effect_copies[e].number, s->file[k].tex[j], s->file[s->file[k].tex[j]].name, k,
+                                 rows == -2 ? "has an impossible palette count (over 65536)" : "cannot be read");
+                    else
+                        log_line("native effect %04lx: effects\\%s.txt line %d asks for palette row %d, but file %d (%s) has %d palette row(s) (0-%d): not played",
+                                 effect_copies[e].number, effect_copies[e].play_name, items[bad - 1].line,
+                                 items[bad - 1].pal.a > items[bad - 1].pal.b ? items[bad - 1].pal.a : items[bad - 1].pal.b,
+                                 s->file[k].tex[j], s->file[s->file[k].tex[j]].name, rows, rows - 1);
+                }
+                return FALSE;
+            }
+        }
+    }
+    return TRUE;
+}
+
+/* The hit for each target of the mask. */
+static void native_hits(int mask)
+{
+    int t;
+
+    for (t = 0; t < 10; t++)
+        if (mask & (1 << t))
+            ((void (__cdecl *)(int))FN_NATIVE_SHOW_HIT)(t);
+}
+
+/* The sounds and hits of frame f (an advancing call). */
+static void native_events(int f)
+{
+    const struct nfx_script *s = &nfx_scripts[native_play.effect];
+    const struct nfx_item *items = nfx_pool + s->first;
+    int i, n, k, pans[10], due;
+
+    for (i = 0; i < s->count; i++)
+        for (n = nfx_sound_masks(&items[i], f, native_play.mask, native_play.actor, pans), k = 0; k < n; k++) {
+            int route = nfx_sound_route(&items[i]), pan = ((int (__cdecl *)(int))FN_NATIVE_PAN)(pans[k]);
+
+            if (route == NFX_PLAY_HANDLE)          /* a [sound N] handle: FUN_00745160 on its channel, checked (never 00745606) */
+                sound_handle_play(items[i].sound, pan);
+            else if (route == NFX_PLAY_GAME)       /* the game's own sound 1-751: as before */
+                ((void (__cdecl *)(int, int, int))FN_NATIVE_SOUND)(items[i].sound_kind, pan, items[i].sound);
+        }
+    due = nfx_hits_due(items, s->count, f, native_play.mask, native_play.clock.hit_done);
+    if (due) {
+        native_play.clock.hit_done |= due;
+        native_hits(due);
+        if (native_say())
+            log_line("native effect %04lx: hit queued at frame %d for targets %04x", native_play.number, f, due);
+    }
+}
+
+/* The place a sprite or model line `i` is drawn at on actor t (whose model has `bones` bones): stage 3b's
+   bone=ground is the floor under the actor's place now (x and z of 00be12de / 00be12e2, which the battle's
+   scripts move as the actor steps; y 0, the floor's height, as the game draws every shadow); otherwise the bone
+   place's (FUN_005d2e00; random chosen once per target), as before. The bone place asked for, or NFX_BONE_GROUND. */
+static int native_place(const struct nfx_item *it, int i, int t, int bones, short *place)
+{
+    DWORD base = (DWORD)t * ACTOR_EFFECT_STRIDE;
+    int bone;
+
+    if (it->bone == NFX_BONE_GROUND) {
+        place[0] = *(const short *)(ADDR_NATIVE_PLACE_X + base);
+        place[1] = 0;
+        place[2] = *(const short *)(ADDR_NATIVE_PLACE_Z + base);
+        return NFX_BONE_GROUND;
+    }
+    if (it->bone == NFX_BONE_RANDOM) {
+        if (native_play.bones[i][t] < 0 || native_play.bones[i][t] >= bones) {
+            native_random = native_random * 1103515245u + 12345u;
+            native_play.bones[i][t] = (signed char)((native_random >> 16) % (DWORD)(bones < NFX_BONE_MAX + 1 ? bones : NFX_BONE_MAX + 1));
+        }
+        bone = native_play.bones[i][t];
+    } else
+        bone = it->bone < bones ? it->bone : bones - 1;
+    ((void (__cdecl *)(int, int, short *))FN_NATIVE_BONE_PLACE)(t, bone, place);
+    return bone;
+}
+
+/* (centre anchor) The place of an at=centre line: x and z the box-centre of the targets' floor places by the game's
+   own FUN_005bfec9 (where their sound pans from, and Comet2's place for several targets), over the targets with a
+   battle model (the actors an at=target line draws on); y 0 with bone=ground, else the mean y of their bone places
+   (FUN_005d2e00, the bone past a model's last its last, as native_place). *height: their mean model height (a
+   sprite's depth=model). FALSE: no target has a model, nothing is drawn. The first is logged (once a cast). */
+static BOOL native_centre_place(const struct nfx_item *it, short *place, int *height)
+{
+    int t, n = 0, mask = 0, y = 0, h = 0;
+    short bone_place[4] = { 0, 0, 0, 0 };
+
+    for (t = 0; t < 10; t++) {
+        DWORD base = (DWORD)t * ACTOR_EFFECT_STRIDE;
+        int bones;
+
+        if (!(native_play.mask >> t & 1) || !*(const DWORD *)(ADDR_NATIVE_MODEL + base) || (bones = *(const short *)(ADDR_NATIVE_BONES + base)) < 1)
+            continue;
+        mask |= 1 << t;
+        n++;
+        h += *(const short *)(ADDR_NATIVE_HEIGHT + base);
+        if (it->bone != NFX_BONE_GROUND) {
+            ((void (__cdecl *)(int, int, short *))FN_NATIVE_BONE_PLACE)(t, it->bone < bones ? it->bone : bones - 1, bone_place);
+            y += bone_place[1];
+        }
+    }
+    if (!n) {
+        if (!native_play.centre_said && native_say())
+            log_line("native effect %04lx: at=centre: no target (%04x) has a battle model: those lines are not drawn (said once)",
+                     native_play.number, native_play.mask);
+        native_play.centre_said = 1;
+        return FALSE;
+    }
+    ((short *(__cdecl *)(unsigned, short *))FN_NATIVE_CENTRE)((unsigned)mask, place);
+    place[1] = it->bone == NFX_BONE_GROUND ? 0 : (short)nfx_mean(y, n);
+    *height = nfx_mean(h, n);
+    if (!native_play.centre_said && native_say())
+        log_line("native effect %04lx: at=centre: the first at (%d, %d, %d), the middle of targets %04x (line %d, %s)",
+                 native_play.number, place[0], place[1], place[2], mask, it->line,
+                 it->bone == NFX_BONE_GROUND ? "on the ground" : "their mean bone height");
+    native_play.centre_said = 1;
+    return TRUE;
+}
+
+/* (screen anchor) The first at=screen draw of a cast, logged once (bounded by NATIVE_LOGS). */
+static void native_screen_said(int f, const struct nfx_item *it, int x, int y, int z, int sx, int sy, int sz)
+{
+    if (native_play.screen_said)
+        return;
+    native_play.screen_said = 1;
+    if (native_say())
+        log_line("native effect %04lx: first screen draw at frame %d: line %d (%s) at (%d, %d, %d) in the camera's space, scale (%d, %d, %d)",
+                 native_play.number, f, it->line, it->kind == NFX_MODEL ? "model" : "sprite", x, y, z, sx, sy, sz);
+}
+
+static int camera_battle_h_now(void);
+
+/* (arena anchor) An at=arena line's place on the arena pass: the line's (x, y, z) in the world's own axes, never turned,
+   into the short place the billboard and the world matrix take (the reader holds each to +-32767); the first of a cast
+   logged. */
+static void native_arena_place(int f, const struct nfx_item *it, int x, int y, int z, short *place)
+{
+    place[0] = (short)x, place[1] = (short)y, place[2] = (short)z;
+    if (native_play.arena_said)
+        return;
+    native_play.arena_said = 1;
+    if (native_say())
+        log_line("native effect %04lx: first arena draw at frame %d: line %d (%s) at (%d, %d, %d) in the world (caster %d, targets %04x)",
+                 native_play.number, f, it->line, it->kind == NFX_MODEL ? "model" : "sprite", x, y, z, native_play.actor,
+                 native_play.mask);
+}
+
+/* (screen anchor) zoom=fixed: the line's matrix m (written by nfx_screen_model / nfx_screen_sprite) made the size it
+   has at the battle's own H, for the H at 00c05f7c now (the camera's of the frame before: this task draws before
+   native_task_cameras writes this frame's, and the game makes the projection from it after the task lists, so the
+   size lags the zoom by one frame). One line a cast if the matrix's range holds it smaller. */
+static void native_screen_zoom(int f, const struct nfx_item *it, BYTE *m)
+{
+    int h;
+
+    if (!(it->flags & NFX_F_ZOOM_FIXED))
+        return;
+    h = camera_battle_h_now();
+    if (nfx_screen_zoom(m, h) && !native_play.zoom_said) {
+        native_play.zoom_said = 1;
+        if (native_say())
+            log_line("native effect %04lx: frame %d: line %d (zoom=fixed) is drawn smaller than at H %d (the battle's H is %d): at its size the matrix would pass the engine's range (a smaller scale= on it, or a bigger model file, keeps it whole)",
+                     native_play.number, f, it->line, NFX_SCREEN_H_HOME, h);
+    }
+}
+
+/* Stage 3a: every model line on at frame f, after the frame's sprites: one instance at each target (or the caster)
+   with a battle model, 64 an update. How many were added; *last the line of the last, and its place and draw. */
+static int native_draw_models(DWORD group, int f, int *last, int *at, struct nfx_model_draw *shown)
+{
+    const struct nfx_script *s = &nfx_scripts[native_play.effect];
+    const struct nfx_item *items = nfx_pool + s->first;
+    DWORD records[NFX_FILES_MAX];
+    int i, k, t, models = 0, coloured = 0, pinned = 0, full = 0;
+    short place[4] = { 0, 0, 0, 0 };
+
+    for (i = 0; i < s->count; i++)
+        if (items[i].kind == NFX_MODEL && (items[i].flags & NFX_F_PALETTE))
+            pinned |= 1 << items[i].entry;      /* a file some line gives palette= to: every line of it names its row */
+    for (k = 0; k < s->file_count; k++) {
+        records[k] = 0;
+        if (s->model_files >> k & 1) {
+            /* a model entry only (model_files: a file NAME.RSD); asked each frame, never kept (the group can be freed) */
+            DWORD m = ((DWORD (__cdecl *)(int, DWORD))FN_NATIVE_MODEL_RECORD)(k, group);
+
+            if (m && !IsBadReadPtr((const void *)m, 8) && *(const DWORD *)(m + 4))
+                records[k] = m;
+        }
+    }
+    for (i = 0; i < s->count && !full; i++) {
+        const struct nfx_item *it = &items[i];
+
+        if (it->kind != NFX_MODEL || !records[it->entry])
+            continue;
+        for (t = 0; t <= NFX_ARENA_PASS; t++) {
+            DWORD base = (DWORD)t * ACTOR_EFFECT_STRIDE;
+            struct nfx_model_draw d;
+            int own, bones = 0, turn = nfx_pass_turn(it, t, native_play.mask, native_play.actor), height = 0;
+
+            if (turn < 0 || (own = nfx_item_frame(it, f, turn)) < 0)
+                continue;
+            if (t >= NFX_SCREEN_PASS ? 0        /* (screen and arena anchors) no actor, no place to look up */
+                : t == NFX_CENTRE_PASS ? !native_centre_place(it, place, &height)
+                                       : (!*(const DWORD *)(ADDR_NATIVE_MODEL + base) || (bones = *(const short *)(ADDR_NATIVE_BONES + base)) < 1))
+                continue;
+            if (models == NFX_MODEL_DRAWS_MAX) {
+                if (!native_play.model_limit_said && native_say())
+                    log_line("native effect %04lx: frame %d asks for more than %d models: the rest are not drawn (said once)",
+                             native_play.number, f, NFX_MODEL_DRAWS_MAX);
+                native_play.model_limit_said = 1;
+                full = 1;               /* (the colour is put back below) */
+                break;
+            }
+            nfx_model_at(it, own, &d);
+            if (t < NFX_CENTRE_PASS)
+                native_place(it, i, t, bones, place);
+            else if (t == NFX_ARENA_PASS) {
+                /* (arena anchor) x, y, z are the place in the arena, not offsets from it: the offsets below are 0 */
+                native_arena_place(f, it, d.x, d.y, d.z, place);
+                d.x = d.y = d.z = 0;
+            }
+            nfx_model_matrix((short *)native_model_out, d.turn, d.scale);
+            if (t == NFX_SCREEN_PASS) {
+                /* (screen anchor) the model-to-view matrix written directly: its turn and scale in the screen's axes
+                   (as face=camera), its place (x, y, z) in the camera's own space; no FUN_005d2b44, no camera read */
+                nfx_screen_model(native_model_out, &d);
+                native_screen_zoom(f, it, native_model_out);
+                native_screen_said(f, it, d.x, d.y, d.z, d.scale[0], d.scale[1], d.scale[2]);
+            } else if (it->flags & NFX_F_FACE) {
+                /* stage 3b, face=camera: the billboard's place (camera x place, moved z along the line of sight),
+                   the model's own turn and scale in the screen's axes, x and y on the screen's plane: the sprites'
+                   NFX_F_MATRIX path */
+                const BYTE *m = ((const BYTE *(__cdecl *)(short *, int, int))FN_NATIVE_BILLBOARD)(place, 0x1000, d.z);
+
+                if (!m)
+                    continue;
+                copy_bytes(native_model_out + 0x12, m + 0x12, 12);
+                *(int *)(native_model_out + 0x12) += d.x;
+                *(int *)(native_model_out + 0x16) += d.y;
+            } else {
+                /* the model to the world (R | the place + offsets), then camera x that, as Dynamite's stick */
+                copy_bytes(native_model_local, native_model_out, 18);
+                *(int *)(native_model_local + 0x12) = place[0] + d.x;
+                *(int *)(native_model_local + 0x16) = place[1] + d.y;
+                *(int *)(native_model_local + 0x1a) = place[2] + d.z;
+                ((BYTE *(__cdecl *)(const BYTE *, const BYTE *, BYTE *))FN_NATIVE_CAMERA_TIMES)((const BYTE *)ADDR_NATIVE_CAMERA,
+                                                                                                 native_model_local, native_model_out);
+            }
+            ((void (__cdecl *)(const BYTE *))FN_NATIVE_SET_ROTATION)(native_model_out);
+            ((void (__cdecl *)(const BYTE *))FN_NATIVE_SET_PLACE)(native_model_out);
+            if (it->flags & NFX_F_COLOUR) {
+                ((void (__cdecl *)(int, int, int))FN_NATIVE_COLOUR)(d.r, d.g, d.b);
+                coloured = 1;
+            } else
+                ((void (__cdecl *)(int, int, int))FN_NATIVE_COLOUR)(0, 0, 0);
+            /* {record, 0x80, 0, 0x20} with none of stage 3b's keys (stage 3a's call to the bit) */
+            nfx_model_context(&d, (it->flags & NFX_F_COLOUR) != 0, pinned >> it->entry & 1, records[it->entry], native_model_ctx);
+            ((DWORD (__cdecl *)(DWORD *, DWORD, DWORD, DWORD))FN_NATIVE_ADD_INSTANCE)(native_model_ctx, 0, 0xc, 0);
+            models++;
+            *last = i;
+            if (t == NFX_SCREEN_PASS)
+                at[0] = d.x, at[1] = d.y, at[2] = d.z;
+            else if (it->flags & NFX_F_FACE)
+                at[0] = place[0], at[1] = place[1], at[2] = place[2];
+            else
+                at[0] = place[0] + d.x, at[1] = place[1] + d.y, at[2] = place[2] + d.z;
+            *shown = d;
+        }
+    }
+    if (coloured)
+        ((void (__cdecl *)(int, int, int))FN_NATIVE_COLOUR)(0, 0, 0);   /* as the frame left it for the lists (0042daaa) */
+    return models;
+}
+
+/* This call's picture at frame f: every sprite line on at f, at each target (or the caster) with a model; then
+   (stage 3a) every model line. */
+static void native_draw(DWORD group, int f)
+{
+    const struct nfx_script *s = &nfx_scripts[native_play.effect];
+    const struct nfx_item *items = nfx_pool + s->first;
+    DWORD sheets[NFX_FILES_MAX], drawables[NFX_FILES_MAX];
+    int pages[NFX_FILES_MAX], i, k, j, t, drawn = 0, last = -1, models = 0, model_last = -1, model_at[3] = { 0, 0, 0 };
+    short place[4] = { 0, 0, 0, 0 };
+    struct nfx_model_draw shown = { 0, 0, 0, { 0, 0, 0 }, { 0, 0, 0 }, 0, 0, 0, 0, 0, 0, 0 };
+
+    for (k = 0; k < s->file_count; k++) {
+        DWORD *sheet;
+
+        sheets[k] = drawables[k] = 0;
+        pages[k] = 0;
+        if (!(s->sprite_files >> k & 1))
+            continue;
+        sheet = (DWORD *)((DWORD (__cdecl *)(int, DWORD))FN_NATIVE_SHEET)(k, group);
+        /* the context's drawable: tex's first (the file itself by default). With one texture page FUN_005d1ffb draws
+           with it and never looks at sheet[8]; with several it picks one per quad */
+        drawables[k] = ((DWORD (__cdecl *)(int, DWORD))FN_NATIVE_DRAWABLE)(s->file[k].tex[0], group);
+        if (!sheet || !drawables[k] || (long)sheet[3] < 1 || (long)sheet[3] > s->file[k].tex_count)
+            continue;
+        /* the sheet's textures by the order of its tpage words (Fire writes FIRE00's and FIRE01's every frame) */
+        for (j = 0; j < (int)sheet[3]; j++)
+            sheet[8 + j] = ((DWORD (__cdecl *)(int, DWORD))FN_NATIVE_DRAWABLE)(s->file[k].tex[j], group);
+        pages[k] = sheet[0] && !IsBadReadPtr((const void *)(sheet[0] + 4), 4) ? *(const int *)(sheet[0] + 4) : 0;
+        sheets[k] = (DWORD)sheet;
+    }
+    for (i = 0; i < s->count; i++) {
+        const struct nfx_item *it = &items[i];
+
+        if (it->kind != NFX_SPRITE || !sheets[it->entry])
+            continue;
+        for (t = 0; t <= NFX_ARENA_PASS; t++) {
+            DWORD base = (DWORD)t * ACTOR_EFFECT_STRIDE;
+            struct nfx_draw d;
+            int own, bones = 0, depth, turn = nfx_pass_turn(it, t, native_play.mask, native_play.actor), height = 0;
+
+            if (turn < 0 || (own = nfx_item_frame(it, f, turn)) < 0)
+                continue;
+            if (t >= NFX_SCREEN_PASS ? 0        /* (screen and arena anchors) no actor, no place to look up */
+                : t == NFX_CENTRE_PASS ? !native_centre_place(it, place, &height)
+                                       : (!*(const DWORD *)(ADDR_NATIVE_MODEL + base) || (bones = *(const short *)(ADDR_NATIVE_BONES + base)) < 1))
+                continue;
+            if (drawn == NFX_DRAWS_MAX) {
+                if (!native_play.limit_said && native_say())
+                    log_line("native effect %04lx: frame %d asks for more than %d sprites: the rest are not drawn (said once)",
+                             native_play.number, f, NFX_DRAWS_MAX);
+                native_play.limit_said = 1;
+                break;
+            }
+            nfx_sprite_at(it, own, pages[it->entry], &d);
+            if (t == NFX_SCREEN_PASS) {
+                /* (screen anchor) the DLL's own matrix, written directly: scale and rot in the screen's plane, the place
+                   (x, y, z) in the camera's own space (z held in depth); FUN_005d2b44 is not called */
+                nfx_screen_sprite(native_matrix, &d);
+                native_screen_zoom(f, it, native_matrix);
+                ((void (__cdecl *)(const BYTE *))FN_NATIVE_SET_ROTATION)(native_matrix);
+                ((void (__cdecl *)(const BYTE *))FN_NATIVE_SET_PLACE)(native_matrix);
+                native_screen_said(f, it, d.x, d.y, d.depth, d.sx, d.sy, 0);
+                depth = 0;
+            } else if (t == NFX_ARENA_PASS) {
+                /* (arena anchor) x, y and z (held in depth) are the place in the arena: no offset on the screen's plane,
+                   no depth along the line of sight (the reader keeps NFX_F_MATRIX for rot= or an uneven scale only) */
+                native_arena_place(f, it, d.x, d.y, d.depth, place);
+                d.x = d.y = 0;
+                depth = 0;
+            } else if (t == NFX_CENTRE_PASS)
+                depth = it->flags & NFX_F_DEPTH_MODEL ? -height : d.depth;      /* the targets' mean height */
+            else {
+                depth = it->flags & NFX_F_DEPTH_MODEL ? -*(const short *)(ADDR_NATIVE_HEIGHT + base) : d.depth;
+                native_place(it, i, t, bones, place);
+            }
+            if (t == NFX_SCREEN_PASS)
+                ;                       /* (the matrix is set) */
+            else if (!(it->flags & NFX_F_MATRIX))
+                ((void *(__cdecl *)(short *, int, int))FN_NATIVE_BILLBOARD)(place, d.sx * 0x1000 / 100, depth);
+            else {
+                /* the billboard's place, with the DLL's own rotation and scale and the offsets on the screen's plane */
+                const BYTE *m = ((const BYTE *(__cdecl *)(short *, int, int))FN_NATIVE_BILLBOARD)(place, 0x1000, depth);
+
+                if (!m)
+                    continue;
+                copy_bytes(native_matrix, m, 0x1e);
+                nfx_matrix((short *)native_matrix, d.sx, d.sy, d.rot);
+                *(int *)(native_matrix + 0x12) += d.x;
+                *(int *)(native_matrix + 0x16) += d.y;
+                ((void (__cdecl *)(const BYTE *))FN_NATIVE_SET_ROTATION)(native_matrix);
+                ((void (__cdecl *)(const BYTE *))FN_NATIVE_SET_PLACE)(native_matrix);
+            }
+            native_ctx[0] = sheets[it->entry];
+            native_ctx[1] = drawables[it->entry];
+            native_ctx[2] = d.colour;
+            native_ctx[3] = nfx_page_word(d.page, d.palette);     /* palette -1: bit 0x8000 clear, as before */
+            native_spt_value = ((DWORD (__cdecl *)(DWORD *, DWORD, int, DWORD))FN_NATIVE_DRAW_SPRITE)(
+                native_ctx, *(const DWORD *)ADDR_NATIVE_SPT_ARG + 0x70, 0xc, native_spt_value);
+            drawn++;
+            last = i;
+        }
+    }
+    if (s->model_files)
+        models = native_draw_models(group, f, &model_last, model_at, &shown);
+    if (!*(const DWORD *)ADDR_NATIVE_DRAWING || (!drawn && !models)) {
+        native_play.undrawn++;          /* a catch-up update (FUN_005d1ffb draws nothing), or nothing on at this frame */
+        return;
+    }
+    native_play.drawn++;
+    if (models && !native_play.model_said) {
+        const struct nfx_item *mi = &items[model_last];
+
+        native_play.model_said = 1;
+        if ((mi->flags & (NFX_F_COLOUR | NFX_F_FACE | NFX_F_PALETTE)) || mi->bone == NFX_BONE_GROUND || mi->fade.a != NFX_FADE_MAX ||
+            mi->fade.b != NFX_FADE_MAX || mi->u.a || mi->u.b || mi->v.a || mi->v.b) {
+            /* stage 3b's keys: the same line and what they gave (a line with none of them is logged as before) */
+            if (native_say())
+                log_line("native effect %04lx: first model draw at frame %d: %d sprite(s), %d model(s), the last model of line %d at (%d, %d, %d)%s%s, turn (%d, %d, %d), scale (%d, %d, %d), fade %d colour %s%02x%02x%02x uv %d,%d row %d (context %08lx %08lx %08lx)",
+                         native_play.number, f, drawn, models, mi->line, model_at[0], model_at[1], model_at[2],
+                         mi->bone == NFX_BONE_GROUND ? " on the ground" : "", (mi->flags & NFX_F_FACE) ? " facing the camera" : "",
+                         shown.turn[0], shown.turn[1], shown.turn[2], shown.scale[0], shown.scale[1], shown.scale[2], shown.fade,
+                         (mi->flags & NFX_F_COLOUR) ? "" : "none ", (mi->flags & NFX_F_COLOUR) ? shown.r : 0,
+                         (mi->flags & NFX_F_COLOUR) ? shown.g : 0, (mi->flags & NFX_F_COLOUR) ? shown.b : 0, shown.u, shown.v, shown.palette,
+                         native_model_ctx[1], native_model_ctx[2], native_model_ctx[3]);
+        } else if (native_say())
+            log_line("native effect %04lx: first model draw at frame %d: %d sprite(s), %d model(s), the last model of line %d at (%d, %d, %d), turn (%d, %d, %d), scale (%d, %d, %d)",
+                     native_play.number, f, drawn, models, items[model_last].line, model_at[0], model_at[1], model_at[2], shown.turn[0],
+                     shown.turn[1], shown.turn[2], shown.scale[0], shown.scale[1], shown.scale[2]);
+    }
+    if (!drawn)
+        return;                         /* (the sprites' first-draw line below names a sprite line) */
+    if (!native_play.draw_said) {
+        native_play.draw_said = 1;
+        if (native_say()) {
+            if (native_ctx[3] & 0x8000)
+                log_line("native effect %04lx: first draw at frame %d: %d sprite(s), the last of line %d (page %lu, palette row %lu, colour %08lx), at (%d, %d, %d)",
+                         native_play.number, f, drawn, items[last].line, native_ctx[3] & 0x7fff, native_ctx[3] >> 22,
+                         native_ctx[2], place[0], place[1], place[2]);
+            else
+                log_line("native effect %04lx: first draw at frame %d: %d sprite(s), the last of line %d (page %lu, colour %08lx), at (%d, %d, %d)",
+                         native_play.number, f, drawn, items[last].line, native_ctx[3], native_ctx[2], place[0], place[1], place[2]);
+        }
+    }
+}
+
+/* camera stage 0: the roll of the camera a native effect runs under ("Camera roll", with the cameras of our own) */
+static void camera_roll_begin(WORD serial);
+static void camera_roll_step(WORD serial, int frame, int length, DWORD effect);
+static void camera_roll_stop(WORD serial, const char *why);
+static void camera_roll_battle_start(void);
+/* camera stage 1: FF8's camera played under a native effect ("FF8's camera, played", with the cameras of our own) */
+static void camera_ff8_begin(WORD serial);
+static void camera_ff8_step(WORD serial, int frame, int length, DWORD effect);
+static void camera_ff8_stop(WORD serial, const char *why);
+static void camera_ff8_battle_start(void);
+static void native_task_cameras(WORD serial, int frame, int length, DWORD effect, int todo);
+/* stage fx 1: the stage hidden or darkened by a native effect's stage lines ("STAGE FX", after the camera players) */
+static BOOL stage_fx_site_ok(void);
+static void stage_fx_begin(WORD serial);
+static void stage_fx_stop(WORD serial, const char *why);
+static void stage_fx_battle_start(void);
+static void native_task_stage(WORD serial, const struct nfx_item *items, int count, int frame, DWORD effect, int todo);
+/* stage fx 2: fills, flashes and shakes (in the STAGE FX block too) */
+static BOOL stage_fill_site_ok(void);
+static BOOL stage_shake_site_ok(void);
+/* stage fx 3: the actors and the backdrop (in the STAGE FX block too) */
+static BOOL stage_back_site_ok(void);
+static void native_task_actors(WORD serial, const struct nfx_item *items, int count, int frame, DWORD effect, int todo, int caster, int mask);
+
+/* The task, in the list of 100. */
+static void __cdecl native_task(void)
+{
+    short *task = (short *)(ADDR_NATIVE_TASK_DATA + *(const short *)ADDR_NATIVE_TASK_INDEX * 0x20);
+    int paused = *(const BYTE *)ADDR_NATIVE_PAUSED != 0, todo, frame, rest;
+    DWORD group;
+
+    if (!native_play.running || native_play.serial != (WORD)task[2] || native_play.generation != native_generation) {
+        camera_roll_stop((WORD)task[2], "its effect was ended early");    /* (only if this task's effect owns the roll) */
+        camera_ff8_stop((WORD)task[2], "its effect was ended early");     /* (camera stage 1: likewise) */
+        stage_fx_stop((WORD)task[2], "its effect was ended early");       /* (stage fx 1: the stage back, likewise) */
+        *task = -1;                     /* a newer cast has a task of its own, or a battle start, or the scripts were read again */
+        return;
+    }
+    group = native_group_now(native_play.effect);
+    frame = native_play.clock.frame;    /* this call's frame, before the clock advances */
+    todo = native_clock_step(&native_play.clock, paused, group != 0, native_play.length, native_play.watchdog);
+    if (todo & NATIVE_DO_EVENTS)
+        native_events(frame);
+    if (todo & NATIVE_DO_DRAW)
+        native_draw(group, native_play.clock.page);
+    native_task_cameras(native_play.serial, frame, native_play.length, native_play.number, todo);
+    if (nfx_scripts[native_play.effect].stage || nfx_scripts[native_play.effect].fill || nfx_scripts[native_play.effect].shake)
+        /* (stage fx 1, 2) a script without stage, fill, flash or shake lines: as before, nothing called */
+        native_task_stage(native_play.serial, nfx_pool + nfx_scripts[native_play.effect].first, nfx_scripts[native_play.effect].count,
+                          frame, native_play.number, todo);
+    if (nfx_scripts[native_play.effect].actors)
+        /* (stage fx 3) a script without actors lines: as before, nothing called */
+        native_task_actors(native_play.serial, nfx_pool + nfx_scripts[native_play.effect].first, nfx_scripts[native_play.effect].count,
+                           frame, native_play.number, todo, native_play.actor, native_play.mask);
+    if (todo & NATIVE_DO_END) {
+        rest = native_play.mask & ~native_play.clock.hit_done;
+        if (rest) {                     /* every target's result is shown, exactly once */
+            native_play.clock.hit_done |= rest;
+            native_hits(rest);
+            if (native_say())
+                log_line("native effect %04lx: hit queued at frame %d for targets %04x (as it ends)", native_play.number, frame, rest);
+        }
+        if (native_say())
+            log_line("native effect %04lx: ended at frame %d (%s); %d update(s) drawn, %d not drawn, %d call(s)", native_play.number,
+                     native_play.clock.frame, (todo & NATIVE_END_LENGTH) ? "its length"
+                                              : (todo & NATIVE_END_GROUP) ? "its files were freed (another effect's preload?)"
+                                              : "WATCHDOG: too many calls", native_play.drawn, native_play.undrawn,
+                     native_play.clock.calls);
+        native_play.running = 0;
+        *task = -1;
+    }
+}
+
+/* The effect step of a magic cast (start_effect_copy): TRUE if the actor's action plays a native effect and its
+   task was started; FALSE and the game's routine runs (nothing native noted, or a refusal: logged). */
+static BOOL native_effect_step(int actor_arg)
+{
+    int actor = (BYTE)actor_arg, c, number, i, t;
+    unsigned shown;
+    short slot;
+
+    if (!effect_natives_usable || actor >= 10 || *(const BYTE *)(ADDR_ACTOR_COMMAND_TYPE + actor * ACTOR_EFFECT_STRIDE) != 2)
+        return FALSE;
+    shown = *(const WORD *)ADDR_EFFECT_TARGETS;
+    number = *(const BYTE *)(ADDR_ACTOR_NUMBER + actor * ACTOR_EFFECT_STRIDE);
+    /* one target or several from the record's results, as for a copy (effect_for_actor) */
+    c = effect_native_choice(effect_copy_cast[actor].single, effect_copy_cast[actor].several, (shown & (shown - 1)) != 0, number,
+                             effect_copies, effect_copy_count);
+    if (c < 0 || !nfx_scripts[c].usable)
+        return FALSE;
+    if (!native_routines_ok())
+        return FALSE;                   /* (said once) */
+    if (native_play.running) {
+        /* one native effect at a time: a cast's script waits (9e) for the last one, so this is not expected */
+        int rest = native_play.mask & ~native_play.clock.hit_done;
+
+        if (rest) {
+            native_play.clock.hit_done |= rest;
+            native_hits(rest);
+        }
+        if (native_say())
+            log_line("native effect %04lx: still running at frame %d as actor %d's next one starts: ended (its hits are queued)",
+                     native_play.number, native_play.clock.frame, actor);
+        camera_roll_stop(native_play.serial, "a newer effect starts");
+        camera_ff8_stop(native_play.serial, "a newer effect starts");
+        stage_fx_stop(native_play.serial, "a newer effect starts");    /* (stage fx 1) before the newer one saves the base */
+        native_play.running = 0;        /* its task ends itself at its next call */
+    }
+    if (!native_load(c, actor)) {
+        if (native_say())
+            log_line("native effect %04lx: not played for actor %d: the game's effect %02x plays instead", effect_copies[c].number, actor,
+                     number);
+        return FALSE;
+    }
+    slot = ((short (__cdecl *)(DWORD))FN_NATIVE_NEW_TASK)((DWORD)native_task);
+    /* (and the task is really in the list: a replacement of FUN_005bec50 that keeps its own list would not run it) */
+    if (slot < 0 || slot >= 100 || ((const DWORD *)ADDR_NATIVE_TASK_FNS)[slot] != (DWORD)native_task) {
+        if (native_say())
+            log_line("native effect %04lx: no task slot (FUN_005bec50 gave %d%s): the game's effect %02x plays instead for actor %d",
+                     effect_copies[c].number, slot, slot < 0 || slot >= 100 ? ": the list of 100 is full" : ", and the list holds another routine there",
+                     number, actor);
+        return FALSE;
+    }
+    /* what FUN_00427c22 does for a magic effect before it calls the routine (00427c3b-00427cc5), so that only
+       the routine differs: a byte to 0, and for effect 0x19 on one result the three party actors' bytes at
+       00be119e (stride 0x1aec) set */
+    *(BYTE *)ADDR_NATIVE_STEP_FLAG = 0;
+    if (number == 0x19 && !*(const BYTE *)ADDR_EFFECT_SEVERAL) {
+        *(BYTE *)0x00be119eu = 1;
+        *(BYTE *)0x00be2c8au = 1;
+        *(BYTE *)0x00be4776u = 1;
+    }
+    native_play.serial = ++native_serial;
+    camera_roll_begin(native_play.serial);
+    camera_ff8_begin(native_play.serial);
+    stage_fx_begin(native_play.serial);
+    native_play.actor = actor;
+    native_play.mask = (int)(shown & 0x3ff);
+    native_play.number = effect_copies[c].number;
+    native_play.effect = c;
+    native_play.generation = native_generation;
+    native_play.length = nfx_scripts[c].length;
+    native_play.watchdog = native_watchdog(nfx_scripts[c].length);
+    native_play.drawn = native_play.undrawn = 0;
+    native_play.draw_said = native_play.limit_said = native_play.model_said = native_play.model_limit_said = 0;
+    native_play.centre_said = native_play.screen_said = native_play.zoom_said = 0;
+    native_play.arena_said = 0;
+    native_play.clock.frame = native_play.clock.calls = native_play.clock.page = native_play.clock.hit_done = 0;
+    for (i = 0; i < nfx_scripts[c].count && i < NFX_ITEMS_MAX; i++)
+        for (t = 0; t < 10; t++)
+            native_play.bones[i][t] = -1;
+    native_random ^= GetTickCount() * 2654435761u + native_serial;
+    native_play.running = 1;
+    {
+        short *data = (short *)(ADDR_NATIVE_TASK_DATA + slot * 0x20);
+
+        data[1] = 0;
+        data[2] = (short)native_play.serial;
+    }
+    if (native_say())
+        log_line("native effect %04lx: started for actor %d (effects\\%s.txt, record effect %02x, targets %04x, task %d, group %08lx): %d frames, %d timeline line(s)",
+                 native_play.number, actor, effect_copies[c].play_name, number, native_play.mask, slot, native_handles[c],
+                 native_play.length, nfx_scripts[c].count);
+    return TRUE;
+}
+
+/* A battle starts (battle_start_party_hook): the task lists were emptied (FUN_005beec6) and the last battle's
+   groups freed; a handle still set is dropped, never used (native_load also compares the manager). */
+static void native_battle_start(void)
+{
+    int e, held = 0;
+
+    InterlockedExchange(&native_logs, 0);
+    if (native_play.running)
+        log_line("native effect %04lx: still marked running as a battle starts (frame %d): dropped", native_play.number,
+                 native_play.clock.frame);
+    native_play.running = 0;
+    camera_roll_battle_start();     /* camera stage 0: no roll is carried over */
+    camera_ff8_battle_start();      /* camera stage 1: no play is carried over */
+    stage_fx_battle_start();        /* stage fx 1: no stage write is carried over */
+    for (e = 0; e < EFFECT_COPY_MAX; e++) {
+        held += native_handles[e] != 0;
+        native_handles[e] = native_managers[e] = 0;
+        native_orphaned[e] = 0;         /* the last battle's groups are freed (FUN_00428c99 -> FUN_0068a567) */
+        native_list_count[e] = 0;
+    }
+    if (held)
+        log_line("native effects: %d group handle(s) still held as a battle started: set to 0", held);
+}
+
+/* ---- Native effect scripts: reading them (load_effect_copies) and finding their files ---- */
+static const char *native_script_name;  /* for native_script_say */
+static int native_script_said;
+
+static void native_script_say(int line, int refusal, const char *what)
+{
+    if (++native_script_said > NFX_PROBLEMS_SAID)
+        return;
+    if (line)
+        log_line("effect script effects\\%s.txt line %d: %s%s", native_script_name, line, refusal ? "" : "(note) ", what);
+    else
+        log_line("effect script effects\\%s.txt: %s%s", native_script_name, refusal ? "" : "(note) ", what);
+}
+
+/* Before the effects file is read again: no task or group of the last reading is used any more. */
+static void native_scripts_forget(void)
+{
+    int e, held = 0;
+
+    native_generation++;
+    if (native_play.running)
+        log_line("native effect %04lx: still running as the scripts are read again: it ends at its next call", native_play.number);
+    native_play.running = 0;
+    for (e = 0; e < EFFECT_COPY_MAX; e++) {
+        held += native_handles[e] != 0;
+        native_orphaned[e] |= native_handles[e] != 0;   /* its group lives on until the game frees it: see native_load */
+        native_handles[e] = native_managers[e] = 0;
+    }
+    if (held)
+        log_line("native effects: %d group handle(s) held as the scripts are read again: dropped (the game frees those groups)", held);
+    nfx_pool_used = 0;
+}
+
+/* Reads native effect i's script (load_effect_copies). Not usable if it is not there or any line is refused. */
+static void native_script_read(int i)
+{
+    struct effect_copy *c = &effect_copies[i];
+    struct nfx_script *s = &nfx_scripts[i];
+    char file[EFFECT_NAME_MAX + 16];
+    char *text;
+    DWORD size = 0;
+    BOOL built_in = FALSE;
+
+    lstrcpyA(file, "effects\\");
+    lstrcatA(file, c->play_name);
+    lstrcatA(file, ".txt");
+    native_script_name = c->play_name;
+    native_script_said = 0;
+    s->usable = 0;
+    s->count = 0;
+    text = read_whole_file(file, &size);
+    if (text) {
+        nfx_pool_used = nfx_parse(text, size, s, nfx_pool, nfx_pool_used, NFX_POOL_ITEMS, native_script_say);
+        VirtualFree(text, 0, MEM_RELEASE);
+    } else if (effect_same_name(c->play_name, "stage0_test")) {
+        /* stage 0's timeline, built in (nfx_parse only reads the text) */
+        nfx_pool_used = nfx_parse((char *)nfx_stage0_text, sizeof nfx_stage0_text - 1, s, nfx_pool, nfx_pool_used, NFX_POOL_ITEMS,
+                                  native_script_say);
+        built_in = TRUE;
+    } else {
+        log_line("effect script %s%s: not found: native effect %04lx is not used (its spells play effect %02x)", config_dir, file,
+                 c->number, c->play_base);
+        c->usable = 0;
+        return;
+    }
+    if (native_script_said > NFX_PROBLEMS_SAID)
+        log_line("effect script effects\\%s.txt: %d more problem(s) or note(s) not listed", c->play_name, native_script_said - NFX_PROBLEMS_SAID);
+    if (!s->usable) {
+        log_line("native effect %04lx: effects\\%s.txt has %d refused line(s): not used (its spells play effect %02x)", c->number,
+                 c->play_name, s->problems, c->play_base);
+        c->usable = 0;
+        return;
+    }
+    log_line("native effect %04lx: plays effects\\%s.txt%s: %d file(s), %d frames, %d timeline line(s), %d note(s); the record holds effect %02x",
+             c->number, c->play_name, built_in ? " (not found: the built-in stage-0 timeline)" : "", s->file_count, s->length, s->count,
+             s->notes, c->play_base);
+    if (s->stage && !stage_fx_site_ok())    /* (stage fx 1) "stage lines: on / OFF", said once a run */
+        log_line("native effect %04lx: its %d stage line(s) will not be played (the rest of it plays)", c->number, s->stage);
+    if (s->fill && !stage_fill_site_ok())   /* (stage fx 2) "fill lines: on / OFF", likewise */
+        log_line("native effect %04lx: its %d fill or flash line(s) will not be drawn (the rest of it plays)", c->number, s->fill);
+    if (s->shake && !stage_shake_site_ok()) /* (stage fx 2) "shake lines: on / OFF", likewise */
+        log_line("native effect %04lx: its %d shake line(s) will not be played (the rest of it plays)", c->number, s->shake);
+    if (s->fill) {                      /* (stage fx 3) "backdrop lines: on / OFF", likewise, for its layer=back lines */
+        int k, back = 0;
+
+        for (k = 0; k < s->count; k++)
+            back += nfx_pool[s->first + k].kind == NFX_FILL && (nfx_pool[s->first + k].entry & NFX_FILL_BACK);
+        if (back && !stage_back_site_ok())
+            log_line("native effect %04lx: its %d fill layer=back line(s) will not be drawn (the rest of it plays)", c->number, back);
+    }
+}
+
+/* The names in magic.lgp (20 bytes each in entries of 27), read once: a script may name the game's own files. */
+static BYTE *magic_lgp_names;
+static DWORD magic_lgp_count;
+
+static BOOL in_magic_lgp(const char *file_name)
+{
+    static LONG tried;
+    DWORD i;
+
+    if (!InterlockedExchange(&tried, 1)) {
+        char path[MAX_PATH + 32];
+        DWORD n = GetModuleFileNameA(NULL, path, MAX_PATH), got = 0, count;
+        BYTE head[16];
+        HANDLE file;
+
+        while (n > 0 && path[n - 1] != '\\' && path[n - 1] != '/')
+            n--;
+        lstrcpyA(path + n, NATIVE_MAGIC_LGP);
+        file = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+        if (file != INVALID_HANDLE_VALUE) {
+            if (ReadFile(file, head, 16, &got, NULL) && got == 16 && (count = *(const DWORD *)(head + 12)) - 1 < 200000u) {
+                BYTE *names = VirtualAlloc(NULL, count * 27, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+
+                if (names && ReadFile(file, names, count * 27, &got, NULL) && got == count * 27) {
+                    magic_lgp_names = names;
+                    magic_lgp_count = count;
+                } else if (names) {
+                    VirtualFree(names, 0, MEM_RELEASE);
+                }
+            }
+            CloseHandle(file);
+        }
+        if (!magic_lgp_names)
+            log_line("native effects: %s could not be read: a script's files are looked for in the mod folders only", path);
+    }
+    for (i = 0; i < magic_lgp_count; i++) {
+        char name[21];
+
+        copy_bytes((BYTE *)name, magic_lgp_names + i * 27, 20);
+        name[20] = 0;
+        if (!lstrcmpiA(name, file_name))
+            return TRUE;
+    }
+    return FALSE;
+}
+
+/* Where the file a list name asks for will be found (as effect_copies_check_files looks for a copy's, and
+   then magic.lgp), or NULL. */
+static const char *native_file_source(const char *list_name)
+{
+    char asked[EFFECT_NAME_MAX + 4], path[MAX_PATH + 200], png[2][EFFECT_NAME_MAX + 8];
+    BOOL ffnx = driver_reads_files_itself(), loose;
+    int length, pngs;
+
+    effect_asked_name(list_name, asked);
+    length = lstrlenA(asked);
+    pngs = effect_png_names(asked, png[0], png[1]);
+    loose = find_loose_file(asked, path) || find_loose_entry(png[0]) != NULL || (pngs > 1 && find_loose_entry(png[1]) != NULL);
+    if (ffnx ? supplied_in_direct_folder(3, asked) || (loose && lstrcmpiA(asked + (length > 4 ? length - 4 : 0), ".tex")) : loose)
+        return "a mod's files";
+    return in_magic_lgp(asked) ? "magic.lgp" : NULL;
+}
+
+/* Stage 3b: up to cap bytes of a model's RSD text from where the game will read it (FFNx: <game>\\direct\\magic first,
+   as its lgp_open_file; then this DLL's loose files; then magic.lgp, the first entry of that name: an archive entry
+   is its 20-byte name, its size, then its bytes). The count read, or -1. Read only, at Re-init. */
+#define NATIVE_RSD_TEXT_MAX     4096
+static int native_rsd_text(const char *rsd, char *buf, int cap)
+{
+    char path[MAX_PATH + 200];
+    HANDLE file = INVALID_HANDLE_VALUE;
+    DWORD got = 0, offset = 0, i;
+    int n = -1;
+
+    if (driver_reads_files_itself() && lstrlenA(rsd) <= 60) {
+        WCHAR wide[MAX_PATH + 96];
+        DWORD k = GetModuleFileNameA(NULL, path, MAX_PATH);
+
+        while (k > 0 && path[k - 1] != '\\' && path[k - 1] != '/')
+            k--;
+        lstrcpyA(path + k, "direct\\magic\\");
+        lstrcatA(path, rsd);
+        for (i = 0; path[i]; i++)
+            wide[i] = (BYTE)path[i];
+        wide[i] = 0;
+        file = CreateFileW(wide, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+        if (file == NULL)
+            file = INVALID_HANDLE_VALUE;
+    }
+    if (file == INVALID_HANDLE_VALUE && find_loose_file(rsd, path))
+        file = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+    if (file != INVALID_HANDLE_VALUE) {
+        if (ReadFile(file, buf, (DWORD)cap, &got, NULL))
+            n = (int)got;
+        CloseHandle(file);
+        return n;
+    }
+    if (!in_magic_lgp(rsd))
+        return -1;
+    for (i = 0; i < magic_lgp_count && !offset; i++) {
+        char name[21];
+
+        copy_bytes((BYTE *)name, magic_lgp_names + i * 27, 20);
+        name[20] = 0;
+        if (!lstrcmpiA(name, rsd))
+            offset = *(const DWORD *)(magic_lgp_names + i * 27 + 20);
+    }
+    if (offset) {
+        DWORD k = GetModuleFileNameA(NULL, path, MAX_PATH), size = 0;
+        BYTE head[24];
+
+        while (k > 0 && path[k - 1] != '\\' && path[k - 1] != '/')
+            k--;
+        lstrcpyA(path + k, NATIVE_MAGIC_LGP);
+        file = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+        if (file != INVALID_HANDLE_VALUE) {
+            if (SetFilePointer(file, (LONG)offset, NULL, FILE_BEGIN) != INVALID_SET_FILE_POINTER && ReadFile(file, head, 24, &got, NULL) &&
+                got == 24 && (size = *(const DWORD *)(head + 20)) < 0x100000u &&
+                ReadFile(file, buf, size < (DWORD)cap ? size : (DWORD)cap, &got, NULL))
+                n = (int)got;
+            CloseHandle(file);
+        }
+    }
+    return n;
+}
+
+/* The .P the Re-init check looks for beside a model's RSD: the name its PLY= line gives (stage 3b), or NAME.P when
+   the RSD cannot be read or has no usable PLY line (stage 3a's guess, which the game's own models and the prop's
+   follow). out holds EFFECT_NAME_MAX. */
+static void native_model_p_file(const char *rsd, char *out)
+{
+    static char text[NATIVE_RSD_TEXT_MAX];
+    char asked[EFFECT_NAME_MAX + 4];
+    int n;
+
+    effect_asked_name(rsd, asked);
+    n = native_rsd_text(asked, text, NATIVE_RSD_TEXT_MAX);
+    if (n <= 0 || !nfx_rsd_ply(text, n, out))
+        nfx_model_p_name(rsd, out);
+}
+
+/* (effect_copies_check_files) Every file of a usable script must be found: otherwise the effect is not used
+   (its spells play their base effect), as a missing name would be asked of the archive. */
+static void native_scripts_check_files(void)
+{
+    int i, k, j;
+
+    for (i = 0; i < effect_copy_count; i++) {
+        struct effect_copy *c = &effect_copies[i];
+        struct nfx_script *s = &nfx_scripts[i];
+
+        for (k = 0; c->usable && c->play && k < s->file_count; k++)
+            for (j = 0; j < 2 && c->usable; j++) {
+                char p_name[EFFECT_NAME_MAX];
+                const char *name = j ? s->file[k].second : s->file[k].name;
+                char asked[EFFECT_NAME_MAX + 4];
+
+                if (j && s->file[k].model) {
+                    native_model_p_file(s->file[k].name, p_name);   /* a model: NAME.RSD and the .P its PLY line names
+                                                                       (its textures are not looked at here: the cast's
+                                                                       check finds them) */
+                    name = p_name;
+                }
+                if (!*name || native_file_source(name))
+                    continue;
+                effect_asked_name(name, asked);
+                log_line("effect script effects\\%s.txt line %d: the file %s is not found (in the mod's magic folder, SpellExtConfig\\files or magic.lgp): native effect %04lx is not used (its spells play effect %02x)",
+                         c->play_name, s->file[k].line, asked, c->number, c->play_base);
+                c->usable = 0;
+                s->usable = 0;
+                effect_natives_usable--;
+            }
+    }
 }
 
 /* ---- Materia table --------------------------------------------------------- */
@@ -14138,6 +18218,765 @@ static int field_entities_mode;     /* `field_entities` in the game file: 0 off,
 static int field_model_check = 1;   /* `field_model_check`: look for the skeleton file before naming it in a field */
 static BOOL field_join_guarded;     /* guard_field_join's answer: without the guard a bare entity makes JOIN wait for ever */
 static DWORD field_read_next = FN_FIELD_READ;
+static BOOL field_entities_hooked;  /* (field capacity) install_field_entities put the hook in: the seats' entities are its; the hook may be in for the field capacity alone */
+
+/* The game's allocator and free (mem_alloc_0065fda1 / mem_free_0065fb40, FN_GAME_ALLOC and FN_GAME_FREE further
+   down): the field capacity block below makes the maplist block with them, so that the game's own free at the
+   field module's shutdown (FUN_00620f24) and its loader's free match it. Outside the block, so that its native
+   test can give its own. */
+static BYTE *fields_game_alloc(DWORD size)
+{
+    return ((BYTE *(__cdecl *)(DWORD, const char *, int))0x0065fda1u)(size, "spellext fields", 0);
+}
+
+static void fields_game_free(void *block)
+{
+    ((void (__cdecl *)(void *, const char *, int))0x0065fb40u)(block, "spellext fields", 0);
+}
+
+/* ==== FIELD CAPACITY BEGIN (stage 1: more field ids than the game ships; FF7FF8Fusion/Notes/Field_Capacity_Design.md) ====
+
+   The game knows a field by a 16-bit id. Three things are sized to the ids it ships, and are rebuilt here, at the
+   first kernel load, from the registry file the game file names (fields_file); with no fields_file nothing of
+   this is done and the game keeps its own (all read from ff7_en.exe and the decompile, 2026-10-21):
+     - the MAPLIST block: field_load_maplist_00620db6 (called once, from init_game_004089c5 at 00408df0, before the
+       kernel load at 00408e70) reads flevel.lgp's maplist (a u16 count, then 32-byte names) into a block of
+       `push 0x9600` bytes (00620e65: 1,200 names) from the game's allocator, pointer 00cff430, count (u32)
+       00cff464, copying `count` names with no bound. Read only by 00620c0b-00620f9x and 00621d7e. A field id's
+       name is that block's entry (FUN_00620f54); field_enter_0060e0bd makes "<name>\<name>" of it, which
+       field_open_file_0060b9d0 hands to the reader through 00cc1ef0 (the call at 0060ba9f).
+     - the field INFO table: 1,200 records of 0xd0 at 00cc2280 (BSS, to 00cff180), written once at start-up
+       (FUN_0060eeb2, 67 operands; FFNx's flevel.siz filler writes +0xbc, the file buffer's size, for 1,200) and
+       read ONLY by FUN_0060dad4, through the 12 operands of fields_info_sites, at (u16 id 00cff468) * 0xd0. A
+       scan of every operand in [00cc2280, 00cff180) finds 80: 12 there, 67 in FUN_0060eeb2, 1 in FUN_0060f65a.
+     - the default-SCALE table: 787 dwords at 00906c68, read at 0063e77f only (a model whose scale text is above
+       0x1000 takes its field's default); past 786 it would read the next table (009078b4).
+   So: (step 0, from DllMain, whatever the config) the 0x9600 becomes 0x00200000, room for any u16 count, so a
+   maplist longer than 1,200 is no longer a heap overrun; (at the first kernel load) the maplist block is made
+   again with the game's allocator at N names (N = fields_table_size: the game's names, the registered ones, and
+   the placeholder "sx_none" for every other id below N), and the info and scale tables are copied into tables
+   of N, the 13 operands repointed, all or nothing, every instruction's bytes checked first. FFNx reads none of
+   these sites (its reads near them: open_flevel_siz + 0xAF, sub_60EEB2 + 0x79F, sub_60DF96 + 0x26 / + 0xB0,
+   read_field_file + 0xA4 / + 0xB2, field_load_models + 0xE / + 0x262 (the atoi call at 0063e74d it replaces, an
+   instruction before the scale read) / + 0x8DF / + 0xA79 / + 0xB8C / + 0xB90). The reader's call at 0060ba9f
+   (SITE_FIELD_READ, chained) logs a registered field as it is read and does not read a placeholder: the lookup
+   of "sx_none" stays inside FFNx's LGP table, an empty name would not. Nothing here names a character. */
+#define ADDR_MAPLIST_BLOCK      0x00cff430u  /* BYTE *: the field names, 32 bytes each */
+#define ADDR_MAPLIST_COUNT      0x00cff464u  /* DWORD: how many */
+#define ADDR_FIELD_INFOS        0x00cc2280u  /* the game's 1,200 records of 0xd0 */
+#define FIELD_INFO_SIZE         0xd0
+#define FIELD_INFO_BUFFER       0xbc         /* in a record: the field file buffer's size (FUN_0060dad4 -> 00cff598) */
+#define FIELD_INFOS_GAME        1200
+#define ADDR_FIELD_SCALES       0x00906c68u  /* 787 dwords: a field's default model scale (a u16, high half 0) */
+#define FIELD_SCALES_GAME       787
+#define FIELD_SCALE_EXTRA       512          /* the most common default of the game's own fields */
+#define SITE_FIELD_SCALE        0x0063e77fu  /* mov ax, [ecx*4 + 00906c68] (66 8b 04 8d + operand) */
+#define SITE_MAPLIST_PUSH       0x00620e65u  /* push 0x9600 (68 + immediate) */
+#define MAPLIST_BLOCK_GAME      0x00009600u
+#define MAPLIST_BLOCK_WIDE      0x00200000u  /* 65,536 x 32: any u16 count */
+#define ADDR_FIELD_MODULE_ID    0x00cff468u  /* WORD: the field being entered (FUN_0060dad4's index) */
+#define ADDR_FIELD_BUFFER_ROOM  0x00cff598u  /* DWORD: the buffer size FUN_0060dad4 copied from the record */
+#define FIELDS_PLACEHOLDER      "sx_none"
+#define FIELDS_ID_MOST          32766        /* 00409a4d sign-extends an id; 0x7fff marks an unused gateway */
+#define FIELDS_TABLE_MOST       32767
+#define FIELD_BUFFER_DEFAULT    4000000u     /* FFNx's own for a field id past the flevel.siz entries */
+#define FIELD_BUFFER_LEAST      4000000u     /* the key can only raise the size: never below FFNx's own for a new id */
+#define FIELD_BUFFER_MOST       0x04000000u
+#define FIELDS_FILE_NAME_MAX    64
+
+/* The 12 instructions of FUN_0060dad4 that name the info table (00cc2280 + a record offset), as the exe has them. */
+static const struct { DWORD at; BYTE length, operand; BYTE bytes[8]; } fields_info_sites[12] = {
+    { 0x0060db12u, 6, 2, { 0x8b, 0x8a, 0x84, 0x22, 0xcc, 0x00 } },         /* mov ecx, [edx + 00cc2284] */
+    { 0x0060db42u, 6, 2, { 0x8b, 0x91, 0x80, 0x22, 0xcc, 0x00 } },         /* mov edx, [ecx + 00cc2280] */
+    { 0x0060db5cu, 6, 2, { 0x8b, 0x88, 0x18, 0x23, 0xcc, 0x00 } },         /* mov ecx, [eax + 00cc2318] */
+    { 0x0060db77u, 6, 2, { 0x8b, 0x82, 0x24, 0x23, 0xcc, 0x00 } },         /* mov eax, [edx + 00cc2324] */
+    { 0x0060db91u, 6, 2, { 0x8b, 0x91, 0x1c, 0x23, 0xcc, 0x00 } },         /* mov edx, [ecx + 00cc231c] */
+    { 0x0060dbabu, 6, 2, { 0x8b, 0x88, 0x20, 0x23, 0xcc, 0x00 } },         /* mov ecx, [eax + 00cc2320] */
+    { 0x0060dc01u, 7, 3, { 0x8b, 0x94, 0x8a, 0x88, 0x22, 0xcc, 0x00 } },   /* mov edx, [edx + ecx*4 + 00cc2288] */
+    { 0x0060dc23u, 7, 3, { 0x8b, 0x84, 0x90, 0xd0, 0x22, 0xcc, 0x00 } },   /* mov eax, [eax + edx*4 + 00cc22d0] */
+    { 0x0060dc43u, 8, 4, { 0x0f, 0xbe, 0x84, 0x11, 0x28, 0x23, 0xcc, 0x00 } },  /* movsx eax, byte [ecx + edx + 00cc2328] */
+    { 0x0060dc66u, 6, 2, { 0x8a, 0x82, 0x3a, 0x23, 0xcc, 0x00 } },         /* mov al, [edx + 00cc233a] */
+    { 0x0060dc80u, 6, 2, { 0x8b, 0x91, 0x3c, 0x23, 0xcc, 0x00 } },         /* mov edx, [ecx + 00cc233c]: the buffer size */
+    { 0x0060dc9au, 5, 1, { 0x05, 0x40, 0x23, 0xcc, 0x00 } },               /* add eax, 00cc2340 */
+};
+static const BYTE fields_scale_bytes[8] = { 0x66, 0x8b, 0x04, 0x8d, 0x68, 0x6c, 0x90, 0x00 };
+static const BYTE fields_push_game[5] = { 0x68, 0x00, 0x96, 0x00, 0x00 };
+static const BYTE fields_push_wide[5] = { 0x68, 0x00, 0x00, 0x20, 0x00 };
+
+/* The game file's keys, as the last reading left them, and as the tables were built with (once, at start-up). */
+static char fields_file_asked[FIELDS_FILE_NAME_MAX + 1], fields_file_taken[FIELDS_FILE_NAME_MAX + 1];
+static DWORD fields_table_asked, fields_table_taken;           /* 0: auto */
+static DWORD fields_buffer_asked = FIELD_BUFFER_DEFAULT, fields_buffer_taken;
+static BOOL fields_taken;
+
+static BOOL fields_step0_done;      /* the 0x9600 is the DLL's 0x00200000 */
+static BOOL fields_step0_late;      /* ... but the game had read its maplist already when it was written */
+static BOOL fields_live;            /* the tables are the DLL's */
+static BYTE *fields_block;          /* the maplist block the DLL made, with fields_count names */
+static DWORD fields_count;
+static DWORD fields_table;          /* N: names, info records and scales the DLL's tables hold */
+static DWORD fields_game_count;     /* the names the game read from its maplist */
+static BYTE *fields_infos;
+static DWORD *fields_scales;
+static BOOL fields_guard_said;
+
+struct fields_entry { WORD id; WORD line; char name[32]; };
+static struct fields_entry *fields_entries;     /* the registered fields, in the file's order */
+static int fields_entry_count;
+static BYTE fields_registered[(FIELDS_TABLE_MOST + 1) / 8 + 1];     /* a bit per registered id */
+
+static BOOL fields_is_registered(DWORD id)
+{
+    return id <= FIELDS_TABLE_MOST && (fields_registered[id >> 3] >> (id & 7) & 1);
+}
+
+static char fields_lower(char c)
+{
+    return c >= 'A' && c <= 'Z' ? (char)(c + 0x20) : c;
+}
+
+/* The same name, as the file look-up sees it (case ignored), within a 32-byte entry. */
+static BOOL fields_same_name(const char *a, const char *b)
+{
+    int i;
+
+    for (i = 0; i < 32; i++) {
+        if (fields_lower(a[i]) != fields_lower(b[i]))
+            return FALSE;
+        if (!a[i])
+            return TRUE;
+    }
+    return TRUE;
+}
+
+static BOOL fields_bytes_are(DWORD address, const BYTE *bytes, int count)
+{
+    int i;
+
+    for (i = 0; i < count; i++)
+        if (((const BYTE *)address)[i] != bytes[i])
+            return FALSE;
+    return TRUE;
+}
+
+/* Why a registered name cannot be, or NULL. FFNx serves a field file from a mod folder first and from flevel.lgp
+   after; its look-up there (ff7/file.cpp lgp_lookup_value, original_lgp_open_file) indexes a 30 x 30 table by the
+   name's first two characters and knows only letters (either case), digits, _ and -: any other character, or a
+   one-character name (the second is the NUL), reads outside the table, as an empty name would. Its entries of
+   that table keep a file's name in 16 bytes (lgp_toc_entry's name[16], ff7.h): a name is 15 characters at most. "maplist" is
+   flevel.lgp's list of the field names, not a field. */
+static const char *fields_name_fault(const char *name, int length)
+{
+    static const char maplist[] = "maplist";
+    int i;
+
+    if (length < 2 || length > 15)
+        return "a field name is 2 to 15 characters (FFNx's table of the files in flevel.lgp keeps a name in 16 bytes)";
+    for (i = 0; i < length; i++) {
+        char c = name[i];
+
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-'))
+            return "a field name has only letters, digits, _ and - (FFNx's look-up in flevel.lgp reads no other character)";
+    }
+    for (i = 0; i < length && i < 7 && fields_lower(name[i]) == FIELDS_PLACEHOLDER[i]; i++)
+        ;
+    if (length == 7 && i == 7)          /* (the name is not ended by a NUL in the text: its length is compared) */
+        return "sx_none is the placeholder of the ids nobody registered: it cannot be registered";
+    for (i = 0; i < length && i < 7 && fields_lower(name[i]) == maplist[i]; i++)
+        ;
+    if (length == 7 && i == 7)
+        return "maplist is flevel.lgp's list of the field names, not a field: it cannot be registered";
+    return NULL;
+}
+
+/* ---- the names already taken: a small hash set (case ignored) over the game's names and the registered ---- */
+static const char **fields_names_set;
+static DWORD fields_names_mask;
+
+static DWORD fields_name_hash(const char *name)
+{
+    DWORD h = 2166136261u;
+    int i;
+
+    for (i = 0; i < 32 && name[i]; i++)
+        h = (h ^ (BYTE)fields_lower(name[i])) * 16777619u;
+    return h;
+}
+
+/* The entry of `name` in the set, or NULL; with add, it is put in when absent (and NULL returned). */
+static const char *fields_names_find(const char *name, BOOL add)
+{
+    DWORD k = fields_name_hash(name) & fields_names_mask;
+
+    while (fields_names_set[k]) {
+        if (fields_same_name(fields_names_set[k], name))
+            return fields_names_set[k];
+        k = (k + 1) & fields_names_mask;
+    }
+    if (add)
+        fields_names_set[k] = name;
+    return NULL;
+}
+
+/* ---- the game file's keys ---- */
+static void fields_keys_begin(void)
+{
+    fields_file_asked[0] = 0;
+    fields_table_asked = 0;
+    fields_buffer_asked = FIELD_BUFFER_DEFAULT;
+}
+
+/* 0: not a key of this block; 1: read; -1: a mistake (*fault says what; the key keeps its default). */
+static int fields_key_line(char *start, char *key_end, char *value, char *stop, const char **fault)
+{
+    char *p = value;
+    DWORD n;
+
+    if (word_is(start, key_end, "fields_file")) {
+        int length = (int)(stop - value), i;
+
+        if (length == 0 || word_is(value, stop, "none") || word_is(value, stop, "off")) {
+            fields_file_asked[0] = 0;
+            return 1;
+        }
+        for (i = 0; i < length; i++)
+            if (value[i] == ':' || (value[i] == '.' && i + 1 < length && value[i + 1] == '.') || (BYTE)value[i] < 0x20)
+                break;
+        if (length > FIELDS_FILE_NAME_MAX || i < length || value[0] == '\\' || value[0] == '/') {
+            *fault = "fields_file takes the name of a file in the SpellExtConfig folder (like FF7_SpellExt_Fields.ini; no drive, no .., at most 64 characters), or none: the feature stays off";
+            fields_file_asked[0] = 0;
+            return -1;
+        }
+        for (i = 0; i < length; i++)
+            fields_file_asked[i] = value[i];
+        fields_file_asked[length] = 0;
+        return 1;
+    }
+    if (word_is(start, key_end, "fields_table_size")) {
+        if (word_is(value, stop, "auto")) {
+            fields_table_asked = 0;
+            return 1;
+        }
+        if (!parse_number(&p, stop, &n) || p != stop || n < FIELD_INFOS_GAME || n > FIELDS_TABLE_MOST) {
+            *fault = "fields_table_size takes auto, or a number of field ids from 1200 to 32767: auto is used";
+            fields_table_asked = 0;
+            return -1;
+        }
+        fields_table_asked = n;
+        return 1;
+    }
+    if (word_is(start, key_end, "field_buffer_bytes")) {
+        if (!parse_number(&p, stop, &n) || p != stop || n < FIELD_BUFFER_LEAST || n > FIELD_BUFFER_MOST) {
+            *fault = "field_buffer_bytes takes a number of bytes from 4000000 to 67108864 (it can only raise the size): 4000000 is used";
+            fields_buffer_asked = FIELD_BUFFER_DEFAULT;
+            return -1;
+        }
+        fields_buffer_asked = n;
+        return 1;
+    }
+    return 0;
+}
+
+/* After each reading of the game file: the tables are built once; a later change waits for the next start. */
+static void fields_keys_settle(void)
+{
+    if (!fields_taken)
+        return;
+    if (lstrcmpiA(fields_file_asked, fields_file_taken) || fields_table_asked != fields_table_taken ||
+        fields_buffer_asked != fields_buffer_taken)
+        log_line("fields: the game file now says fields_file = %s, fields_table_size = %lu (0 = auto), field_buffer_bytes = %lu; the field tables were built at start-up with %s, %lu, %lu and are not built again: restart the game for the change",
+                 fields_file_asked[0] ? fields_file_asked : "none", fields_table_asked, fields_buffer_asked,
+                 fields_file_taken[0] ? fields_file_taken : "none", fields_table_taken, fields_buffer_taken);
+}
+
+/* ---- the registry file: `id = name` lines in [fields] ---- */
+
+/* Reads the registry against the game's names; every refused line says why. Returns how many were taken. */
+static int fields_read_registry(char *text, DWORD size, const BYTE *game_names, DWORD game_count, DWORD table_asked,
+                                int *problems)
+{
+    char *line, *end, *file_end = text + size;
+    DWORD lines = 1, room, k;
+    int line_number = 0, in_fields = 1;
+
+    fields_entry_count = 0;
+    for (k = 0; k < sizeof fields_registered; k++)
+        fields_registered[k] = 0;
+    for (k = 0; k < size; k++)
+        lines += text[k] == '\n';
+    fields_entries = VirtualAlloc(NULL, lines * sizeof *fields_entries, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    for (room = 1; room < 2 * (game_count + lines + 1); room <<= 1)
+        ;
+    fields_names_set = VirtualAlloc(NULL, room * sizeof *fields_names_set, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!fields_entries || !fields_names_set) {
+        log_line("fields: no memory for the registry (%lu lines)", lines);
+        (*problems)++;
+        return 0;
+    }
+    fields_names_mask = room - 1;
+    for (k = 0; k < game_count; k++)
+        if (game_names[k * 32])                     /* (the game's own empty name, id 787, is no name) */
+            fields_names_find((const char *)game_names + k * 32, TRUE);
+    for (line = text; line < file_end; line = end + 1) {
+        char *start = line, *stop, *equals, *key_end, *value, *p;
+        const char *why, *taken;
+        DWORD id;
+        struct fields_entry *e;
+        int length, i;
+
+        for (end = line; end < file_end && *end != '\n'; end++)
+            ;
+        line_number++;
+        for (stop = start; stop < end; stop++)
+            if ((*stop == ';' || *stop == '#') && (stop == start || is_space(stop[-1])))
+                break;
+        trim(&start, &stop);
+        if (start == stop)
+            continue;
+        if (*start == '[') {
+            in_fields = word_is(start, stop, "[fields]");
+            if (!in_fields) {
+                char section[40];
+
+                for (i = 0; i < 39 && start + i < stop; i++)
+                    section[i] = start[i];
+                section[i] = 0;
+                log_line("fields file line %d: only the section [fields] is read: the lines of %s are skipped", line_number, section);
+            }
+            continue;
+        }
+        if (!in_fields)
+            continue;
+        for (equals = start; equals < stop && *equals != '='; equals++)
+            ;
+        key_end = equals;
+        value = equals < stop ? equals + 1 : stop;
+        trim(&start, &key_end);
+        trim(&value, &stop);
+        p = start;
+        if (equals == stop || !parse_number(&p, key_end, &id) || p != key_end) {
+            for (p = start; p < key_end && *p != '-'; p++)
+                ;
+            if (p < key_end && value < stop && *value == '@')
+                log_line("fields file line %d: the range form (FIRST-LAST = @file) is not read by this build: one `id = name` line per field; skipped",
+                         line_number);
+            else
+                log_line("fields file line %d: not `id = name` (a field id, then the field's name): skipped", line_number);
+            (*problems)++;
+            continue;
+        }
+        if (id < game_count) {
+            log_line("fields file line %d: id %lu is one of the game's own (its maplist has %lu names, ids 0 to %lu): skipped",
+                     line_number, id, game_count, game_count - 1);
+            (*problems)++;
+            continue;
+        }
+        if (id > FIELDS_ID_MOST) {
+            log_line("fields file line %d: id %lu is above 32766, the highest a field id can be (the game reads ids as signed numbers, and 32767 marks an unused exit): skipped",
+                     line_number, id);
+            (*problems)++;
+            continue;
+        }
+        if (table_asked && id >= table_asked) {
+            log_line("fields file line %d: id %lu is not below fields_table_size = %lu: skipped", line_number, id, table_asked);
+            (*problems)++;
+            continue;
+        }
+        if (fields_is_registered(id)) {
+            for (i = 0; i < fields_entry_count && fields_entries[i].id != id; i++)
+                ;
+            log_line("fields file line %d: id %lu is already registered (line %d, %s): skipped", line_number, id,
+                     fields_entries[i].line, fields_entries[i].name);
+            (*problems)++;
+            continue;
+        }
+        if (fields_entry_count == (int)lines)
+            break;                                  /* (cannot be: one entry a line) */
+        length = (int)(stop - value);
+        if ((why = fields_name_fault(value, length)) != NULL) {
+            log_line("fields file line %d: %s: skipped", line_number, why);
+            (*problems)++;
+            continue;
+        }
+        e = &fields_entries[fields_entry_count];
+        for (i = 0; i < 32; i++)
+            e->name[i] = i < length ? value[i] : 0;
+        if ((taken = fields_names_find(e->name, FALSE)) != NULL) {
+            if (taken >= (const char *)game_names && taken < (const char *)game_names + game_count * 32)
+                log_line("fields file line %d: %s is already the name of the game's field %lu: skipped", line_number, e->name,
+                         (DWORD)(taken - (const char *)game_names) / 32);
+            else {
+                const struct fields_entry *first = &fields_entries[(taken - (const char *)fields_entries) / (int)sizeof *fields_entries];
+
+                log_line("fields file line %d: %s is already registered (line %d, id %u; names are the same whatever their case): skipped",
+                         line_number, e->name, first->line, first->id);
+            }
+            (*problems)++;
+            continue;
+        }
+        e->id = (WORD)id;
+        e->line = (WORD)(line_number > 0xffff ? 0xffff : line_number);
+        fields_names_find(e->name, TRUE);
+        fields_registered[id >> 3] |= (BYTE)(1 << (id & 7));
+        fields_entry_count++;
+    }
+    VirtualFree(fields_names_set, 0, MEM_RELEASE);
+    fields_names_set = NULL;
+    return fields_entry_count;
+}
+
+/* N: fields_table_size, or the highest registered id + 1; never below 1,200 or the game's own count. */
+static DWORD fields_table_size(DWORD asked, DWORD game_count)
+{
+    DWORD n = asked, i;
+
+    if (!n)
+        for (i = 0; i < (DWORD)fields_entry_count; i++)
+            if (fields_entries[i].id + 1u > n)
+                n = fields_entries[i].id + 1u;
+    if (n < FIELD_INFOS_GAME)
+        n = FIELD_INFOS_GAME;
+    if (n < game_count)
+        n = game_count;
+    if (n > FIELDS_TABLE_MOST + 1)
+        n = FIELDS_TABLE_MOST + 1;
+    return n;
+}
+
+/* ---- the three tables ---- */
+
+/* The maplist of `table` names: the game's `game_count` (as the game copied them, 32 bytes each), the placeholder
+   for every id below `table` nobody registered, the registered names. */
+static void fields_fill_maplist(BYTE *block, DWORD table, const BYTE *game, DWORD game_count)
+{
+    DWORD i, k;
+    int e;
+
+    if (game_count > table)
+        game_count = table;
+    for (i = 0; i < game_count * 32; i++)
+        block[i] = game[i];
+    for (i = game_count; i < table; i++)
+        for (k = 0; k < 32; k++)
+            block[i * 32 + k] = k < sizeof FIELDS_PLACEHOLDER ? (BYTE)FIELDS_PLACEHOLDER[k] : 0;
+    for (e = 0; e < fields_entry_count; e++)
+        if (fields_entries[e].id < table && fields_entries[e].id >= game_count)
+            for (k = 0; k < 32; k++)
+                block[fields_entries[e].id * 32 + k] = (BYTE)fields_entries[e].name[k];
+}
+
+/* The bytes the info table of `table` records is given: whole pages (what VirtualAlloc commits). */
+static DWORD fields_infos_bytes(DWORD table)
+{
+    return (table * FIELD_INFO_SIZE + 0xfffu) & ~0xfffu;
+}
+
+/* The info table of `table` records: the game's 1,200 as they are (its defaults, its special cases, the driver's
+   buffer sizes), record 1,199 (a default one) for the rest, and `buffer` as every registered id's buffer size.
+   The page's slack after the last record is copies of record 1,199 too: FUN_0060dad4 reads an id's record before
+   the reader's hook sees the id, so an id just past the table reads a default record there, not zeros. */
+static void fields_fill_infos(BYTE *infos, DWORD table, const BYTE *game, DWORD buffer)
+{
+    DWORD i, bytes = fields_infos_bytes(table);
+    int e;
+
+    for (i = 0; i < bytes; i++)
+        infos[i] = game[i < FIELD_INFOS_GAME * FIELD_INFO_SIZE ? i : (FIELD_INFOS_GAME - 1) * FIELD_INFO_SIZE + i % FIELD_INFO_SIZE];
+    for (e = 0; e < fields_entry_count; e++)
+        if (fields_entries[e].id < table)
+            *(DWORD *)(infos + fields_entries[e].id * FIELD_INFO_SIZE + FIELD_INFO_BUFFER) = buffer;
+}
+
+static void fields_fill_scales(DWORD *scales, DWORD table, const DWORD *game)
+{
+    DWORD i;
+
+    for (i = 0; i < table; i++)
+        scales[i] = i < FIELD_SCALES_GAME ? game[i] : FIELD_SCALE_EXTRA;
+}
+
+/* Writes a dword into the game's code; the caller made the page writable. */
+static void fields_code_dword(DWORD address, DWORD value)
+{
+    *(DWORD *)address = value;
+}
+
+/* ---- step 0, from DllMain: the maplist block's size ---- */
+static void fields_widen_maplist_block(void)
+{
+    DWORD old_protect;
+    const BYTE *p = (const BYTE *)SITE_MAPLIST_PUSH;
+
+    if (IsBadReadPtr(p, 5))
+        return;
+    fields_step0_late = *(const DWORD *)ADDR_MAPLIST_BLOCK != 0;
+    if (!fields_bytes_are(SITE_MAPLIST_PUSH, fields_push_game, 5)) {
+        log_line("fields: the maplist block's size at %08lx is not the game's push 0x9600 (bytes %02x %02x %02x %02x %02x): not widened; a maplist of more than 1,200 names overruns its block as in the plain game",
+                 SITE_MAPLIST_PUSH, p[0], p[1], p[2], p[3], p[4]);
+        return;
+    }
+    if (!VirtualProtect((void *)(SITE_MAPLIST_PUSH + 1), 4, PAGE_EXECUTE_READWRITE, &old_protect)) {
+        log_line("fields: the maplist block's size at %08lx could not be made writable (error %lu): not widened", SITE_MAPLIST_PUSH,
+                 GetLastError());
+        return;
+    }
+    fields_code_dword(SITE_MAPLIST_PUSH + 1, MAPLIST_BLOCK_WIDE);
+    VirtualProtect((void *)(SITE_MAPLIST_PUSH + 1), 4, old_protect, &old_protect);
+    FlushInstructionCache(GetCurrentProcess(), (void *)(SITE_MAPLIST_PUSH + 1), 4);
+    fields_step0_done = TRUE;
+    log_line("fields: the block the game reads its maplist into at start-up (push at %08lx) is now 0x00200000 bytes (65,536 names) instead of 0x9600 (1,200): a maplist of any length is read whole%s",
+             SITE_MAPLIST_PUSH, fields_step0_late ? "; BUT the game has read its maplist already (00cff430 is set): too late for this run" : "");
+}
+
+/* With the feature off or refused: the maplist block back to the game's 0x9600 bytes (unless it holds more than
+   1,200 names) and the push back to the game's, so the game is as it was without this DLL. */
+static void fields_give_back(void)
+{
+    BYTE *block = *(BYTE **)ADDR_MAPLIST_BLOCK, *small;
+    DWORD count = *(const DWORD *)ADDR_MAPLIST_COUNT, i, old_protect;
+
+    if (!fields_step0_done)
+        return;
+    if (!fields_step0_late && block) {
+        if (count > MAPLIST_BLOCK_GAME / 32)
+            log_line("fields: the maplist has %lu names, more than the 1,200 the game's block holds: its 2 MB block is kept (the plain game would have overrun its heap)",
+                     count);
+        else if ((small = fields_game_alloc(MAPLIST_BLOCK_GAME)) == NULL)
+            log_line("fields: no memory for the game's 0x9600-byte maplist block: the 2 MB one is kept");
+        else {
+            for (i = 0; i < MAPLIST_BLOCK_GAME; i++)
+                small[i] = i < count * 32 ? block[i] : 0;
+            *(BYTE **)ADDR_MAPLIST_BLOCK = small;
+            fields_game_free(block);
+            log_line("fields: the maplist block is the game's size again (0x9600 bytes, %lu names)", count);
+        }
+    }
+    if (fields_bytes_are(SITE_MAPLIST_PUSH, fields_push_wide, 5) &&
+        VirtualProtect((void *)(SITE_MAPLIST_PUSH + 1), 4, PAGE_EXECUTE_READWRITE, &old_protect)) {
+        fields_code_dword(SITE_MAPLIST_PUSH + 1, MAPLIST_BLOCK_GAME);
+        VirtualProtect((void *)(SITE_MAPLIST_PUSH + 1), 4, old_protect, &old_protect);
+        FlushInstructionCache(GetCurrentProcess(), (void *)(SITE_MAPLIST_PUSH + 1), 4);
+        fields_step0_done = FALSE;
+        log_line("fields: the push at %08lx is the game's 0x9600 again", SITE_MAPLIST_PUSH);
+    }
+}
+
+/* The maplist block of fields_table names, made with the game's allocator from the block and count the game has
+   now; the old block is freed with the game's free. FALSE (and nothing changed) without memory. */
+static BOOL fields_make_maplist(void)
+{
+    BYTE *old = *(BYTE **)ADDR_MAPLIST_BLOCK, *block = fields_game_alloc(fields_table * 32);
+    DWORD count = *(const DWORD *)ADDR_MAPLIST_COUNT;
+
+    if (!block)
+        return FALSE;
+    if (count > fields_table) {
+        log_line("fields: the maplist has %lu names, more than the %lu ids of the DLL's tables: the names past id %lu are dropped",
+                 count, fields_table, fields_table - 1);
+        count = fields_table;
+    }
+    fields_fill_maplist(block, fields_table, old, count);
+    *(BYTE **)ADDR_MAPLIST_BLOCK = block;
+    *(DWORD *)ADDR_MAPLIST_COUNT = fields_table;
+    if (old)
+        fields_game_free(old);
+    fields_block = block;
+    fields_count = fields_table;
+    return TRUE;
+}
+
+/* At the first kernel load (the game's maplist and info table exist: init_game made them before the kernel
+   load). Says in the log what it did. */
+static void fields_install(void)
+{
+    static LONG done;
+    DWORD game_count = *(const DWORD *)ADDR_MAPLIST_COUNT, size = 0, low = 0xffff, high = 0, protect_a, protect_b;
+    const BYTE *game_block = *(BYTE *const *)ADDR_MAPLIST_BLOCK;
+    char *text;
+    int problems = 0, e, k;
+    BYTE *infos = NULL, *code_a = (BYTE *)fields_info_sites[0].at;
+    DWORD *scales = NULL;
+    DWORD code_a_length = fields_info_sites[11].at + fields_info_sites[11].length - fields_info_sites[0].at;
+
+    if (InterlockedExchange(&done, 1))
+        return;
+    fields_taken = TRUE;
+    lstrcpyA(fields_file_taken, fields_file_asked);
+    fields_table_taken = fields_table_asked;
+    fields_buffer_taken = fields_buffer_asked;
+    fields_game_count = game_count;
+    log_line("fields: the game read %lu field names from its maplist at start-up (block %08lx); the block's size was %s",
+             game_count, (DWORD)game_block, fields_step0_done && !fields_step0_late ? "this DLL's 2 MB" : "the game's 0x9600 (1,200 names)");
+    if (game_count > MAPLIST_BLOCK_GAME / 32 && !(fields_step0_done && !fields_step0_late))
+        log_line("fields: maplist count %lu exceeds the stock block of 1,200 names: the game's heap was overrun at start-up", game_count);
+    if (!fields_file_taken[0]) {
+        log_line("fields: off (no fields_file in the game file): the game keeps its own field tables");
+        fields_give_back();
+        return;
+    }
+    text = read_whole_file(fields_file_taken, &size);
+    if (!text) {
+        log_line("fields: off: the fields file %s%s was not found", config_dir, fields_file_taken);
+        fields_give_back();
+        return;
+    }
+    if (!game_block || !game_count) {
+        VirtualFree(text, 0, MEM_RELEASE);
+        log_line("fields: off: the game has no maplist (block %08lx, %lu names)", (DWORD)game_block, game_count);
+        fields_give_back();
+        return;
+    }
+    fields_read_registry(text, size, game_block, game_count, fields_table_taken, &problems);
+    VirtualFree(text, 0, MEM_RELEASE);
+    if (!fields_entry_count) {
+        log_line("fields: off: %s registers no field (%d line(s) with problems)", fields_file_taken, problems);
+        fields_give_back();
+        return;
+    }
+    /* all 13 sites, before anything is written */
+    for (k = 0; k < 13; k++) {
+        DWORD at = k < 12 ? fields_info_sites[k].at : SITE_FIELD_SCALE;
+
+        if (IsBadReadPtr((const void *)at, 8) ||
+            !fields_bytes_are(at, k < 12 ? fields_info_sites[k].bytes : fields_scale_bytes, k < 12 ? fields_info_sites[k].length : 8)) {
+            log_line("fields: REFUSED at %08lx (the game's code there is not as the exe has it: another mod's patch?): nothing moved; the game keeps its 1,200 field ids and the registry is not used",
+                     at);
+            fields_give_back();
+            return;
+        }
+    }
+    fields_table = fields_table_size(fields_table_taken, game_count);
+    infos = VirtualAlloc(NULL, fields_infos_bytes(fields_table), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    scales = VirtualAlloc(NULL, fields_table * 4, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!infos || !scales) {
+        log_line("fields: REFUSED: no memory for tables of %lu field ids: nothing moved", fields_table);
+        if (infos)
+            VirtualFree(infos, 0, MEM_RELEASE);
+        if (scales)
+            VirtualFree(scales, 0, MEM_RELEASE);
+        fields_give_back();
+        return;
+    }
+    fields_fill_infos(infos, fields_table, (const BYTE *)ADDR_FIELD_INFOS, fields_buffer_taken);
+    fields_fill_scales(scales, fields_table, (const DWORD *)ADDR_FIELD_SCALES);
+    if (!VirtualProtect(code_a, code_a_length, PAGE_EXECUTE_READWRITE, &protect_a)) {
+        log_line("fields: REFUSED: the code at %08lx could not be made writable (error %lu): nothing moved", (DWORD)code_a, GetLastError());
+        VirtualFree(infos, 0, MEM_RELEASE);
+        VirtualFree(scales, 0, MEM_RELEASE);
+        fields_give_back();
+        return;
+    }
+    if (!VirtualProtect((void *)(SITE_FIELD_SCALE + 4), 4, PAGE_EXECUTE_READWRITE, &protect_b)) {
+        log_line("fields: REFUSED: the code at %08lx could not be made writable (error %lu): nothing moved", SITE_FIELD_SCALE + 4, GetLastError());
+        VirtualProtect(code_a, code_a_length, protect_a, &protect_a);
+        VirtualFree(infos, 0, MEM_RELEASE);
+        VirtualFree(scales, 0, MEM_RELEASE);
+        fields_give_back();
+        return;
+    }
+    if (!fields_make_maplist()) {
+        log_line("fields: REFUSED: no memory for a maplist of %lu names: nothing moved", fields_table);
+        VirtualProtect(code_a, code_a_length, protect_a, &protect_a);
+        VirtualProtect((void *)(SITE_FIELD_SCALE + 4), 4, protect_b, &protect_b);
+        VirtualFree(infos, 0, MEM_RELEASE);
+        VirtualFree(scales, 0, MEM_RELEASE);
+        fields_give_back();
+        return;
+    }
+    for (k = 0; k < 12; k++) {
+        DWORD operand = fields_info_sites[k].at + fields_info_sites[k].operand;
+
+        fields_code_dword(operand, (DWORD)infos + (*(const DWORD *)operand - ADDR_FIELD_INFOS));
+    }
+    fields_code_dword(SITE_FIELD_SCALE + 4, (DWORD)scales);
+    VirtualProtect(code_a, code_a_length, protect_a, &protect_a);
+    VirtualProtect((void *)(SITE_FIELD_SCALE + 4), 4, protect_b, &protect_b);
+    FlushInstructionCache(GetCurrentProcess(), code_a, code_a_length);
+    FlushInstructionCache(GetCurrentProcess(), (void *)(SITE_FIELD_SCALE + 4), 4);
+    fields_infos = infos;
+    fields_scales = scales;
+    fields_live = TRUE;
+    for (e = 0; e < fields_entry_count; e++) {
+        if (fields_entries[e].id < low)
+            low = fields_entries[e].id;
+        if (fields_entries[e].id > high)
+            high = fields_entries[e].id;
+    }
+    log_line("fields: ON: %d field(s) registered in %s (ids %lu to %lu; %d line(s) with problems); the maplist now holds %lu names (the game's %lu, the registered, and the placeholder sx_none for the %lu other ids), the field info table %lu records (%08lx), the scale table %lu entries (%08lx); 13 operands moved (12 in FUN_0060dad4, 1 at %08lx); a registered field gets a %lu-byte file buffer",
+             fields_entry_count, fields_file_taken, low, high, problems, fields_count, game_count,
+             fields_table - game_count - (DWORD)fields_entry_count, fields_table, (DWORD)infos, fields_table, (DWORD)scales,
+             SITE_FIELD_SCALE + 4, fields_buffer_taken);
+}
+
+/* The maplist block changed under the DLL (nothing in the game reloads it after start-up: this should never be):
+   made again. */
+static void fields_guard(void)
+{
+    BYTE *block = *(BYTE **)ADDR_MAPLIST_BLOCK;
+    DWORD count = *(const DWORD *)ADDR_MAPLIST_COUNT;
+
+    if (block == fields_block && count == fields_count)
+        return;
+    if (!fields_guard_said) {
+        fields_guard_said = TRUE;
+        log_line("fields: maplist block changed under this DLL (now %08lx with %lu names; this DLL's was %08lx with %lu): made again with the registered names",
+                 (DWORD)block, count, (DWORD)fields_block, fields_count);
+    }
+    if (!block || !fields_make_maplist())
+        log_line("fields: the maplist could not be made again (block %08lx, %lu names)", (DWORD)block, count);
+}
+
+/* The last part of the reader's path ("...\<name>\<name>"). */
+static const char *fields_last_part(const char *path)
+{
+    const char *part = path;
+
+    for (; *path; path++)
+        if (*path == '\\' || *path == '/')
+            part = path + 1;
+    return part;
+}
+
+/* From the field reader's hook (0060ba9f), before the reader, for a field read afresh: 1 = do not read it (the id
+   is past the DLL's tables, or has the placeholder's name: nobody registered it); the hook then answers 0, as a
+   reader does for a missing file. */
+static int fields_before_read(const char *name)
+{
+    DWORD id = *(const WORD *)ADDR_FIELD_MODULE_ID;
+
+    if (!fields_live)
+        return 0;
+    fields_guard();
+    if (id >= fields_count) {
+        log_line("field %lu is past the field tables (%lu ids): not read; the game goes on as it does for a missing field file",
+                 id, fields_count);
+        return 1;
+    }
+    if (name && fields_same_name(fields_last_part(name), FIELDS_PLACEHOLDER)) {
+        log_line("field %lu is not registered (its name is the placeholder sx_none): not read; the game goes on as it does for a missing field file",
+                 id);
+        return 1;
+    }
+    return 0;
+}
+
+/* After the reader, for a field read afresh: a registered field's line. */
+static void fields_after_read(const char *name, int result)
+{
+    DWORD id = *(const WORD *)ADDR_FIELD_MODULE_ID;
+    const char *part = name ? fields_last_part(name) : "?";
+
+    if (!fields_live || !fields_is_registered(id))
+        return;
+    if (result)
+        log_line("field %lu = %.31s (registered): read; its file buffer is %lu bytes (00cff598, from the DLL's record %08lx)", id,
+                 part, *(const DWORD *)ADDR_FIELD_BUFFER_ROOM, (DWORD)fields_infos + id * FIELD_INFO_SIZE);
+    else
+        log_line("field %lu %.31s: no file (the reader found no whole field file of that name: a registered field must ship one, chunk files alone are not read)",
+                 id, part);
+}
+/* ==== FIELD CAPACITY END ==== */
+
 
 /* The names in char.lgp (20 bytes each in entries of 27), read once: to tell whether a
    field_model is one of the game's own skeletons. */
@@ -14385,10 +19224,15 @@ static void field_add_seats(const char *name)
 static int __cdecl field_read_hook(const char *name)
 {
     BOOL resumed = *(const DWORD *)ADDR_FIELD_RESUMING != 0;    /* before the call, as the reader sees it */
-    int result = ((int (__cdecl *)(const char *))field_read_next)(name);
+    int result;
 
+    if (!resumed && fields_before_read(name))       /* (field capacity) an id nobody registered: not read */
+        return 0;
+    result = ((int (__cdecl *)(const char *))field_read_next)(name);
+    if (!resumed)
+        fields_after_read(name, result);            /* (field capacity) a registered field's line; nothing with the feature off */
     /* back from a battle or a menu nothing was read: the file is as it was left here, and nothing is done or said */
-    if (result && !resumed && field_entities_mode && new_characters_live)
+    if (result && !resumed && field_entities_hooked && field_entities_mode && new_characters_live)
         field_add_seats(name ? name : "?");
     return result;
 }
@@ -14941,7 +19785,7 @@ static void install_field_entities(void)
     const BYTE *code = (const BYTE *)(SITE_FIELD_READ - 5);     /* the push, the call, what follows it */
     int i;
 
-    if (code[5] == 0xe8 && SITE_FIELD_READ + 5 + *(const DWORD *)(code + 6) == (DWORD)field_read_hook)
+    if (field_entities_hooked)      /* (field capacity: the call may go to the hook for the field capacity alone) */
         return;
     for (i = 0; i < 5; i++)
         if (code[i] != before[i] || code[i + 10] != after[i]) {
@@ -14959,10 +19803,35 @@ static void install_field_entities(void)
         log_line("field entities for the seats: NOT on, as the field command JOIN is not guarded (a seat's bare entity would make it wait for ever)");
         return;
     }
+    field_entities_hooked = patch_call_chained(SITE_FIELD_READ, FN_FIELD_READ, field_read_hook, &field_read_next);
     log_line("field entities for the seats (field_entities in the game file; now %s): %s",
              field_entities_mode == 2 ? "seats" : field_entities_mode == 1 ? "party" : "off",
-             patch_call_chained(SITE_FIELD_READ, FN_FIELD_READ, field_read_hook, &field_read_next)
-                 ? "added as a field is read, after the game's reader or the driver's" : "NOT on");
+             field_entities_hooked ? "added as a field is read, after the game's reader or the driver's" : "NOT on");
+}
+
+/* (field capacity) At the first kernel load, after install_hooks: the tables (fields_install), then, with them
+   the DLL's, the field reader's call (the same site and checks as the seats' entities: chained). */
+static void fields_start(void)
+{
+    static const BYTE before[5] = { 0x68, 0xf0, 0x1e, 0xcc, 0x00 };     /* push 00cc1ef0: the field's name */
+    static const BYTE after[5] = { 0x83, 0xc4, 0x04, 0x85, 0xc0 };      /* add esp, 4 / test eax, eax */
+    const BYTE *code = (const BYTE *)(SITE_FIELD_READ - 5);
+    static BOOL said;
+    BOOL hooked;
+
+    fields_install();
+    if (!fields_live || said)
+        return;
+    said = TRUE;
+    if (code[5] == 0xe8 && SITE_FIELD_READ + 5 + *(const DWORD *)(code + 6) == (DWORD)field_read_hook)
+        hooked = TRUE;
+    else if (!fields_bytes_are(SITE_FIELD_READ - 5, before, 5) || !fields_bytes_are(SITE_FIELD_READ + 5, after, 5))
+        hooked = FALSE;
+    else
+        hooked = patch_call_chained(SITE_FIELD_READ, FN_FIELD_READ, field_read_hook, &field_read_next);
+    log_line("fields: the field reader's call at %08lx %s", SITE_FIELD_READ,
+             hooked ? "goes through this DLL (chained): a registered field is logged as it is read, an id nobody registered is not read"
+                    : "is NOT the game's (push 00cc1ef0 / call / add esp,4 / test eax,eax): not hooked; the tables are the DLL's all the same, an id nobody registered then reaches the reader with the name sx_none");
 }
 
 /* ---- New characters in a shop ----
@@ -18421,6 +23290,7 @@ static void __cdecl battle_start_party_hook(void)
     forget_followup_scripts();
     effect_swap_off();          /* a swap left from the last battle's last limit */
     effect_copies_battle_start();   /* effect copies: nothing of the last battle's loads is known */
+    native_battle_start();          /* native effects: no group handle or task is carried over */
     prop_battle_start();        /* props: no group handle, armed prop or task is carried over */
     state_battle_start();       /* states: nobody is in one when a battle starts */
     pause_battle_start();
@@ -30514,6 +35384,99 @@ static void load_shop_file(void)
     log_line("shop file: %d addition(s), %d line(s) with problems", shop_add_count - before, problems);
 }
 
+/* ---- Game settings: test_battle (a testing aid) -----------------------------------------
+   Every battle the game starts becomes the one named, until the line is removed. FUN_00408243,
+   called only from the swirl's mode (0x17) in the main loop when the swirl hands over to the
+   battle, is the one place that writes the battle number for the battle module (00db9588, a
+   16-bit word): from the field's word 00cc0d8a (random encounters and the BATTLE opcode) or, from
+   the world map, the low half of 00cc0d80. The battle module copies it when it starts
+   (FUN_0041b577: 009aad3c), hands it to the scene loader and keeps it as the formation number
+   (009ab0c8: its & 3 picks the formation's AI scripts), and the camera and facing code compare it
+   with 0x3d6. So the number is changed there, after the game wrote it, by chaining behind the
+   routine's last call (sound operation 0xf5 at 004082b5, after the copy), and everything after
+   sees the same battle. A battle the test battle's own scene chains to (009aad3c from 009a8752,
+   battle module mode 0xf) is not touched. Changing it in load_scene_hook instead would leave
+   009ab0c8 on the old number: the wrong formation's AI scripts.
+   What follows the new battle (it comes from its scene): enemies, formation, arena (009a8750),
+   battle kind (009a8762: pre-emptive, back, side, pincer), the scene's escape flag (009a8760).
+   What stays with the battle the game chose: the music (picked by the field or world map before
+   the swirl; FFNx's bat_N music reads 00cc0d8a), and the field's battle flags (00db958a, from
+   BTLMD: a script battle that may not be escaped or lost stays so). */
+/* TEST BATTLE PURE BEGIN */
+#define TEST_BATTLE_OFF         (-1)
+#define TEST_BATTLE_LAST        1023    /* the field and the world map keep the number in 10 bits: 256 scenes of 4 formations */
+
+/* test_battle's value: off / no / 0 (off), a battle number 1 to 1023 (decimal or 0x), or
+   scene:formation (scene 0 to 255, formation 0 to 3; 0:0 is battle 0). FALSE on a mistake. */
+static BOOL test_battle_value(char *value, char *stop, LONG *out)
+{
+    char *p = value;
+    DWORD first, formation;
+
+    if (word_is(value, stop, "off") || word_is(value, stop, "no")) {
+        *out = TEST_BATTLE_OFF;
+        return TRUE;
+    }
+    if (!parse_number(&p, stop, &first))
+        return FALSE;
+    if (p == stop) {
+        if (first > TEST_BATTLE_LAST)
+            return FALSE;
+        *out = first ? (LONG)first : TEST_BATTLE_OFF;
+        return TRUE;
+    }
+    if (*p != ':')
+        return FALSE;
+    p++;
+    if (!parse_number(&p, stop, &formation) || p != stop || first > 255 || formation > 3)
+        return FALSE;
+    *out = (LONG)(first * 4 + formation);
+    return TRUE;
+}
+/* TEST BATTLE PURE END */
+
+#define SITE_BATTLE_NUMBER_SET  0x004082b5u  /* e8 c6 8a 33 00: call FUN_00740d80 (sound operation 0xf5), the routine's last call */
+#define FN_SOUND_OPERATION      0x00740d80u  /* cdecl, nine arguments pushed (add esp, 0x24 after) */
+#define ADDR_BATTLE_NUMBER      0x00db9588u  /* WORD: the battle the battle module will start (written at 0040826e) */
+#define TEST_BATTLE_LOG_MAX     100
+static LONG test_battle = TEST_BATTLE_OFF, test_battle_logged, test_battle_hook;   /* hook: 0 not tried, 1 on, -1 refused */
+
+static int __cdecl battle_number_hook(int op, int a, int b, int c, int d, int e, int f, int g, int h)
+{
+    int result = ((int (__cdecl *)(int, int, int, int, int, int, int, int, int))FN_SOUND_OPERATION)(op, a, b, c, d, e, f, g, h);
+    LONG wanted = test_battle;
+    WORD *number = (WORD *)ADDR_BATTLE_NUMBER;
+
+    if (wanted >= 0) {
+        if (InterlockedIncrement(&test_battle_logged) <= TEST_BATTLE_LOG_MAX)
+            log_line("test_battle: battle %u (scene %u, formation %u) replaced by battle %ld (scene %ld, formation %ld)",
+                     *number, *number >> 2, *number & 3, wanted, wanted >> 2, wanted & 3);
+        *number = (WORD)wanted;
+    }
+    return result;
+}
+
+/* The call is patched the first time the key is on, never while it has always been off. */
+static void test_battle_settle(void)
+{
+    static LONG was_on;
+
+    if (test_battle < 0) {
+        if (InterlockedExchange(&was_on, 0))
+            log_line("test_battle off: battles are the game's own again");
+        return;
+    }
+    was_on = 1;
+    if (!test_battle_hook)
+        test_battle_hook = patch_call(SITE_BATTLE_NUMBER_SET, FN_SOUND_OPERATION, battle_number_hook) ? 1 : -1;
+    if (test_battle_hook > 0)
+        log_line("TESTING AID on: test_battle = %ld (scene %ld, formation %ld): every battle started from now is this one; remove the line when done",
+                 test_battle, test_battle >> 2, test_battle & 3);
+    else
+        log_line("test_battle: NOT on: the call at %08lx is not the expected one (see the line above); battles are the game's own",
+                 (DWORD)SITE_BATTLE_NUMBER_SET);
+}
+
 static void load_game_settings(void)
 {
     char *text, *line, *end, *file_end;
@@ -30540,6 +35503,8 @@ static void load_game_settings(void)
     test_drop_count = test_drop_used = test_steal_count = test_steal_next = 0;
     test_stitm_count = test_stitm_next = 0;     /* (receive) */
     shop_add_count = 0;
+    test_battle = TEST_BATTLE_OFF;  /* (test_battle) off unless this reading names a battle */
+    fields_keys_begin();            /* (field capacity) fields_file, fields_table_size, field_buffer_bytes: their defaults */
     text = read_whole_file(GAME_FILE_NAME, &size);
     if (text) {
         file_end = text + size;
@@ -30636,6 +35601,13 @@ static void load_game_settings(void)
                     shop_adds[shop_add_count].materia = (BYTE)materia;
                     shop_adds[shop_add_count++].id = (WORD)id;
                 }
+            } else if (word_is(start, key_end, "test_battle")) {
+                /* TESTING AID: every battle becomes this one (see test_battle_settle); a line with a mistake leaves it off */
+                if (!test_battle_value(value, stop, &test_battle)) {
+                    test_battle = TEST_BATTLE_OFF;
+                    log_line("game file line %d: test_battle takes a battle number 1 to 1023 (like 16), or scene:formation (like 4:0; scene 0 to 255, formation 0 to 3), or off: the line gives nothing", line_number);
+                    problems++;
+                }
             } else if (word_is(start, key_end, "seats")) {
                 /* read once: the seats are made when the game starts */
                 if (!parse_number(&p, stop, &n) || p != stop || (n != 2 && n != 4)) {
@@ -30690,6 +35662,11 @@ static void load_game_settings(void)
                     log_line("game file line %d: %s", line_number, box_fault);
                     problems++;
                 }
+            } else if ((box_answer = fields_key_line(start, key_end, value, stop, &box_fault)) != 0) {   /* (field capacity) fields_file, fields_table_size, field_buffer_bytes */
+                if (box_answer < 0) {
+                    log_line("game file line %d: %s", line_number, box_fault);
+                    problems++;
+                }
             } else if (word_is(start, key_end, "debug")) {
                 if (word_is(value, stop, "true") || word_is(value, stop, "yes"))
                     debug_menu = TRUE;
@@ -30719,6 +35696,8 @@ static void load_game_settings(void)
     }
     wide_items_settle();
     box_keys_settle();              /* (the box) */
+    fields_keys_settle();           /* (field capacity) built once at start-up: a later change is said, not taken */
+    test_battle_settle();           /* (test_battle) */
     {
         static LONG fixed_hooked;
 
@@ -30799,18 +35778,153 @@ static void load_game_settings(void)
        ff
        [variant 0 1 2 focus]
        ...
-   All three variants of both scripts must be given. */
+   All three variants of both scripts must be given.
+
+   Camera stage 0 (FF7FF8Fusion/Notes/Camera_Stage0_Roll.md): a camera may also have one [roll] section (it turns
+   the arena about the world's Z axis: a camera roll when the shot looks along that axis), a channel beside the two scripts (the game's interpreters have no free command for it, and FFNx simulates
+   their bytes, so it is not put into them):
+       [roll]
+       at 0 roll 0
+       at 10 roll 1024 over 24 ease    ; from frame 10, a quarter turn (4096ths of a turn) in 24 frames, eased
+       at 50 roll 0 over 16            ; back level, linear
+   Its frames are a NATIVE effect's (the effect player's clock, frame 0 = the effect's first): the roll plays
+   while a native effect runs under this camera (camera_roll_step, from native_task) and nowhere else. A text
+   without [roll] reads exactly as before. CAMERA TEXT PURE BEGIN/END: the native test compiles this part.
+
+   Camera stage 1 (FF7FF8Fusion/Notes/Camera_Stage1_Keyframes.md): a camera may instead be FF8's kind, played by
+   this DLL rather than by the game's interpreters:
+       camera = 199
+       engine = ff8                    ; no [variant] scripts: they are made (e1 ff: the battle's home view, idle)
+       unit_scale = 1.0                ; FF8 units -> FF7 units, 0.001 to 16 (default 1.0)
+       select = 0.0                    ; the chain played: animation 0-15 . variant 0-7
+       [anim 0 variant 0]              ; one segment; another heading of the same chain is its next segment
+       snap                            ; FF8's header bit 0: the keys resolved once, when the segment starts
+       H 512 > 352                     ; FF8's zoom (camera stage 2 plays it: zoom = below)
+       roll 0 > 0                      ; FF8's roll of the segment (camera stage 2 plays it, exact)
+       ease 0                          ; FF8's ease count, -16 to 15 (FUN_00503fe0)
+       key 7 eye camera 0 0 0 target focus 0 0 0
+       key 1 eye frame1 -976 -130 8188 target frame1 14 56 81
+   A key: its frames, then the eye and the point looked at, each a reference and an offset in FF8 units: camera /
+   focus (the eye / point this player gave last, exactly: FF8's 0xf3 / 0xf4 ignore the offset), world (0xf1), frame0-frame4 (FF8's effect
+   frames 0xf2, 0xf5-0xf8: the origin halfway from the caster to the target(s), z towards the target(s), the offset
+   turned into it; frame0 in FF8 units, frames 1-4 scaled by the distance / 5000; frame0 on the floor, frames 1-4
+   between the body points since stage 2),
+   target / caster (the highest-numbered target's / the caster's place on the floor; the offset unturned) or target.bone N /
+   caster.bone N (a bone's place). unit_scale applies to every offset but those of frames 1-4, which follow the
+   distance. One or two keys a segment (two: FF8's
+   eased line from key 0 to key 1 over key 0's frames, then key 1 for its own). It plays on a native effect's
+   clock from its frame 0, from native_task (camera_ff8_step); a [roll] section plays beside it as before.
+
+   Camera stage 2 (FF7FF8Fusion/Notes/Camera_Stage2.md): up to 32 keys a segment (three or more: FF8's natural
+   cubic spline through them, every key but the last one frame at least; a segment 2047 frames at most); the H and
+   roll lines are played (roll: -32768 to 32767, FF8's s16); frames 1-4 run between the actors' body points; and
+   two more header keys:
+       zoom = fov                      ; FF8's H as the battle's H, the game's field of view (the default), dolly
+                                       ; (the eye moved), or none
+       blend = 12                      ; FF8's `04 N`: a sine blend back to the battle view over the effect's last
+                                       ; N frames (1-255), in place of the cut */
+/* CAMERA TEXT PURE BEGIN */
 #define CAMERA_FOLDER_NAME      "cameras"
-#define MAX_OWN_CAMERAS         64
+#define MAX_OWN_CAMERAS         128          /* (camera stage 3: 64 before; the converter's 53 FF8 spell cameras and the installed ones together) */
 #define CAMERA_POOL_BYTES       32768
 #define CAMERA_NUMBER_LIMIT     0x2000
+#define CAMERA_ROLL_LINES       32           /* camera stage 0: [roll] lines of one camera */
+#define CAMERA_ROLL_MAX         8192         /* a roll: 4096ths of a turn either way (two turns); FUN_00662ad8 takes any short */
+#define CAMERA_ROLL_FRAMES      NFX_LENGTH_MAX   /* `at` 0..479 and `over` 0..480: a roll is played on a native effect's clock */
+#define CAMERA_ROLL_EASE        0x01         /* eased in and out (smoothstep) rather than linear */
 
+struct camera_roll_line {
+    short at, over;                     /* its first frame (the effect's frames) and its glide (0: there at once) */
+    short to, start;                    /* where it goes, and from where: the roll the lines before give at `at` (read time) */
+    BYTE flags;                         /* CAMERA_ROLL_EASE */
+};
+/* camera stage 1: engine = ff8 cameras (FF8's camera animations: FUN_00503c70 reads a segment, FUN_005035e0 plays it) */
+#define CAMERA_ENGINE_FF8       1            /* own_camera.engine: played by this DLL (0: the game's scripts) */
+#define CAMERA_FF8_SEGMENTS     4096         /* segments of every engine = ff8 camera together (camera stage 3: 256 before; the
+                                                converter's 53 sequence cameras keep 2,415; chain_first / ff8_first are shorts) */
+#define CAMERA_FF8_CHAIN        16           /* segments in the chain played */
+#define CAMERA_FF8_KEYS         32           /* keys a segment: FF8's record holds 32 (key times at +0x24..+0x63); 3 or more: its spline (camera stage 2) */
+#define CAMERA_FF8_FRAMES       480          /* a key's frames at most */
+#define CAMERA_FF8_SEGMENT_FRAMES 2047       /* (camera stage 2) a segment's frames at most: FF8 counts 16 a frame in a short (FUN_00503c70, +0xe) */
+#define CAMERA_FF8_ZOOM_FOV     0            /* (camera stage 2) zoom = fov (the default): H played as the battle's H (00c05f7c), which the game makes the field of view */
+#define CAMERA_FF8_ZOOM_DOLLY   1            /* zoom = dolly: H played as the eye moved along the line of sight */
+#define CAMERA_FF8_ZOOM_NONE    2            /* zoom = none: H read and not played (stage 1's way) */
+#define CAMERA_FF8_H_HOME       512          /* FF8's H with no zoom (FUN_00500520's default): H plays as 512 / H of the game's own view */
+#define CAMERA_FF8_BLEND_MAX    255          /* (camera stage 2) blend = N: FF8's `04 N` takes a byte */
+#define CAMERA_FF8_SCALE_MAX    16000        /* unit_scale in thousandths: 0.001 to 16.000 */
+#define CAMERA_FF8_BONES        64           /* target.bone N / caster.bone N: 0-63 (an actor's last bone at most) */
+#define CAMERA_FF8_SNAP         0x01         /* FF8's header bit 0: the keys' places taken once, when the segment starts */
+#define CAMERA_FF8_HAS_H        0x02         /* an H line (FF8's zoom; stage 2) */
+#define CAMERA_FF8_HAS_ROLL     0x04         /* a roll line (FF8's roll; stage 2) */
+#define CAMERA_FF8_WORLD        0            /* references: FF8 0xf1 (and 0xfb): the offset is the place */
+#define CAMERA_FF8_CAMERA       1            /* 0xf3: the eye this player gave last (the key's offset ignored) */
+#define CAMERA_FF8_FOCUS        2            /* 0xf4: the point looked at it gave last (the key's offset ignored) */
+#define CAMERA_FF8_FRAME        3            /* 0xf2, 0xf5-0xf8: effect frame `bone` (0-4) */
+#define CAMERA_FF8_TARGET       4            /* 0xa0-0xaf: the target, bone `bone` */
+#define CAMERA_FF8_CASTER       5            /* 0x90-0x9f: the caster, bone `bone` */
+#define CAMERA_FF8_PLACE        0xff         /* bone of target / caster: the actor's place (FF8's bone nibble 0xf) */
+/* camera stage 3 (FF7FF8Fusion/Notes/Camera_Stage3.md): FF8's two other frames, the sequence and its chains */
+#define CAMERA_FF8_GROUP        6            /* 0xb0 (and every byte 0xb0-0xff FUN_0050d790 does not name): 01d99b70, a half
+                                                turn about y when no party member is among the targets, at the target point */
+#define CAMERA_FF8_EFFECT       7            /* 0xf9: 01d99ab0, the effect module's own frame (Death's object): the target's place here */
+#define CAMERA_FF8_EMPTY        0x08         /* (reading) an `empty` chain: FF8's lone ffff */
+#define CAMERA_FF8_SEQ_BYTES    2048         /* a [sequence] program's bytes (FF8's longest: 314) */
+#define CAMERA_FF8_SEQ_LABELS   256          /* its labels */
+#define CAMERA_FF8_SEQ_STEPS    4096         /* instructions one run may take (FF8 has no limit: a loop without `wait` hangs it) */
+#define CAMERA_FF8_SEQ_YIELD    1            /* camera_ff8_seq_run: `wait` (01), the program goes on next frame */
+#define CAMERA_FF8_SEQ_END      2            /* `end` (02): the program is over, the chain plays on */
+#define CAMERA_FF8_SEQ_HALT     3            /* 0a-bf: the program is over and every chain stops */
+#define CAMERA_FF8_SEQ_ERROR    4            /* what FF8 would crash or hang on (division by 0, a bad byte, the pc out) */
+
+struct camera_ff8_point {
+    BYTE ref, bone;                     /* CAMERA_FF8_WORLD.., and the bone (frame number for a frame) */
+    short at[3];                        /* the offset, FF8 units */
+};
+struct camera_ff8_key {
+    short frames;                       /* FF8's duration */
+    struct camera_ff8_point eye, look;
+};
+struct camera_ff8_segment {
+    BYTE keys, flags;                   /* 1 to CAMERA_FF8_KEYS; CAMERA_FF8_SNAP / _HAS_H / _HAS_ROLL */
+    signed char ease;                   /* FF8's header bits 1-5 */
+    short h[2], roll[2];                /* FF8's zoom and roll from start to end (camera stage 2 plays them) */
+    int frames;                         /* its length: the keys' frames together */
+    struct camera_ff8_key key[CAMERA_FF8_KEYS];
+};
 struct own_camera {
     int number;
     BYTE *script[6];                    /* variant * 2 + (0 position, 1 focus) */
     int length[6];
     char file[64];
+    int roll_count;                     /* camera stage 0: its [roll] lines; 0 = none, the camera as before */
+    struct camera_roll_line roll[CAMERA_ROLL_LINES];
+    BYTE engine;                        /* camera stage 1: CAMERA_ENGINE_FF8, or 0 (the game's scripts, as before) */
+    BYTE anim, variant;                 /* select = anim.variant: the chain played */
+    short unit_scale;                   /* thousandths */
+    short ff8_first, ff8_count;         /* its chain in camera_ff8_pool */
+    int ff8_frames;                     /* the chain's length */
+    BYTE zoom;                          /* (camera stage 2) CAMERA_FF8_ZOOM_FOV (default), _DOLLY, _NONE */
+    BYTE blend;                         /* (camera stage 2) blend = N: frames of FF8's sine blend back to the battle view (0: the cut) */
+    BYTE ff8_rolls;                     /* (camera stage 2) its chain has a roll other than 0 (the true roll's hook is needed) */
+    /* camera stage 3: select = sequence (FF8's program chooses the chain each cast) */
+    BYTE sequence;                      /* select = sequence: every chain kept, [sequence] played */
+    BYTE anims;                         /* FF8's animation count (the highest [anim A] + 1): a start of a higher one is ignored */
+    BYTE mode[2];                       /* camera_mode = A, B: FF8's two bytes var00 is drawn from (FUN_00500f70) */
+    short seq_at, seq_length;           /* the assembled program in camera_pool */
+    short chain_first[16][8];           /* chain A.V in camera_ff8_pool */
+    BYTE chain_count[16][8];            /* its segments (0: empty) */
 };
+static struct camera_ff8_segment camera_ff8_pool[CAMERA_FF8_SEGMENTS];
+static int camera_ff8_used;
+/* camera_ff8_scaled: an offset (a short) x unit_scale within an int; a lerp (b - a) x 4096 within an int; FF8's
+   time (16 a frame) of a segment within a short; the chain's frames within an int */
+typedef char camera_ff8_limits_check[32768LL * CAMERA_FF8_SCALE_MAX <= 0x7fffffffLL && 65536LL * 4096 <= 0x7fffffffLL &&
+                              CAMERA_FF8_SEGMENT_FRAMES * 16 < 32768 && CAMERA_FF8_KEYS == 32 &&
+                              CAMERA_FF8_CHAIN * CAMERA_FF8_SEGMENT_FRAMES < 0x7fff && CAMERA_FF8_SEGMENTS <= 0x7fff ? 1 : -1];
+/* the arithmetic below (camera_roll_glide): (to - from) x a frame and x 1024 within an int, a frame x 1024 too */
+typedef char camera_roll_check[CAMERA_ROLL_MAX * 2LL * CAMERA_ROLL_FRAMES <= 0x7fffffffLL && CAMERA_ROLL_MAX * 2LL * 1024 <= 0x7fffffffLL &&
+                               CAMERA_ROLL_FRAMES * 1024LL <= 0x7fffffffLL &&
+                               CAMERA_ROLL_FRAMES == 480 && CAMERA_ROLL_LINES == 32 && CAMERA_ROLL_MAX == 8192 ? 1 : -1];
 static struct own_camera own_cameras[MAX_OWN_CAMERAS];
 static int own_camera_count;
 static BYTE camera_pool[CAMERA_POOL_BYTES];
@@ -30866,19 +35980,1339 @@ static BOOL parse_signed(char *p, char *end, long *out)
     return TRUE;
 }
 
+/* (camera stage 0) a / b rounded to the nearest, halves away from 0 (b > 0) */
+static int camera_roll_div(int a, int b)
+{
+    return a >= 0 ? (a + b / 2) / b : -((-a + b / 2) / b);
+}
+
+/* A glide `t` frames into `over`, from `from` to `to`: linear, or eased in and out (3p^2 - 2p^3 with p in 1024ths,
+   unsigned 32-bit: at most 1024^3; never going back, as the polynomial does not on 0..1024). */
+static int camera_roll_glide(int from, int to, int t, int over, int flags)
+{
+    unsigned p;
+
+    if (over <= 0 || t >= over)
+        return to;
+    if (t <= 0)
+        return from;
+    if (!(flags & CAMERA_ROLL_EASE))
+        return from + camera_roll_div((to - from) * t, over);
+    p = (unsigned)camera_roll_div(t * 1024, over);
+    p = (p * p * (3 * 1024 - 2 * p) + (1u << 19)) >> 20;
+    return from + camera_roll_div((to - from) * (int)p, 1024);
+}
+
+/* The roll the lines give at `frame`, relative to the game's own value: 0 before the first line; then the last
+   line begun, from where the lines before it had left the roll at its first frame. */
+static int camera_roll_at(const struct camera_roll_line *r, int count, int frame)
+{
+    int k = -1, i;
+
+    for (i = 0; i < count && r[i].at <= frame; i++)
+        k = i;
+    return k < 0 ? 0 : camera_roll_glide(r[k].start, r[k].to, frame - r[k].at, r[k].over, r[k].flags);
+}
+
+/* The frame from which the roll no longer changes (the end of its last glide); 0 with no lines. */
+static int camera_roll_settles(const struct camera_roll_line *r, int count)
+{
+    int i, last = 0;
+
+    for (i = 0; i < count; i++)
+        if (r[i].at + r[i].over > last)
+            last = r[i].at + r[i].over;
+    return last;
+}
+
+/* Is the running camera's own (scripted) view what the game draws this frame? FUN_005c20ce, after the fixed-camera
+   case (which keeps a roll from starting, camera_roll_step): with 00bf2e04 == 'd' (005c2105) it shows the running
+   camera's variant (FUN_005c2350(00c05f78)); otherwise, with the battle menu in target selection (0091ef9c == 0,
+   005c214f, a short) and time not stopped (00bfb2ec == 0, 005c215a, a byte: the summon task's), it glides to the
+   formation's home view (FUN_005c22a9) whatever the camera, so the roll must not be drawn on it. The later branches
+   (camera -1 / -2, 00bf2128 == 1: the list of 100 empty) do not arise for a roll camera while the effect's task is in
+   that list. */
+static int camera_roll_scripted_shown(int result_x4, int menu_state, int time_stop)
+{
+    return result_x4 == 'd' || menu_state != 0 || time_stop != 0;
+}
+
+/* One line of a [roll] section, [p, stop): at FRAME roll ANGLE [over FRAMES] [ease]. NULL or what is wrong. */
+static const char *camera_roll_line(struct own_camera *camera, char *p, char *stop)
+{
+    static const char shape[] = "a roll line looks like: at FRAME roll ANGLE [over FRAMES] [ease]";
+    struct camera_roll_line *line;
+    char *word_end;
+    long at, to, over = 0;
+    int ease = 0, over_given = 0;
+
+    if (!(word_end = next_word(&p, stop)) || !word_is(p, word_end, "at"))
+        return shape;
+    p = word_end;
+    if (!(word_end = next_word(&p, stop)) || !parse_signed(p, word_end, &at))
+        return shape;
+    if (at < 0 || at >= CAMERA_ROLL_FRAMES)
+        return "at: the frame is 0 to 479 (a native effect's frames, 0 = its first)";
+    p = word_end;
+    if (!(word_end = next_word(&p, stop)) || !word_is(p, word_end, "roll"))
+        return shape;
+    p = word_end;
+    if (!(word_end = next_word(&p, stop)) || !parse_signed(p, word_end, &to))
+        return shape;
+    if (to < -CAMERA_ROLL_MAX || to > CAMERA_ROLL_MAX)
+        return "roll: the angle is -8192 to 8192 (4096ths of a turn: 1024 a quarter, 2048 a half)";
+    for (p = word_end; (word_end = next_word(&p, stop)) != NULL; p = word_end) {
+        if (word_is(p, word_end, "over") && !over_given) {
+            over_given = 1;
+            p = word_end;
+            if (!(word_end = next_word(&p, stop)) || !parse_signed(p, word_end, &over))
+                return "over is followed by the glide's frames";
+            if (over < 0 || over > CAMERA_ROLL_FRAMES)
+                return "over: the glide is 0 to 480 frames";
+        } else if (word_is(p, word_end, "ease") && !ease)
+            ease = 1;
+        else
+            return shape;
+    }
+    if (ease && !over)
+        return "ease needs over FRAMES (a glide to ease)";
+    if (camera->roll_count == CAMERA_ROLL_LINES)
+        return "more than 32 roll lines";
+    if (camera->roll_count && at < camera->roll[camera->roll_count - 1].at)
+        return "roll lines go in the order of their frames (at)";
+    line = &camera->roll[camera->roll_count];
+    line->at = (short)at;
+    line->over = (short)over;
+    line->to = (short)to;
+    line->flags = ease ? CAMERA_ROLL_EASE : 0;
+    line->start = (short)camera_roll_at(camera->roll, camera->roll_count, (int)at);
+    camera->roll_count++;
+    return NULL;
+}
+
+/* ---- camera stage 1: engine = ff8 (reading) ---- */
+
+/* A number of an ff8 line: decimal or 0x, an optional sign (+ too), within a short. */
+static BOOL camera_ff8_number(char *p, char *end, long *out)
+{
+    if (p < end && *p == '+')
+        p++;
+    return parse_signed(p, end, out) && *out >= -32768 && *out <= 32767;
+}
+
+/* unit_scale = N[.ddd]: thousandths, 1 to CAMERA_FF8_SCALE_MAX; -1 if it is not that. */
+static int camera_ff8_scale(const char *p, const char *end)
+{
+    int whole = 0, part = 0, digits = 0, places = 0;
+
+    for (; p < end && *p >= '0' && *p <= '9'; p++, digits++)
+        if ((whole = whole * 10 + (*p - '0')) > CAMERA_FF8_SCALE_MAX / 1000)
+            return -1;
+    if (p < end && *p == '.') {
+        for (p++; p < end && *p >= '0' && *p <= '9'; p++, places++) {
+            if (places < 3)
+                part = part * 10 + (*p - '0');
+            else if (*p != '0')
+                return -1;              /* more than three places that matter */
+        }
+    }
+    if (p != end || (!digits && !places))
+        return -1;
+    for (; places < 3; places++)
+        part *= 10;
+    whole = whole * 1000 + part;
+    return whole >= 1 && whole <= CAMERA_FF8_SCALE_MAX ? whole : -1;
+}
+
+/* A reference of a key, [p, stop) at *p: camera, focus, world, frame0-frame4, target, caster, target.bone N,
+   caster.bone N. Moves *p past it; NULL or what is wrong. */
+static const char *camera_ff8_ref(char **p, char *stop, struct camera_ff8_point *point)
+{
+    char *word_end = next_word(p, stop);
+    long n;
+
+    if (!word_end)
+        return "a key looks like: key FRAMES eye REF X Y Z target REF X Y Z";
+    point->bone = CAMERA_FF8_PLACE;
+    if (**p == '#') {
+        /* (camera stage 3) #hhhh: a reference word as FF8 stores it; FF8 reads its low byte only (FUN_00503ae0's
+           char, FUN_0050d790): Water's 74 words 5ef7 are frame3 */
+        char *q;
+        int code = 0, digits = 0;
+
+        for (q = *p + 1; q < word_end && hex_digit(*q) >= 0 && digits < 4; q++, digits++)
+            code = code * 16 + hex_digit(*q);
+        if (!digits || q != word_end)
+            return "#hhhh is a reference word of one to four hex digits (FF8 reads its low byte)";
+        code &= 0xff;
+        if (code == 0xf1 || code == 0xfb)
+            point->ref = CAMERA_FF8_WORLD;
+        else if (code == 0xf2 || (code >= 0xf5 && code <= 0xf8)) {
+            point->ref = CAMERA_FF8_FRAME;
+            point->bone = (BYTE)(code == 0xf2 ? 0 : code - 0xf4);
+        } else if (code == 0xf3 || code == 0xf4)
+            point->ref = code == 0xf3 ? CAMERA_FF8_CAMERA : CAMERA_FF8_FOCUS;
+        else if (code == 0xf9)
+            point->ref = CAMERA_FF8_EFFECT;
+        else if (code >= 0x90 && code <= 0xaf) {
+            point->ref = code >= 0xa0 ? CAMERA_FF8_TARGET : CAMERA_FF8_CASTER;
+            point->bone = (code & 15) == 15 ? CAMERA_FF8_PLACE : (BYTE)(code & 15);
+        } else if (code < 0x90)
+            return "#hhhh: FF8's entity slots (low byte 00-8f) are not played; caster, target, group and the frames are";
+        else
+            point->ref = CAMERA_FF8_GROUP;
+        *p = word_end;
+        return NULL;
+    }
+    if (word_is(*p, word_end, "group"))
+        point->ref = CAMERA_FF8_GROUP;  /* (camera stage 3) */
+    else if (word_is(*p, word_end, "effect"))
+        point->ref = CAMERA_FF8_EFFECT; /* (camera stage 3) */
+    else if (word_is(*p, word_end, "camera"))
+        point->ref = CAMERA_FF8_CAMERA;
+    else if (word_is(*p, word_end, "focus"))
+        point->ref = CAMERA_FF8_FOCUS;
+    else if (word_is(*p, word_end, "world"))
+        point->ref = CAMERA_FF8_WORLD;
+    else if (word_end - *p == 6 && word_is(*p, *p + 5, "frame") && (*p)[5] >= '0' && (*p)[5] <= '4') {
+        point->ref = CAMERA_FF8_FRAME;
+        point->bone = (BYTE)((*p)[5] - '0');
+    } else if (word_is(*p, word_end, "target") || word_is(*p, word_end, "caster"))
+        point->ref = (**p | 0x20) == 't' ? CAMERA_FF8_TARGET : CAMERA_FF8_CASTER;
+    else if (word_is(*p, word_end, "target.bone") || word_is(*p, word_end, "caster.bone")) {
+        point->ref = (**p | 0x20) == 't' ? CAMERA_FF8_TARGET : CAMERA_FF8_CASTER;
+        *p = word_end;
+        if (!(word_end = next_word(p, stop)) || !parse_signed(*p, word_end, &n) || n < 0 || n >= CAMERA_FF8_BONES)
+            return "target.bone and caster.bone are followed by the bone, 0 to 63";
+        point->bone = (BYTE)n;
+    } else
+        return "a reference is camera, focus, world, frame0 to frame4, target, caster, target.bone N, caster.bone N, group, effect or #hhhh";
+    *p = word_end;
+    return NULL;
+}
+
+/* One line of an [anim A variant V] segment, [p, stop): snap, H A [> B], roll A [> B], ease N, or a key line.
+   NULL or what is wrong. */
+static const char *camera_ff8_line(struct camera_ff8_segment *s, char *p, char *stop)
+{
+    static const char key_shape[] = "a key looks like: key FRAMES eye REF X Y Z target REF X Y Z";
+    char *word_end = next_word(&p, stop), *first = p;
+    long a, b;
+    int i, k;
+
+    if (!word_end)
+        return NULL;
+    p = word_end;
+    if (s->flags & CAMERA_FF8_EMPTY)
+        return "an empty chain has no other lines";
+    if (word_is(first, word_end, "empty")) {
+        /* (camera stage 3) a chain that is FF8's lone ffff: starting it shows nothing */
+        if (s->keys || s->flags || s->ease)
+            return "empty stands alone in its [anim A variant V] section";
+        if (next_word(&p, stop))
+            return "empty stands alone on its line";
+        s->flags = CAMERA_FF8_EMPTY;
+        return NULL;
+    }
+    if (word_is(first, word_end, "snap")) {
+        if (s->flags & CAMERA_FF8_SNAP)
+            return "snap is given twice in this segment";
+        if (next_word(&p, stop))
+            return "snap stands alone on its line";
+        s->flags |= CAMERA_FF8_SNAP;
+        return NULL;
+    }
+    if (word_is(first, word_end, "ease")) {
+        if (!(word_end = next_word(&p, stop)) || !camera_ff8_number(p, word_end, &a) || a < -16 || a > 15)
+            return "ease is followed by FF8's ease count, -16 to 15 (0 straight, below 0 easing in, above easing out)";
+        p = word_end;
+        if (next_word(&p, stop))
+            return "ease has one number";
+        s->ease = (signed char)a;
+        return NULL;
+    }
+    if (word_is(first, word_end, "h") || word_is(first, word_end, "roll")) {
+        int zoom = (*first | 0x20) == 'h', low = zoom ? 1 : -32768, high = zoom ? 4096 : 32767;   /* (stage 2) roll: FF8's s16 */
+
+        if (s->flags & (zoom ? CAMERA_FF8_HAS_H : CAMERA_FF8_HAS_ROLL))
+            return zoom ? "H is given twice in this segment" : "roll is given twice in this segment";
+        if (!(word_end = next_word(&p, stop)) || !camera_ff8_number(p, word_end, &a) || a < low || a > high)
+            return zoom ? "H is followed by FF8's zoom, 1 to 4096, then > and its end if it changes (H 512 > 352)"
+                        : "roll is followed by FF8's roll, -32768 to 32767 (4096 a turn), then > and its end if it changes (roll 0 > 1024)";
+        b = a;
+        p = word_end;
+        if ((word_end = next_word(&p, stop)) != NULL) {
+            if (!word_is(p, word_end, ">"))
+                return zoom ? "H looks like: H 512 or H 512 > 352" : "roll looks like: roll 0 or roll 0 > 1024";
+            p = word_end;
+            if (!(word_end = next_word(&p, stop)) || !camera_ff8_number(p, word_end, &b) || b < low || b > high)
+                return zoom ? "H: the zoom is 1 to 4096" : "roll: the roll is -32768 to 32767";
+            p = word_end;
+            if (next_word(&p, stop))
+                return zoom ? "H looks like: H 512 or H 512 > 352" : "roll looks like: roll 0 or roll 0 > 1024";
+        }
+        if (zoom) {
+            s->flags |= CAMERA_FF8_HAS_H;
+            s->h[0] = (short)a, s->h[1] = (short)b;
+        } else {
+            s->flags |= CAMERA_FF8_HAS_ROLL;
+            s->roll[0] = (short)a, s->roll[1] = (short)b;
+        }
+        return NULL;
+    }
+    if (!word_is(first, word_end, "key"))
+        return "a segment's lines are snap, H, roll, ease and key lines";
+    if (s->keys == CAMERA_FF8_KEYS)
+        return "a segment has 32 keys at most (FF8's)";
+    k = s->keys;
+    if (!(word_end = next_word(&p, stop)) || !camera_ff8_number(p, word_end, &a))
+        return key_shape;
+    if (a < 0 || a > CAMERA_FF8_FRAMES)
+        return "key: the frames are 0 to 480";
+    s->key[k].frames = (short)a;
+    p = word_end;
+    for (i = 0; i < 2; i++) {
+        struct camera_ff8_point *point = i ? &s->key[k].look : &s->key[k].eye;
+        const char *problem;
+        int c;
+
+        if (!(word_end = next_word(&p, stop)) || !word_is(p, word_end, i ? "target" : "eye"))
+            return key_shape;
+        p = word_end;
+        if ((problem = camera_ff8_ref(&p, stop, point)) != NULL)
+            return problem;
+        for (c = 0; c < 3; c++) {
+            if (!(word_end = next_word(&p, stop)) || !camera_ff8_number(p, word_end, &a))
+                return "a key's offsets are three numbers each (FF8 units, -32768 to 32767)";
+            point->at[c] = (short)a;
+            p = word_end;
+        }
+    }
+    if (next_word(&p, stop))
+        return key_shape;
+    if (s->frames + s->key[k].frames > CAMERA_FF8_SEGMENT_FRAMES)
+        return "a segment's keys last 2047 frames at most together (FF8 counts its time in a short)";
+    s->keys++;
+    s->frames += s->key[k].frames;
+    return NULL;
+}
+
+/* ---- camera stage 1: engine = ff8 (playing; the arithmetic of FF8's FUN_005035e0) ---- */
+
+/* FF8's rsin (FUN_0056d130): round(4096 sin(a x 2 pi / 4096)), the x87's float constant and rounding; its rcos
+   (FUN_0056d100) is the same table mirrored (checked for every quarter-turn entry). a: any angle, 4096 a turn. */
+static int camera_ff8_rsin(int a)
+{
+    static const short quarter[1025] = {
+        0, 6, 13, 19, 25, 31, 38, 44, 50, 57, 63, 69, 75, 82, 88, 94,
+        101, 107, 113, 119, 126, 132, 138, 144, 151, 157, 163, 170, 176, 182, 188, 195,
+        201, 207, 214, 220, 226, 232, 239, 245, 251, 257, 264, 270, 276, 283, 289, 295,
+        301, 308, 314, 320, 326, 333, 339, 345, 351, 358, 364, 370, 376, 383, 389, 395,
+        401, 408, 414, 420, 426, 433, 439, 445, 451, 458, 464, 470, 476, 483, 489, 495,
+        501, 508, 514, 520, 526, 533, 539, 545, 551, 557, 564, 570, 576, 582, 589, 595,
+        601, 607, 613, 620, 626, 632, 638, 644, 651, 657, 663, 669, 675, 682, 688, 694,
+        700, 706, 713, 719, 725, 731, 737, 744, 750, 756, 762, 768, 774, 781, 787, 793,
+        799, 805, 811, 818, 824, 830, 836, 842, 848, 854, 861, 867, 873, 879, 885, 891,
+        897, 904, 910, 916, 922, 928, 934, 940, 946, 953, 959, 965, 971, 977, 983, 989,
+        995, 1001, 1007, 1014, 1020, 1026, 1032, 1038, 1044, 1050, 1056, 1062, 1068, 1074, 1080, 1086,
+        1092, 1099, 1105, 1111, 1117, 1123, 1129, 1135, 1141, 1147, 1153, 1159, 1165, 1171, 1177, 1183,
+        1189, 1195, 1201, 1207, 1213, 1219, 1225, 1231, 1237, 1243, 1249, 1255, 1261, 1267, 1273, 1279,
+        1285, 1291, 1297, 1303, 1309, 1315, 1321, 1327, 1332, 1338, 1344, 1350, 1356, 1362, 1368, 1374,
+        1380, 1386, 1392, 1398, 1404, 1409, 1415, 1421, 1427, 1433, 1439, 1445, 1451, 1457, 1462, 1468,
+        1474, 1480, 1486, 1492, 1498, 1503, 1509, 1515, 1521, 1527, 1533, 1538, 1544, 1550, 1556, 1562,
+        1567, 1573, 1579, 1585, 1591, 1596, 1602, 1608, 1614, 1620, 1625, 1631, 1637, 1643, 1648, 1654,
+        1660, 1666, 1671, 1677, 1683, 1689, 1694, 1700, 1706, 1711, 1717, 1723, 1729, 1734, 1740, 1746,
+        1751, 1757, 1763, 1768, 1774, 1780, 1785, 1791, 1797, 1802, 1808, 1813, 1819, 1825, 1830, 1836,
+        1842, 1847, 1853, 1858, 1864, 1870, 1875, 1881, 1886, 1892, 1898, 1903, 1909, 1914, 1920, 1925,
+        1931, 1936, 1942, 1947, 1953, 1958, 1964, 1970, 1975, 1981, 1986, 1992, 1997, 2002, 2008, 2013,
+        2019, 2024, 2030, 2035, 2041, 2046, 2052, 2057, 2062, 2068, 2073, 2079, 2084, 2090, 2095, 2100,
+        2106, 2111, 2117, 2122, 2127, 2133, 2138, 2143, 2149, 2154, 2159, 2165, 2170, 2175, 2181, 2186,
+        2191, 2197, 2202, 2207, 2213, 2218, 2223, 2228, 2234, 2239, 2244, 2249, 2255, 2260, 2265, 2270,
+        2276, 2281, 2286, 2291, 2296, 2302, 2307, 2312, 2317, 2322, 2328, 2333, 2338, 2343, 2348, 2353,
+        2359, 2364, 2369, 2374, 2379, 2384, 2389, 2394, 2399, 2405, 2410, 2415, 2420, 2425, 2430, 2435,
+        2440, 2445, 2450, 2455, 2460, 2465, 2470, 2475, 2480, 2485, 2490, 2495, 2500, 2505, 2510, 2515,
+        2520, 2525, 2530, 2535, 2540, 2545, 2550, 2555, 2559, 2564, 2569, 2574, 2579, 2584, 2589, 2594,
+        2598, 2603, 2608, 2613, 2618, 2623, 2628, 2632, 2637, 2642, 2647, 2652, 2656, 2661, 2666, 2671,
+        2675, 2680, 2685, 2690, 2694, 2699, 2704, 2709, 2713, 2718, 2723, 2727, 2732, 2737, 2741, 2746,
+        2751, 2755, 2760, 2765, 2769, 2774, 2779, 2783, 2788, 2792, 2797, 2802, 2806, 2811, 2815, 2820,
+        2824, 2829, 2833, 2838, 2843, 2847, 2852, 2856, 2861, 2865, 2870, 2874, 2878, 2883, 2887, 2892,
+        2896, 2901, 2905, 2910, 2914, 2918, 2923, 2927, 2932, 2936, 2940, 2945, 2949, 2953, 2958, 2962,
+        2967, 2971, 2975, 2979, 2984, 2988, 2992, 2997, 3001, 3005, 3009, 3014, 3018, 3022, 3026, 3031,
+        3035, 3039, 3043, 3048, 3052, 3056, 3060, 3064, 3068, 3073, 3077, 3081, 3085, 3089, 3093, 3097,
+        3102, 3106, 3110, 3114, 3118, 3122, 3126, 3130, 3134, 3138, 3142, 3146, 3150, 3154, 3158, 3162,
+        3166, 3170, 3174, 3178, 3182, 3186, 3190, 3194, 3198, 3202, 3206, 3210, 3214, 3217, 3221, 3225,
+        3229, 3233, 3237, 3241, 3244, 3248, 3252, 3256, 3260, 3264, 3267, 3271, 3275, 3279, 3282, 3286,
+        3290, 3294, 3297, 3301, 3305, 3309, 3312, 3316, 3320, 3323, 3327, 3331, 3334, 3338, 3342, 3345,
+        3349, 3352, 3356, 3360, 3363, 3367, 3370, 3374, 3378, 3381, 3385, 3388, 3392, 3395, 3399, 3402,
+        3406, 3409, 3413, 3416, 3420, 3423, 3426, 3430, 3433, 3437, 3440, 3444, 3447, 3450, 3454, 3457,
+        3461, 3464, 3467, 3471, 3474, 3477, 3481, 3484, 3487, 3490, 3494, 3497, 3500, 3504, 3507, 3510,
+        3513, 3516, 3520, 3523, 3526, 3529, 3532, 3536, 3539, 3542, 3545, 3548, 3551, 3555, 3558, 3561,
+        3564, 3567, 3570, 3573, 3576, 3579, 3582, 3585, 3588, 3591, 3594, 3597, 3600, 3603, 3606, 3609,
+        3612, 3615, 3618, 3621, 3624, 3627, 3630, 3633, 3636, 3639, 3642, 3644, 3647, 3650, 3653, 3656,
+        3659, 3661, 3664, 3667, 3670, 3673, 3675, 3678, 3681, 3684, 3686, 3689, 3692, 3695, 3697, 3700,
+        3703, 3705, 3708, 3711, 3713, 3716, 3719, 3721, 3724, 3727, 3729, 3732, 3734, 3737, 3739, 3742,
+        3745, 3747, 3750, 3752, 3755, 3757, 3760, 3762, 3765, 3767, 3770, 3772, 3775, 3777, 3779, 3782,
+        3784, 3787, 3789, 3791, 3794, 3796, 3798, 3801, 3803, 3805, 3808, 3810, 3812, 3815, 3817, 3819,
+        3822, 3824, 3826, 3828, 3831, 3833, 3835, 3837, 3839, 3842, 3844, 3846, 3848, 3850, 3852, 3854,
+        3857, 3859, 3861, 3863, 3865, 3867, 3869, 3871, 3873, 3875, 3877, 3879, 3881, 3883, 3885, 3887,
+        3889, 3891, 3893, 3895, 3897, 3899, 3901, 3903, 3905, 3907, 3909, 3910, 3912, 3914, 3916, 3918,
+        3920, 3921, 3923, 3925, 3927, 3929, 3930, 3932, 3934, 3936, 3937, 3939, 3941, 3943, 3944, 3946,
+        3948, 3949, 3951, 3953, 3954, 3956, 3958, 3959, 3961, 3962, 3964, 3965, 3967, 3969, 3970, 3972,
+        3973, 3975, 3976, 3978, 3979, 3981, 3982, 3984, 3985, 3987, 3988, 3989, 3991, 3992, 3994, 3995,
+        3996, 3998, 3999, 4001, 4002, 4003, 4005, 4006, 4007, 4008, 4010, 4011, 4012, 4014, 4015, 4016,
+        4017, 4019, 4020, 4021, 4022, 4023, 4024, 4026, 4027, 4028, 4029, 4030, 4031, 4032, 4034, 4035,
+        4036, 4037, 4038, 4039, 4040, 4041, 4042, 4043, 4044, 4045, 4046, 4047, 4048, 4049, 4050, 4051,
+        4052, 4053, 4053, 4054, 4055, 4056, 4057, 4058, 4059, 4060, 4060, 4061, 4062, 4063, 4064, 4064,
+        4065, 4066, 4067, 4067, 4068, 4069, 4070, 4070, 4071, 4072, 4072, 4073, 4074, 4074, 4075, 4076,
+        4076, 4077, 4077, 4078, 4079, 4079, 4080, 4080, 4081, 4081, 4082, 4082, 4083, 4083, 4084, 4084,
+        4085, 4085, 4086, 4086, 4087, 4087, 4088, 4088, 4088, 4089, 4089, 4089, 4090, 4090, 4090, 4091,
+        4091, 4091, 4092, 4092, 4092, 4092, 4093, 4093, 4093, 4093, 4094, 4094, 4094, 4094, 4094, 4095,
+        4095, 4095, 4095, 4095, 4095, 4095, 4096, 4096, 4096, 4096, 4096, 4096, 4096, 4096, 4096, 4096,
+        4096,
+    };
+
+    a &= 4095;
+    return a <= 1024 ? quarter[a] : a <= 2048 ? quarter[2048 - a] : a <= 3072 ? -quarter[a - 2048] : -quarter[4096 - a];
+}
+
+/* FF8's ease (FUN_00503fe0): t (0-4096) through rsin(t / 4) n times (n > 0: easing out) or 4096 - rcos(t / 4)
+   |n| times (n < 0: easing in); 0 straight. 15 is FF8's "save the base camera" mark: eased 15 times all the same. */
+static int camera_ff8_ease(int t, int n)
+{
+    for (; n > 0; n--)
+        t = camera_ff8_rsin(t / 4);
+    for (; n < 0; n++)
+        t = 4096 - camera_ff8_rsin(t / 4 + 1024);
+    return t;
+}
+
+/* FF8's line between two shorts at t (4096ths): ((b - a) t >> 12) + a, kept as a short */
+static int camera_ff8_lerp(int a, int b, int t)
+{
+    return (short)(((b - a) * t >> 12) + a);
+}
+
+static int camera_ff8_short(int v)
+{
+    return v < -32768 ? -32768 : v > 32767 ? 32767 : v;
+}
+
+/* x / 4096 rounded to the nearest, a half to the even: FF8's x87 rounding (fmuls by 1/4096 at 00b695f8, then faddl
+   2^52 + 2^31 at 00b693d8) in its software GTE's gpf / gpl (FUN_0045e9d0 / FUN_0045ebf0) and in FUN_0056c4f0 */
+static int camera_ff8_rne12(long long x)
+{
+    long long q = x >> 12;
+    int r = (int)(x & 4095);
+
+    return (int)(q + (r > 2048 || (r == 2048 && (q & 1))));
+}
+
+/* FF8's blend of two places (FUN_0056cb90 -> FUN_0056cb50: gpf with IR0 = 4096 - t, then gpl with IR0 = t, IR
+   clamped to a short): each product rounded to the nearest, added, clamped */
+static int camera_ff8_blend(int a, int b, int t)
+{
+    return camera_ff8_short(camera_ff8_rne12(a * (4096 - t)) + camera_ff8_rne12(b * t));
+}
+
+/* floor(sqrt(v)) (FUN_0056bec0: fild, fsqrt, __ftol; exact for a 32-bit integer) */
+static unsigned camera_ff8_isqrt(unsigned v)
+{
+    unsigned r = 0, bit = 1u << 30;
+
+    while (bit > v)
+        bit >>= 2;
+    for (; bit; bit >>= 2)
+        if (v >= r + bit) {
+            v -= r + bit;
+            r = (r >> 1) + bit;
+        } else
+            r >>= 1;
+    return r;
+}
+
+/* FF8's VectorNormal (FUN_0056bc50): out = v x 4096 / |v|, each rounded to the nearest (a half to the even), worked
+   in integers; v kept when it is 0. Returns |v|^2. Components within 10000 (FUN_0050cba0 halves them to that).
+   This is the exact arithmetic, not FF8's bits: FF8 stores two of the three products as float32 (fstp dword at
+   0056bc9e, 0056bca6) before rounding, so a component lying within float32's error of a half may differ by 1. */
+static int camera_ff8_normal(const int v[3], int out[3])
+{
+    unsigned s = 0;
+    int i;
+
+    for (i = 0; i < 3; i++)
+        s += (unsigned)(v[i] * v[i]);
+    for (i = 0; i < 3; i++) {
+        unsigned long long want = 8192ULL * (unsigned)(v[i] < 0 ? -v[i] : v[i]), lo = 0, hi = 4096, m;
+
+        if (!s) {
+            out[i] = v[i];
+            continue;
+        }
+        want *= want;               /* k is the rounding of X = 4096 |v| / |v_all|: k >= m when (2m - 1)^2 s <= (2 X)^2 s */
+        while (lo < hi) {
+            m = (lo + hi + 1) >> 1;
+            if ((2 * m - 1) * (2 * m - 1) * s <= want)
+                lo = m;
+            else
+                hi = m - 1;
+        }
+        if (lo && (2 * lo - 1) * (2 * lo - 1) * s == want && (lo & 1))
+            lo--;                   /* exactly a half: to the even */
+        out[i] = v[i] < 0 ? -(int)lo : (int)lo;
+    }
+    return (int)s;
+}
+
+/* FF8's effect frame from `from` to `to` (FUN_0050d6b0 with FUN_0050cba0, built by FUN_0050d300): the origin halfway
+   ((from + to) / 2), the axes z = unit(to - from), x = unit(z.z, 0, -z.x), y = unit(z x x), 4096 a unit;
+   m[3 i + j] = axis j's component i (FUN_0056c040 transposes the rows), so a point is origin + m v / 4096. Frames
+   1-4 (0xf5-0xf8) are scaled by (|to - from| << 12) / 5000 (FUN_0050d790's value, FUN_0056bef0): 0 is returned,
+   the offsets are in fifths of a thousandth of the distance. Frame 0 (0xf2) keeps the scale 1.0, and so does any
+   frame when from = to (FF8 then turns it to the caster's heading + 0x800, which is not read here: the world's
+   axes): 1 is returned, the offsets are FF8 units. */
+static int camera_ff8_frame(const int from[3], const int to[3], int frame, int origin[3], int m[9])
+{
+    int d[3], z[3], x[3], y[3], i, s, len, twice = 1;
+
+    for (i = 0; i < 3; i++) {
+        d[i] = to[i] - from[i];
+        origin[i] = (from[i] + to[i]) / 2;
+        m[i * 3] = m[i * 3 + 1] = m[i * 3 + 2] = 0;
+        m[i * 4] = 4096;
+    }
+    if (!d[0] && !d[1] && !d[2])
+        return 1;
+    while (d[0] > 10000 || d[0] < -10000 || d[1] > 10000 || d[1] < -10000 || d[2] > 10000 || d[2] < -10000) {
+        for (i = 0; i < 3; i++)
+            d[i] = (d[i] & 1) + d[i] / 2;
+        twice *= 2;
+    }
+    len = (int)camera_ff8_isqrt((unsigned)camera_ff8_normal(d, z)) * twice;
+    d[0] = z[2], d[1] = 0, d[2] = -z[0];
+    camera_ff8_normal(d, x);
+    d[0] = (x[2] * z[1] - x[1] * z[2]) >> 12;     /* FUN_0056bbf0(z, x): z x x, each >> 12 */
+    d[1] = (x[0] * z[2] - z[0] * x[2]) >> 12;
+    d[2] = (z[0] * x[1] - x[0] * z[1]) >> 12;
+    camera_ff8_normal(d, y);
+    for (i = 0; i < 3; i++)
+        m[i * 3] = x[i], m[i * 3 + 1] = y[i], m[i * 3 + 2] = z[i];
+    if (frame == 0)
+        return 1;
+    s = (short)((len << 12) / 5000);
+    for (i = 0; i < 9; i++)
+        m[i] = (short)(m[i] * s >> 12);
+    return 0;
+}
+
+/* The place a reference gives, before the offset: camera / focus the player's own last eye / point, the others
+   from the game (the runtime's camera_ff8_base); world 0. Returns how the offset is applied: 0 added as it is
+   (x unit_scale); 1 turned by m (camera_ff8_frame's, scale included) after x unit_scale; 2 turned by m as written
+   (a frame scaled by the distance: FF8's units do not come into it). */
+typedef int (*camera_ff8_base_fn)(void *context, int ref, int bone, int out[3], int m[9]);
+
+/* One key's eye or point, resolved: the reference's place + the offset, as shorts. A frame turns and scales the
+   offset by its matrix, rounded to the nearest (FUN_00503ae0 -> FUN_0056c4f0; FF8's mirrored battle, x negated
+   under 01d96a9c & 0x20, has no FF7 counterpart). Target and caster add it unturned: FF8 also turns it by the
+   actor's matrix and scale (FUN_0050d790's 0x90-0xaf case); stage 1 does not (Camera_Stage1_Keyframes.md).
+   Camera and focus ignore the offset: FUN_0050d790's cases 0xf3 / 0xf4 zero the matrix (FUN_0050d9d0), so the place
+   is the live eye / point exactly (Flare's 'key 25 eye camera 0 0 -2000' is the live eye). */
+static void camera_ff8_resolve(const struct camera_ff8_point *point, const int at[3], int scale, camera_ff8_base_fn base,
+                               void *context, int out[3])
+{
+    int b[3] = { 0, 0, 0 }, m[9], v[3], c, how = 0;
+
+    if (point->ref != CAMERA_FF8_WORLD)
+        how = base(context, point->ref, point->bone, b, m);
+    for (c = 0; c < 3; c++)
+        v[c] = point->ref == CAMERA_FF8_CAMERA || point->ref == CAMERA_FF8_FOCUS ? 0
+             : how == 2 ? at[c] : camera_roll_div(at[c] * scale, 1000);
+    for (c = 0; c < 3; c++)
+        out[c] = camera_ff8_short(b[c] + (how ? camera_ff8_rne12((long long)m[c * 3] * v[0] + (long long)m[c * 3 + 1] * v[1] +
+                                                                 (long long)m[c * 3 + 2] * v[2]) : v[c]));
+}
+
+/* ---- camera stage 2: FF8's spline (three keys or more), its H and roll, the field of view ---- */
+
+/* FF8's natural cubic spline through n points (t[i], y[i]), n >= 3, t rising strictly (FUN_0050d060, objdump
+   0050d060-0050d1d2): m[i] = the second derivative / 6, 0 at both ends; the steps, the slopes, the diagonal and m
+   are kept as floats where FF8 stores them (fst / fstp dword), the rest in the x87's registers. */
+static void camera_ff8_spline_solve(const int *t, const int *y, int n, float *m)
+{
+    float h[CAMERA_FF8_KEYS], slope[CAMERA_FF8_KEYS + 1], diagonal[CAMERA_FF8_KEYS];
+    int i;
+
+    m[0] = m[n - 1] = 0.0f;
+    for (i = 0; i < n - 1; i++) {
+        h[i] = (float)(t[i + 1] - t[i]);
+        slope[i + 1] = (float)(y[i + 1] - y[i]) / h[i];
+    }
+    m[1] = (slope[2] - slope[1]) - h[0] * m[0];
+    diagonal[1] = (float)((t[2] - t[0]) * 2);
+    for (i = 1; i < n - 2; i++) {
+        float f = h[i] / diagonal[i];
+
+        m[i + 1] = (slope[i + 2] - slope[i + 1]) - f * m[i];
+        diagonal[i + 1] = (float)((t[i + 2] - t[i]) * 2) - f * h[i];
+    }
+    for (i = n - 2; i > 0; i--)
+        m[i] = (m[i] - h[i] * m[i + 1]) / diagonal[i];
+}
+
+/* The spline at x (FUN_0050d240, objdump 0050d240-0050d2f1): the interval by FF8's binary search (the first knot not
+   below x, less one, 0 at least), then y[i] + dx (slope - h (2 m[i] + m[i+1]) + dx (3 m[i] + (m[i+1] - m[i]) dx / h)),
+   in FF8's order, truncated toward 0 (__ftol, 0055ad90) and kept as a short (FF8's record holds shorts). */
+static int camera_ff8_spline_at(int x, const int *t, const int *y, const float *m, int n)
+{
+    int lo = 0, hi = n - 1, mid;
+    float h, dx;
+    long double v;                      /* the x87's own width, as FF8 keeps it in its registers */
+
+    while (lo < hi) {
+        mid = (lo + hi) / 2;
+        if (t[mid] < x)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    if (lo > 0)
+        lo--;
+    h = (float)(t[lo + 1] - t[lo]);
+    dx = (float)(x - t[lo]);
+    v = (long double)(float)(y[lo + 1] - y[lo]) / h - ((long double)m[lo] + m[lo] + m[lo + 1]) * h;
+    v = (v + (((long double)m[lo + 1] - m[lo]) * dx / h + (long double)m[lo] * 3.0f) * dx) * dx + y[lo];
+    if (v > 2147483000.0 || v < -2147483000.0)
+        v = 0;                          /* (not reached by shorts: FF8's __ftol gives 80000000 there) */
+    return (short)(int)v;
+}
+
+/* FF8's H as the battle's own H (zoom = fov): FF7's battle H (the short at 00c05f7c, 512) is the same projection
+   distance as FF8's H (FF8's picture is H / 512 times the size of its default's). The game turns it into its field of
+   view every battle frame (FUN_0042d808 at 0042d929 -> FUN_00661a1c: game + 0x99c = FUN_006619ee(H), 2 atan of a
+   half width over H, then FUN_0067ccde: the projection and game + 0x8d0, which the damage numbers and cursors use).
+   So the H that draws the picture H / 512 times the size of the game's own `base`: base x H / 512 (rounded), 16 to
+   32767; H 512 gives `base` itself. */
+static int camera_ff8_battle_h(int base, int h)
+{
+    long long v;
+
+    if (h == CAMERA_FF8_H_HOME)
+        return base;
+    v = ((long long)base * h + CAMERA_FF8_H_HOME / 2) / CAMERA_FF8_H_HOME;
+    return v < 16 ? 16 : v > 32767 ? 32767 : (int)v;
+}
+
+/* FF8's H as a dolly (zoom = dolly): the eye moved along the line to the point looked at, its distance x 512 / H
+   (rounded, halves away from 0), kept as a short */
+static int camera_ff8_dolly(int eye, int look, int h)
+{
+    return camera_ff8_short(look + camera_roll_div((eye - look) * CAMERA_FF8_H_HOME, h));
+}
+
+/* A camera's chain as it plays (one native effect's) */
+struct camera_ff8_play {
+    int segment, start;                 /* the segment playing (-1: none yet, or the chain is over) and its first frame */
+    int last_frame;                     /* the frame worked out last (a frame repeated while paused is not worked again) */
+    int snap[CAMERA_FF8_KEYS][2][3];    /* snap: key k's eye [0] and point [1], taken when the segment started */
+    int out[2][3];                      /* the eye [0] and point [1] it gives now: what camera and focus refer to */
+    /* camera stage 2 */
+    int h, roll;                        /* FF8's H and roll at this frame (01d8e038, 01d977a2) */
+    int h_range[2], roll_range[2];      /* the segment's, from start to end (FUN_00503c70: no H line keeps the last) */
+    int times[CAMERA_FF8_KEYS];         /* three keys or more: the knots, FF8's time (16 a frame) of each key */
+    int knots[2][3][CAMERA_FF8_KEYS];   /* the eye's and point's coordinates at the knots (snap: places; else offsets) */
+    float bend[2][3][CAMERA_FF8_KEYS];  /* their spline's second derivatives / 6 (camera_ff8_spline_solve) */
+    /* camera stage 3 */
+    int first, count;                   /* the chain played: its segments in camera_ff8_pool (count 0: none); first -1:
+                                           the camera's own chain (select = A.V, stages 1-2) */
+};
+
+/* A play starts over (a camera's first frame): no segment yet, FF8's H 512 and roll 0 (eye and point are the
+   caller's; the chain too, camera stage 3) */
+static void camera_ff8_play_reset(struct camera_ff8_play *play)
+{
+    play->segment = -1;
+    play->first = -1;                   /* (camera stage 3) the camera's own chain, until a sequence starts one */
+    play->count = 0;
+    play->last_frame = -1;
+    play->h = play->h_range[0] = play->h_range[1] = CAMERA_FF8_H_HOME;
+    play->roll = play->roll_range[0] = play->roll_range[1] = 0;
+}
+
+/* The segment of the chain (`count` segments from `first` in the pool) at `frame` and its first frame, or -1 past its
+   end. A segment of 0 frames is never the one at a frame (FF8 reads it and the next in the same frame). */
+static int camera_ff8_segment_at(int first, int count, int frame, int *start)
+{
+    int i, at = 0;
+
+    for (i = 0; i < count; i++) {
+        if (frame < at + camera_ff8_pool[first + i].frames) {
+            *start = at;
+            return i;
+        }
+        at += camera_ff8_pool[first + i].frames;
+    }
+    *start = at;
+    return -1;
+}
+
+/* (camera stage 3) a chain's frames: its segments' together */
+static int camera_ff8_chain_frames(int first, int count)
+{
+    int i, n = 0;
+
+    for (i = 0; i < count; i++)
+        n += camera_ff8_pool[first + i].frames;
+    return n;
+}
+
+/* The play at `frame` (the effect's): play->out is the eye and point for it, play->h and play->roll FF8's H and roll.
+   FUN_005035e0's two-key case: until key 1's time (key 0's frames) t = ease(elapsed / key 0's frames), the offsets
+   lerped, then resolved in the key's reference (two references: resolved in both and blended by t); after it key 1.
+   One key: held. snap: the keys' places taken when the segment starts, with the references as they are then, and
+   lerped. Three keys or more (camera stage 2): t = ease(elapsed / the segment's frames), FF8's time t x the
+   segment's; before the last key's time the natural cubic spline of the coordinates (snap: the places; else the
+   offsets, then resolved in the references of the interval's two keys, blended by the interval's own parameter
+   when they differ); from it the last key. H and roll: a straight line over the whole segment, computed after the
+   frame's step (frame 0 shows 1 / frames of the change). Past the chain's end the last place, H and roll are kept
+   (FF8 leaves the live camera there). Returns 1 when a segment started at this frame. */
+static int camera_ff8_play_frame(const struct own_camera *c, struct camera_ff8_play *play, int frame, camera_ff8_base_fn base,
+                                 void *context)
+{
+    const struct camera_ff8_segment *s;
+    int start, i, w, k, n, t, started = 0, next[2][3];
+    int first = play->first < 0 ? c->ff8_first : play->first, count = play->first < 0 ? c->ff8_count : play->count;
+
+    if (frame == play->last_frame)
+        return 0;
+    play->last_frame = frame;
+    i = camera_ff8_segment_at(first, count, frame, &start);
+    if (i < 0) {
+        play->segment = -1;
+        return 0;
+    }
+    s = &camera_ff8_pool[first + i];
+    if (i != play->segment) {
+        /* (camera stage 3) segments passed over since the last one played (0 frames: Apocalypse's closing one) were read
+           by FF8 all the same: an H line of theirs is the pair a later segment without one keeps (FUN_00503c70, mode 0) */
+        for (k = play->segment >= 0 && play->segment < i ? play->segment + 1 : 0; k < i; k++)
+            if (camera_ff8_pool[first + k].flags & CAMERA_FF8_HAS_H)
+                play->h_range[0] = camera_ff8_pool[first + k].h[0], play->h_range[1] = camera_ff8_pool[first + k].h[1];
+        play->segment = i;
+        play->start = start;
+        started = 1;
+        if (s->flags & CAMERA_FF8_SNAP)
+            for (k = 0; k < s->keys; k++) {
+                int at[3];
+
+                for (w = 0; w < 2; w++) {
+                    const struct camera_ff8_point *point = w ? &s->key[k].look : &s->key[k].eye;
+
+                    at[0] = point->at[0], at[1] = point->at[1], at[2] = point->at[2];
+                    camera_ff8_resolve(point, at, c->unit_scale, base, context, play->snap[k][w]);
+                }
+            }
+        if (s->flags & CAMERA_FF8_HAS_H)
+            play->h_range[0] = s->h[0], play->h_range[1] = s->h[1];
+        if (s->flags & CAMERA_FF8_HAS_ROLL)
+            play->roll_range[0] = s->roll[0], play->roll_range[1] = s->roll[1];
+        else
+            play->roll_range[0] = play->roll_range[1] = play->roll;
+        if (s->keys >= 3) {
+            /* FUN_00503c70: the knots at the keys' times (16 a frame), the spline of each coordinate (FUN_0050d010) */
+            for (k = 0, t = 0; k < s->keys; t += s->key[k].frames * 16, k++) {
+                play->times[k] = t;
+                for (w = 0; w < 2; w++) {
+                    const struct camera_ff8_point *point = w ? &s->key[k].look : &s->key[k].eye;
+                    int m;
+
+                    for (m = 0; m < 3; m++)
+                        play->knots[w][m][k] = (s->flags & CAMERA_FF8_SNAP) ? play->snap[k][w][m] : point->at[m];
+                }
+            }
+            for (w = 0; w < 2; w++)
+                for (k = 0; k < 3; k++)
+                    camera_ff8_spline_solve(play->times, play->knots[w][k], s->keys, play->bend[w][k]);
+        }
+    }
+    n = frame - play->start;
+    for (w = 0; w < 2; w++) {
+        const struct camera_ff8_point *p0 = w ? &s->key[0].look : &s->key[0].eye;
+        const struct camera_ff8_point *p1 = w ? &s->key[1].look : &s->key[1].eye;
+        int at[3], a[3], b[3], out[3], m;
+
+        if (s->keys >= 3) {
+            int x = s->frames * 16 * camera_ff8_ease((n << 12) / s->frames, s->ease) >> 12, last = s->keys - 1;
+
+            if (x < play->times[last]) {
+                int u;
+
+                for (m = 0; m < 3; m++)
+                    at[m] = camera_ff8_spline_at(x, play->times, play->knots[w][m], play->bend[w][m], s->keys);
+                for (k = 1; play->times[k] <= x; k++)
+                    ;
+                u = ((x - play->times[k - 1]) << 12) / (play->times[k] - play->times[k - 1]);
+                p0 = w ? &s->key[k - 1].look : &s->key[k - 1].eye;
+                p1 = w ? &s->key[k].look : &s->key[k].eye;
+                if (s->flags & CAMERA_FF8_SNAP)
+                    for (m = 0; m < 3; m++)
+                        out[m] = at[m];
+                else if (p0->ref == p1->ref && p0->bone == p1->bone)
+                    camera_ff8_resolve(p1, at, c->unit_scale, base, context, out);
+                else {
+                    camera_ff8_resolve(p0, at, c->unit_scale, base, context, a);
+                    camera_ff8_resolve(p1, at, c->unit_scale, base, context, b);
+                    for (m = 0; m < 3; m++)
+                        out[m] = camera_ff8_blend(a[m], b[m], u);
+                }
+            } else if (s->flags & CAMERA_FF8_SNAP)
+                for (m = 0; m < 3; m++)
+                    out[m] = play->snap[last][w][m];
+            else {
+                const struct camera_ff8_point *p = w ? &s->key[last].look : &s->key[last].eye;
+
+                at[0] = p->at[0], at[1] = p->at[1], at[2] = p->at[2];
+                camera_ff8_resolve(p, at, c->unit_scale, base, context, out);
+            }
+        } else if (s->keys == 1 || n >= s->key[0].frames) {
+            k = s->keys == 1 ? 0 : 1;
+            if (s->flags & CAMERA_FF8_SNAP)
+                for (m = 0; m < 3; m++)
+                    out[m] = play->snap[k][w][m];
+            else {
+                const struct camera_ff8_point *p = k ? p1 : p0;
+
+                at[0] = p->at[0], at[1] = p->at[1], at[2] = p->at[2];
+                camera_ff8_resolve(p, at, c->unit_scale, base, context, out);
+            }
+        } else {
+            t = camera_ff8_ease((n << 12) / s->key[0].frames, s->ease);
+            if (s->flags & CAMERA_FF8_SNAP)
+                for (m = 0; m < 3; m++)
+                    out[m] = camera_ff8_lerp(play->snap[0][w][m], play->snap[1][w][m], t);
+            else {
+                for (m = 0; m < 3; m++)
+                    at[m] = camera_ff8_lerp(p0->at[m], p1->at[m], t);
+                camera_ff8_resolve(p0, at, c->unit_scale, base, context, a);
+                if (p0->ref == p1->ref && p0->bone == p1->bone)
+                    for (m = 0; m < 3; m++)
+                        out[m] = a[m];
+                else {
+                    camera_ff8_resolve(p1, at, c->unit_scale, base, context, b);
+                    for (m = 0; m < 3; m++)
+                        out[m] = camera_ff8_blend(a[m], b[m], t);
+                }
+            }
+        }
+        for (m = 0; m < 3; m++)
+            next[w][m] = out[m];
+    }
+    /* both from the same state (FF8 copies the record to the live camera, what 0xf3 / 0xf4 read, after the task) */
+    for (w = 0; w < 2; w++)
+        for (k = 0; k < 3; k++)
+            play->out[w][k] = next[w][k];
+    /* H and roll after the frame's step (FUN_005035e0 at 00503a70: (elapsed + 16) / the segment's time) */
+    t = ((n + 1) << 12) / s->frames;
+    play->h = (short)(((play->h_range[1] - play->h_range[0]) * t >> 12) + play->h_range[0]);
+    play->roll = (short)(((play->roll_range[1] - play->roll_range[0]) * t >> 12) + play->roll_range[0]);
+    return started;
+}
+
+/* The eye a look-at was built from (FUN_005c68b7: rows x y z, 4096 = 1.0, translation = -(R eye)): -R^T t. For the
+   self-check: the game's matrix of the last frame against the eye this player wrote. */
+static void camera_ff8_eye_from_lookat(const short r[9], const int t[3], int eye[3])
+{
+    int i;
+
+    for (i = 0; i < 3; i++)
+        eye[i] = camera_roll_div(-(r[i] * t[0] + r[3 + i] * t[1] + r[6 + i] * t[2]), 4096);
+}
+
+/* ---- camera stage 3: FF8's sequence (FF7FF8Fusion/Notes/Camera_Stage3.md) ----
+   FF8_EN.exe's VM 0050db40 (objdump 0050db40-0050de6d; jump tables 0050de70 operand kinds, 0050de80 / 0050dea8
+   arithmetic, 0050decc control) run by FUN_00509610 with the camera's callbacks LAB_00509810 (opcodes below c0,
+   table 00509908), FUN_00509640 (variable read) and LAB_005097c0 (variable write). The program's text is the
+   decoder's disassembly (Tools/ff8cam/FORMAT.md 5); camera_ff8_assemble makes FF8's bytes of it. */
+
+/* varHH (one or two hex digits) at [p, end): the variable, or -1 */
+static int camera_ff8_seq_var(const char *p, const char *end)
+{
+    int v = 0;
+
+    if (end - p < 4 || end - p > 5 || (p[0] | 0x20) != 'v' || (p[1] | 0x20) != 'a' || (p[2] | 0x20) != 'r')
+        return -1;
+    for (p += 3; p < end; p++) {
+        if (hex_digit(*p) < 0)
+            return -1;
+        v = v * 16 + hex_digit(*p);
+    }
+    return v;
+}
+
+/* A variable FF8 reads and writes without harm: below 80 (its callbacks) or f0-ff (the sixteen ints of its own frame,
+   esp+0x10..0x4c: 0050dbe0 / 0050dcad address var v at esp+0x40c-4v); 80-ef lie on its return address, its
+   arguments and its caller's frame. NULL or what is wrong. */
+static const char *camera_ff8_seq_var_ok(int v)
+{
+    return v >= 0x80 && v < 0xf0 ? "variables 80-ef are refused: FF8 keeps them outside its own frame (only 00-7f and f0-ff are safe)" : NULL;
+}
+
+/* One line of a [sequence] (the comment gone, trimmed), the label already taken off: its bytes in code[] (a jump's
+   offset left 0), *size, and for a jump *jump (1: s8, 2: s16) with its label [*target, *target_end) or, for @N,
+   *rel (*target NULL). NULL or what is wrong. */
+static const char *camera_ff8_seq_line(char *p, char *stop, BYTE code[3], int *size, int *jump, char **target, char **target_end, long *rel)
+{
+    static const char *const jumps[7] = { "jmp", "jgt", "jge", "jeq", "jne", "jle", "jlt" };
+    static const char *const ops[9] = { "=", "+=", "-=", "*=", "/=", "&=", "|=", "^=", "%=" };
+    char *word_end = next_word(&p, stop), *first = p;
+    long n;
+    int i, v;
+
+    *size = 0;
+    *jump = 0;
+    if (!word_end)
+        return NULL;
+    p = word_end;
+    for (i = 0; i < 7; i++)
+        if (word_is(first, word_end, jumps[i]) ||
+            (word_end - first == 5 && word_is(first, first + 3, jumps[i]) && first[3] == '.' && (first[4] | 0x20) == 'w')) {
+            int wide = word_end - first == 5;
+
+            if (!(word_end = next_word(&p, stop)))
+                return "a jump needs its label (jmp L0010) or @N";
+            *target = p, *target_end = word_end;
+            if (*p == '@') {
+                if (!parse_signed(p + 1, word_end, &n) || n < -32768 || n > 32767)
+                    return "@N is the jump's offset from its own first byte";
+                *rel = n;
+                *target = NULL;
+            }
+            p = word_end;
+            if (next_word(&p, stop))
+                return "a jump has one label";
+            code[0] = (BYTE)((wide ? 0xed : 0xe6) + i);
+            *size = wide ? 3 : 2;
+            *jump = wide ? 2 : 1;
+            return NULL;
+        }
+    if (word_is(first, word_end, "acc")) {
+        long value;
+        int kind;
+
+        if (!(word_end = next_word(&p, stop)))
+            return "acc is followed by an operation (=, +=, -=, *=, /=, &=, |=, ^=, %=) and a value";
+        if (word_is(p, word_end, "clear"))
+            return "acc clear (e4) is refused: FF8's VM never moves past it (0050dc92 does not step the program on): a hang";
+        for (i = 0; i < 9 && !word_is(p, word_end, ops[i]); i++)
+            ;
+        if (i == 9)
+            return "acc is followed by =, +=, -=, *=, /=, &=, |=, ^= or %=";
+        code[0] = (BYTE)(0xc0 + 4 * i);
+        p = word_end;
+        if (!(word_end = next_word(&p, stop)))
+            return "the value is missing: varHH, N (-128 to 127), u8 N or s16 N";
+        if ((v = camera_ff8_seq_var(p, word_end)) >= 0) {
+            const char *bad = camera_ff8_seq_var_ok(v);
+
+            if (bad)
+                return bad;
+            kind = 3, value = v;
+        } else if (word_is(p, word_end, "u8") || word_is(p, word_end, "s16")) {
+            kind = (p[0] | 0x20) == 'u' ? 2 : 0;
+            p = word_end;
+            if (!(word_end = next_word(&p, stop)) || !parse_signed(p, word_end, &value) ||
+                (kind == 2 ? value < 0 || value > 255 : value < -32768 || value > 32767))
+                return kind == 2 ? "u8 is followed by 0 to 255" : "s16 is followed by -32768 to 32767";
+        } else {
+            if (!parse_signed(p, word_end, &value) || value < -128 || value > 127)
+                return "a plain value is -128 to 127 (write u8 N or s16 N for others), or varHH";
+            kind = 1;
+        }
+        p = word_end;
+        if (next_word(&p, stop))
+            return "acc OP VALUE has one value";
+        code[0] |= (BYTE)kind;
+        code[1] = (BYTE)value;
+        code[2] = (BYTE)(value >> 8);
+        *size = kind ? 2 : 3;
+        return NULL;
+    }
+    if ((v = camera_ff8_seq_var(first, word_end)) >= 0) {
+        const char *bad = camera_ff8_seq_var_ok(v);
+
+        if (!(word_end = next_word(&p, stop)) || !word_is(p, word_end, "="))
+            return "a store looks like varHH = acc";
+        p = word_end;
+        if (!(word_end = next_word(&p, stop)) || !word_is(p, word_end, "acc"))
+            return "a store looks like varHH = acc";
+        p = word_end;
+        if (next_word(&p, stop))
+            return "a store looks like varHH = acc";
+        if (bad)
+            return bad;
+        code[0] = 0xe5, code[1] = (BYTE)v;
+        *size = 2;
+        return NULL;
+    }
+    {
+        static const struct { const char *name; BYTE op; BYTE operand; } names[] = {
+            { "start", 0x00, 1 }, { "wait", 0x01, 0 }, { "end", 0x02, 0 }, { "save", 0x03, 0 }, { "blend", 0x04, 1 },
+            { "hold", 0x06, 0 }, { "release", 0x07, 0 }, { "stop", 0x08, 0 }, { "skip", 0x09, 1 }, { "halt", 0x0a, 1 },
+        };
+
+        for (i = 0; i < (int)(sizeof names / sizeof names[0]) && !word_is(first, word_end, names[i].name); i++)
+            ;
+        if (i == (int)(sizeof names / sizeof names[0]))
+            return word_is(first, word_end, "bytes") ? "bytes lines are refused: FF8's programs are whole instructions"
+                                                      : "not a sequence line (start, wait, end, save, blend, hold, release, stop, skip, halt, acc, varHH = acc, jmp ...)";
+        code[0] = names[i].op;
+        *size = 1;
+        if (names[i].operand) {
+            if (!(word_end = next_word(&p, stop)))
+                return "start, blend, skip and halt are followed by a number (start: or varHH)";
+            if (names[i].op == 0x00 && (v = camera_ff8_seq_var(p, word_end)) >= 0) {
+                if (v >= 0x80)
+                    return "start varHH takes a variable 00-7f (FF8's opcode 05 reads through FUN_00509640, which has no f0-ff)";
+                code[0] = 0x05, code[1] = (BYTE)v;
+            } else {
+                if (!parse_signed(p, word_end, &n) || n < 0 || n > 255)
+                    return "start, blend, skip and halt take a byte, 0 to 255";
+                if (names[i].op == 0x04 && !n)
+                    return "blend 0 is refused: FF8's blend task divides by it (00509930)";
+                if (names[i].op == 0x0a) {
+                    if (n < 0x0a || n > 0xbf)
+                        return "halt N: N is 0x0a to 0xbf (FF8's opcodes that stop the sequence)";
+                    code[0] = (BYTE)n;
+                    *size = 0;
+                } else
+                    code[1] = (BYTE)n;
+            }
+            *size += 1;
+            p = word_end;
+        }
+        if (next_word(&p, stop))
+            return "too many words on this sequence line";
+        return NULL;
+    }
+}
+
+/* [a, a + n) and [b, b + n) hold the same characters (label names, case kept) */
+static BOOL camera_ff8_same(const char *a, const char *b, int n)
+{
+    for (; n > 0; n--)
+        if (*a++ != *b++)
+            return FALSE;
+    return TRUE;
+}
+
+/* The [sequence] section's text [from, to) (lines, `;` comments) -> FF8's bytes in out[CAMERA_FF8_SEQ_BYTES], in two
+   passes (labels: a first word ending in `:`). The last instruction must be end, halt or jmp (FF8 would run on past
+   the program), and every jump lands inside it. NULL or what is wrong, *problem_line its line. */
+static const char *camera_ff8_assemble(char *from, char *to, int first_line, BYTE *out, int *length, int *problem_line)
+{
+    static char *label[CAMERA_FF8_SEQ_LABELS];
+    static int label_length[CAMERA_FF8_SEQ_LABELS], label_at[CAMERA_FF8_SEQ_LABELS];
+    int labels = 0, pass, last = -1;
+
+    for (pass = 0; pass < 2; pass++) {
+        char *line, *end;
+        int at = 0, number = first_line;
+
+        for (line = from; line < to; line = end + 1, number++) {
+            char *p = line, *stop, *word_end, *target = NULL, *target_end = NULL;
+            BYTE code[3] = { 0, 0, 0 };
+            const char *problem;
+            int size, jump, i;
+            long rel = 0;
+
+            for (end = line; end < to && *end != '\n'; end++)
+                ;
+            for (stop = line; stop < end && *stop != ';'; stop++)
+                ;
+            *problem_line = number;
+            trim(&p, &stop);
+            if (p == stop)
+                continue;
+            if ((word_end = next_word(&p, stop)) != NULL) {
+                char *colon;
+
+                for (colon = p; colon < word_end && *colon != ':'; colon++)
+                    ;
+                if (colon < word_end) {
+                    if (colon == p)
+                        return "a label has a name before its colon (L0010:)";
+                    if (!pass) {
+                        for (i = 0; i < labels; i++)
+                            if (label_length[i] == colon - p && camera_ff8_same(label[i], p, (int)(colon - p)))
+                                return "this label is given twice";
+                        if (labels == CAMERA_FF8_SEQ_LABELS)
+                            return "more than 256 labels in the sequence";
+                        label[labels] = p, label_length[labels] = (int)(colon - p), label_at[labels++] = at;
+                    }
+                    p = colon + 1;
+                }
+            }
+            if ((problem = camera_ff8_seq_line(p, stop, code, &size, &jump, &target, &target_end, &rel)) != NULL)
+                return problem;
+            if (!size)
+                continue;
+            if (at + size > CAMERA_FF8_SEQ_BYTES)
+                return "the sequence is longer than 2048 bytes";
+            if (pass) {
+                if (jump) {
+                    if (target) {
+                        for (i = 0; i < labels && (label_length[i] != target_end - target || !camera_ff8_same(label[i], target, (int)(target_end - target))); i++)
+                            ;
+                        if (i == labels)
+                            return "a jump to a label the sequence does not have";
+                        rel = label_at[i] - at;
+                    }
+                    if (jump == 1 && (rel < -128 || rel > 127))
+                        return "the jump is too far for its byte: write jmp.w (and so on) for a 16-bit jump";
+                    code[1] = (BYTE)rel, code[2] = (BYTE)(rel >> 8);
+                }
+                for (i = 0; i < size; i++)
+                    out[at + i] = code[i];
+            }
+            last = code[0];
+            at += size;
+        }
+        *length = at;
+        *problem_line = number - 1;
+    }
+    if (!*length)
+        return "the [sequence] section has no instruction";
+    if (last != 0x02 && last != 0xe6 && last != 0xed && !(last >= 0x0a && last < 0xc0))
+        return "the sequence must end with end, halt or jmp (FF8 would run on past it)";
+    {
+        /* every jump lands inside the program (FF8 would run wherever it points) */
+        int at = 0;
+
+        while (at < *length) {
+            int op = out[at], size = op < 0xc0 ? (op == 0x00 || op == 0x04 || op == 0x05 || op == 0x09 ? 2 : 1)
+                                   : op < 0xe4 ? ((op & 3) ? 2 : 3) : op == 0xe5 ? 2 : op <= 0xec ? 2 : 3;
+
+            if (op >= 0xe6 && op <= 0xf3) {
+                int to_at = at + (op <= 0xec ? (signed char)out[at + 1] : (short)(out[at + 1] | out[at + 2] << 8));
+
+                if (to_at < 0 || to_at >= *length)
+                    return "a jump goes outside the sequence";
+            }
+            at += size;
+        }
+    }
+    return NULL;
+}
+
+/* What the VM needs from its caller: FUN_00509640 (read, a variable 00-7f), LAB_005097c0 (write; FF8 keeps the low
+   16 bits) and LAB_00509810's camera opcodes (op 00 start with the code, 03 save, 04 blend N, 06 hold, 07 release,
+   08 stop, 0a-bf halt). */
+struct camera_ff8_seq_env {
+    int (*read)(void *context, int var);
+    void (*write)(void *context, int var, int value);
+    void (*op)(void *context, int op, int arg);
+    void *context;
+};
+
+/* One frame's run of FF8's VM (0050db40) from *pc until a yield (01: *pc after it), an end (02: *pc -1), a halt (0a-bf:
+   the op called, *pc -1) or an error. FF8's accumulator and operand are 32-bit ints (imul, idiv: truncated toward 0,
+   the remainder of the dividend's sign; +, - and * wrap); their values on entry are the program's address in FF8
+   (esi / ebx = the pc argument): 0 here. Jumps (e6-ec s8, ed-f3 s16) are taken from the opcode's own byte on acc > 0,
+   >= 0, == 0, != 0, <= 0, < 0 (in that order after jmp). Variables f0-ff are FF8's stack frame, fresh each run: 0
+   here (uninitialised in FF8). What FF8 would crash or hang on (a division by 0 or of -2^31 by -1, e4, f4-ff, a
+   variable 80-ef, the program run past its end, more than CAMERA_FF8_SEQ_STEPS instructions) is
+   CAMERA_FF8_SEQ_ERROR with *problem, *pc -1. */
+static int camera_ff8_seq_run(const BYTE *seq, int length, int *pc, const struct camera_ff8_seq_env *env, const char **problem)
+{
+    int stack[16], steps, p = *pc, i;
+    unsigned acc = 0, value = 0;
+
+    for (i = 0; i < 16; i++)
+        stack[i] = 0;
+    *problem = NULL;
+    for (steps = 0; steps < CAMERA_FF8_SEQ_STEPS && !*problem; steps++) {
+        int op, need;
+
+        if (p < 0 || p >= length) {
+            *problem = "the program ran past its end";
+            break;
+        }
+        op = seq[p];
+        need = op < 0xc0 ? (op == 0x00 || op == 0x04 || op == 0x05 || op == 0x09 ? 2 : 1)
+             : op < 0xe4 ? ((op & 3) ? 2 : 3) : op == 0xe5 ? 2 : op <= 0xec ? 2 : op <= 0xf3 ? 3 : 1;
+        if (p + need > length) {
+            *problem = "the program's last instruction is cut short";
+            break;
+        }
+        if (op < 0xc0) {
+            /* LAB_00509810: 0 to go on, -1 to return (01 wait: the pc after it; 02 end and 0a-bf: the pc 0) */
+            switch (op) {
+            case 0x00:
+                env->op(env->context, 0x00, seq[p + 1]);
+                break;
+            case 0x05:
+                if (seq[p + 1] >= 0x80) {
+                    *problem = "start varHH of a variable 80-ff";
+                    continue;
+                }
+                env->op(env->context, 0x00, env->read(env->context, seq[p + 1]));
+                break;
+            case 0x01:
+                *pc = p + 1;
+                return CAMERA_FF8_SEQ_YIELD;
+            case 0x02:
+                *pc = -1;
+                return CAMERA_FF8_SEQ_END;
+            case 0x04:
+                if (!seq[p + 1]) {
+                    *problem = "blend 0 (FF8's blend task divides by it)";
+                    continue;
+                }
+                env->op(env->context, 0x04, seq[p + 1]);
+                break;
+            case 0x03: case 0x06: case 0x07: case 0x08:
+                env->op(env->context, op, 0);
+                break;
+            case 0x09:
+                break;                          /* 005098d9: the byte after it passed over */
+            default:
+                env->op(env->context, op, 0);   /* 005098e6: every animation stops, the sequence ends */
+                *pc = -1;
+                return CAMERA_FF8_SEQ_HALT;
+            }
+            p += need;
+            continue;
+        }
+        if (op < 0xe4) {
+            switch (op & 3) {
+            case 0: value = (unsigned)(int)(short)(seq[p + 1] | seq[p + 2] << 8); break;    /* FUN_0050dac0 */
+            case 1: value = (unsigned)(int)(signed char)seq[p + 1]; break;                  /* FUN_0050daa0 */
+            case 2: value = seq[p + 1]; break;                                              /* FUN_0050dab0 */
+            default:
+                if (seq[p + 1] < 0x80)
+                    value = (unsigned)env->read(env->context, seq[p + 1]);
+                else if (seq[p + 1] >= 0xf0)
+                    value = (unsigned)stack[seq[p + 1] - 0xf0];
+                else {
+                    *problem = "a variable 80-ef (outside FF8's frame)";
+                    continue;
+                }
+            }
+            p += need;
+            switch (op & 0xfc) {
+            case 0xc0: acc = value; break;
+            case 0xc4: acc += value; break;
+            case 0xc8: acc -= value; break;
+            case 0xcc: acc *= value; break;     /* imul: the low 32 bits */
+            case 0xd0: case 0xe0:
+                if (!value || (acc == 0x80000000u && value == 0xffffffffu)) {
+                    *problem = "a division by 0 (FF8's idiv faults)";
+                    continue;
+                }
+                acc = (op & 0xfc) == 0xd0 ? (unsigned)((int)acc / (int)value) : (unsigned)((int)acc % (int)value);
+                break;
+            case 0xd4: acc &= value; break;
+            case 0xd8: acc |= value; break;
+            default: acc ^= value; break;       /* 0xdc */
+            }
+            continue;
+        }
+        if (op == 0xe5) {
+            /* the store: below 80 the write callback (it keeps 16 bits), f0-ff the frame (32 bits) */
+            if (seq[p + 1] < 0x80)
+                env->write(env->context, seq[p + 1], (int)acc);
+            else if (seq[p + 1] >= 0xf0)
+                stack[seq[p + 1] - 0xf0] = (int)acc;
+            else {
+                *problem = "a variable 80-ef (outside FF8's frame)";
+                continue;
+            }
+            p += 2;
+            continue;
+        }
+        if (op >= 0xe6 && op <= 0xf3) {
+            int j = op <= 0xec ? op - 0xe6 : op - 0xed, a = (int)acc;
+            int taken = j == 0 ? 1 : j == 1 ? a > 0 : j == 2 ? a >= 0 : j == 3 ? a == 0 : j == 4 ? a != 0 : j == 5 ? a <= 0 : a < 0;
+
+            p = taken ? p + (op <= 0xec ? (signed char)seq[p + 1] : (short)(seq[p + 1] | seq[p + 2] << 8)) : p + need;
+            continue;
+        }
+        *problem = op == 0xe4 ? "e4 (FF8's VM never moves past it: a hang)" : "a byte FF8's VM loops on (f4-ff: a hang)";
+    }
+    if (!*problem)
+        *problem = "more than 4096 instructions in one frame without wait (FF8 would hang)";
+    *pc = -1;
+    return CAMERA_FF8_SEQ_ERROR;
+}
+
 /* Reads one camera's text. Returns NULL or what is wrong (with *problem_line set). */
 static const char *parse_camera_text(char *text, DWORD size, struct own_camera *camera, int *problem_line)
 {
     char *line, *end, *file_end = text + size;
-    int variants[3], variant_count = 0, kind = -1, line_number = 0, i;
+    int variants[3], variant_count = 0, kind = -1, line_number = 0, i, roll_section = 0;
+    int engine_given = 0, scale_given = 0, select_given = 0, zoom_given = 0, blend_given = 0;
+    int mode_given = 0, seq_line = 0, cur_a = 0, cur_v = 0, last_a = -1, last_v = -1;   /* (camera stage 3) */
+    char *seq_from = NULL;              /* (camera stage 3) the [sequence] section's first line */
+    BYTE chain_seen[16];                /* (camera stage 3) the chains a heading has named (a bit a variant) */
     BYTE *start = NULL;
+    struct camera_ff8_segment scratch, *seg = &scratch;     /* (camera stage 1) the segment being read */
 
     camera->number = -1;
+    camera->roll_count = 0;
+    camera->engine = camera->anim = camera->variant = 0;
+    camera->unit_scale = 1000;
+    camera->ff8_first = (short)camera_ff8_used;
+    camera->ff8_count = 0;
+    camera->ff8_frames = 0;
+    camera->zoom = CAMERA_FF8_ZOOM_FOV;     /* (camera stage 2) */
+    camera->blend = camera->ff8_rolls = 0;
+    camera->sequence = camera->anims = 0;   /* (camera stage 3) */
+    camera->mode[0] = 0, camera->mode[1] = 1;
+    camera->seq_at = camera->seq_length = 0;
+    for (i = 0; i < 16 * 8; i++) {
+        camera->chain_first[i / 8][i % 8] = 0;
+        camera->chain_count[i / 8][i % 8] = 0;
+    }
+    for (i = 0; i < 16; i++)
+        chain_seen[i] = 0;
     for (i = 0; i < 6; i++)
         camera->script[i] = NULL;
+    /* kind: -1 before the first heading, 0 position, 1 focus, 2 the [roll] section (camera stage 0), 3 an
+       [anim A variant V] segment (camera stage 1), 4 the [sequence] section (camera stage 3: assembled at its end) */
 #define FINISH_SCRIPT() \
     do { \
-        if (kind >= 0) { \
+        if (kind == 3 && (seg->flags & CAMERA_FF8_EMPTY)) { \
+            /* (camera stage 3) an empty chain keeps no segment */ \
+            BYTE *count = camera->sequence ? &camera->chain_count[cur_a][cur_v] : NULL; \
+            if (seg != &scratch) { \
+                if ((count ? *count : camera->ff8_count) != 1) \
+                    return "empty: a chain is empty or has segments, not both"; \
+                camera_ff8_used--, camera->ff8_count--; \
+                if (count) \
+                    *count = 0; \
+            } \
+            break; \
+        } \
+        if (kind == 3 && !seg->keys) \
+            return "the segment that ends here has no key line"; \
+        if (kind == 4) { \
+            /* (camera stage 3) the program, assembled into the pool */ \
+            int seq_length = 0, seq_problem_line = seq_line; \
+            const char *seq_problem; \
+            if (camera_pool_used + CAMERA_FF8_SEQ_BYTES > CAMERA_POOL_BYTES) \
+                return "too much camera script in all (32768 bytes)"; \
+            seq_problem = camera_ff8_assemble(seq_from, line < file_end ? line : file_end, seq_line, camera_pool + camera_pool_used, &seq_length, &seq_problem_line); \
+            if (seq_problem) { \
+                *problem_line = seq_problem_line; \
+                return seq_problem; \
+            } \
+            camera->seq_at = (short)camera_pool_used; \
+            camera->seq_length = (short)seq_length; \
+            camera_pool_used += seq_length; \
+        } \
+        if (kind == 3 && seg->keys >= 3) \
+            for (i = 0; i < seg->keys - 1; i++) \
+                if (!seg->key[i].frames) \
+                    return "in a segment of three keys or more every key but the last lasts one frame at least (FF8's spline divides by it)"; \
+        if (kind == 0 || kind == 1) { \
             BYTE *now = camera_pool + camera_pool_used; \
             if (now == start || (now[-1] != 0xff && now[-1] != 0xc0)) \
                 return "a script must end with ff (or fe then c0)"; \
@@ -30900,6 +37334,8 @@ static const char *parse_camera_text(char *text, DWORD size, struct own_camera *
         trim(&p, &stop);
         if (p == stop)
             continue;
+        if (kind == 4 && *p != '[')
+            continue;                   /* (camera stage 3) a [sequence] line: assembled when the section ends */
         if (*p == '[') {
             /* [variant 0 1 2 position] */
             FINISH_SCRIPT();
@@ -30910,8 +37346,90 @@ static const char *parse_camera_text(char *text, DWORD size, struct own_camera *
             p++;
             stop--;
             word_end = next_word(&p, stop);
+            if (word_end && word_is(p, word_end, "roll")) {
+                /* [roll] (camera stage 0): the lines after it are roll lines */
+                p = word_end;
+                if (next_word(&p, stop))
+                    return "the roll section's heading is [roll], with nothing else in it";
+                if (roll_section)
+                    return "only one [roll] section in a camera";
+                roll_section = 1;
+                kind = 2;
+                continue;
+            }
+            if (word_end && word_is(p, word_end, "sequence")) {
+                /* [sequence] (camera stage 3): FF8's program, in the decoder's words, up to the next heading */
+                p = word_end;
+                if (next_word(&p, stop))
+                    return "the sequence's heading is [sequence], with nothing else in it";
+                if (camera->engine != CAMERA_ENGINE_FF8 || !camera->sequence)
+                    return "a [sequence] section needs engine = ff8 and select = sequence before the first heading";
+                if (seq_from)
+                    return "only one [sequence] section in a camera";
+                seq_from = end + 1;
+                seq_line = line_number + 1;
+                kind = 4;
+                continue;
+            }
+            if (word_end && word_is(p, word_end, "anim")) {
+                /* [anim A variant V] (camera stage 1): a segment of FF8's chain A.V */
+                static const char heading[] = "an ff8 segment's heading looks like [anim 0 variant 0] (animation 0-15, variant 0-7)";
+                long a, v;
+
+                if (camera->engine != CAMERA_ENGINE_FF8)
+                    return "an [anim A variant V] section needs engine = ff8 before the first heading";
+                if (!select_given)
+                    return "select = ANIM.VARIANT comes before the first [anim ...] section (the chain played)";
+                p = word_end;
+                if (!(word_end = next_word(&p, stop)) || !parse_signed(p, word_end, &a) || a < 0 || a > 15)
+                    return heading;
+                p = word_end;
+                if (!(word_end = next_word(&p, stop)) || !word_is(p, word_end, "variant"))
+                    return heading;
+                p = word_end;
+                if (!(word_end = next_word(&p, stop)) || !parse_signed(p, word_end, &v) || v < 0 || v > 7)
+                    return heading;
+                p = word_end;
+                if (next_word(&p, stop))
+                    return heading;
+                if (camera->sequence) {
+                    /* (camera stage 3) every chain is kept: its segments one after another */
+                    if ((chain_seen[a] >> v & 1) && (a != last_a || v != last_v))
+                        return "the segments of a chain go one after another (this chain had segments before another chain's)";
+                    if (camera->chain_count[a][v] == CAMERA_FF8_CHAIN)
+                        return "more than 16 segments in this chain";
+                    if (camera_ff8_used == CAMERA_FF8_SEGMENTS)
+                        return "too many ff8 segments in all (4096)";
+                    if (!camera->chain_count[a][v])
+                        camera->chain_first[a][v] = (short)camera_ff8_used;
+                    camera->chain_count[a][v]++;
+                    chain_seen[a] |= (BYTE)(1 << v);
+                    last_a = (int)a, last_v = (int)v;
+                    if (a >= camera->anims)
+                        camera->anims = (BYTE)(a + 1);
+                    seg = &camera_ff8_pool[camera_ff8_used++];
+                    camera->ff8_count++;
+                } else if (a == camera->anim && v == camera->variant) {
+                    if (camera->ff8_count == CAMERA_FF8_CHAIN)
+                        return "more than 16 segments in the chain played";
+                    if (camera_ff8_used == CAMERA_FF8_SEGMENTS)
+                        return "too many ff8 segments in all (4096)";
+                    seg = &camera_ff8_pool[camera_ff8_used++];
+                    camera->ff8_count++;
+                } else
+                    seg = &scratch;     /* another chain: read for its mistakes, not kept */
+                seg->keys = seg->flags = 0;
+                seg->ease = 0;
+                seg->frames = 0;
+                seg->h[0] = seg->h[1] = seg->roll[0] = seg->roll[1] = 0;
+                cur_a = (int)a, cur_v = (int)v;
+                kind = 3;
+                continue;
+            }
             if (!word_end || !word_is(p, word_end, "variant"))
                 return "a heading looks like [variant 0 1 2 position]";
+            if (camera->engine == CAMERA_ENGINE_FF8)
+                return "an engine = ff8 camera has no [variant] scripts (they are made for it)";
             for (p = word_end; (word_end = next_word(&p, stop)) != NULL; p = word_end) {
                 if (word_is(p, word_end, "position"))
                     kind = 0;
@@ -30937,6 +37455,81 @@ static const char *parse_camera_text(char *text, DWORD size, struct own_camera *
             key_end = equals;
             value = equals + 1;
             trim(&p, &key_end);
+            if (equals < stop && word_is(p, key_end, "camera_mode")) {
+                /* camera stage 3: camera_mode = A[, B]: FF8's two bytes var00 is drawn from (FUN_00500f70) */
+                char *q = value, *q_end;
+                long m[2];
+                int k;
+
+                if (mode_given++)
+                    return "camera_mode is given twice";
+                for (k = 0; k < 2 && (q_end = next_word(&q, stop)) != NULL; k++, q = q_end)
+                    if (!parse_signed(q, q_end, &m[k]) || m[k] < 0 || m[k] > 255)
+                        return "camera_mode is one or two numbers 0 to 255 (FF8's two bytes var00 is drawn from: camera_mode = 0, 1)";
+                if (!k || next_word(&q, stop))
+                    return "camera_mode is one or two numbers 0 to 255 (FF8's two bytes var00 is drawn from: camera_mode = 0, 1)";
+                camera->mode[0] = (BYTE)m[0];
+                camera->mode[1] = (BYTE)(k == 2 ? m[1] : m[0]);
+                continue;
+            }
+            if (equals < stop && (word_is(p, key_end, "zoom") || word_is(p, key_end, "blend"))) {
+                /* camera stage 2: zoom = fov | dolly | none, blend = N */
+                trim(&value, &stop);
+                if ((*p | 0x20) == 'z') {
+                    if (zoom_given++)
+                        return "zoom is given twice";
+                    if (word_is(value, stop, "fov"))
+                        camera->zoom = CAMERA_FF8_ZOOM_FOV;
+                    else if (word_is(value, stop, "dolly"))
+                        camera->zoom = CAMERA_FF8_ZOOM_DOLLY;
+                    else if (word_is(value, stop, "none"))
+                        camera->zoom = CAMERA_FF8_ZOOM_NONE;
+                    else
+                        return "zoom is fov (FF8's H as the field of view, the default), dolly (the eye moved instead) or none";
+                } else {
+                    long n;
+
+                    if (blend_given++)
+                        return "blend is given twice";
+                    if (!parse_signed(value, stop, &n) || n < 1 || n > CAMERA_FF8_BLEND_MAX)
+                        return "blend is FF8's blend back to the battle view, 1 to 255 frames (the effect's last ones)";
+                    camera->blend = (BYTE)n;
+                }
+                continue;
+            }
+            if (equals < stop && (word_is(p, key_end, "engine") || word_is(p, key_end, "unit_scale") || word_is(p, key_end, "select"))) {
+                /* camera stage 1: engine = ff7 | ff8, unit_scale = N, select = A.V */
+                trim(&value, &stop);
+                if ((*p | 0x20) == 'e') {
+                    if (engine_given++)
+                        return "engine is given twice";
+                    if (word_is(value, stop, "ff8"))
+                        camera->engine = CAMERA_ENGINE_FF8;
+                    else if (!word_is(value, stop, "ff7"))
+                        return "engine is ff7 (the game's scripts, the default) or ff8 (FF8's camera, played by SpellExt)";
+                } else if ((*p | 0x20) == 'u') {
+                    int scale = camera_ff8_scale(value, stop);
+
+                    if (scale_given++)
+                        return "unit_scale is given twice";
+                    if (scale < 0)
+                        return "unit_scale is a number from 0.001 to 16 (FF8 units to FF7 units: 1.0, 2.0, 0.5)";
+                    camera->unit_scale = (short)scale;
+                } else {
+                    if (select_given++)
+                        return "select is given twice";
+                    if (word_is(value, stop, "sequence")) {
+                        camera->sequence = 1;   /* (camera stage 3) */
+                        continue;
+                    }
+                    if (stop - value < 3 || stop - value > 4 || value[stop - value - 2] != '.' || stop[-1] < '0' || stop[-1] > '7' ||
+                        value[0] < '0' || value[0] > '9' || (stop - value == 4 && (value[0] != '1' || value[1] < '0' || value[1] > '5')))
+                        return "select is ANIM.VARIANT: the animation 0-15, a dot, the variant 0-7 (select = 0.0), or sequence";
+                    camera->anim = (BYTE)(stop - value == 4 ? 10 + value[1] - '0' : value[0] - '0');
+                    camera->variant = (BYTE)(stop[-1] - '0');
+                }
+                continue;
+            }
             if (equals == stop || !word_is(p, key_end, "camera"))
                 return "expected camera = NUMBER (in hex) before the first [variant ...] heading";
             trim(&value, &stop);
@@ -30952,6 +37545,22 @@ static const char *parse_camera_text(char *text, DWORD size, struct own_camera *
             if (n == 0 || n >= CAMERA_NUMBER_LIMIT)
                 return "the camera number must be hex, from 1 to 1fff";
             camera->number = (int)n;
+            continue;
+        }
+        if (kind == 2) {
+            /* a roll line (camera stage 0) */
+            const char *problem = camera_roll_line(camera, p, stop);
+
+            if (problem)
+                return problem;
+            continue;
+        }
+        if (kind == 3) {
+            /* a line of an ff8 segment (camera stage 1) */
+            const char *problem = camera_ff8_line(seg, p, stop);
+
+            if (problem)
+                return problem;
             continue;
         }
         {
@@ -31005,11 +37614,50 @@ static const char *parse_camera_text(char *text, DWORD size, struct own_camera *
 #undef FINISH_SCRIPT
     if (camera->number < 0)
         return "no camera = NUMBER line";
+    if (camera->engine == CAMERA_ENGINE_FF8) {
+        /* camera stage 1: the game's interpreters get scripts that set the variant's point to the battle's home
+           view (e1, the formation camera 009a8764 + 00bfcb28 x 0xc) and stay there (ff): the view while the
+           player is not writing, and what the game cuts back to when it stops */
+        if (!select_given)
+            return "an engine = ff8 camera needs select = ANIM.VARIANT (the chain played)";
+        if (camera->sequence && !seq_from)
+            return "a select = sequence camera needs its [sequence] section (FF8's program)";
+        if (!camera->sequence && mode_given)
+            return "camera_mode belongs to a select = sequence camera (it is FF8's var00)";
+        if (!camera->ff8_count)
+            return camera->sequence ? "a select = sequence camera needs one segment at least ([anim A variant V] sections)"
+                                    : "no [anim A variant V] section for the chain select names";
+        if (camera_pool_used + 4 > CAMERA_POOL_BYTES)
+            return "too much camera script in all (32768 bytes)";
+        start = camera_pool + camera_pool_used;
+        start[0] = 0xe1, start[1] = 0xff, start[2] = 0xe1, start[3] = 0xff;
+        camera_pool_used += 4;
+        for (i = 0; i < 3; i++) {
+            camera->script[i * 2] = start;
+            camera->script[i * 2 + 1] = start + 2;
+            camera->length[i * 2] = camera->length[i * 2 + 1] = 2;
+        }
+        for (i = 0; i < camera->ff8_count; i++) {
+            const struct camera_ff8_segment *s = &camera_ff8_pool[camera->ff8_first + i];
+
+            camera->ff8_frames += s->frames;
+            if ((s->flags & CAMERA_FF8_HAS_ROLL) && (s->roll[0] || s->roll[1]))
+                camera->ff8_rolls = 1;  /* (camera stage 2) */
+        }
+    } else if (scale_given || select_given)
+        return "unit_scale and select belong to an engine = ff8 camera";
+    else if (zoom_given || blend_given)
+        return "zoom and blend belong to an engine = ff8 camera";
+    else if (mode_given)
+        return "camera_mode belongs to an engine = ff8 camera with select = sequence";
     for (i = 0; i < 6; i++)
         if (!camera->script[i])
             return "all three variants need a position and a focus script";
+    if (roll_section && !camera->roll_count)
+        return "the [roll] section has no lines (at FRAME roll ANGLE [over FRAMES] [ease])";
     return NULL;
 }
+/* CAMERA TEXT PURE END */
 
 /* Reads every *.txt in SpellExtConfig\cameras: the first time a camera file is read, and again
    after the config files have been read again from the SpellExt menu (forget_own_cameras). */
@@ -31034,7 +37682,7 @@ static void load_own_cameras(void)
         const char *problem;
         char *text;
         DWORD size = 0;
-        int line = 0, used_before = camera_pool_used, i;
+        int line = 0, used_before = camera_pool_used, ff8_before = camera_ff8_used, i;
 
         if (own_camera_count == MAX_OWN_CAMERAS || lstrlenA(found.cFileName) > 60)
             continue;
@@ -31050,6 +37698,7 @@ static void load_own_cameras(void)
                 problem = "another file already defines this camera number";
         if (problem) {
             camera_pool_used = used_before;
+            camera_ff8_used = ff8_before;   /* (camera stage 1) its segments are not kept */
             problems++;
             log_line("camera text %s line %d: %s", found.cFileName, line, problem);
             continue;
@@ -31059,6 +37708,28 @@ static void load_own_cameras(void)
         log_line("camera %x from %s: %d + %d, %d + %d, %d + %d bytes (position + focus, variants 0 1 2)", camera->number,
                  found.cFileName, camera->length[0], camera->length[1], camera->length[2], camera->length[3],
                  camera->length[4], camera->length[5]);
+        if (camera->roll_count)         /* (camera stage 0) a camera without [roll] logs as before */
+            log_line("camera %x: %d roll line(s), settled at %d from frame %d (played on a native effect's frames, under this camera only)",
+                     camera->number, camera->roll_count, camera_roll_at(camera->roll, camera->roll_count, CAMERA_ROLL_FRAMES),
+                     camera_roll_settles(camera->roll, camera->roll_count));
+        if (camera->engine == CAMERA_ENGINE_FF8) {
+            /* (camera stage 1; stage 2: the zoom, the roll, the splines, the blend) */
+            int splines = 0;
+
+            for (i = 0; i < camera->ff8_count; i++)
+                splines += camera_ff8_pool[camera->ff8_first + i].keys >= 3;
+            if (camera->sequence)       /* (camera stage 3) */
+                log_line("camera %x: engine ff8, select sequence: a program of %d byte(s), %d animation(s), %d segment(s) in its chains (%d of three keys or more: splines), camera_mode %d, %d, unit_scale %d.%03d, zoom %s, %s, %s (played on a native effect's frames from its first; scripts made: the battle's home view)",
+                         camera->number, camera->seq_length, camera->anims, camera->ff8_count, splines, camera->mode[0], camera->mode[1],
+                         camera->unit_scale / 1000, camera->unit_scale % 1000,
+                         camera->zoom == CAMERA_FF8_ZOOM_FOV ? "fov" : camera->zoom == CAMERA_FF8_ZOOM_DOLLY ? "dolly" : "none",
+                         camera->ff8_rolls ? "a roll (exact)" : "no roll", camera->blend ? "a blend back at the end" : "a cut at the end");
+            else
+                log_line("camera %x: engine ff8, anim %d variant %d: %d segment(s) (%d of three keys or more: splines), %d frame(s), unit_scale %d.%03d, zoom %s, %s, %s (played on a native effect's frames from its first; scripts made: the battle's home view)",
+                         camera->number, camera->anim, camera->variant, camera->ff8_count, splines, camera->ff8_frames, camera->unit_scale / 1000,
+                         camera->unit_scale % 1000, camera->zoom == CAMERA_FF8_ZOOM_FOV ? "fov" : camera->zoom == CAMERA_FF8_ZOOM_DOLLY ? "dolly" : "none",
+                         camera->ff8_rolls ? "a roll (exact)" : "no roll", camera->blend ? "a blend back at the end" : "a cut at the end");
+        }
     } while (FindNextFileA(search, &found));
     FindClose(search);
     log_line("camera texts: %d camera(s) of our own, %d file(s) with problems", own_camera_count, problems);
@@ -31068,8 +37739,2351 @@ static void load_own_cameras(void)
 static void forget_own_cameras(void)
 {
     own_camera_count = camera_pool_used = 0;
+    camera_ff8_used = 0;                /* (camera stage 1) */
     own_cameras_loaded = 0;
 }
+
+/* CAMERA PLAY BEGIN: (camera stage 1) the roll's and FF8's players, which the native test runs against game memory
+   mapped at its addresses */
+/* ---- Camera roll (camera stage 0; FF7FF8Fusion/Notes/Camera_Stage0_Roll.md) ----------------------------
+   FUN_0042d971 (called once a frame at 0041bda4, after the drawing) builds the battle's camera 00bfcb30 with
+   FUN_00430b7b: a look-at from the eye 00bf2158 to the focus 00bfb1a0 with a fixed up vector (FUN_005c68b7,
+   008fe110), then FUN_00662ad8(00bfcb30 + 0x1e) composes the three Euler angles there (X, Y, Z shorts, 4096 a
+   turn) with it. The Z angle 00bfcb52 turns the ARENA about the world's Z axis (the level line through the arena's
+   centre at floor height, from the party's side to the enemies'), before the look-at: it reads as a roll of the
+   camera only when the shot looks along that axis; looking across it, it tilts the floor instead. A true roll
+   about the line of sight is a later stage (a chained call at 0041bda4). The game never writes the Z angle by name
+   (it writes X, 00bfcb4e, to turn the picture over: FUN_004da182 / 004da447, Typhoon's, which reads all three
+   angles, Z included, and is never run during a native effect; and the offsets 00bfcb58 / 00bfcb5a to shake it).
+   FUN_0042ab91 zeroes the whole block in the set-up of the first battle after the battle module is entered
+   (FUN_00429ac0); a battle chained straight after another is not set up so, and relies on the effect's task
+   ending. Everything in the battle is drawn through 00bfcb30 or the per-group records made from it each frame
+   (FUN_0042e52e, models; the actors' screen places 00bf2e24 that the damage numbers and cursors use), so a value
+   written there turns the whole picture; billboards (FUN_005d2b44) stay upright on the screen.
+   native_task runs in the list of 100 at 0042dac0, after the camera scripts and the view's choice (FUN_005c20ce,
+   whose call FFNx may own) and before 0041bda4: what it writes is what that frame's matrix is built from. No
+   patch: a short is written, after the bytes of the three game routines that make it count are checked once.
+   The rules (camera_roll_step / camera_roll_stop):
+   - the roll is the game's own value when it begins (the base, 0 unless something else rolled) plus the
+     camera's [roll] value at the effect's frame; it is written each call of the effect's task, and only while
+     the camera running (00c05eb8) is one with [roll] lines and the game draws that camera's view
+     (camera_roll_scripted_shown: not its home view during target selection); otherwise the base;
+   - when the effect ends (any way: its length, its files gone, the watchdog, a newer cast, a re-read) the base
+     is written back, if the value there is still this DLL's (the matrix built after that call is level: the
+     picture one frame later);
+   - if the value there is not what this DLL wrote last, the game wrote it: the game's value is kept and this
+     cast rolls no more (one log line); the game's turn-over and shakes are other fields and add to the roll;
+   - the Config menu's fixed camera ((00dc0e12 & 0x300) == 0x100, FUN_005c20ce's test): no roll;
+   - a battle start forgets the roll without writing; 00bfcb30 is referenced only in the battle module
+     (004217ba-005d7b5c): field and world code never read it. */
+#define ADDR_CAMERA_ROLL        0x00bfcb52u  /* short: 00bfcb30 + 0x22, the Euler Z angle FUN_00430b7b applies (readers: FUN_00430b7b, FUN_004da447) */
+#define ADDR_CAMERA_NUMBER      0x00c05eb8u  /* short: the running camera (FUN_00430aa7 takes the display record's word) */
+#define ADDR_CAMERA_OPTION      0x00dc0e12u  /* word: & 0x300 == 0x100: the Config menu's fixed camera (FUN_005c20ce) */
+#define ADDR_CAMERA_RESULT_X4   0x00bf2e04u  /* signed byte: == 'd' (0x64): FUN_005c20ce shows the running camera's variant */
+#define ADDR_BATTLE_MENU_STATE  0x0091ef9cu  /* short: the battle menu's state, 0 = target selection (FUN_006db0ee) */
+#define SITE_CAMERA_BUILD       0x0041bda4u  /* e8 c8 1b 01 00: call FUN_0042d971, in FUN_0041bab3 (its only call) */
+#define FN_CAMERA_BUILD         0x0042d971u  /* FUN_00430b7b(00bfcb30, 00bf2130, eye 00bf2158, focus 00bfb1a0) */
+#define SITE_CAMERA_EULER       0x00430b98u  /* in FUN_00430b7b: FUN_00662ad8(record + 0x1e, record) */
+#define SITE_CAMERA_NUMBER_READ 0x0042da86u  /* in FUN_0042d992: mov ax, [00c05eb8]; push eax (FUN_005c20ce's camera) */
+#define CAMERA_FIXED_MASK       0x0300u
+#define CAMERA_FIXED            0x0100u
+#define CAMERA_ROLL_LOGS        30           /* roll log lines a battle */
+
+static struct {
+    BYTE active;                        /* the value at ADDR_CAMERA_ROLL is this DLL's now */
+    BYTE done;                          /* nothing more for this cast (ended, the game's value kept, fixed camera) */
+    WORD serial;                        /* the native effect's task that owns it (native_play.serial) */
+    short base, written;                /* the game's own value at the start; what this DLL wrote last */
+    int camera, last_frame;
+} camera_roll = { 0, 1, 0, 0, 0, -1, -1 };
+static int camera_roll_sites;           /* 0 not looked at, 1 as expected, -1 not: no roll is played */
+static LONG camera_roll_logs;
+
+static BOOL camera_roll_say(void)
+{
+    return InterlockedIncrement(&camera_roll_logs) <= CAMERA_ROLL_LOGS;
+}
+
+static void __cdecl camera_true_build(void);
+
+/* (camera stage 2) the call at 0041bda4 goes to this DLL's camera_true_build (the true roll's hook, which calls
+   FUN_0042d971 first): as good as the game's own call for the roll and the ff8 player */
+static BOOL camera_true_hooked_here(void)
+{
+    return *(const BYTE *)SITE_CAMERA_BUILD == 0xe8 &&
+           SITE_CAMERA_BUILD + 5 + *(const DWORD *)(SITE_CAMERA_BUILD + 1) == (DWORD)camera_true_build;
+}
+
+/* The three places that make a write at 00bfcb52 turn the picture, once. */
+static BOOL camera_roll_sites_ok(void)
+{
+    static const BYTE build_call[5] = { 0xe8, 0xc8, 0x1b, 0x01, 0x00 };
+    static const BYTE build[28] = { 0x55, 0x8b, 0xec, 0x68, 0xa0, 0xb1, 0xbf, 0x00, 0x68, 0x58, 0x21, 0xbf, 0x00, 0x68,
+                                    0x30, 0x21, 0xbf, 0x00, 0x68, 0x30, 0xcb, 0xbf, 0x00, 0xe8, 0xee, 0x31, 0x00, 0x00 };
+    static const BYTE euler[16] = { 0x8b, 0x45, 0x08, 0x50, 0x8b, 0x4d, 0x08, 0x83, 0xc1, 0x1e, 0x51, 0xe8, 0x30, 0x1f, 0x23, 0x00 };
+    static const BYTE number[7] = { 0x66, 0xa1, 0xb8, 0x5e, 0xc0, 0x00, 0x50 };
+
+    if (camera_roll_sites)
+        return camera_roll_sites > 0;
+    camera_roll_sites = (bytes_are(SITE_CAMERA_BUILD, build_call, 5) || camera_true_hooked_here()) && bytes_are(FN_CAMERA_BUILD, build, 28) &&
+                        bytes_are(SITE_CAMERA_EULER, euler, 16) && bytes_are(SITE_CAMERA_NUMBER_READ, number, 7) ? 1 : -1;
+    log_line("camera roll: %s (the camera's build at %08lx -> %08lx, its Euler step at %08lx, the camera number read at %08lx)",
+             camera_roll_sites > 0 ? "on" : "OFF: the game's bytes there are not as expected; no camera rolls",
+             SITE_CAMERA_BUILD, FN_CAMERA_BUILD, SITE_CAMERA_EULER, SITE_CAMERA_NUMBER_READ);
+    return camera_roll_sites > 0;
+}
+
+static const struct own_camera *camera_with_roll(int number)
+{
+    int i;
+
+    for (i = 0; i < own_camera_count; i++)
+        if (own_cameras[i].number == number)
+            return own_cameras[i].roll_count ? &own_cameras[i] : NULL;
+    return NULL;
+}
+
+/* The roll ends for the effect `serial`: the game's own value back, if the value there is still ours. */
+static void camera_roll_stop(WORD serial, const char *why)
+{
+    short now;
+
+    if (camera_roll.serial != serial)
+        return;
+    camera_roll.done = 1;
+    if (!camera_roll.active)
+        return;
+    camera_roll.active = 0;
+    now = *(const short *)ADDR_CAMERA_ROLL;
+    if (now == camera_roll.written)
+        *(short *)ADDR_CAMERA_ROLL = camera_roll.base;
+    if (camera_roll_say())
+        log_line(now == camera_roll.written ? "camera %x roll: cleared (%s): back to the game's %d"
+                                            : "camera %x roll: ends (%s); the game had written its own value there: left as it is (%d)",
+                 camera_roll.camera, why, now == camera_roll.written ? camera_roll.base : now);
+}
+
+/* A native effect's task starts (native_effect_step): it owns the roll from now on; nothing is written yet. */
+static void camera_roll_begin(WORD serial)
+{
+    camera_roll_stop(camera_roll.serial, "a newer effect starts");
+    camera_roll.serial = serial;
+    camera_roll.active = camera_roll.done = 0;
+    camera_roll.last_frame = -1;
+}
+
+/* Each call of the effect's task but its last: the roll at the effect's `frame` (paused calls repeat a frame). */
+static void camera_roll_step(WORD serial, int frame, int length, DWORD effect)
+{
+    const struct own_camera *c;
+    int camera, value, i;
+
+    if (camera_roll.serial != serial || camera_roll.done)
+        return;
+    camera = *(const short *)ADDR_CAMERA_NUMBER;
+    c = camera_with_roll(camera);
+    if (!camera_roll.active) {
+        if (!c)
+            return;                     /* this camera has no roll: nothing is written, the camera as before */
+        if (!camera_roll_sites_ok()) {
+            camera_roll.done = 1;
+            return;
+        }
+        if ((*(const WORD *)ADDR_CAMERA_OPTION & CAMERA_FIXED_MASK) == CAMERA_FIXED) {
+            camera_roll.done = 1;
+            if (camera_roll_say())
+                log_line("camera %x roll: not played (the Config menu's camera is fixed)", camera);
+            return;
+        }
+        camera_roll.base = camera_roll.written = *(const short *)ADDR_CAMERA_ROLL;
+        camera_roll.active = 1;
+        camera_roll.camera = camera;
+        if (camera_roll_say())
+            log_line("camera %x roll: starts at native effect %04lx's frame %d (%d line(s)); the game's own roll %d stays under it",
+                     camera, effect, frame, c->roll_count, camera_roll.base);
+        value = camera_roll_at(c->roll, c->roll_count, length - 1);
+        i = camera_roll_settles(c->roll, c->roll_count);
+        if ((value || i > length - 1) && camera_roll_say())
+            log_line("camera %x roll: %d at the effect's last frame (%d; its last glide ends at %d): it is cut back to the game's value as the effect ends",
+                     camera, value, length - 1, i);
+    }
+    if (*(const short *)ADDR_CAMERA_ROLL != camera_roll.written) {
+        camera_roll.active = 0;
+        camera_roll.done = 1;
+        if (camera_roll_say())
+            log_line("camera %x roll: the game wrote its own roll there (%d, this DLL's was %d) at frame %d: the game's is kept, this effect rolls no more",
+                     camera_roll.camera, *(const short *)ADDR_CAMERA_ROLL, camera_roll.written, frame);
+        return;
+    }
+    if (c && camera != camera_roll.camera) {
+        if (camera_roll_say())
+            log_line("camera roll: the camera is now %x (it was %x) at frame %d: its roll lines are played", camera, camera_roll.camera, frame);
+        camera_roll.camera = camera;
+    }
+    /* another camera, or the game drawing its home view (target selection): the game's own value */
+    value = c && camera_roll_scripted_shown(*(const signed char *)ADDR_CAMERA_RESULT_X4, *(const short *)ADDR_BATTLE_MENU_STATE,
+                                            *(const BYTE *)ADDR_SUMMON_ACTIVE) ? camera_roll_at(c->roll, c->roll_count, frame) : 0;
+    camera_roll.written = (short)(camera_roll.base + value);
+    *(short *)ADDR_CAMERA_ROLL = camera_roll.written;
+    if (c && frame != camera_roll.last_frame)
+        for (i = 0; i < c->roll_count; i++)
+            if (frame == c->roll[i].at + c->roll[i].over && camera_roll_say())
+                log_line("camera %x roll: %d at frame %d", camera, value, frame);
+    camera_roll.last_frame = frame;
+}
+
+/* A battle starts (native_battle_start): a roll left from the last one is forgotten, nothing written (FUN_0042ab91
+   zeroes 00bfcb30 in the first battle's set-up; a chained battle relies on the effect's task having ended). */
+static void camera_roll_battle_start(void)
+{
+    if (camera_roll.active)
+        log_line("camera %x roll: still on as a battle starts: dropped (the game's set-up zeroes the camera block)", camera_roll.camera);
+    camera_roll.active = 0;
+    camera_roll.done = 1;
+    InterlockedExchange(&camera_roll_logs, 0);
+}
+
+/* ---- FF8's camera, played (camera stage 1; FF7FF8Fusion/Notes/Camera_Stage1_Keyframes.md) ----------------------
+   Route A of FF8_Camera_Emulation_Plan.md: while a native effect runs under an engine = ff8 camera (00c05eb8), the
+   effect's task (native_task, in the list of 100 at 0042dac0) writes, each call but its last, the eye 00bf2158 and
+   the point looked at 00bfb1a0 (three shorts each) that the camera's chain gives at the effect's frame (the chain's
+   frame 0 is the first frame played under the camera: the effect's first, unless it became the running camera
+   later). The game
+   chose its own eye and point earlier in the same frame (FUN_005c20ce at 0042da8d, whose call FFNx owns: it calls
+   the game's routine first, then moves the eye only if it sits on the formation camera); FUN_0042d971 builds the
+   camera from what is there at the end of the frame (0041bda4). The same four sites as the roll are checked once
+   (camera_roll_sites_ok: 0042d971 pushes 00bfb1a0, 00bf2158, 00bf2130, 00bfcb30).
+   The camera's made scripts (e1 ff) put each variant's point on the battle's home view and stay idle, so:
+   - while the player does not write (before the effect, target selection's home view, another camera, the Config
+     menu's fixed camera, after it) the game draws its own view, the home view;
+   - nothing needs restoring when it stops: the game writes the eye and point every frame before the task runs,
+     and the matrix of the frame the effect ends on is built from the game's own choice: a cut back to the battle
+     view, with no task left and no frame of delay (the effect's task ends at its length as before);
+   - a battle start forgets the play without writing.
+   Self-check (risk 3 of the plan): at each call after one that wrote, the eye the game's last look-at was built
+   from (00bf2130, written by FUN_005c68b7 in that build: 9 shorts, rows, and -(R eye) at +0x12) is worked back
+   and compared with the eye written; the first CAMERA_FF8_CHECKS are logged, the rest counted.
+   Camera stage 2 (FF7FF8Fusion/Notes/Camera_Stage2.md) adds, on the same calls:
+   - FF8's H (camera_ff8_play_frame) as zoom = fov (the default: the battle's own H, 00c05f7c, written while the
+     eye is written, which the game turns into its field of view and projection later in the same frame; the
+     game's own H back on every other call and when the play ends) or zoom = dolly (the eye written moved along
+     the line of sight);
+   - FF8's roll, exact (route B): the call at 0041bda4 is hooked once (bytes checked, refused otherwise) and,
+     after the game's own build, the camera is built again by the game's own routines with the up vector turned
+     as FF8's formula turns it (camera_true_build), checked once a play against the game's build at roll 0;
+   - blend = N: FF8's sine blend from the chain's eye and point to the game's (the battle view) over the effect's
+     last N frames, so that the effect's end lands on the view it cuts to (no frame added);
+   - frames 1-4 between the actors' body points (camera_ff8_body) rather than on the floor. */
+#define ADDR_CAMERA_EYE         0x00bf2158u  /* 3 shorts: the eye FUN_0042d971 builds from (pushed at 0042d979) */
+#define ADDR_CAMERA_FOCUS       0x00bfb1a0u  /* 3 shorts: the point looked at (pushed at 0042d974) */
+#define ADDR_CAMERA_LOOKAT      0x00bf2130u  /* FUN_005c68b7's look-at (pushed at 0042d97e): 9 shorts, 3 ints at +0x12 */
+#define CAMERA_FF8_LOGS         30           /* log lines a battle */
+#define CAMERA_FF8_CHECKS       10           /* self-check lines a cast */
+/* camera stage 2: the body points (frames 1-4) */
+#define ADDR_CAMERA_BODY_POINT  0x00be11a3u  /* per actor (+ x 0x1aec), signed byte: its model's point 0, a bone entry of
+                                                00be1d24 (FUN_0042b66a copies 16 from the model's data + 0x12): the point
+                                                FF7 projects for the cursor and damage numbers (FUN_0042f3e8: 0042fca1 reads
+                                                it, 0042fcf2 FUN_0067ce9d -> 00bf2e24) and aims its own spells at
+                                                (FUN_005d2e00(actor, point 0) in the effect modules) */
+/* camera stage 2: the zoom, played as the battle's own H */
+#define ADDR_BATTLE_H           0x00c05f7cu  /* short: the battle's H, 512 (FUN_00429ac0 sets 0x200 at 00429b5b, every battle
+                                                init; the summon and limit modules write it too); only the battle reads it
+                                                (FUN_0042a06a, FUN_0042d808) */
+#define SITE_BATTLE_H_READ      0x0042d929u  /* in FUN_0042d808, every battle frame after the task lists (0042d838): movsx ecx,
+                                                word [00c05f7c]; push ecx; call FUN_00661a1c: the fov and the projection from it,
+                                                before the camera's build at 0041bda4 */
+#define SITE_FOV_WRITE          0x00661a76u  /* in FUN_00661a1c: fstp dword [game + 0x99c] (the fov in degrees, FUN_006619ee(H)) */
+#define SITE_FOV_PROJECTION     0x00661accu  /* in FUN_00661a1c: call FUN_0067ccde (the projection, game + 0x8d0) */
+/* camera stage 2: the true roll (route B) */
+#define SITE_CAMERA_BUILD_TEST  0x0041bd9bu  /* cmp dword [009ad1ac], 0 / je +5: the test before the call at 0041bda4 */
+#define ADDR_CAMERA_RECORD      0x00bfcb30u  /* the battle's camera (FUN_0042d971's first push) */
+#define FN_CAMERA_MATRIX        0x00430b7bu  /* FUN_00430b7b(record, look-at, eye, focus): the routines below, in this order */
+#define FN_CAMERA_LOOKAT        0x005c68b7u  /* FUN_005c68b7(look-at, eye, focus, up int[3]) */
+#define FN_CAMERA_EULER         0x00662ad8u  /* FUN_00662ad8(record + 0x1e, record): the Euler angles' rotation */
+#define FN_CAMERA_OFFSET        0x00663766u  /* FUN_00663766(record, record + 0x26): the offset as the translation */
+#define FN_CAMERA_TIMES         0x00662134u  /* FUN_00662134(look-at, record): record = look-at x record */
+#define FN_CAMERA_SET_ROTATION  0x00663673u  /* FUN_00663673(matrix): the current rotation */
+#define FN_CAMERA_SET_PLACE     0x00663707u  /* FUN_00663707(matrix): the current translation */
+#define FN_CAMERA_TRANSLATE     0x00662eccu  /* FUN_00662ecc(record + 0x26, record + 0x12, int *): the translation */
+#define FN_CAMERA_FINISH        0x00430391u  /* FUN_00430391(record, 008fe120): scaled by 1.0, the current matrix */
+#define ADDR_CAMERA_SCALE       0x008fe120u  /* 3 ints 4096 (FUN_00430b7b pushes it at 00430c00) */
+#define CAMERA_UP               (-4096)      /* the up vector FUN_00430b7b pushes (008fe110: 0, -4096, 0) */
+
+static struct {
+    BYTE active;                        /* writing for this cast (the camera found, the sites as expected) */
+    BYTE done;                          /* nothing more for this cast */
+    BYTE wrote;                         /* the last call wrote the eye and point */
+    BYTE ended_said;
+    WORD serial;                        /* the native effect's task that owns it */
+    int camera;
+    int origin;                         /* the effect's frame the chain's frame 0 is (the first played under this camera) */
+    short written[2][3];                /* the eye and point written last */
+    int checks, matched, worst;
+    struct camera_ff8_play play;
+    BYTE blend_said;                    /* (camera stage 2) the blend's line, once a cast */
+    BYTE fov_refused;                   /* (camera stage 2) no H can be written this play: zoom = fov is played as a dolly */
+    int view_frame;                     /* (camera stage 2) the frame the game's view below was read at (FFNx's 30/60 fps repeat it) */
+    short view[2][3];                   /* the game's own eye and point that frame: what the blend goes to */
+} camera_ff8 = { 0, 1, 0, 0, 0, -1, 0, { { 0, 0, 0 }, { 0, 0, 0 } }, 0, 0, 0, { -1, 0, -1, { { { 0 } } }, { { 0 } }, 512, 0, { 512, 512 }, { 0, 0 },
+                 { 0 }, { { { 0 } } }, { { { 0 } } }, -1, 0 }, 0, 0, -1, { { 0, 0, 0 }, { 0, 0, 0 } } };
+static LONG camera_ff8_logs;
+/* (camera stage 2) the zoom (zoom = fov): the battle's H */
+static struct {
+    BYTE active;                        /* the value at 00c05f7c is this DLL's (or its base) for the play */
+    short base;                         /* the game's own H when the play began (512) */
+    short written;                      /* the H written last */
+} camera_zoom;
+static int camera_zoom_sites;           /* 0 not looked at, 1 as expected, -1 not: FF8's H is played as a dolly */
+/* (camera stage 2) the true roll: route B */
+static struct {
+    BYTE armed;                         /* this frame's build gets the roll (set by the step, taken by the hook) */
+    BYTE check;                         /* the layout self-check is due at the next armed build (once a play) */
+    BYTE failed;                        /* the self-check found the rebuild unlike the game's: never again */
+    short roll;                         /* FF8's roll for this frame's build, 4096 a turn */
+    int camera;
+    int skipped;                        /* builds left level: the line of sight along the turned up vector */
+} camera_true;
+static int camera_true_hook;            /* 0 not yet, 1 in at 0041bda4, -1 refused (the bytes, or the patch) */
+
+static BOOL camera_ff8_say(void)
+{
+    return InterlockedIncrement(&camera_ff8_logs) <= CAMERA_FF8_LOGS;
+}
+
+static const struct own_camera *camera_ff8_find(int number)
+{
+    int i;
+
+    for (i = 0; i < own_camera_count; i++)
+        if (own_cameras[i].number == number)
+            return own_cameras[i].engine == CAMERA_ENGINE_FF8 && own_cameras[i].ff8_count ? &own_cameras[i] : NULL;
+    return NULL;
+}
+
+/* An actor's place on the floor (x, 0, z: 00be12de / 00be12e2), or a bone's (FUN_005d2e00, as native_place: the
+   last bone at most) when it has a model. */
+static void camera_ff8_actor(int actor, int bone, int out[3])
+{
+    DWORD base = (DWORD)actor * ACTOR_EFFECT_STRIDE;
+    int bones = *(const short *)(ADDR_NATIVE_BONES + base);
+
+    if (bone != CAMERA_FF8_PLACE && *(const DWORD *)(ADDR_NATIVE_MODEL + base) && bones >= 1) {
+        short place[3];
+
+        ((void (__cdecl *)(int, int, short *))FN_NATIVE_BONE_PLACE)(actor, bone < bones ? bone : bones - 1, place);
+        out[0] = place[0], out[1] = place[1], out[2] = place[2];
+        return;
+    }
+    out[0] = *(const short *)(ADDR_NATIVE_PLACE_X + base);
+    out[1] = 0;
+    out[2] = *(const short *)(ADDR_NATIVE_PLACE_Z + base);
+}
+
+/* (camera stage 2) An actor's body point: FF8's model points 0xf0 and 0xf1 (FUN_00502170: a bone of the model's own
+   list, half way along it) are both played as FF7's model point 0 (ADDR_CAMERA_BODY_POINT: the bone the game aims
+   its cursor, damage numbers and spells at; FF8's two points sit near each other at body height, 0xf1 most often
+   the body's root bone). No model, or a point the actor's bones do not hold: its place on the floor (FF8: the
+   entity's place). */
+static void camera_ff8_body(int actor, int out[3])
+{
+    DWORD base = (DWORD)actor * ACTOR_EFFECT_STRIDE;
+    int point = *(const signed char *)(ADDR_CAMERA_BODY_POINT + base);
+
+    camera_ff8_actor(actor, point >= 0 && point < *(const short *)(ADDR_NATIVE_BONES + base) ? point : CAMERA_FF8_PLACE, out);
+}
+
+/* camera_ff8_base_fn for the game: camera / focus the play's own last eye and point; target the highest-numbered
+   target (FUN_0050d300's loop leaves 01d99aaa at the mask's last set bit),
+   caster the effect's actor (target the caster when the effect has none); frameN FF8's effect frame N
+   (camera_ff8_frame, FUN_0050d300): frame0 from the caster's place to the target's, or with several targets to the
+   centre of the box round them (FUN_005020a0: (min + max) / 2 of x and of z), on the floor; frames 1-4 (camera stage
+   2) from the caster's body point (FF8's 0xf0 for frames 1 and 2, 0xf1 for 3 and 4) to the target's (0xf0 for 1
+   and 3, 0xf1 for 2 and 4), with several targets to the box's centre at the height of the caster's point (FF8's
+   own choice at 0050d3f0). */
+static int camera_ff8_base(void *context, int ref, int bone, int out[3], int m[9])
+{
+    struct camera_ff8_play *play = (struct camera_ff8_play *)context;
+    int t, n = 0, last = -1, box[4] = { 0, 0, 0, 0 }, from[3], to[3];
+
+    out[0] = out[1] = out[2] = 0;
+    if (ref == CAMERA_FF8_CAMERA || ref == CAMERA_FF8_FOCUS) {
+        for (t = 0; t < 3; t++)
+            out[t] = play->out[ref == CAMERA_FF8_FOCUS][t];
+        return 0;
+    }
+    for (t = 0; t < 10; t++)
+        if (native_play.mask >> t & 1) {
+            int x = *(const short *)(ADDR_NATIVE_PLACE_X + (DWORD)t * ACTOR_EFFECT_STRIDE);
+            int z = *(const short *)(ADDR_NATIVE_PLACE_Z + (DWORD)t * ACTOR_EFFECT_STRIDE);
+
+            if (last < 0)
+                box[0] = box[1] = x, box[2] = box[3] = z;
+            last = t;
+            box[0] = x < box[0] ? x : box[0], box[1] = x > box[1] ? x : box[1];
+            box[2] = z < box[2] ? z : box[2], box[3] = z > box[3] ? z : box[3];
+            n++;
+        }
+    if (ref == CAMERA_FF8_CASTER || (ref == CAMERA_FF8_TARGET && last < 0)) {
+        camera_ff8_actor(native_play.actor, bone, out);
+        return 0;
+    }
+    if (ref == CAMERA_FF8_TARGET) {
+        camera_ff8_actor(last, bone, out);
+        return 0;
+    }
+    if (ref == CAMERA_FF8_EFFECT) {
+        /* (camera stage 3) FF8's 0xf9 is 01d99ab0, a frame the effect module itself writes every frame (Death's task
+           copies its own object's matrix there, 008b6fc3: rep movs from its record + 0x70); FF7's effects have no such
+           frame: the target's place on the floor, the world's axes, scale 1.0 (the offset x unit_scale) */
+        camera_ff8_actor(last >= 0 ? last : native_play.actor, CAMERA_FF8_PLACE, out);
+        return 0;
+    }
+    if (ref == CAMERA_FF8_GROUP) {
+        /* (camera stage 3) FF8's 0xb0 is 01d99b70, built by FUN_0050d300 when the action starts: at the target point
+           (one target: its place; several: the centre of the box round them, FUN_005020a0, y 0), turned by
+           FUN_0056ce30(0, 0x800, 0) (a half turn about y: x and z negated) when no party member is among the targets
+           (the mask & 7 == 0), else not turned; scale 1.0 (FUN_0050d790 returns 0x1000: the offset x unit_scale) */
+        int k;
+
+        if (n == 1)
+            camera_ff8_actor(last, CAMERA_FF8_PLACE, out);
+        else if (n > 1)
+            out[0] = (box[0] + box[1]) / 2, out[1] = 0, out[2] = (box[2] + box[3]) / 2;
+        else
+            camera_ff8_actor(native_play.actor, CAMERA_FF8_PLACE, out);
+        for (k = 0; k < 9; k++)
+            m[k] = 0;
+        m[0] = m[8] = native_play.mask & 7 ? 4096 : -4096;
+        m[4] = 4096;
+        return 1;
+    }
+    if (bone == 0)
+        camera_ff8_actor(native_play.actor, CAMERA_FF8_PLACE, from);
+    else
+        camera_ff8_body(native_play.actor, from);       /* (FF8's 0xf0 and 0xf1 are the same point here) */
+    if (n == 1) {
+        if (bone == 0)
+            camera_ff8_actor(last, CAMERA_FF8_PLACE, to);
+        else
+            camera_ff8_body(last, to);
+    } else if (n > 1)
+        to[0] = (box[0] + box[1]) / 2, to[1] = bone == 0 ? 0 : from[1], to[2] = (box[2] + box[3]) / 2;
+    else
+        to[0] = from[0], to[1] = from[1], to[2] = from[2];
+    return camera_ff8_frame(from, to, bone, out, m) ? 1 : 2;
+}
+
+/* ---- camera stage 3: FF8's sequence, played (FF7FF8Fusion/Notes/Camera_Stage3.md) ----
+   A select = sequence camera runs its program (camera_ff8_seq_run, FF8's VM) once a new effect frame (a repeated
+   frame is not run again, as FF8 runs it only unpaused: FUN_00504060), before its chain's frame, from the effect's
+   first frame shown under it: `start` begins chain A.V there (FF8's FUN_00503520: a start of an animation the table
+   does not have is ignored), `stop` and a halt stop it (the game's view: FF8 cuts to its base), `blend N` blends
+   to the game's view, `hold` plays it under the Config menu's fixed camera. FF8's variables, as FUN_00509640 reads
+   them, from FF7's battle (each one's evidence in the note's table): */
+#define ADDR_CAMERA_SEQ_PRESENT 0x009a8894u  /* word: the actors in the battle, a bit each (FUN_005dc390 ANDs it with 009a8896) */
+#define ADDR_CAMERA_SEQ_STATUS  0x009ab0dcu  /* dword, 0x68 per actor: the statuses; bit 0 Death */
+#define ADDR_CAMERA_SEQ_IDLE    0x00bf2df8u  /* char per actor: the idle script the display uses (FUN_0042db05 copies it from
+                                                009a87f5 + actor x 0x10, which FUN_004326bf works out: 2 dead, 1 the weak idle:
+                                                HP x 4 < max HP or sleep, poison and the others of 0x0e20008c) */
+#define CAMERA_SEQ_READS        12           /* variables a run's log line names */
+#define CAMERA_SEQ_TASKS        2            /* FF8's chain tasks: FUN_005041e0's FUN_00508300(&01d97768, &01d97738, 0x10, 2),
+                                                and two records (01d977a8, 0x524 each); a start while both run fails in
+                                                FUN_00508360 ("BdLinkTask FAILED") */
+#define CAMERA_SEQ_BLENDS       16           /* FF8's list 01d986b8 (FUN_00506bf0: 16 tasks of 0x2c, shared with its other
+                                                battle tasks), where each `04` links a blend task 00509930 */
+/* THE FIXED-CAMERA RULE for select = sequence cameras (the user's choice, 2026-10-19: "you can skip them like FF7's"):
+   0 = a sequence camera is not played under the Config menu's fixed camera, as the cameras without a sequence (stage
+   1) and FF7's own; 1 = FF8's (FUN_00504060: under the fixed camera a chain is shown while the hold flag is set, which
+   each start sets) */
+#define CAMERA_FF8_SEQ_FIXED_AS_FF8 0
+
+static struct {
+    BYTE running;                       /* the program runs (its pc is not over) */
+    BYTE hold;                          /* FF8's hold flag (01d97704 & 0x8000): played under the fixed camera */
+    BYTE stopped;                       /* 08 or a halt ran in this frame's program (for the log) */
+    BYTE shown;                         /* what FF8's display globals hold: 1 the record (FUN_00504060 copied or blended it
+                                           last), 0 the base (the game's own view) */
+    BYTE fixed_said, refused_said;
+    int pc, frame;                      /* the program's place; the effect frame it ran last */
+    WORD mask;                          /* FF8's animation mask (01d97718): the variant's bit while its chain runs */
+    int w;                              /* FF8's 01d9771e: 0 the record, 1-4095 the record blended to the base, 4096 the base */
+    int display_frame, display_w;       /* the frame the display was chosen for (a repeated frame repeats it) and its weight */
+    int chain, start, frames;           /* the chain started last (01d97798's: anim << 3 | variant, -1 none), its first
+                                           frame, its frames */
+    signed char task_variant[CAMERA_SEQ_TASKS]; /* FF8's chain tasks (005035e0): the variant of each running one, -1 free */
+    int task_end[CAMERA_SEQ_TASKS];     /* the frame it reads FF8's ffff in (after the program): its bit cleared, slot freed */
+    int blends;                         /* FF8's blend tasks (00509930), in link order */
+    BYTE blend_n[CAMERA_SEQ_BLENDS], blend_k[CAMERA_SEQ_BLENDS];
+    short var[8], local[8];             /* FF8's 01d97728 (00-07) and 01d99b1e - 2v (78-7f): kept for the battle */
+    DWORD seed;                         /* FF8's random (FUN_00534aa0) */
+    int reads, read_var[CAMERA_SEQ_READS], read_value[CAMERA_SEQ_READS];
+    const struct own_camera *camera;    /* the camera the program is of, for the callbacks */
+} camera_seq;                           /* (set up by camera_ff8_restart before any use) */
+
+/* FF8's random (FUN_00534aa0, 00534aa0-00534ac0): seed = seed x 69069 + 1, the top 15 bits */
+static int camera_ff8_random(void)
+{
+    camera_seq.seed = camera_seq.seed * 69069u + 1u;
+    return (int)(camera_seq.seed >> 17);
+}
+
+/* An FF7 actor as FF8 numbers its entities: 0-2 the party, 3 and up the enemies (FF7's 4-9 become 3-8; FF7's 3,
+   never an actor of an action, stays 3) */
+static int camera_ff8_entity(int actor)
+{
+    return actor >= 4 ? actor - 1 : actor;
+}
+
+/* FF8's variable read (FUN_00509640) with FF7's values: see the note's table */
+static int camera_ff8_seq_read(void *context, int v)
+{
+    int value = 0, t, last = -1, n = 0;
+
+    (void)context;
+    for (t = 0; t < 10; t++)
+        if (native_play.mask >> t & 1)
+            last = t, n++;
+    if (v < 8)
+        value = camera_seq.var[v];
+    else if (v >= 0x78)
+        value = camera_seq.local[v - 0x78];
+    else
+        switch (v) {
+        case 0x10:
+            value = camera_seq.mask & 0xff;             /* 00509686: the mask's low byte */
+            break;
+        case 0x11:
+            value = camera_ff8_random();
+            break;
+        case 0x13: case 0x1b:
+            /* 00509699 / 0050972a: FF8 counts its three party entities that are there and not KO (13) or there with
+               no status at all (1b): FF7's party actors 0-2 in the battle (009a8894) not dead / with no status */
+            for (t = 0; t < 3; t++)
+                if ((*(const WORD *)ADDR_CAMERA_SEQ_PRESENT >> t & 1) &&
+                    (v == 0x13 ? !(*(const DWORD *)(ADDR_CAMERA_SEQ_STATUS + (DWORD)t * 0x68) & 1)
+                               : !*(const DWORD *)(ADDR_CAMERA_SEQ_STATUS + (DWORD)t * 0x68)))
+                    value++;
+            break;
+        case 0x15:
+            value = 0;          /* 005096bc: the target's size class (characters 0; a monster's from its info byte +0xf6,
+                                   00502944): FF7 has none: 0, a person's size */
+            break;
+        case 0x16:
+            /* 005096d6: the target's shown statuses; bit 0 set for a character in its weak pose (0x41021) and cleared for a
+               monster, bit 1 KO: FF7's bit 1 = Death, bit 0 = a party target shown in its weak idle (00bf2df8 == 1) */
+            t = last >= 0 ? last : native_play.actor;
+            value = (*(const DWORD *)(ADDR_CAMERA_SEQ_STATUS + (DWORD)t * 0x68) & 1 ? 2 : 0) |
+                    (t < 3 && *(const signed char *)(ADDR_CAMERA_SEQ_IDLE + (DWORD)t) == 1 ? 1 : 0);
+            break;
+        case 0x17:
+            value = 0;          /* FUN_0050a6d0: the action's byte +0x11 (not 0: the programs' "no camera"); FF7 has none */
+            break;
+        case 0x18:
+            value = camera_ff8_entity(native_play.actor);       /* 0050970f: the caster, 01d99b95 */
+            break;
+        case 0x19:
+            value = camera_ff8_entity(last >= 0 ? last : native_play.actor);   /* 00509718: 01d99aaa, the mask's last target */
+            break;
+        case 0x1a:
+            value = n;                                          /* 00509721: 01d99b94, the targets */
+            break;
+        case 0x1c: case 0x1d: case 0x1e: case 0x1f: case 0x20: case 0x21: case 0x22:
+            value = (int)((unsigned)camera_ff8_random() % (unsigned)(v - 0x1a));   /* 0050974e: random modulo 2-8 */
+            break;
+        case 0x23:
+            value = 0;          /* FUN_0050e4e0: from an FF8 global (01d99bf0) with no FF7 counterpart */
+            break;
+        default:
+            value = v - 0x10;   /* 00509763: FF8 returns its index less 0x10 for the rest (12 -> 2, 14 -> 4, 08 -> -8) */
+        }
+    if (camera_seq.reads < CAMERA_SEQ_READS) {
+        camera_seq.read_var[camera_seq.reads] = v;
+        camera_seq.read_value[camera_seq.reads] = value;
+    }
+    camera_seq.reads++;
+    return value;
+}
+
+/* FF8's variable write (LAB_005097c0): 00-07 and 78-7f keep the low 16 bits, 10 the mask; FF8 drops the others */
+static void camera_ff8_seq_write(void *context, int v, int value)
+{
+    (void)context;
+    if (v < 8)
+        camera_seq.var[v] = (short)value;
+    else if (v >= 0x78)
+        camera_seq.local[v - 0x78] = (short)value;
+    else if (v == 0x10)
+        camera_seq.mask = (WORD)value;
+}
+
+/* FF8's chain and blend tasks all gone (FUN_005041e0 at the battle start; camera_ff8_restart at a cast's) */
+static void camera_ff8_seq_tasks_clear(void)
+{
+    int t;
+
+    for (t = 0; t < CAMERA_SEQ_TASKS; t++)
+        camera_seq.task_variant[t] = -1;
+    camera_seq.blends = 0;
+}
+
+/* FF8's camera opcodes (LAB_00509810) */
+static void camera_ff8_seq_op(void *context, int op, int arg)
+{
+    const struct own_camera *c = camera_seq.camera;
+    int t;
+
+    (void)context;
+    switch (op) {
+    case 0x00: {
+        /* FUN_00503520 (objdump 00503520-005035d5): animation (code >> 4) & 15, variant code & 7; none of a higher
+           animation than the table has; the hold flag set when the mask's high byte is 0 (00503551-00503564: or byte
+           [01d97705], 0x80), before the task is linked (00503575): a start while FF8's two chain tasks run fails there
+           (BdLinkTask FAILED) and leaves only the hold flag: no bit, no record, the chain shown unchanged. Else the
+           first free record becomes the one shown (005035bd: 01d97798), its first frame this one, 01d9771e = 0
+           (005035c3: shown unblended in this frame; a blend task still running goes on from the next), the mask gets
+           the variant's bit (005035cc) */
+        int a = arg >> 4 & 15, v = arg & 7;
+
+        if (!c || a >= c->anims)
+            break;
+        if (!(camera_seq.mask & 0xff00))
+            camera_seq.hold = 1;
+        for (t = 0; t < CAMERA_SEQ_TASKS && camera_seq.task_variant[t] >= 0; t++)
+            ;
+        if (t == CAMERA_SEQ_TASKS) {
+            if (!camera_seq.refused_said && camera_ff8_say())
+                log_line("camera %x (engine ff8) sequence: start of anim %d variant %d at frame %d refused: FF8's two chain tasks run (its BdLinkTask fails; only the hold flag is set)",
+                         c->number, a, v, camera_seq.frame);
+            camera_seq.refused_said = 1;
+            break;
+        }
+        camera_seq.stopped = 0;         /* (for the log: a start after a stop in the same frame is said as a start) */
+        camera_seq.chain = a << 3 | v;
+        camera_seq.start = camera_seq.frame;
+        camera_seq.frames = camera_ff8_chain_frames(c->chain_first[a][v], c->chain_count[a][v]);
+        camera_seq.mask |= (WORD)(1 << v);
+        /* its task (005035e0) reads ffff in the frame after its chain's last, after the program: it clears its own
+           variant's bit then, whatever started or stopped since */
+        camera_seq.task_variant[t] = (signed char)v;
+        camera_seq.task_end[t] = camera_seq.frame + camera_seq.frames;
+        camera_seq.w = 0;
+        camera_ff8.origin = camera_seq.frame;
+        camera_ff8.ended_said = 0;
+        camera_ff8.play.segment = -1;
+        camera_ff8.play.last_frame = -1;
+        camera_ff8.play.first = c->chain_first[a][v];
+        camera_ff8.play.count = c->chain_count[a][v];
+        break;
+    }
+    case 0x03:
+        camera_seq.hold = 0;            /* 0050984d: the base saved (FF7's base is the battle's own view), hold cleared */
+        break;
+    case 0x04:
+        /* 0050985f: a blend task 00509930 linked into list 01d986b8 (FUN_00506c10), its count 0 (00509870); that list
+           runs before the program (FUN_00500900), so it counts first in the next frame; an earlier one runs on beside
+           it. FF8 would crash on a full list (00509870 writes through the null task): ignored here, with a line */
+        if (camera_seq.blends < CAMERA_SEQ_BLENDS) {
+            camera_seq.blend_n[camera_seq.blends] = (BYTE)arg;
+            camera_seq.blend_k[camera_seq.blends++] = 0;
+        } else if (camera_ff8_say())
+            log_line("camera %x (engine ff8) sequence: blend %d at frame %d ignored: %d blends run (FF8's list would be full)",
+                     c ? c->number : 0, arg, camera_seq.frame, CAMERA_SEQ_BLENDS);
+        break;
+    case 0x06: case 0x07:
+        camera_seq.hold = op == 0x06;   /* 005098ab / 005098b6 */
+        break;
+    default:
+        /* 08 (005098c3) and the halts (005098e6): the mask 0 and 01d9771e = 0x1000 (the base in this frame); the chain
+           tasks and the blend tasks run on (each chain task still clears its own bit at its end) */
+        camera_seq.mask = 0;
+        camera_seq.w = 0x1000;
+        camera_seq.stopped = 1;
+        break;
+    }
+}
+
+/* " varHH=N" at out (16 bytes at most): a read for the log */
+static int camera_ff8_seq_said(char *out, int v, int value)
+{
+    static const char hex[] = "0123456789abcdef";
+    char digits[12];
+    unsigned u = value < 0 ? 0u - (unsigned)value : (unsigned)value;
+    int n = 0, at = 0;
+
+    out[at++] = ' ', out[at++] = 'v', out[at++] = 'a', out[at++] = 'r';
+    out[at++] = hex[v >> 4 & 15], out[at++] = hex[v & 15], out[at++] = '=';
+    if (value < 0)
+        out[at++] = '-';
+    do
+        digits[n++] = (char)('0' + u % 10);
+    while ((u /= 10) != 0);
+    while (n)
+        out[at++] = digits[--n];
+    out[at] = 0;
+    return at;
+}
+
+/* (camera stage 3) The program's run of this effect frame; a line with the variables it read and what it did, and one
+   when it starts a chain or stops them */
+static void camera_ff8_seq_frame(const struct own_camera *c, int frame)
+{
+    static const struct camera_ff8_seq_env env = { camera_ff8_seq_read, camera_ff8_seq_write, camera_ff8_seq_op, NULL };
+    char line[CAMERA_SEQ_READS * 20 + 8];
+    const char *problem = NULL;
+    int result, i, at = 0;
+
+    if (frame == camera_seq.frame)
+        return;                         /* a repeated frame (paused calls, FFNx's 30/60 fps): not run again */
+    camera_seq.frame = frame;
+    camera_seq.camera = c;
+    /* FUN_00500900's order: list 01d986b8 first (its blend tasks: 00509930 counts ++k, 01d9771e = rsin(k x 1024 / N),
+       the task over at k >= N), then FUN_00504060: the program (FUN_00509610), the chain tasks (FUN_00508420(&01d97768)),
+       the display */
+    for (i = at = 0; i < camera_seq.blends; i++) {
+        int k = ++camera_seq.blend_k[i], n = camera_seq.blend_n[i];
+
+        camera_seq.w = camera_ff8_rsin((k << 10) / n);
+        if (k == 1 && camera_ff8_say())
+            log_line("camera %x (engine ff8) sequence: blend %d back to the battle view from frame %d (FF8's sine)", c->number, n, frame);
+        if (k < n) {                    /* (kept, in link order) */
+            camera_seq.blend_n[at] = (BYTE)n;
+            camera_seq.blend_k[at++] = (BYTE)k;
+        }
+    }
+    camera_seq.blends = at;
+    at = 0;
+    camera_seq.stopped = 0;
+    result = -1;
+    if (camera_seq.running) {
+        camera_seq.reads = 0;
+        result = camera_ff8_seq_run(camera_pool + c->seq_at, c->seq_length, &camera_seq.pc, &env, &problem);
+        camera_seq.running = result == CAMERA_FF8_SEQ_YIELD;
+    }
+    /* a chain's task reads FF8's ffff in the frame after its chain's last, after the program: it clears its own
+       variant's bit (005035e0: a bit set again by a later start or through var10 too) and frees its slot */
+    for (i = 0; i < CAMERA_SEQ_TASKS; i++)
+        if (camera_seq.task_variant[i] >= 0 && frame >= camera_seq.task_end[i]) {
+            camera_seq.mask &= (WORD)~(1 << camera_seq.task_variant[i]);
+            camera_seq.task_variant[i] = -1;
+        }
+    if (result < 0 || !camera_ff8_say())
+        return;
+    line[0] = 0;
+    for (i = 0; i < camera_seq.reads && i < CAMERA_SEQ_READS; i++)
+        at += camera_ff8_seq_said(line + at, camera_seq.read_var[i], camera_seq.read_value[i]);
+    log_line("camera %x (engine ff8) sequence at frame %d: read%s%s; the program %s%s",
+             c->number, frame, camera_seq.reads ? line : " nothing", camera_seq.reads > CAMERA_SEQ_READS ? " ..." : "",
+             result == CAMERA_FF8_SEQ_ERROR ? "STOPPED: " : result == CAMERA_FF8_SEQ_HALT ? "halted (every chain stops)"
+             : result == CAMERA_FF8_SEQ_END ? "ended" : "waits a frame", result == CAMERA_FF8_SEQ_ERROR ? problem : "");
+    if (camera_seq.chain >= 0 && camera_seq.start == frame && !camera_seq.stopped)
+        log_line("camera %x (engine ff8) sequence: anim %d variant %d from frame %d (%d segment(s), %d frame(s))%s",
+                 c->number, camera_seq.chain >> 3, camera_seq.chain & 7, frame, camera_ff8.play.count, camera_seq.frames,
+                 camera_ff8.play.count ? "" : ": an empty chain, nothing shown");
+    else if (camera_seq.stopped)
+        log_line("camera %x (engine ff8) sequence: every chain stopped at frame %d: the game's own view", c->number, frame);
+}
+
+/* The play of camera c starts over at the effect's `frame` (its chain's frame 0), from the eye and point the game
+   chose for it. */
+static void camera_ff8_restart(const struct own_camera *c, int frame)
+{
+    int i;
+
+    camera_ff8.camera = c->number;
+    camera_ff8.origin = frame;
+    camera_ff8_play_reset(&camera_ff8.play);
+    /* (camera stage 3) a cast starts with the mask 0 and the hold flag clear: FF8's action ends (FUN_0050b190 case 4
+       for magic, also FUN_0050b0c0, FUN_0050b830, FUN_0050bee0) when FUN_0050ae80 finds the mask's low byte 0 and the
+       effect over, then FUN_0050aed0, when the mask or the hold flag is not 0, zeroes the whole mask word (0050aeed: a
+       high-byte bit written through var10 too) and writes 01d9771e = 0x1000 (0050aef6: the base, which the next display
+       turns into w = 0: the DLL's w = 0 shows the same), and always clears the hold flag (0050aeff); its guard, the
+       state byte 01d9771a != 3, always holds (its only writer is the 1 at 0050421f). FUN_00500f70, the next cast's
+       camera start, clears neither. A DLL CHOICE: a low-byte bit written through var10 that no chain task clears would
+       keep FF8's action waiting (FUN_0050ae80; FUN_0050b190 case 4 has no time-out); the DLL zeroes it at the next
+       cast. FF8's chain and blend tasks still running then (a stopped chain, a long blend) run on into the next action;
+       the DLL ends them with the cast, as it drops the cast's chain */
+    camera_seq.mask = 0;
+    camera_seq.hold = 0;
+    camera_seq.w = 0;
+    camera_seq.shown = 0;
+    camera_seq.display_frame = -1;
+    camera_ff8_seq_tasks_clear();
+    if (c->sequence) {
+        /* (camera stage 3) no chain until the program starts one; var00 drawn from camera_mode (FUN_00500f70:
+           the byte rnd & 1 of the pair) */
+        camera_ff8.play.first = c->ff8_first;
+        camera_ff8.play.count = 0;
+        camera_seq.running = 1;
+        camera_seq.pc = 0;
+        camera_seq.frame = -1;
+        camera_seq.chain = -1;
+        camera_seq.stopped = camera_seq.fixed_said = camera_seq.refused_said = 0;
+        camera_seq.var[0] = c->mode[camera_ff8_random() & 1];
+        camera_seq.camera = c;
+    } else
+        camera_seq.running = 0;
+    for (i = 0; i < 3; i++) {
+        camera_ff8.play.out[0][i] = ((const short *)ADDR_CAMERA_EYE)[i];
+        camera_ff8.play.out[1][i] = ((const short *)ADDR_CAMERA_FOCUS)[i];
+    }
+    camera_ff8.wrote = camera_ff8.ended_said = camera_ff8.blend_said = 0;
+    camera_ff8.view_frame = -1;
+    camera_true.check = 1;              /* (camera stage 2) the true roll's layout check, at its first build */
+}
+
+/* ---- camera stage 2: the zoom (zoom = fov), played as the battle's own H ---- */
+
+/* The game's code that makes the battle's H (00c05f7c) the field of view and the projection each frame, once. */
+static BOOL camera_zoom_sites_ok(void)
+{
+    static const BYTE h_read[13] = { 0x0f, 0xbf, 0x0d, 0x7c, 0x5f, 0xc0, 0x00, 0x51, 0xe8, 0xe6, 0x40, 0x23, 0x00 };
+    static const BYTE fov_write[6] = { 0xd9, 0x9a, 0x9c, 0x09, 0x00, 0x00 };
+    static const BYTE projection[5] = { 0xe8, 0x0d, 0xb2, 0x01, 0x00 };
+
+    if (camera_zoom_sites)
+        return camera_zoom_sites > 0;
+    camera_zoom_sites = bytes_are(SITE_BATTLE_H_READ, h_read, 13) && bytes_are(SITE_FOV_WRITE, fov_write, 6) &&
+                        bytes_are(SITE_FOV_PROJECTION, projection, 5) ? 1 : -1;
+    log_line("camera zoom: %s (the battle's H %08lx read at %08lx; the fov written at %08lx, the projection at %08lx)",
+             camera_zoom_sites > 0 ? "zoom = fov on" : "zoom = fov OFF: the game's bytes there are not as expected; FF8's H is played as a dolly instead",
+             ADDR_BATTLE_H, SITE_BATTLE_H_READ, SITE_FOV_WRITE, SITE_FOV_PROJECTION);
+    return camera_zoom_sites > 0;
+}
+
+/* The play begins: the game's own H is its base. FALSE: no H can be written (the sites, an H not above 0). */
+static BOOL camera_zoom_begin(void)
+{
+    camera_zoom.active = 0;
+    if (!camera_zoom_sites_ok() || *(const short *)ADDR_BATTLE_H <= 0)
+        return FALSE;
+    camera_zoom.base = camera_zoom.written = *(const short *)ADDR_BATTLE_H;
+    camera_zoom.active = 1;
+    return TRUE;
+}
+
+/* FF8's H for this call (512: the game's own view). If the value there is not what this DLL wrote last, the game
+   wrote it (a summon's or limit's own zoom): it is kept and this play zooms no more (one line). */
+static void camera_zoom_write(int h)
+{
+    short *at = (short *)ADDR_BATTLE_H;
+
+    if (!camera_zoom.active)
+        return;
+    if (*at != camera_zoom.written) {
+        camera_zoom.active = 0;
+        if (camera_ff8_say())
+            log_line("camera %x (engine ff8): the game wrote its own H (%d, this DLL's was %d): the game's is kept, this play zooms no more",
+                     camera_ff8.camera, *at, camera_zoom.written);
+        return;
+    }
+    camera_zoom.written = (short)camera_ff8_battle_h(camera_zoom.base, h);
+    *at = camera_zoom.written;
+}
+
+/* The play ends: the game's own H back, if the value there is still this DLL's. */
+static void camera_zoom_end(void)
+{
+    if (camera_zoom.active && *(const short *)ADDR_BATTLE_H == camera_zoom.written)
+        *(short *)ADDR_BATTLE_H = camera_zoom.base;
+    camera_zoom.active = 0;
+}
+
+/* (screen anchor) The battle's H now (the short at 00c05f7c: 512, or what a camera of this DLL, a summon or a limit
+   wrote), for zoom=fixed (native_screen_zoom); read only. */
+static int camera_battle_h_now(void)
+{
+    return *(const short *)ADDR_BATTLE_H;
+}
+
+/* ---- camera stage 2: the true roll (route B of FF8_Camera_Emulation_Plan.md) ----
+   FF8 (FUN_005033e0) rolls its view by r as lookat(Rz eye, Rz target) x Rz, Rz = RotMatrix(0, 0, r) ((c, -s, 0),
+   (s, c, 0), (0, 0, 1): FUN_0056ce30 -> FUN_0056d090): the same eye and line of sight as the level view, with the
+   up vector turned to Rz^T up. The game's look-at takes its up vector as an argument (FUN_005c68b7's fourth), so
+   after the game's own build (the call at 0041bda4) the camera is built again by FUN_00430b7b's own routines in its
+   own order, the up vector (-s, -c, 0) x 4096 (rsin, rcos of r, 4096 = 1.0) in place of 008fe110's (0, -4096, 0):
+   the picture turns about the screen's centre (the eye and the point looked at stay), and the Euler angles and the
+   offset at 00bfcb30 + 0x1e / + 0x26 (stage 0's [roll], the game's turn-over and shakes) apply on top as in the
+   game's build. Everything drawn reads 00bfcb30 or the records FUN_0042e52e makes from it the next frame, as for
+   the eye. Layout self-check, once a play: at the first armed build the rebuild is run with the game's own up
+   vector and compared with what the game built (look-at 00bf2130 and camera 00bfcb30, rotation and translation):
+   it must be equal to the bit; if not, the game's build is put back and no roll is played again (one line). */
+
+/* The camera built again with the up vector `up` (FUN_00430b7b's body, 00430b7f-00430c0e). */
+static void camera_true_rebuild(const int up[3])
+{
+    BYTE *rec = (BYTE *)ADDR_CAMERA_RECORD;
+    int scratch = 0;
+
+    ((void (__cdecl *)(void *, void *, void *, const int *))FN_CAMERA_LOOKAT)((void *)ADDR_CAMERA_LOOKAT, (void *)ADDR_CAMERA_EYE,
+                                                                               (void *)ADDR_CAMERA_FOCUS, up);
+    ((void (__cdecl *)(void *, void *))FN_CAMERA_EULER)(rec + 0x1e, rec);
+    ((void (__cdecl *)(void *, void *))FN_CAMERA_OFFSET)(rec, rec + 0x26);
+    ((void (__cdecl *)(void *, void *))FN_CAMERA_TIMES)((void *)ADDR_CAMERA_LOOKAT, rec);
+    ((void (__cdecl *)(void *))FN_CAMERA_SET_ROTATION)((void *)ADDR_CAMERA_LOOKAT);
+    ((void (__cdecl *)(void *))FN_CAMERA_SET_PLACE)((void *)ADDR_CAMERA_LOOKAT);
+    ((void (__cdecl *)(void *, void *, int *))FN_CAMERA_TRANSLATE)(rec + 0x26, rec + 0x12, &scratch);
+    ((void (__cdecl *)(void *, void *))FN_CAMERA_FINISH)(rec, (void *)ADDR_CAMERA_SCALE);
+}
+
+/* The differences between two builds (9 shorts, then 3 ints, of the look-at and of the camera): how many, the largest */
+static int camera_true_compare(const BYTE *a, const BYTE *b, int *largest)
+{
+    int k, i, count = 0;
+
+    *largest = 0;
+    for (k = 0; k < 2; k++, a += 0x1e, b += 0x1e) {
+        for (i = 0; i < 12; i++) {
+            int x = i < 9 ? ((const short *)a)[i] : ((const int *)(a + 0x12))[i - 9];
+            int y = i < 9 ? ((const short *)b)[i] : ((const int *)(b + 0x12))[i - 9];
+            int d = x > y ? x - y : y - x;
+
+            count += d != 0;
+            if (d > *largest)
+                *largest = d;
+        }
+    }
+    return count;
+}
+
+/* The hook at 0041bda4 (in place of `call FUN_0042d971`): the game's build first, always; then, when the step
+   armed it this frame, the self-check (once a play) and the rolled build. */
+static void __cdecl camera_true_build(void)
+{
+    static const int level[3] = { 0, CAMERA_UP, 0 };
+    BYTE game[0x3c], again[0x3c];
+    int up[3], s, c, i, largest, count;
+    long long d[3], cross[3], d2, u2, x2;
+
+    ((void (__cdecl *)(void))FN_CAMERA_BUILD)();
+    if (!camera_true.armed)
+        return;
+    camera_true.armed = 0;
+    if (camera_true.failed)
+        return;
+    if (camera_true.check) {
+        camera_true.check = 0;
+        copy_bytes(game, (const BYTE *)ADDR_CAMERA_LOOKAT, 0x1e);
+        copy_bytes(game + 0x1e, (const BYTE *)ADDR_CAMERA_RECORD, 0x1e);
+        camera_true_rebuild(level);
+        copy_bytes(again, (const BYTE *)ADDR_CAMERA_LOOKAT, 0x1e);
+        copy_bytes(again + 0x1e, (const BYTE *)ADDR_CAMERA_RECORD, 0x1e);
+        count = camera_true_compare(game, again, &largest);
+        if (count) {
+            camera_true.failed = 1;
+            copy_bytes((BYTE *)ADDR_CAMERA_LOOKAT, game, 0x1e);
+            copy_bytes((BYTE *)ADDR_CAMERA_RECORD, game + 0x1e, 0x1e);
+            ((void (__cdecl *)(void *, void *))FN_CAMERA_FINISH)((void *)ADDR_CAMERA_RECORD, (void *)ADDR_CAMERA_SCALE);
+        }
+        if (camera_ff8_say())
+            log_line(count ? "camera %x (engine ff8) roll: layout self-check at roll 0: DIFFERENT from the game's build (%d value(s), largest %d): the game's build is kept; no roll is played again"
+                           : "camera %x (engine ff8) roll: layout self-check at roll 0: the same as the game's build (difference %d in %d values)",
+                     camera_true.camera, count ? count : largest, count ? largest : 24);
+        if (count)
+            return;
+    }
+    if (!(camera_true.roll & 4095))
+        return;                         /* level (a whole turn is level too): the game's build as it is */
+    s = camera_ff8_rsin(camera_true.roll);
+    c = camera_ff8_rsin(camera_true.roll + 1024);
+    up[0] = -s, up[1] = -c, up[2] = 0;  /* Rz^T (0, -4096, 0) */
+    for (i = 0; i < 3; i++)
+        d[i] = (long long)((const short *)ADDR_CAMERA_FOCUS)[i] - ((const short *)ADDR_CAMERA_EYE)[i];
+    cross[0] = d[1] * up[2] - d[2] * up[1], cross[1] = d[2] * up[0] - d[0] * up[2], cross[2] = d[0] * up[1] - d[1] * up[0];
+    d2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+    u2 = (long long)up[0] * up[0] + (long long)up[1] * up[1];
+    x2 = cross[0] * cross[0] + cross[1] * cross[1] + cross[2] * cross[2];
+    if (!d2 || x2 < (d2 * u2) >> 12) {
+        camera_true.skipped++;          /* the line of sight within 0.9 degrees of the turned up vector: left level */
+        return;
+    }
+    camera_true_rebuild(up);
+}
+
+/* The hook at 0041bda4, once: the game's call there and the routine it calls as expected (the four sites of
+   camera_roll_sites_ok, the test before the call and the call after it, FUN_00430b7b whole), else refused. */
+static BOOL camera_true_install(void)
+{
+    static const BYTE test[9] = { 0x83, 0x3d, 0xac, 0xd1, 0x9a, 0x00, 0x00, 0x74, 0x05 };
+    static const BYTE after[4] = { 0x8b, 0x55, 0x08, 0x52 };
+    static const BYTE matrix[154] = {
+        0x55, 0x8b, 0xec, 0x51, 0x68, 0x10, 0xe1, 0x8f, 0x00, 0x8b, 0x45, 0x14, 0x50, 0x8b, 0x4d, 0x10, 0x51, 0x8b, 0x55, 0x0c,
+        0x52, 0xe8, 0x22, 0x5d, 0x19, 0x00, 0x83, 0xc4, 0x10, 0x8b, 0x45, 0x08, 0x50, 0x8b, 0x4d, 0x08, 0x83, 0xc1, 0x1e, 0x51,
+        0xe8, 0x30, 0x1f, 0x23, 0x00, 0x83, 0xc4, 0x08, 0x8b, 0x55, 0x08, 0x83, 0xc2, 0x26, 0x52, 0x8b, 0x45, 0x08, 0x50, 0xe8,
+        0xab, 0x2b, 0x23, 0x00, 0x83, 0xc4, 0x08, 0x8b, 0x4d, 0x08, 0x51, 0x8b, 0x55, 0x0c, 0x52, 0xe8, 0x69, 0x15, 0x23, 0x00,
+        0x83, 0xc4, 0x08, 0x8b, 0x45, 0x0c, 0x50, 0xe8, 0x9c, 0x2a, 0x23, 0x00, 0x83, 0xc4, 0x04, 0x8b, 0x4d, 0x0c, 0x51, 0xe8,
+        0x24, 0x2b, 0x23, 0x00, 0x83, 0xc4, 0x04, 0x8d, 0x55, 0xfc, 0x52, 0x8b, 0x45, 0x08, 0x83, 0xc0, 0x12, 0x50, 0x8b, 0x4d,
+        0x08, 0x83, 0xc1, 0x26, 0x51, 0xe8, 0xcf, 0x22, 0x23, 0x00, 0x83, 0xc4, 0x0c, 0x68, 0x20, 0xe1, 0x8f, 0x00, 0x8b, 0x55,
+        0x08, 0x52, 0xe8, 0x83, 0xf7, 0xff, 0xff, 0x83, 0xc4, 0x08, 0x8b, 0xe5, 0x5d, 0xc3 };
+
+    if (camera_true_hook)
+        return camera_true_hook > 0;
+    camera_true_hook = -1;
+    if (!camera_roll_sites_ok())
+        return FALSE;                   /* (its own line: camera roll: OFF) */
+    if (!bytes_are(SITE_CAMERA_BUILD_TEST, test, 9) || !bytes_are(SITE_CAMERA_BUILD + 5, after, 4) ||
+        !bytes_are(FN_CAMERA_MATRIX, matrix, 154)) {
+        log_line("camera roll (engine ff8): OFF: the code around %08lx or FUN_00430b7b is not the game's; FF8's roll is not played (the rest of the camera is)",
+                 SITE_CAMERA_BUILD);
+        return FALSE;
+    }
+    if (!patch_call(SITE_CAMERA_BUILD, FN_CAMERA_BUILD, (void *)camera_true_build)) {
+        log_line("camera roll (engine ff8): OFF: the call at %08lx could not be hooked; FF8's roll is not played", SITE_CAMERA_BUILD);
+        return FALSE;
+    }
+    camera_true_hook = 1;
+    log_line("camera roll (engine ff8): on: the call at %08lx goes to this DLL, which calls the game's %08lx first and then builds the camera again with FF8's turned up vector while an ff8 camera rolls",
+             SITE_CAMERA_BUILD, FN_CAMERA_BUILD);
+    return TRUE;
+}
+
+/* The play ends for the effect `serial`: nothing is written (the game's own view is there already), but the game's
+   H goes back and the roll is not armed. */
+static void camera_ff8_stop(WORD serial, const char *why)
+{
+    if (camera_ff8.serial != serial)
+        return;
+    camera_ff8.done = 1;
+    camera_true.armed = 0;
+    camera_seq.running = 0;             /* (camera stage 3) */
+    if (!camera_ff8.active)
+        return;
+    camera_zoom_end();
+    camera_ff8.active = camera_ff8.wrote = 0;
+    if (camera_ff8_say())
+        log_line("camera %x (engine ff8): ends (%s): the game's own view from this frame (the battle's home view); self-check: %d of %d frame(s) built from the eye written, largest difference %d",
+                 camera_ff8.camera, why, camera_ff8.matched, camera_ff8.checks, camera_ff8.worst);
+}
+
+/* A native effect's task starts (native_effect_step): it owns the play from now on; nothing is written yet. */
+static void camera_ff8_begin(WORD serial)
+{
+    camera_ff8_stop(camera_ff8.serial, "a newer effect starts");
+    camera_ff8.serial = serial;
+    camera_ff8.active = camera_ff8.done = camera_ff8.wrote = 0;
+}
+
+/* The self-check: the eye the game's last look-at was built from, against the eye written by the last call. */
+static void camera_ff8_check(int frame)
+{
+    const BYTE *m = (const BYTE *)ADDR_CAMERA_LOOKAT;
+    int t[3], eye[3], i, d = 0, size = 0, tolerance;
+
+    for (i = 0; i < 3; i++) {
+        t[i] = *(const int *)(m + 0x12 + i * 4);
+        size += camera_ff8.written[0][i] < 0 ? -camera_ff8.written[0][i] : camera_ff8.written[0][i];
+    }
+    camera_ff8_eye_from_lookat((const short *)m, t, eye);
+    for (i = 0; i < 3; i++) {
+        int e = eye[i] - camera_ff8.written[0][i];
+
+        if ((e < 0 ? -e : e) > d)
+            d = e < 0 ? -e : e;
+    }
+    tolerance = 4 + size / 1024;        /* the look-at's shorts are 4096ths: about 1/4096 of the distance a row */
+    camera_ff8.checks++;
+    camera_ff8.matched += d <= tolerance;
+    if (d > camera_ff8.worst)
+        camera_ff8.worst = d;
+    if (camera_ff8.checks <= CAMERA_FF8_CHECKS && camera_ff8_say())
+        log_line("camera %x (engine ff8) self-check at frame %d: the eye written (%d, %d, %d), the game built from (%d, %d, %d): %s (difference %d)",
+                 camera_ff8.camera, frame, camera_ff8.written[0][0], camera_ff8.written[0][1], camera_ff8.written[0][2], eye[0], eye[1],
+                 eye[2], d <= tolerance ? "the same" : "DIFFERENT", d);
+}
+
+/* Each call of the effect's task but its last: the eye and point of the chain at the effect's `frame` (of
+   `length`), its H as the battle's H or a dolly, its roll armed for the build, the blend over the last frames. */
+static void camera_ff8_step(WORD serial, int frame, int length, DWORD effect)
+{
+    const struct own_camera *c;
+    int camera, i, started, h, b = 0, count, eye[3], look[3], first, segments, frames, fixed, h_end = 0, seq_blend = 0;
+
+    if (camera_ff8.serial != serial || camera_ff8.done)
+        return;
+    camera = *(const short *)ADDR_CAMERA_NUMBER;
+    c = camera_ff8_find(camera);
+    camera_true.armed = 0;
+    fixed = (*(const WORD *)ADDR_CAMERA_OPTION & CAMERA_FIXED_MASK) == CAMERA_FIXED;
+    if (!camera_ff8.active) {
+        BOOL zoom, roll = TRUE;
+
+        if (!c)
+            return;                     /* not an ff8 camera: nothing is written or logged */
+        if (!camera_roll_sites_ok()) {
+            camera_ff8.done = 1;
+            return;
+        }
+        /* (camera stage 3) THE FIXED-CAMERA RULE: with CAMERA_FF8_SEQ_FIXED_AS_FF8 a sequence camera plays on and FF8's
+           hold flag decides each frame (below); without it, it is not played, as a camera without a sequence */
+        if (fixed && (!c->sequence || !CAMERA_FF8_SEQ_FIXED_AS_FF8)) {
+            camera_ff8.done = 1;
+            if (camera_ff8_say())
+                log_line("camera %x (engine ff8): not played (the Config menu's camera is fixed)", camera);
+            return;
+        }
+        camera_ff8.active = 1;
+        camera_ff8.checks = camera_ff8.matched = camera_ff8.worst = 0;
+        camera_ff8_restart(c, frame);
+        zoom = camera_zoom_begin();     /* (camera stage 2) */
+        camera_ff8.fov_refused = !zoom;
+        if (c->ff8_rolls)
+            roll = camera_true_install() && !camera_true.failed;
+        camera_true.camera = camera;
+        camera_true.skipped = 0;
+        if (camera_ff8_say()) {
+            if (c->sequence)            /* (camera stage 3) */
+                log_line("camera %x (engine ff8): starts at native effect %04lx's frame %d: select sequence (%d byte(s), %d segment(s) in its chains), var00 %d (camera_mode %d, %d), unit_scale %d.%03d; from the game's eye (%d, %d, %d) and point (%d, %d, %d); zoom %s%s%s",
+                         camera, effect, frame, c->seq_length, c->ff8_count, camera_seq.var[0], c->mode[0], c->mode[1], c->unit_scale / 1000,
+                         c->unit_scale % 1000, camera_ff8.play.out[0][0], camera_ff8.play.out[0][1], camera_ff8.play.out[0][2],
+                         camera_ff8.play.out[1][0], camera_ff8.play.out[1][1], camera_ff8.play.out[1][2],
+                         c->zoom == CAMERA_FF8_ZOOM_NONE ? "none" : c->zoom == CAMERA_FF8_ZOOM_DOLLY ? "dolly" : zoom ? "fov" : "dolly (no fov can be written)",
+                         c->ff8_rolls ? (roll ? "; its roll exact (0041bda4)" : "; its roll NOT played") : "",
+                         c->blend ? "; a blend back over the last frames" : "; a cut at the end");
+            else
+                log_line("camera %x (engine ff8): starts at native effect %04lx's frame %d: anim %d variant %d, %d segment(s), %d frame(s), unit_scale %d.%03d; from the game's eye (%d, %d, %d) and point (%d, %d, %d); zoom %s%s%s",
+                         camera, effect, frame, c->anim, c->variant, c->ff8_count, c->ff8_frames, c->unit_scale / 1000, c->unit_scale % 1000,
+                         camera_ff8.play.out[0][0], camera_ff8.play.out[0][1], camera_ff8.play.out[0][2], camera_ff8.play.out[1][0],
+                         camera_ff8.play.out[1][1], camera_ff8.play.out[1][2],
+                         c->zoom == CAMERA_FF8_ZOOM_NONE ? "none" : c->zoom == CAMERA_FF8_ZOOM_DOLLY ? "dolly" : zoom ? "fov" : "dolly (no fov can be written)",
+                         c->ff8_rolls ? (roll ? "; its roll exact (0041bda4)" : "; its roll NOT played") : "",
+                         c->blend ? "; a blend back over the last frames" : "; a cut at the end");
+        }
+    } else if (c && camera != camera_ff8.camera) {
+        if (camera_ff8_say())
+            log_line("camera %x (engine ff8): the camera is now %x at frame %d: its chain starts there", camera_ff8.camera, camera, frame);
+        camera_ff8_restart(c, frame);
+        camera_true.camera = camera;
+        if (c->ff8_rolls)
+            camera_true_install();      /* (camera stage 2: the first camera of the effect may not have rolled) */
+    }
+    if (camera_ff8.wrote)
+        camera_ff8_check(frame);
+    camera_ff8.wrote = 0;
+    if (!c) {
+        camera_zoom_write(CAMERA_FF8_H_HOME);
+        return;                         /* another camera runs now: the game's view */
+    }
+    if (c->sequence)
+        camera_ff8_seq_frame(c, frame); /* (camera stage 3) the program before the chain's frame, as FF8 (FUN_00504060) */
+    first = camera_ff8.play.first < 0 ? c->ff8_first : camera_ff8.play.first;
+    segments = camera_ff8.play.first < 0 ? c->ff8_count : camera_ff8.play.count;
+    frames = c->sequence ? camera_seq.frames : c->ff8_frames;
+    if (c->sequence) {
+        /* (camera stage 3) FUN_00504060's display (objdump 00504060-005041d5), after the program and the chain tasks:
+           with the Config menu's camera fixed, a mask not 0 and the hold flag clear: the base (01d9771e = 0); else by
+           01d9771e (w): 0 the record shown last-started (01d97798) when the mask & 0xdfff is not 0, else nothing written
+           (the last display stays); 1-4095 the record blended to the base by w (H too); 4096 or more the base, w = 0.
+           FF7's base is the game's own view. Not reproduced: "nothing written" after the record keeps playing the record
+           (held at its chain's end) where FF8 freezes the last display (only a program clearing the mask through var10
+           while a chain runs can tell); a record of an empty chain or none (var10 written before any start) is the
+           game's view where FF8 shows what that record held before */
+        int show;                       /* 0 the base, 1 the record, 2 nothing written */
+
+        if (frame == camera_seq.display_frame)
+            show = camera_seq.shown, seq_blend = camera_seq.display_w;  /* a repeated frame: as chosen */
+        else if (camera_seq.mask && !camera_seq.hold && fixed) {
+            if (!camera_seq.fixed_said && camera_ff8_say())
+                log_line("camera %x (engine ff8): not shown at frame %d: the Config menu's camera is fixed and its sequence released the hold", camera, frame);
+            camera_seq.fixed_said = 1;
+            show = 0;
+            camera_seq.w = 0;
+        } else if (!camera_seq.w)
+            show = camera_seq.mask & 0xdfff ? 1 : 2;
+        else if (camera_seq.w < 0x1000)
+            show = 1, seq_blend = camera_seq.w;
+        else {
+            show = 0;
+            camera_seq.w = 0;
+        }
+        if (show == 2)
+            show = camera_seq.shown;
+        if (show && (camera_seq.chain < 0 || !segments))
+            show = 0;
+        camera_seq.shown = (BYTE)show;
+        camera_seq.display_frame = frame;
+        camera_seq.display_w = seq_blend;
+        if (!show) {
+            camera_zoom_write(CAMERA_FF8_H_HOME);
+            return;                     /* the game's own view */
+        }
+    }
+    started = camera_ff8_play_frame(c, &camera_ff8.play, frame - camera_ff8.origin, camera_ff8_base, &camera_ff8.play);
+    if (started && camera_ff8_say()) {
+        const struct camera_ff8_segment *s = &camera_ff8_pool[first + camera_ff8.play.segment];
+        const int (*k)[2][3] = camera_ff8.play.snap;
+
+        if (s->flags & CAMERA_FF8_SNAP)
+            log_line("camera %x (engine ff8): segment %d of %d at frame %d (%d frame(s), ease %d): eye (%d, %d, %d) -> (%d, %d, %d), point (%d, %d, %d) -> (%d, %d, %d)",
+                     camera, camera_ff8.play.segment + 1, segments, frame, s->frames, s->ease, k[0][0][0], k[0][0][1], k[0][0][2],
+                     k[s->keys - 1][0][0], k[s->keys - 1][0][1], k[s->keys - 1][0][2], k[0][1][0], k[0][1][1], k[0][1][2],
+                     k[s->keys - 1][1][0], k[s->keys - 1][1][1], k[s->keys - 1][1][2]);
+        else
+            log_line("camera %x (engine ff8): segment %d of %d at frame %d (%d frame(s), ease %d, its references followed): eye (%d, %d, %d), point (%d, %d, %d)",
+                     camera, camera_ff8.play.segment + 1, segments, frame, s->frames, s->ease, camera_ff8.play.out[0][0],
+                     camera_ff8.play.out[0][1], camera_ff8.play.out[0][2], camera_ff8.play.out[1][0], camera_ff8.play.out[1][1],
+                     camera_ff8.play.out[1][2]);
+    }
+    if (frame - camera_ff8.origin >= frames && !camera_ff8.ended_said) {
+        camera_ff8.ended_said = 1;
+        if (camera_ff8_say())
+            log_line("camera %x (engine ff8): its chain ends at frame %d: held at eye (%d, %d, %d), point (%d, %d, %d) until the effect ends",
+                     camera, camera_ff8.origin + frames, camera_ff8.play.out[0][0], camera_ff8.play.out[0][1], camera_ff8.play.out[0][2],
+                     camera_ff8.play.out[1][0], camera_ff8.play.out[1][1], camera_ff8.play.out[1][2]);
+    }
+    /* the game drawing its home view (target selection): its own eye and point; the chain goes on underneath */
+    if (!camera_roll_scripted_shown(*(const signed char *)ADDR_CAMERA_RESULT_X4, *(const short *)ADDR_BATTLE_MENU_STATE,
+                                    *(const BYTE *)ADDR_SUMMON_ACTIVE)) {
+        camera_zoom_write(CAMERA_FF8_H_HOME);
+        return;
+    }
+    /* (camera stage 2) the blend back (FF8's `04 N`, task 00509930: rsin(count x 1024 / N), count 1..N): its count
+       reaches N on the effect's last frame, the call that writes nothing; the H goes with it, the roll does not
+       (FUN_00504060 blends eye, point and H only) */
+    if (frame != camera_ff8.view_frame) {
+        camera_ff8.view_frame = frame;  /* (a frame repeated by FFNx's 30/60 fps: the view the game chose, not what was written) */
+        for (i = 0; i < 3; i++) {
+            camera_ff8.view[0][i] = ((const short *)ADDR_CAMERA_EYE)[i];
+            camera_ff8.view[1][i] = ((const short *)ADDR_CAMERA_FOCUS)[i];
+        }
+    }
+    count = c->blend ? frame - (length - 1 - c->blend) : 0;
+    if (count > 0 && count < c->blend) {
+        b = camera_ff8_rsin((count << 10) / c->blend);
+        if (!camera_ff8.blend_said && camera_ff8_say())
+            log_line("camera %x (engine ff8): blend back to the battle view from frame %d (%d frame(s), FF8's sine): the effect's last frame %d is the battle view",
+                     camera, frame, c->blend, length - 1);
+        camera_ff8.blend_said = 1;
+    }
+    if (seq_blend) {
+        /* (camera stage 3) the sequence's `blend N` (w from the blend tasks, seq_frame): FF7's base is the game's own
+           view; H from the record's H end (FUN_00504060: ((H base - record +6) w >> 12) + record +6) */
+        b = seq_blend;
+        h_end = camera_ff8.play.h_range[1];
+        h_end = (short)(((CAMERA_FF8_H_HOME - h_end) * b >> 12) + h_end);
+    }
+    h = camera_ff8.play.h;
+    for (i = 0; i < 3; i++) {
+        eye[i] = camera_ff8.play.out[0][i];
+        look[i] = camera_ff8.play.out[1][i];
+        if (b) {
+            eye[i] = camera_ff8_blend(eye[i], camera_ff8.view[0][i], b);
+            look[i] = camera_ff8_blend(look[i], camera_ff8.view[1][i], b);
+        }
+    }
+    if (seq_blend)
+        h = h_end;                      /* (camera stage 3) the sequence's blend */
+    else if (b)
+        h = (short)(((CAMERA_FF8_H_HOME - h) * b >> 12) + h);
+    if (c->zoom == CAMERA_FF8_ZOOM_DOLLY || (c->zoom == CAMERA_FF8_ZOOM_FOV && camera_ff8.fov_refused))
+        for (i = 0; i < 3; i++)
+            eye[i] = camera_ff8_dolly(eye[i], look[i], h);
+    camera_zoom_write(c->zoom == CAMERA_FF8_ZOOM_FOV ? h : CAMERA_FF8_H_HOME);
+    for (i = 0; i < 3; i++) {
+        camera_ff8.written[0][i] = (short)eye[i];
+        camera_ff8.written[1][i] = (short)look[i];
+        ((short *)ADDR_CAMERA_EYE)[i] = camera_ff8.written[0][i];
+        ((short *)ADDR_CAMERA_FOCUS)[i] = camera_ff8.written[1][i];
+    }
+    camera_ff8.wrote = 1;
+    if (c->ff8_rolls && camera_true_hook > 0 && !camera_true.failed) {
+        camera_true.roll = (short)camera_ff8.play.roll;
+        camera_true.armed = 1;
+    }
+}
+
+/* A battle starts (native_battle_start): a play left from the last one is forgotten, nothing written (camera
+   stage 2: the battle's H too is forgotten, not put back: FUN_00429ac0 sets 00c05f7c to 512 at every battle init,
+   and nothing outside the battle reads it). */
+static void camera_ff8_battle_start(void)
+{
+    int i;
+
+    if (camera_ff8.active)
+        log_line("camera %x (engine ff8): still on as a battle starts: dropped", camera_ff8.camera);
+    camera_zoom.active = 0;
+    camera_ff8.active = camera_ff8.wrote = 0;
+    camera_ff8.done = 1;
+    camera_true.armed = 0;
+    InterlockedExchange(&camera_ff8_logs, 0);
+    /* (camera stage 3) FUN_005041e0 at FF8's battle start: the variables 00-07 and the mask 0 (the locals 78-7f too
+       here), the chain tasks' pool made anew (FUN_00508300), the records free, 01d9771e the base; FF8's random runs on
+       from the game's seed: this DLL's own, started once from the clock */
+    for (i = 0; i < 8; i++)
+        camera_seq.var[i] = camera_seq.local[i] = 0;
+    camera_seq.mask = 0;
+    camera_seq.hold = 0;
+    camera_seq.w = 0;
+    camera_seq.shown = 0;
+    camera_ff8_seq_tasks_clear();
+    camera_seq.running = 0;
+    if (!camera_seq.seed)
+        camera_seq.seed = GetTickCount() | 1u;
+}
+
+/* native_task's camera calls, at each call of the effect's task with native_clock_step's `todo` (here so that the
+   native test runs them): each call but the last, the roll's and FF8's step at this call's frame; the last call
+   (NATIVE_DO_END: its length, its files freed, its watchdog) writes nothing and stops both, so the frame it ends on
+   is built from the game's own view. */
+static void native_task_cameras(WORD serial, int frame, int length, DWORD effect, int todo)
+{
+    const char *why;
+
+    if (!(todo & NATIVE_DO_END)) {
+        camera_roll_step(serial, frame, length, effect);
+        camera_ff8_step(serial, frame, length, effect);
+        return;
+    }
+    why = (todo & NATIVE_END_LENGTH) ? "the effect's length" : (todo & NATIVE_END_GROUP) ? "the effect's files were freed"
+                                                                                        : "the effect's watchdog";
+    camera_roll_stop(serial, why);
+    camera_ff8_stop(serial, why);
+}
+/* CAMERA PLAY END */
+
+/* STAGE FX BEGIN: (stage fx 1; FF7FF8Fusion/Notes/Stage_FX_Stage1.md) the stage lines' player, which the native test
+   runs against game memory mapped at the game's addresses.
+   ---- The battle stage hidden or darkened by a native effect's `stage` lines ----------------------------------
+   FUN_0042e52e (update_3d_battleground, the first thing FUN_0042d992 draws each frame) draws the stage's part groups,
+   each guarded by a bit of the byte 00bfcb64 (bits 0-2; bit 3 the Midgar rain, never touched here): with bits 0-2
+   set nothing of the stage is drawn and the frame's clear colour shows, as the game's own Shadow Flare, Omnislash,
+   Super Nova, the Bahamuts and KotR do it (`|= 7`, `&= 0xf8` back). Bit 2 alone leaves out parts 2-4, the far layer
+   (Typhoon's 004db15f). It draws them with the colour 00c05ec8/9/a (three bytes, read at 0042e56f-0042e57f) and the
+   alpha 255 - (00c05ecc >> 4) (a word 0-0x1000, read at 0042f1e0): 0x1000 with 0,0,0 is a black stage, as Shadow
+   Flare writes it each frame (0057708e). Only FUN_0042e52e reads 00bfcb64 (0042e550-0042ef00); FUN_0042a72d
+   (0042a7d4) and FUN_0042ab91 (0042ae1a-0042ae37) zero the mask and the darkness and tint in the set-up of the first
+   battle after the battle module is entered. No patch: the native task (list of 100, 0042dac0, after the stage was
+   drawn) writes them, so a write shows on the next frame's stage. The rules, as the camera roll's:
+   - nothing is written until a stage line is on; from then on, each call of the task but its last: the mask's bits
+     a hide= line asks for that the game had not set (the DLL's bits) set, and those it no longer asks for cleared;
+     the darkness and tint of the dark= line on, or the game's own values (the base, saved at the first write) when
+     no dark= line is on;
+   - the game's bits of the mask are never cleared, whatever the lines say (a bit set before the effect stays set);
+   - if the game cleared one of the DLL's bits, or wrote another darkness or tint, the game is writing them: what is
+     still the DLL's goes back and this cast writes that global no more (one log line);
+   - when the effect ends (any way: its length, its files gone, the watchdog, a newer cast, a re-read, an early
+     end), the DLL's bits still set are cleared and the darkness and tint that are still what the DLL wrote get the
+     base back; one written over by the game stays the game's;
+   - a battle start forgets everything without writing (the first battle's set-up zeroes them; a chained battle has
+     no set-up, and relies on the effect's task having ended: the display waits for the list of 100 to be empty);
+   - FUN_0042e52e's first bytes are checked once; if they are not as expected no stage line is played (the rest of
+     the script plays), said once.
+   ---- (stage fx 2; FF7FF8Fusion/Notes/Stage_FX_Stage2.md) fills, flashes and shakes ----------------------------
+   - fill / flash: each call that draws (paused calls too, as the Blue Light fade task the DLL already runs), each
+     fill or flash line on at the frame asks for one of the game's full-screen quads: FUN_005bd436(r, g, b) (mode 1,
+     z 0.1: polygon set 00d8f638[1], made with blend 1, additive: FUN_0066bf8e builds it through FUN_0066bdc5, FFNx
+     draws blend 1 as ONE + ONE; the white-outs' routine), FUN_005bd456(alpha, 0, 0) (FUN_005bd473 mode 2: set [5],
+     made with blend 0, the alpha from 0090c9e8, colour 0,0,0, z 0: black laid over the picture, the boss death's
+     darkening), or for a colour laid over (blend=alpha) stage_fx_over: mode 2's own three setters, FUN_00667270(0),
+     FUN_0066727d(1), FUN_0066723c(alpha), then FUN_005bd473(r, g, b, mode 0, z 0), so the same set [5] at the alpha
+     with the colour kept (005bd52c). FUN_0066a47e only APPENDS the quad to its set's buffer (FUN_00668792 / 00668a30
+     through FUN_0066e272) and puts the engine's blend state back (0090c9ec 1, 00d8f668 0) whether it drew or not;
+     the sets are drawn later in the same main-loop pass, after the 100-list ran (FUN_0041c0bb): 0042908c(0, 1) ->
+     FUN_0066c19e(1) draws [0] and [1], then 0042908c(009ad1ac, 2) -> FUN_0066c19e(2) draws [5]. So a fill shows on
+     its own frame, every added quad of a frame is drawn before every laid-over one, and the call order decides
+     nothing between the two kinds. Nothing is written that needs restoring. 16 lines an update. The routines' first
+     bytes are checked once (FFNx patches two x operands inside FUN_005bd473 at +0xDA / +0x112 for its wide
+     viewport, past the bytes checked, and references none of the three setters); if they differ no fill is drawn,
+     said once.
+   - shake: the three shorts 00bfcb56/58/5a (00bfcb30 + 0x26), the offset FUN_00430b7b reads as one vector, turns by
+     the look-at and adds to the camera's translation (FUN_00662ecc, called at 00430bf8): a world offset s that moves
+     the whole picture by R s. The line's jolt v is in the screen's axes, so s = R^T v with R the look-at at
+     00bf2130 (nfx_shake_world), on top of the game's own offset (the base, saved at the first write). The same rules
+     as the darkness: nothing written until a shake line is on; each call but the last the base + s, or the base when
+     no shake line is on; the game writing another value meanwhile: what is still the DLL's goes back, the game's is
+     kept, this cast shakes no more; every end puts the base back on each short still the DLL's; a battle start
+     forgets it (FUN_0042ab91 zeroes the block in the first battle's set-up). The build's call 0041bda4 (or this
+     DLL's own hook there), FUN_0042d971 and the call at 00430be6 are checked once; if they differ no shake is
+     played, said once.
+   ---- (stage fx 3; FF7FF8Fusion/Notes/Stage_FX_Stage3.md) the actors and the backdrop ---------------------------
+   - actors: per actor 0-9 (never 3, the summons' own slot) the record at 00be1170 + actor * 0x1aec. FUN_0042f3e8 draws
+     the body with the colour 00be11a0..a2 (FUN_0066335f) and the alpha 255 - (00be118c >> 4) (FUN_00429343): with
+     colour 0,0,0 mixing state 0xc, the body's colours x alpha (black at 0x1000); with a colour state 0xb, the body's
+     colours x alpha + the colour x (1 - alpha) (FUN_0068d2b8 -> FUN_0068f2d6 / FUN_0068f413). Never see-through:
+     the vertex alpha is untouched (Shadow Flare's actors turn black, 0057708e). Bit 2 (0x04) of 00be119d leaves the
+     body, its weapon and its shadow out of the draw (0042f3e8, 004303cc, 0043076b) and the status animations and
+     the player's marker (005b9b30, 005b9c8e); the bone tables are still filled and the actor's scripts run. Bit 1
+     (0x02) also stops the actor's scripts (0042e275 / 0042e3ca: the battle would wait on it): never written here.
+     Bit 0 is not a tint switch (its only reader, 005b9b30, leaves out the player's marker): not written either.
+   - the look (fade=, tint=): the same rules as the stage's darkness, per actor: nothing written until a line names
+     the actor; the game's fade and colour saved at the first write; each call but the last the line's, or the
+     game's when no line names the actor; if the game writes any of the four meanwhile (a status's colour and its
+     pulse, FUN_005ba335 / FUN_005b9ec2; a death's fade, 005bbd24 ...; the summons' fades, 0042c66d / 0042c823), what
+     is still the DLL's goes back, the game's is kept, and this cast leaves that actor's look alone (one log line);
+   - the hide: bit by bit, never the whole byte: the DLL sets bit 2 only where it was clear, on an actor with a model
+     of the caster's side that is not a target of the cast (the reader allows hide with who=caster|allies only; the
+     death path sets bit 2 on a dying target, 0041fba4 opcodes b8 and e7, which the DLL would otherwise clear), and
+     never on one with bit 1 set; it clears only the bit 2 it set. If the game clears it meanwhile it is the game's;
+     if the game sets bit 1 meanwhile (a summon takes the party out) bit 2 is left to it (its fade-in clears it:
+     0042c31c);
+   - an actor whose model changes during the cast (removed, another loaded in the slot) is forgotten: nothing written
+     to its record any more, at the end neither;
+   - every end restores (the same ends as the stage's); a battle start forgets without writing.
+   - backdrop (fill layer=back): each call that draws, the game's own Shadow Flare backdrop FUN_0057747e(r, g, b): 30
+     opaque strips in the exe, 40 under Enhanced Stock UI's hext (03-Battle.txt, "Aali's fix for Shadowflare - full
+     screen": 0057748C = c7 45 e8 28 00 00 00, the count's immediate at +0x11 not compared; 0057749A its half width at
+     +0x1c) (POLY_F4 code 0x28: polygon set [4], drawn in phase 0) at z 0.99998 over the viewport, which FFNx widens by
+     two operands at +0x18 / +0x1F (widescreen.cpp 200), outside the bytes checked. It leaves 00c1ea68 (the
+     effects' instance pointer) pointing at its strip: put back after the call. Its bytes, its object's (FUN_00667297)
+     and the frame test's are checked once; if they differ no backdrop is drawn, said once. */
+#define ADDR_STAGE_MASK         0x00bfcb64u  /* byte: bits 0-2 the stage's part groups not drawn (FUN_0042e52e), bit 3 the rain */
+#define ADDR_STAGE_TINT         0x00c05ec8u  /* 3 bytes R, G, B: the colour the stage is drawn toward (0042e56f) */
+#define ADDR_STAGE_DARK         0x00c05eccu  /* short 0-0x1000: how far toward the tint (alpha 255 - v / 16, 0042f1e0) */
+#define FN_STAGE_DRAW           0x0042e52eu  /* update_3d_battleground: the only reader of ADDR_STAGE_MASK */
+#define STAGE_FX_LOGS           30           /* stage log lines a battle */
+
+static struct {
+    WORD serial;                        /* the native effect's task that owns the stage (native_play.serial) */
+    BYTE hide_active, hide_done;        /* the mask: written by this cast / nothing more for this cast */
+    BYTE hide_set;                      /* the bits of the mask this DLL set and holds now */
+    BYTE dark_active, dark_done;
+    BYTE tint_base[3], tint_written[3];
+    short dark_base, dark_written;
+    int hide_frame, dark_frame;         /* the frame of the last mask change / -1 (for the log) */
+} stage_fx = { 0, 0, 1, 0, 0, 1, { 0, 0, 0 }, { 0, 0, 0 }, 0, 0, -1, -1 };
+static int stage_fx_site;               /* 0 not looked at, 1 as expected, -1 not: no stage line is played */
+static LONG stage_fx_logs;
+/* (stage fx 2) fills, flashes and shakes */
+#define FN_STAGE_FILL_ADD       0x005bd436u  /* battle_boss_death_call: FUN_005bd473(r, g, b, 1, 0.1f): the colour added */
+#define FN_STAGE_FILL_ALPHA     0x005bd456u  /* FUN_005bd473(alpha, g, b, 2, 0): black at alpha (005bd503: 0090c9e8 = the first byte) */
+#define FN_STAGE_QUAD           0x005bd473u  /* battle_draw_quad(r, g, b, mode, z): the shared quad 00d8e490, appended to its polygon set by FUN_0066a47e */
+#define FN_STAGE_SET_MODE       0x00667270u  /* FUN_00667270(v): 0090c9ec = v (0: FUN_0066a47e takes set [0] or [5]; 1 its default, set [1]) */
+#define FN_STAGE_SET_FIVE       0x0066727du  /* FUN_0066727d(v): 00d8f668 = v (1: set [5] rather than [0]) */
+#define FN_STAGE_SET_ALPHA      0x0066723cu  /* FUN_0066723c(a): byte 0090c9e8 = a (the alpha of sets [0] and [5]) */
+#define FN_STAGE_DRAWING        0x0066c3bfu  /* gfx_is_drawing_frame: 0090c9f0 (FFNx calls it too: battle_sub_66C3BF) */
+#define ADDR_STAGE_SHAKE        0x00bfcb56u  /* 3 shorts at 00bfcb30 + 0x26: the camera's offset, a world vector (FUN_00430b7b) */
+#define SITE_STAGE_SHAKE_ADD    0x00430be6u  /* in FUN_00430b7b: FUN_00662ecc(record + 0x26, record + 0x12, &scratch) */
+
+static int stage_fill_site;             /* 0 not looked at, 1 as expected, -1 not: no fill or flash is drawn */
+static int stage_shake_site;            /* likewise for shake lines */
+static struct {
+    BYTE fill_said, fill_limit_said;    /* this cast's first fill said; its 16-a-frame limit said */
+    BYTE shake_active, shake_done;      /* the offset is this DLL's now / nothing more for this cast */
+    BYTE shake_said;                    /* this cast's first jolt said */
+    short shake_base[3], shake_written[3];
+} stage_fx2 = { 0, 0, 0, 1, 0, { 0, 0, 0 }, { 0, 0, 0 } };
+/* (stage fx 3) the actors and the backdrop */
+#define STAGE_ACTOR_FADE        0x00be118cu  /* short, per actor STAGE_ACTOR_STRIDE apart: the amount toward the colour (FUN_00429343) */
+#define STAGE_ACTOR_FLAGS       0x00be119du  /* byte: bit 2 the body not drawn (written bit by bit); bit 1 never written */
+#define STAGE_ACTOR_TINT        0x00be11a0u  /* 3 bytes R, G, B: the body's colour (FUN_0066335f in FUN_0042f3e8) */
+#define STAGE_ACTOR_MODEL       0x00be1d20u  /* DWORD: the actor's battle model, 0 none */
+#define STAGE_ACTOR_TURN        0x00be12d6u  /* (actor move) 3 shorts: the turn about X, Y (the facing), Z, 4096 a turn. FUN_0042f3e8
+                                                converts them to degrees (x 007b74ec, 360/4096) into the model's +0x30/34/38 on
+                                                every drawn frame; draw_3d_model_006840da turns the posed body by Y, then X,
+                                                then Z (each about the world's axis: FUN_0067c17f multiplies on the right)
+                                                about the model's origin, then adds the place */
+#define STAGE_ACTOR_PLACE       0x00be12deu  /* (actor move) 3 shorts: the place x, y (the floor 0, negative up), z: the model's
+                                                +0x24/28/2c in the same draw; the shadow stays on the floor (y -4 / -10) */
+#define STAGE_MOVE_FIELDS       0x3f         /* (actor move) the six fields as bits: 0-2 the place x, y, z; 3-5 the turn X, Y, Z */
+#define STAGE_ACTOR_STRIDE      0x1aecu
+#define STAGE_ENEMY_COUNT       0x00bf2050u  /* signed byte: FUN_0042f287 draws the enemies 4 .. 3 + this */
+#define STAGE_ACTOR_HIDDEN      0x04         /* 00be119d bit 2 */
+#define STAGE_ACTOR_OUT         0x02         /* 00be119d bit 1: the actor out of the picture AND its scripts stopped (the game's) */
+#define STAGE_ACTOR_THERE       0x80         /* (target hide) 00be119d bit 7: the enemy is there (read, never written): FUN_0042f287
+                                                draws an enemy only with it set; set by the battle's set-up (0042ca34) and an
+                                                enemy's appearing, cleared by every death task's last frame (005bbe32,
+                                                005bc04d, 005bbbde, 005bc32d, 005bc6ed, 005bc920, 005bcbb8), opcode b8 (with
+                                                bit 2 set), 0042e219 (an actor removed) and the escape (005d699c) */
+#define STAGE_ACTOR_PULSE       0x08         /* 00be119d bit 3: a status's pulse (set by FUN_005ba1eb): FUN_005b9ec2 steps 00be118c
+                                                by +-0x80 a frame from whatever is there, so a look written there would move the
+                                                pulse's centre for the rest of the status: such an actor's look is the game's */
+#define FN_STAGE_BACKDROP       0x0057747eu  /* shadow_flare_draw_white_bg(r, g, b): opaque strips at the far plane: 30 in the
+                                                exe, 40 with Enhanced Stock UI's hext (0057748C; the immediate not compared) */
+#define FN_STAGE_PRIM           0x00667297u  /* the shared 2-D object 00d8e490 (the backdrop's and the quad's) */
+#define SITE_STAGE_BACK_TAIL    0x005775f5u  /* in FUN_0057747e: mov [00c1ea68], ecx (the strip's address) */
+#define ADDR_STAGE_BACK_CHAIN   0x00c1ea68u  /* the effects' instance pointer the backdrop leaves pointing at its strip */
+
+static int stage_back_site;             /* 0 not looked at, 1 as expected, -1 not: no backdrop is drawn */
+static struct stage_actor {
+    BYTE look_active, look_done;        /* the fade and colour: this DLL's now / nothing more for this cast */
+    BYTE hide_held, hide_done;          /* bit 2: set by this DLL and held now / nothing more for this cast */
+    short fade_base, fade_written;
+    BYTE tint_base[3], tint_written[3];
+    DWORD model;                        /* the actor's model when this DLL first wrote: another means another actor */
+    BYTE move_mine, move_done;          /* (actor move) a bit per field (STAGE_MOVE_FIELDS): this DLL's now / the game's for
+                                           the rest of the cast */
+    short move_base[6], move_written[6];    /* the game's value when the DLL took the field, and the DLL's last write */
+} stage_actors[10];
+static struct {
+    BYTE back_said;                     /* this cast's first backdrop said */
+    BYTE target_said;                   /* this cast's "a target is not hidden" said */
+    BYTE absent_said;                   /* (target hide) this cast's "an enemy the game does not draw" said */
+    BYTE move_target_said, move_absent_said;    /* (actor move) this cast's "a target is not moved" and "never moved" said */
+} stage_fx3;
+
+static BOOL stage_fx_say(void)
+{
+    return InterlockedIncrement(&stage_fx_logs) <= STAGE_FX_LOGS;
+}
+
+/* FUN_0042e52e as ff7_en.exe has it (push ebp; mov ebp, esp; sub esp, 0x10; mov eax, [009adfd8]; push eax; call):
+   FFNx patches it only at ff7_fps_limiter >= 2 (ff7_opengl.cpp:254-261, animations_hook_init: the shake-train call at
+   +0xBF, the frame-multiplier divides from +0x1D4), never these 13 bytes; at 1 it patches nothing in it. Checked once,
+   said once. */
+static BOOL stage_fx_site_ok(void)
+{
+    static const BYTE draw[13] = { 0x55, 0x8b, 0xec, 0x83, 0xec, 0x10, 0xa1, 0xd8, 0xdf, 0x9a, 0x00, 0x50, 0xe8 };
+
+    if (stage_fx_site)
+        return stage_fx_site > 0;
+    stage_fx_site = bytes_are(FN_STAGE_DRAW, draw, 13) ? 1 : -1;
+    log_line("stage lines: %s (the stage's draw %08lx, its mask %08lx, darkness %08lx, tint %08lx)",
+             stage_fx_site > 0 ? "on (0042e52e as expected)" : "OFF: the game's bytes at 0042e52e are not as expected; no stage line is played",
+             FN_STAGE_DRAW, ADDR_STAGE_MASK, ADDR_STAGE_DARK, ADDR_STAGE_TINT);
+    return stage_fx_site > 0;
+}
+
+/* (stage fx 2) The quad's three routines as ff7_en.exe has them (objdump 005bd436-005bd5e8): FUN_005bd436 pushes 0.1f,
+   mode 1 and the colour; FUN_005bd456 pushes 0, mode 2 and its three bytes; FUN_005bd473 starts by pointing 00bfb2e0 at
+   the quad 00d8e490. FFNx reads the first two (ff7_data.h: battle_boss_death_call_5BD436, battle_draw_quad_5BD473), calls
+   005bd436 itself (the boss death's white flash) and patches two operands of FUN_005bd473 (+0xDA, +0x112: its wide
+   viewport), past the 16 bytes checked. FUN_0066c3bf (push ebp; mov ebp, esp; mov eax, [0090c9f0]; pop ebp; ret) is
+   the frame test FUN_005bd473 makes before it draws: asked first, so that FUN_005bd456 or stage_fx_over never leaves
+   the blend state (0090c9ec = 0, 00d8f668 = 1) set when the quad is not passed on (FUN_0066a47e puts it back, and is
+   called only when that test is true). FUN_00667270, FUN_0066727d, FUN_0066723c (each push ebp; mov ebp, esp; one
+   store; pop ebp; ret) are the setters mode 2 calls at 005bd4f1 / 005bd4fb / 005bd50d; stage_fx_over calls them
+   itself. Checked once, said once. */
+static BOOL stage_fill_site_ok(void)
+{
+    static const BYTE add[14] = { 0x55, 0x8b, 0xec, 0x68, 0xcd, 0xcc, 0xcc, 0x3d, 0x6a, 0x01, 0x8a, 0x45, 0x10, 0x50 };
+    static const BYTE alpha[11] = { 0x55, 0x8b, 0xec, 0x6a, 0x00, 0x6a, 0x02, 0x8a, 0x45, 0x10, 0x50 };
+    static const BYTE quad[16] = { 0x55, 0x8b, 0xec, 0x83, 0xec, 0x0c, 0xc7, 0x05, 0xe0, 0xb2, 0xbf, 0x00, 0x90, 0xe4, 0xd8, 0x00 };
+    static const BYTE drawing[10] = { 0x55, 0x8b, 0xec, 0xa1, 0xf0, 0xc9, 0x90, 0x00, 0x5d, 0xc3 };
+    static const BYTE set_mode[13] = { 0x55, 0x8b, 0xec, 0x8b, 0x45, 0x08, 0xa3, 0xec, 0xc9, 0x90, 0x00, 0x5d, 0xc3 };
+    static const BYTE set_five[13] = { 0x55, 0x8b, 0xec, 0x8b, 0x45, 0x08, 0xa3, 0x68, 0xf6, 0xd8, 0x00, 0x5d, 0xc3 };
+    static const BYTE set_alpha[13] = { 0x55, 0x8b, 0xec, 0x8a, 0x45, 0x08, 0xa2, 0xe8, 0xc9, 0x90, 0x00, 0x5d, 0xc3 };
+
+    if (stage_fill_site)
+        return stage_fill_site > 0;
+    stage_fill_site = bytes_are(FN_STAGE_FILL_ADD, add, 14) && bytes_are(FN_STAGE_FILL_ALPHA, alpha, 11) && bytes_are(FN_STAGE_QUAD, quad, 16) &&
+                      bytes_are(FN_STAGE_DRAWING, drawing, 10) && bytes_are(FN_STAGE_SET_MODE, set_mode, 13) &&
+                      bytes_are(FN_STAGE_SET_FIVE, set_five, 13) && bytes_are(FN_STAGE_SET_ALPHA, set_alpha, 13) ? 1 : -1;
+    log_line("fill lines: %s (the added quad %08lx, the black quad %08lx, the quad %08lx, the frame test %08lx, its setters %08lx %08lx %08lx)",
+             stage_fill_site > 0 ? "on (005bd436, 005bd456, 005bd473, 0066c3bf, 00667270, 0066727d, 0066723c as expected)"
+                                 : "OFF: the game's bytes at 005bd436 / 005bd456 / 005bd473 / 0066c3bf / 00667270 / 0066727d / 0066723c are not as expected; no fill or flash is drawn",
+             FN_STAGE_FILL_ADD, FN_STAGE_FILL_ALPHA, FN_STAGE_QUAD, FN_STAGE_DRAWING, FN_STAGE_SET_MODE, FN_STAGE_SET_FIVE, FN_STAGE_SET_ALPHA);
+    return stage_fill_site > 0;
+}
+
+/* (stage fx 2) What makes the offset count: the frame's build call at 0041bda4 (the game's, or this DLL's own hook
+   there, camera_true_build, which calls FUN_0042d971 first and rebuilds with the same offset), FUN_0042d971 as the
+   camera roll checks it (it pushes 00bfb1a0, 00bf2158, 00bf2130, 00bfcb30: the look-at read here is the one the build
+   writes), and FUN_00430b7b's call of FUN_00662ecc with the record + 0x26 (lea edx, [ebp-4]; push edx; mov eax,
+   [ebp+8]; add eax, 0x12; push eax; mov ecx, [ebp+8]; add ecx, 0x26; push ecx; call). Checked once, said once. */
+static BOOL stage_shake_site_ok(void)
+{
+    static const BYTE build_call[5] = { 0xe8, 0xc8, 0x1b, 0x01, 0x00 };
+    static const BYTE build[28] = { 0x55, 0x8b, 0xec, 0x68, 0xa0, 0xb1, 0xbf, 0x00, 0x68, 0x58, 0x21, 0xbf, 0x00, 0x68,
+                                    0x30, 0x21, 0xbf, 0x00, 0x68, 0x30, 0xcb, 0xbf, 0x00, 0xe8, 0xee, 0x31, 0x00, 0x00 };
+    static const BYTE add[23] = { 0x8d, 0x55, 0xfc, 0x52, 0x8b, 0x45, 0x08, 0x83, 0xc0, 0x12, 0x50, 0x8b,
+                                  0x4d, 0x08, 0x83, 0xc1, 0x26, 0x51, 0xe8, 0xcf, 0x22, 0x23, 0x00 };
+
+    if (stage_shake_site)
+        return stage_shake_site > 0;
+    stage_shake_site = (bytes_are(SITE_CAMERA_BUILD, build_call, 5) || camera_true_hooked_here()) && bytes_are(FN_CAMERA_BUILD, build, 28) &&
+                       bytes_are(SITE_STAGE_SHAKE_ADD, add, 23) ? 1 : -1;
+    log_line("shake lines: %s (the camera's build at %08lx -> %08lx, its offset added at %08lx, the offset %08lx, the look-at %08lx)",
+             stage_shake_site > 0 ? "on (0041bda4, 0042d971, 00430be6 as expected)" : "OFF: the game's bytes there are not as expected; no shake is played",
+             SITE_CAMERA_BUILD, FN_CAMERA_BUILD, SITE_STAGE_SHAKE_ADD, ADDR_STAGE_SHAKE, ADDR_CAMERA_LOOKAT);
+    return stage_shake_site > 0;
+}
+
+/* (stage fx 2) The offset's shorts that are still what the DLL wrote get the game's own back. */
+static void stage_fx_shake_release(const char *why)
+{
+    short *now = (short *)ADDR_STAGE_SHAKE;
+    int k, kept = 0;
+
+    stage_fx2.shake_done = 1;
+    if (!stage_fx2.shake_active)
+        return;
+    stage_fx2.shake_active = 0;
+    for (k = 0; k < 3; k++)
+        if (now[k] == stage_fx2.shake_written[k])
+            now[k] = stage_fx2.shake_base[k];
+        else
+            kept |= 1 << k;
+    if (stage_fx_say()) {
+        if (kept)
+            log_line("shake: ends (%s); the game had written its own offset there: left as it is (%d, %d, %d)", why, now[0], now[1], now[2]);
+        else
+            log_line("shake: back to the game's offset %d, %d, %d (%s)", stage_fx2.shake_base[0], stage_fx2.shake_base[1],
+                     stage_fx2.shake_base[2], why);
+    }
+}
+
+/* The mask's bits that are still the DLL's are cleared (the game's are left as they are). */
+static void stage_fx_hide_release(const char *why)
+{
+    BYTE now = *(const BYTE *)ADDR_STAGE_MASK, still = (BYTE)(now & stage_fx.hide_set);
+
+    stage_fx.hide_done = 1;
+    if (!stage_fx.hide_active)
+        return;
+    stage_fx.hide_active = 0;
+    if (still)
+        *(BYTE *)ADDR_STAGE_MASK = (BYTE)(now & ~still);
+    if (stage_fx_say()) {
+        if (still != stage_fx.hide_set)
+            log_line("stage: ends (%s); the game had cleared %02x of this effect's bits %02x: the mask left %02x", why,
+                     stage_fx.hide_set & ~now, stage_fx.hide_set, *(const BYTE *)ADDR_STAGE_MASK);
+        else
+            log_line("stage: back to the game's %02x (%s)", *(const BYTE *)ADDR_STAGE_MASK, why);
+    }
+    stage_fx.hide_set = 0;
+}
+
+/* The darkness and the tint bytes that are still what the DLL wrote get the game's own values back. */
+static void stage_fx_dark_release(const char *why)
+{
+    BYTE *tint = (BYTE *)ADDR_STAGE_TINT;
+    int k, kept = 0;
+
+    stage_fx.dark_done = 1;
+    if (!stage_fx.dark_active)
+        return;
+    stage_fx.dark_active = 0;
+    if (*(const short *)ADDR_STAGE_DARK == stage_fx.dark_written)
+        *(short *)ADDR_STAGE_DARK = stage_fx.dark_base;
+    else
+        kept |= 8;
+    for (k = 0; k < 3; k++)
+        if (tint[k] == stage_fx.tint_written[k])
+            tint[k] = stage_fx.tint_base[k];
+        else
+            kept |= 1 << k;
+    if (stage_fx_say()) {
+        if (kept)
+            log_line("stage: darkening ends (%s); the game had written its own %s there: left as it is (darkness %d, tint %d,%d,%d)", why,
+                     kept & 8 ? (kept & 7 ? "darkness and tint" : "darkness") : "tint", *(const short *)ADDR_STAGE_DARK, tint[0], tint[1], tint[2]);
+        else
+            log_line("stage: darkening back to the game's %d, tint %d,%d,%d (%s)", stage_fx.dark_base, stage_fx.tint_base[0],
+                     stage_fx.tint_base[1], stage_fx.tint_base[2], why);
+    }
+}
+
+/* (stage fx 3) Actor t's record: a field at `address` (00be1170's block, STAGE_ACTOR_STRIDE apart). */
+static BYTE *stage_actor_field(int t, DWORD address)
+{
+    return (BYTE *)(address + (DWORD)t * STAGE_ACTOR_STRIDE);
+}
+
+/* (stage fx 3) Actor t is there to be hidden or coloured: not slot 3, an enemy within the count FUN_0042f287 draws,
+   with a battle model. */
+static int stage_actor_present(int t)
+{
+    int enemies = *(const signed char *)STAGE_ENEMY_COUNT;
+
+    if (t < 0 || t > 9 || t == 3 || (t >= 4 && t - 4 >= enemies))
+        return 0;
+    return *(const DWORD *)stage_actor_field(t, STAGE_ACTOR_MODEL) != 0;
+}
+
+/* (target hide) Actor t's bit 2 may be set: present (above), and an enemy only while the game draws it (bit 7 set): an
+   enemy dead, removed or not yet appeared is never hidden (guard 1). */
+static int stage_actor_hideable(int t)
+{
+    return stage_actor_present(t) && (t < 4 || (*stage_actor_field(t, STAGE_ACTOR_FLAGS) & STAGE_ACTOR_THERE));
+}
+
+/* (target hide) The game has taken over a held actor's bit 2: an enemy whose bit 7 the game cleared since the DLL set
+   bit 2 (a death task's last frame, opcode b8 which sets bit 2 itself, a removal). Its bit 2 is left set (guard 2): the
+   body is not drawn without bit 7 whatever bit 2 says (FUN_0042f287). The death tasks themselves clear only bit 7
+   (005bbe7a and al,7f), so after one of them bit 2 stays set where the game alone would have left it clear; only
+   opcode b8 sets bit 2 itself. */
+static int stage_actor_died(int t, BYTE now)
+{
+    return t >= 4 && !(now & STAGE_ACTOR_THERE);
+}
+
+/* (stage fx 3) Actor t's fade and colour bytes that are still what the DLL wrote get the game's back. 0 if nothing
+   was the DLL's; else 0x10 | the ones the game had written (8 the fade, 1 2 4 the colour bytes), which stay. */
+static int stage_actor_look_release(int t)
+{
+    struct stage_actor *a = &stage_actors[t];
+    short *fade = (short *)stage_actor_field(t, STAGE_ACTOR_FADE);
+    BYTE *tint = stage_actor_field(t, STAGE_ACTOR_TINT);
+    int k, kept = 0x10;
+
+    a->look_done = 1;
+    if (!a->look_active)
+        return 0;
+    a->look_active = 0;
+    if (*fade == a->fade_written)
+        *fade = a->fade_base;
+    else
+        kept |= 8;
+    for (k = 0; k < 3; k++)
+        if (tint[k] == a->tint_written[k])
+            tint[k] = a->tint_base[k];
+        else
+            kept |= 1 << k;
+    return kept;
+}
+
+/* (stage fx 3) Actor t's bit 2, if the DLL holds it: 0 not held; 1 cleared (the body drawn again); 2 left to the game,
+   which has set bit 1 meanwhile (a summon took the actor out; its fade-in clears bit 2, 0042c31c); 3 the game had
+   cleared it already; (target hide) 4 left set: the game's death took the enemy (bit 7 cleared, stage_actor_died).
+   Never another bit. */
+static int stage_actor_hide_release(int t)
+{
+    struct stage_actor *a = &stage_actors[t];
+    BYTE *flags = stage_actor_field(t, STAGE_ACTOR_FLAGS), now = *flags;
+
+    a->hide_done = 1;
+    if (!a->hide_held)
+        return 0;
+    a->hide_held = 0;
+    if (!(now & STAGE_ACTOR_HIDDEN))
+        return 3;
+    if (now & STAGE_ACTOR_OUT)
+        return 2;
+    if (stage_actor_died(t, now))
+        return 4;
+    *flags = (BYTE)(now & ~STAGE_ACTOR_HIDDEN);
+    return 1;
+}
+
+static int stage_actor_move_release(int t, int which, int *kept);
+
+/* (stage fx 3) An actor whose model is not the one the DLL first wrote with is another actor now (removed, or another
+   loaded in the slot): forgotten, nothing written to its record. 1 if forgotten now. (actor move) Its place and turn
+   too, but a field that still holds what the DLL wrote gets the value the DLL took back (the record is the slot's: a
+   model loaded without a new place would keep the offset); one the game wrote since is left as it is. */
+static int stage_actor_gone(int t)
+{
+    struct stage_actor *a = &stage_actors[t];
+    int dummy = 0;
+
+    if (!(a->look_active || a->hide_held || a->move_mine) || *(const DWORD *)stage_actor_field(t, STAGE_ACTOR_MODEL) == a->model)
+        return 0;
+    a->look_active = a->hide_held = 0;
+    a->look_done = a->hide_done = 1;
+    stage_actor_move_release(t, STAGE_MOVE_FIELDS, &dummy);
+    a->move_mine = 0;
+    a->move_done = STAGE_MOVE_FIELDS;
+    return 1;
+}
+
+/* (actor move) Actor t's field k (STAGE_MOVE_FIELDS' bit k): 0-2 its place x, y, z, 3-5 its turn about X, Y, Z. */
+static short *stage_actor_move_field(int t, int k)
+{
+    return (short *)stage_actor_field(t, k < 3 ? STAGE_ACTOR_PLACE + 2u * (DWORD)k : STAGE_ACTOR_TURN + 2u * (DWORD)(k - 3));
+}
+
+/* (actor move) Actor t's fields of `which` that the DLL holds: each still what the DLL wrote gets the game's value back;
+   one the game wrote since is the game's (left as it is, not taken again this cast: *kept). Returns the fields put back.
+   Never a field the DLL does not hold. */
+static int stage_actor_move_release(int t, int which, int *kept)
+{
+    struct stage_actor *a = &stage_actors[t];
+    int k, back = 0;
+
+    for (k = 0; k < 6; k++) {
+        short *v;
+
+        if (!(a->move_mine & which & (1 << k)))
+            continue;
+        v = stage_actor_move_field(t, k);
+        a->move_mine &= (BYTE)~(1 << k);
+        if (*v == a->move_written[k]) {
+            *v = a->move_base[k];
+            back |= 1 << k;
+        } else {
+            a->move_done |= (BYTE)(1 << k);
+            *kept |= 1 << k;
+        }
+    }
+    return back;
+}
+
+/* (stage fx 3) Every actor's: what is still the DLL's goes back. One log line if anything was the DLL's. */
+static void stage_fx_actors_release(const char *why)
+{
+    int t, k, shown = 0, handed = 0, game_shown = 0, back = 0, kept = 0, gone = 0, died = 0;
+    int placed = 0, place_kept = 0;     /* (actor move) */
+
+    for (t = 0; t < 10; t++) {
+        if (stage_actor_gone(t)) {
+            gone |= 1 << t;
+            continue;
+        }
+        {                               /* (actor move) the place and turn first: what is still the DLL's back */
+            int left = 0;
+
+            placed |= (stage_actor_move_release(t, STAGE_MOVE_FIELDS, &left) != 0) << t;
+            place_kept |= (left != 0) << t;
+            stage_actors[t].move_done = STAGE_MOVE_FIELDS;
+        }
+        k = stage_actor_hide_release(t);
+        shown |= (k == 1) << t;
+        handed |= (k == 2) << t;
+        game_shown |= (k == 3) << t;
+        died |= (k == 4) << t;          /* (target hide) */
+        k = stage_actor_look_release(t);
+        back |= (k == 0x10) << t;
+        kept |= (k > 0x10) << t;
+    }
+    if ((shown | handed | game_shown | back | kept | gone) && stage_fx_say())
+        log_line("actors: back to the game's (%s): bit 2 cleared on %03x, the look back on %03x; the game's own kept: the look on %03x, bit 2 on %03x (%03x a summon's); %03x hold another model: not touched (but a place or turn still this DLL's, put back)",
+                 why, shown, back, kept, game_shown | handed, handed, gone);
+    if (died && stage_fx_say())
+        log_line("actors: the game's death took %03x (00be119d bit 7 cleared) before the end (%s): bit 2 left set (the body is not drawn without bit 7; opcode b8 sets bit 2 itself)", died, why);
+    if ((placed | place_kept) && stage_fx_say())
+        log_line("actors: back at the game's place and turn on %03x (%s); the game's own kept on %03x", placed, why, place_kept);
+}
+
+/* (stage fx 3) Each call of the effect's task but its last: the actors lines at the effect's `frame` (paused calls
+   repeat a frame and write the same values), for the cast by `caster` on the targets `mask`. */
+static void stage_fx_actors_step(WORD serial, const struct nfx_item *items, int count, int frame, DWORD effect, int caster, int mask)
+{
+    struct nfx_actor_state st[10];
+    int t, k, first = -1, hidden = 0, shown = 0, game_shown = 0, handed = 0, started = 0, game_look = 0, gone = 0, targets = 0;
+    int pulsing = 0, died = 0, absent = 0;
+    int moved = 0, first_moved = -1, placed = 0, game_placed = 0, left = 0, unmoved = 0, move_targets = 0;    /* (actor move) */
+
+    if (stage_fx.serial != serial)
+        return;
+    nfx_actors_at(items, count, frame, caster, mask, st);
+    for (t = 0; t < 10; t++) {
+        struct stage_actor *a = &stage_actors[t];
+        BYTE *flags = stage_actor_field(t, STAGE_ACTOR_FLAGS);
+        short *fade = (short *)stage_actor_field(t, STAGE_ACTOR_FADE);
+        BYTE *tint = stage_actor_field(t, STAGE_ACTOR_TINT);
+        DWORD model = *(const DWORD *)stage_actor_field(t, STAGE_ACTOR_MODEL);
+
+        if (stage_actor_gone(t)) {
+            gone |= 1 << t;
+            continue;
+        }
+        targets |= (st[t].hide_target && !st[t].hide) << t;
+        if (!a->hide_done) {
+            BYTE now = *flags;
+
+            if (a->hide_held) {
+                if (!(now & STAGE_ACTOR_HIDDEN)) {
+                    a->hide_held = 0;   /* the game cleared it: the game's, not hidden again this cast */
+                    a->hide_done = 1;
+                    game_shown |= 1 << t;
+                } else if (now & STAGE_ACTOR_OUT) {
+                    a->hide_held = 0;   /* the game took the actor out (a summon): bit 2 is the game's from now on */
+                    a->hide_done = 1;
+                    handed |= 1 << t;
+                } else if (stage_actor_died(t, now)) {
+                    a->hide_held = 0;   /* (target hide) the game's death took the enemy: bit 2 left set (not drawn without bit 7) */
+                    a->hide_done = 1;
+                    died |= 1 << t;
+                } else if (!st[t].hide) {
+                    *flags = (BYTE)(now & ~STAGE_ACTOR_HIDDEN);
+                    a->hide_held = 0;
+                    shown |= 1 << t;
+                }
+            } else if (st[t].hide && stage_actor_present(t) && !stage_actor_hideable(t)) {
+                absent |= 1 << t;       /* (target hide) an enemy the game does not draw (bit 7 clear): never touched */
+            } else if (st[t].hide && stage_actor_hideable(t) && !(now & (STAGE_ACTOR_HIDDEN | STAGE_ACTOR_OUT))) {
+                if (!a->look_active)
+                    a->model = model;
+                *flags = (BYTE)(now | STAGE_ACTOR_HIDDEN);
+                a->hide_held = 1;
+                hidden |= 1 << t;
+            }
+        }
+        /* (actor move) The place and turn, field by field. A field the DLL holds that no longer holds what it wrote is the
+           game's for the rest of the cast (a script's step, a mover); an actor that leaves the picture (bit 1) or whose
+           death took it (an enemy's bit 7 cleared) gets back what is still the DLL's and is not moved again; a field no
+           line names now gets the game's value back (a later line takes it afresh). Otherwise: the value the DLL took
+           (the actor's own) plus the line's offset or turn. An actor is taken only when it may be hidden (present, an
+           enemy drawn: bit 7) and not out of the picture. */
+        move_targets |= (st[t].move_target && !st[t].move && !st[t].turn) << t;
+        if (a->move_mine || st[t].move || st[t].turn) {
+            int want = (st[t].move ? 0x07 : 0) | (st[t].turn ? 0x38 : 0), took = 0, kept = 0, start;
+            int movable = stage_actor_hideable(t) && !(*flags & STAGE_ACTOR_OUT);
+            int off[6] = { 0, 0, 0, 0, 0, 0 }, offset = 0;  /* the DLL's offset in a field handed to the game */
+
+            for (k = 0; k < 6; k++)
+                if ((a->move_mine >> k & 1) && *stage_actor_move_field(t, k) != a->move_written[k]) {
+                    a->move_mine &= (BYTE)~(1 << k);
+                    a->move_done |= (BYTE)(1 << k);
+                    took |= 1 << k;
+                    off[k] = k < 3 ? a->move_written[k] - a->move_base[k] : (short)(WORD)(a->move_written[k] - a->move_base[k]);
+                    offset |= off[k] != 0;
+                }
+            game_placed |= (took != 0) << t;
+            if (offset && stage_fx_say())       /* a step from the moved place keeps the offset: the game's from now on */
+                log_line("actors: actor %d handed to the game at frame %d while moved by %d,%d,%d and turned by %d,%d,%d (4096ths): a game step taken while an actor is moved keeps that moment's offset",
+                         t, frame, off[0], off[1], off[2], off[3], off[4], off[5]);
+            if (!movable) {
+                if (a->move_mine) {
+                    stage_actor_move_release(t, STAGE_MOVE_FIELDS, &kept);
+                    a->move_done = STAGE_MOVE_FIELDS;
+                    left |= 1 << t;
+                } else if ((want & ~a->move_done) && stage_actor_present(t))
+                    unmoved |= 1 << t;  /* an enemy the game does not draw, or one out of the picture: never taken */
+            } else {
+                placed |= (stage_actor_move_release(t, a->move_mine & ~want, &kept) != 0) << t;
+                start = want & ~a->move_mine & ~a->move_done;
+                if (start) {
+                    if (!(a->move_mine || a->look_active || a->hide_held))
+                        a->model = model;
+                    for (k = 0; k < 6; k++)
+                        if (start >> k & 1)
+                            a->move_base[k] = *stage_actor_move_field(t, k);
+                    a->move_mine |= (BYTE)start;
+                    moved |= 1 << t;
+                    if (first_moved < 0)
+                        first_moved = t;
+                }
+                for (k = 0; k < 6; k++) {
+                    int v;
+
+                    if (!(a->move_mine & want & (1 << k)))
+                        continue;
+                    if (k < 3) {
+                        v = a->move_base[k] + st[t].d[k];
+                        v = v < -32768 ? -32768 : v > 32767 ? 32767 : v;
+                    } else
+                        v = (short)(WORD)(a->move_base[k] + st[t].u[k - 3]);   /* an angle: whole turns of a short wrap */
+                    a->move_written[k] = (short)v;
+                    *stage_actor_move_field(t, k) = (short)v;
+                }
+            }
+        }
+        if (!a->look_done && !a->look_active && st[t].look_on && stage_actor_present(t) && (*flags & STAGE_ACTOR_PULSE)) {
+            a->look_done = 1;   /* a status's pulse moves the fade relatively: never started (one that starts mid-cast is
+                                   005ba335's absolute write first, seen below as the game's) */
+            pulsing |= 1 << t;
+        }
+        if (!a->look_done && (a->look_active || (st[t].look_on && stage_actor_present(t)))) {
+            if (!a->look_active) {
+                if (!a->hide_held)
+                    a->model = model;
+                a->fade_base = a->fade_written = *fade;
+                for (k = 0; k < 3; k++)
+                    a->tint_base[k] = a->tint_written[k] = tint[k];
+                a->look_active = 1;
+                started |= 1 << t;
+                if (first < 0)
+                    first = t;
+            }
+            if (*fade != a->fade_written || tint[0] != a->tint_written[0] || tint[1] != a->tint_written[1] || tint[2] != a->tint_written[2]) {
+                stage_actor_look_release(t);    /* the game wrote its own: kept; what is still the DLL's back */
+                game_look |= 1 << t;
+                continue;
+            }
+            if (st[t].look_on) {
+                a->fade_written = (short)(st[t].amount < 0 ? 0 : st[t].amount > NFX_ACTOR_AMOUNT_MAX ? NFX_ACTOR_AMOUNT_MAX : st[t].amount);
+                a->tint_written[0] = (BYTE)(st[t].tint_on ? st[t].r : a->tint_base[0]);
+                a->tint_written[1] = (BYTE)(st[t].tint_on ? st[t].g : a->tint_base[1]);
+                a->tint_written[2] = (BYTE)(st[t].tint_on ? st[t].b : a->tint_base[2]);
+            } else {
+                a->fade_written = a->fade_base;     /* no line names the actor now: the game's own */
+                for (k = 0; k < 3; k++)
+                    a->tint_written[k] = a->tint_base[k];
+            }
+            *fade = a->fade_written;
+            for (k = 0; k < 3; k++)
+                tint[k] = a->tint_written[k];
+        }
+    }
+    if (hidden && stage_fx_say())
+        log_line("actors: hidden (00be119d bit 2) at native effect %04lx's frame %d: %03x (caster %d, targets %03x)", effect, frame, hidden,
+                 caster, mask);
+    if (shown && stage_fx_say())
+        log_line("actors: shown again at native effect %04lx's frame %d: %03x", effect, frame, shown);
+    if (targets && !stage_fx3.target_said) {
+        stage_fx3.target_said = 1;
+        if (stage_fx_say())
+            log_line("actors: %03x are targets of native effect %04lx: who=caster or who=allies does not hide a target (who=targets hides it until the first hit)",
+                     targets, effect);
+    }
+    if (absent && !stage_fx3.absent_said) {
+        stage_fx3.absent_said = 1;     /* (target hide) */
+        if (stage_fx_say())
+            log_line("actors: %03x are enemies the game does not draw now (00be119d bit 7 clear: dead, removed or not yet there) at frame %d: never hidden",
+                     absent, frame);
+    }
+    if (died && stage_fx_say())
+        log_line("actors: the game's death took %03x (00be119d bit 7 cleared) at frame %d: bit 2 left set (the body is not drawn without bit 7; opcode b8 sets bit 2 itself)", died, frame);
+    if (first >= 0 && stage_fx_say())
+        log_line("actors: the look of %03x starts at native effect %04lx's frame %d (actor %d: fade %d, colour %d,%d,%d; the game's own %d, %d,%d,%d)",
+                 started, effect, frame, first, stage_actors[first].fade_written, stage_actors[first].tint_written[0],
+                 stage_actors[first].tint_written[1], stage_actors[first].tint_written[2], stage_actors[first].fade_base,
+                 stage_actors[first].tint_base[0], stage_actors[first].tint_base[1], stage_actors[first].tint_base[2]);
+    if (pulsing && stage_fx_say())
+        log_line("actors: %03x show a status colour (00be119d bit 3) at frame %d: their look is the game's, not written this cast",
+                 pulsing, frame);
+    if (first_moved >= 0 && stage_fx_say()) {      /* (actor move) */
+        const struct stage_actor *m = &stage_actors[first_moved];
+
+        log_line("actors: moved %03x at native effect %04lx's frame %d (caster %d, targets %03x): actor %d's place %d,%d,%d and turn %d,%d,%d now %d,%d,%d and %d,%d,%d",
+                 moved, effect, frame, caster, mask, first_moved, m->move_base[0], m->move_base[1], m->move_base[2], m->move_base[3],
+                 m->move_base[4], m->move_base[5], *stage_actor_move_field(first_moved, 0), *stage_actor_move_field(first_moved, 1),
+                 *stage_actor_move_field(first_moved, 2), *stage_actor_move_field(first_moved, 3), *stage_actor_move_field(first_moved, 4),
+                 *stage_actor_move_field(first_moved, 5));
+    }
+    if (placed && stage_fx_say())
+        log_line("actors: back at the game's place and turn on %03x at frame %d (their lines ended)", placed, frame);
+    if (game_placed && stage_fx_say())
+        log_line("actors: the game wrote the place or turn of %03x itself at frame %d: left to it for the rest of the cast", game_placed, frame);
+    if (left && stage_fx_say())
+        log_line("actors: %03x left the picture or died at frame %d (00be119d bit 1 set or bit 7 cleared): their place and turn back to the game's, not moved again this cast",
+                 left, frame);
+    if (unmoved && !stage_fx3.move_absent_said) {
+        stage_fx3.move_absent_said = 1;
+        if (stage_fx_say())
+            log_line("actors: %03x are not drawn by the game now (an enemy dead, removed or not yet there, or out of the picture) at frame %d: never moved",
+                     unmoved, frame);
+    }
+    if (move_targets && !stage_fx3.move_target_said) {
+        stage_fx3.move_target_said = 1;
+        if (stage_fx_say())
+            log_line("actors: %03x are targets of native effect %04lx: who=caster or who=allies does not move or turn a target (who=targets does, until the first hit)",
+                     move_targets, effect);
+    }
+    if (game_look && stage_fx_say())
+        log_line("actors: the game wrote its own look on %03x at frame %d (a status, a death, a fade): left as it is, this cast colours them no more",
+                 game_look, frame);
+    if (game_shown && stage_fx_say())
+        log_line("actors: the game cleared bit 2 of %03x at frame %d: left as it is, not hidden again this cast", game_shown, frame);
+    if (handed && stage_fx_say())
+        log_line("actors: the game took %03x out of the picture (00be119d bit 1, a summon) at frame %d: bit 2 left to it (its fade-in clears it)",
+                 handed, frame);
+    if (gone && stage_fx_say())
+        log_line("actors: %03x hold another model at frame %d (removed, or another actor loaded): forgotten, nothing written there but a place or turn still this DLL's (put back)", gone, frame);
+}
+
+/* The effect `serial` ends: what is still the DLL's goes back (nothing if another effect owns the stage now). */
+static void stage_fx_stop(WORD serial, const char *why)
+{
+    if (stage_fx.serial != serial)
+        return;
+    stage_fx_hide_release(why);
+    stage_fx_dark_release(why);
+    stage_fx_shake_release(why);        /* (stage fx 2) */
+    stage_fx_actors_release(why);       /* (stage fx 3) */
+}
+
+/* A native effect's task starts (native_effect_step): it owns the stage from now on; nothing is written yet. */
+static void stage_fx_begin(WORD serial)
+{
+    stage_fx_stop(stage_fx.serial, "a newer effect starts");
+    stage_fx.serial = serial;
+    stage_fx.hide_active = stage_fx.dark_active = 0;
+    stage_fx.hide_done = stage_fx.dark_done = 0;
+    stage_fx.hide_set = 0;
+    stage_fx.hide_frame = stage_fx.dark_frame = -1;
+    stage_fx2.fill_said = stage_fx2.fill_limit_said = stage_fx2.shake_said = 0;    /* (stage fx 2) */
+    stage_fx2.shake_active = stage_fx2.shake_done = 0;
+    {                                   /* (stage fx 3) every actor free again; nothing written */
+        int t;
+
+        for (t = 0; t < 10; t++) {
+            stage_actors[t].look_active = stage_actors[t].look_done = stage_actors[t].hide_held = stage_actors[t].hide_done = 0;
+            stage_actors[t].move_mine = stage_actors[t].move_done = 0;     /* (actor move) */
+        }
+        stage_fx3.back_said = stage_fx3.target_said = stage_fx3.absent_said = 0;
+        stage_fx3.move_target_said = stage_fx3.move_absent_said = 0;
+    }
+}
+
+/* Each call of the effect's task but its last: the stage lines at the effect's `frame` (paused calls repeat a frame
+   and write the same values). items: the script's lines. */
+static void stage_fx_step(WORD serial, const struct nfx_item *items, int count, int frame, DWORD effect)
+{
+    struct nfx_stage_state st;
+
+    if (stage_fx.serial != serial || (stage_fx.hide_done && stage_fx.dark_done))
+        return;
+    nfx_stage_at(items, count, frame, &st);
+    if (!stage_fx.hide_active && !stage_fx.dark_active && !st.hide_on && !st.dark_on)
+        return;                         /* no stage line yet: nothing written */
+    if (!stage_fx_site_ok()) {
+        stage_fx.hide_done = stage_fx.dark_done = 1;
+        return;
+    }
+    if (!stage_fx.hide_done && (stage_fx.hide_active || (st.hide_on && st.hide))) {
+        BYTE now = *(const BYTE *)ADDR_STAGE_MASK, game, want, set;
+
+        if ((now & stage_fx.hide_set) != stage_fx.hide_set) {
+            if (stage_fx_say())
+                log_line("stage: the game wrote %02x there at frame %d (this effect's bits were %02x): left as it is, this effect hides no more",
+                         now, frame, stage_fx.hide_set);
+            stage_fx.hide_set &= now;   /* (the bits the game cleared are the game's now) */
+            stage_fx_hide_release("the game wrote the mask");
+        } else {
+            game = (BYTE)(now & ~stage_fx.hide_set);
+            want = (BYTE)(st.hide_on ? st.hide & NFX_HIDE_ALL : 0);
+            set = (BYTE)(want & ~game);         /* never a bit the game set, never bit 3 */
+            if ((BYTE)(game | set) != now)
+                *(BYTE *)ADDR_STAGE_MASK = (BYTE)(game | set);
+            if (set != stage_fx.hide_set || !stage_fx.hide_active) {
+                if (stage_fx_say())
+                    log_line(set ? "stage: hidden (%02x of %02x) at native effect %04lx's frame %d" : "stage: shown again (%02x of %02x) at native effect %04lx's frame %d",
+                             set, (unsigned)(game | set), effect, frame);
+                stage_fx.hide_frame = frame;
+            }
+            stage_fx.hide_set = set;
+            stage_fx.hide_active = 1;
+        }
+    }
+    if (!stage_fx.dark_done && (stage_fx.dark_active || st.dark_on)) {
+        BYTE *tint = (BYTE *)ADDR_STAGE_TINT;
+        int dark;
+
+        if (!stage_fx.dark_active) {
+            stage_fx.dark_base = stage_fx.dark_written = *(const short *)ADDR_STAGE_DARK;
+            stage_fx.tint_base[0] = stage_fx.tint_written[0] = tint[0];
+            stage_fx.tint_base[1] = stage_fx.tint_written[1] = tint[1];
+            stage_fx.tint_base[2] = stage_fx.tint_written[2] = tint[2];
+            stage_fx.dark_active = 1;
+            stage_fx.dark_frame = frame;
+            if (stage_fx_say())
+                log_line("stage: darkening starts at native effect %04lx's frame %d (%d toward %d,%d,%d); the game's own %d, tint %d,%d,%d",
+                         effect, frame, st.dark, st.r, st.g, st.b, stage_fx.dark_base, tint[0], tint[1], tint[2]);
+        }
+        if (*(const short *)ADDR_STAGE_DARK != stage_fx.dark_written || tint[0] != stage_fx.tint_written[0] ||
+            tint[1] != stage_fx.tint_written[1] || tint[2] != stage_fx.tint_written[2]) {
+            if (stage_fx_say())
+                log_line("stage: the game wrote its own darkness %d, tint %d,%d,%d at frame %d (this effect's %d, %d,%d,%d): this effect darkens no more",
+                         *(const short *)ADDR_STAGE_DARK, tint[0], tint[1], tint[2], frame, stage_fx.dark_written,
+                         stage_fx.tint_written[0], stage_fx.tint_written[1], stage_fx.tint_written[2]);
+            stage_fx_dark_release("the game wrote the darkness");
+            return;
+        }
+        if (st.dark_on) {
+            dark = st.dark < 0 ? 0 : st.dark > NFX_DARK_MAX ? NFX_DARK_MAX : st.dark;
+            stage_fx.dark_written = (short)dark;
+            stage_fx.tint_written[0] = (BYTE)st.r;
+            stage_fx.tint_written[1] = (BYTE)st.g;
+            stage_fx.tint_written[2] = (BYTE)st.b;
+        } else {
+            stage_fx.dark_written = stage_fx.dark_base;     /* no dark= line on: the game's own */
+            stage_fx.tint_written[0] = stage_fx.tint_base[0];
+            stage_fx.tint_written[1] = stage_fx.tint_base[1];
+            stage_fx.tint_written[2] = stage_fx.tint_base[2];
+        }
+        *(short *)ADDR_STAGE_DARK = stage_fx.dark_written;
+        tint[0] = stage_fx.tint_written[0];
+        tint[1] = stage_fx.tint_written[1];
+        tint[2] = stage_fx.tint_written[2];
+    }
+}
+
+/* A battle starts (native_battle_start): what is left from the last one is forgotten, nothing written. */
+static void stage_fx_battle_start(void)
+{
+    if (stage_fx.hide_active || stage_fx.dark_active)
+        log_line("stage: still this DLL's as a battle starts (mask bits %02x%s): dropped (the game's set-up zeroes them)", stage_fx.hide_set,
+                 stage_fx.dark_active ? ", darkness" : "");
+    stage_fx.hide_active = stage_fx.dark_active = 0;
+    stage_fx.hide_done = stage_fx.dark_done = 1;
+    stage_fx.hide_set = 0;
+    if (stage_fx2.shake_active)         /* (stage fx 2) */
+        log_line("shake: still this DLL's as a battle starts: dropped (the game's set-up zeroes the camera's block)");
+    stage_fx2.shake_active = 0;
+    stage_fx2.shake_done = 1;
+    {                                   /* (stage fx 3) the first battle's set-up writes the actors' records afresh */
+        int t, held = 0;
+
+        for (t = 0; t < 10; t++) {
+            held |= (stage_actors[t].look_active || stage_actors[t].hide_held || stage_actors[t].move_mine) << t;
+            stage_actors[t].look_active = stage_actors[t].hide_held = 0;
+            stage_actors[t].look_done = stage_actors[t].hide_done = 1;
+            stage_actors[t].move_mine = 0;      /* (actor move) the set-up writes every place and turn afresh */
+            stage_actors[t].move_done = STAGE_MOVE_FIELDS;
+        }
+        if (held)
+            log_line("actors: %03x still this DLL's as a battle starts: dropped (the battle's set-up writes the actors afresh)", held);
+    }
+    InterlockedExchange(&stage_fx_logs, 0);
+}
+
+/* (stage fx 2) Each call of the effect's task but its last: the shake lines at the effect's `frame` (paused calls
+   repeat a frame and write the same values), on top of the game's offset. */
+static void stage_fx_shake_step(WORD serial, const struct nfx_item *items, int count, int frame, DWORD effect)
+{
+    short *now = (short *)ADDR_STAGE_SHAKE, s[3];
+    int v[3], on, k, w;
+
+    if (stage_fx.serial != serial || stage_fx2.shake_done)
+        return;
+    on = nfx_shake_at(items, count, frame, v);
+    if (!stage_fx2.shake_active && !on)
+        return;                         /* no shake line yet: nothing written */
+    if (!stage_shake_site_ok()) {
+        stage_fx2.shake_done = 1;
+        return;
+    }
+    if (stage_fx2.shake_active && (now[0] != stage_fx2.shake_written[0] || now[1] != stage_fx2.shake_written[1] ||
+                                   now[2] != stage_fx2.shake_written[2])) {
+        if (stage_fx_say())
+            log_line("shake: the game wrote its own offset %d, %d, %d at frame %d (this effect's %d, %d, %d): this effect shakes no more",
+                     now[0], now[1], now[2], frame, stage_fx2.shake_written[0], stage_fx2.shake_written[1], stage_fx2.shake_written[2]);
+        stage_fx_shake_release("the game wrote the offset");
+        return;
+    }
+    if (!stage_fx2.shake_active) {
+        for (k = 0; k < 3; k++)
+            stage_fx2.shake_base[k] = stage_fx2.shake_written[k] = now[k];
+        stage_fx2.shake_active = 1;
+    }
+    nfx_shake_world((const short *)ADDR_CAMERA_LOOKAT, v, s);
+    for (k = 0; k < 3; k++) {
+        w = stage_fx2.shake_base[k] + s[k];
+        stage_fx2.shake_written[k] = (short)(w > 32767 ? 32767 : w < -32768 ? -32768 : w);
+        now[k] = stage_fx2.shake_written[k];
+    }
+    if (on && !stage_fx2.shake_said) {
+        stage_fx2.shake_said = 1;
+        if (stage_fx_say())
+            log_line("shake: starts at native effect %04lx's frame %d: %d, %d, %d on the screen, the camera's offset %d, %d, %d (the game's %d, %d, %d)",
+                     effect, frame, v[0], v[1], v[2], now[0], now[1], now[2], stage_fx2.shake_base[0], stage_fx2.shake_base[1],
+                     stage_fx2.shake_base[2]);
+    }
+}
+
+/* (stage fx 2) A colour laid over the picture at alpha / 255 (blend=alpha), as ONE quad in polygon set [5], drawn
+   SRC_ALPHA, INV_SRC_ALPHA: what FUN_005bd456 does (005bd4ef-005bd512: the three setters, then the colour bytes 0),
+   but with the colour kept: mode 0 is not 2, so 005bd52c writes r, g, b into the quad; z 0.0f as FUN_005bd456's.
+   The caller has asked FUN_0066c3bf first: FUN_005bd473 then passes the quad on to FUN_0066a47e, which puts 0090c9ec
+   and 00d8f668 back. */
+static void stage_fx_over(int alpha, const int c[3])
+{
+    ((void (__cdecl *)(DWORD))FN_STAGE_SET_MODE)(0);
+    ((void (__cdecl *)(DWORD))FN_STAGE_SET_FIVE)(1);
+    ((void (__cdecl *)(DWORD))FN_STAGE_SET_ALPHA)((DWORD)alpha);
+    ((DWORD (__cdecl *)(DWORD, DWORD, DWORD, DWORD, DWORD))FN_STAGE_QUAD)((DWORD)(c[0] & 0xff), (DWORD)(c[1] & 0xff), (DWORD)(c[2] & 0xff), 0, 0);
+}
+
+/* (stage fx 3) The game's own Shadow Flare backdrop as ff7_en.exe has it (objdump 0057747e-005775fe): push ebp; mov
+   ebp, esp; sub esp, 0x1c; call FUN_00667297; mov [ebp-0xc], eax; mov dword [ebp-0x18], 0x1e (30 strips in the exe;
+   40 with Enhanced Stock UI's hext, which rewrites that instruction at 0057748C as c7 45 e8 28 00 00 00 and the half
+   width's at 0057749A: so the immediate at +0x11..+0x14 is not compared); then c7 45 f8 / c7 45 f0 whose operands FFNx
+   patches (+0x18 its wide viewport's x, +0x1F half its width: widescreen.cpp 200-201), so of the 24 bytes before them
+   0..0x10 and 0x15..0x17 are compared, and the next instruction (mov dword [ebp-0x1c], 0x60000:
+   six lines a strip) at +0x23. FUN_00667297 (push ebp; mov ebp, esp; mov eax, 00d8e490; pop ebp; ret) gives the shared
+   object; at +0x177 the routine stores it in 00c1ea68 (mov [00c1ea68], ecx), which stage_fx_back puts back; the frame
+   test FUN_0066c3bf as the fills check it. FFNx references the routine (ff7_data.h:1397) and patches those two
+   operands only; it does not replace it, nor FUN_0066a47e it calls (FFNx only calls it). Checked once, said once. */
+static BOOL stage_back_site_ok(void)
+{
+    static const BYTE back[24] = { 0x55, 0x8b, 0xec, 0x83, 0xec, 0x1c, 0xe8, 0x0e, 0xfe, 0x0e, 0x00, 0x89,
+                                   0x45, 0xf4, 0xc7, 0x45, 0xe8, 0x1e, 0x00, 0x00, 0x00, 0xc7, 0x45, 0xf8 };
+    static const BYTE lines[7] = { 0xc7, 0x45, 0xe4, 0x00, 0x00, 0x06, 0x00 };
+    static const BYTE tail[6] = { 0x89, 0x0d, 0x68, 0xea, 0xc1, 0x00 };
+    static const BYTE prim[10] = { 0x55, 0x8b, 0xec, 0xb8, 0x90, 0xe4, 0xd8, 0x00, 0x5d, 0xc3 };
+    static const BYTE drawing[10] = { 0x55, 0x8b, 0xec, 0xa1, 0xf0, 0xc9, 0x90, 0x00, 0x5d, 0xc3 };
+
+    if (stage_back_site)
+        return stage_back_site > 0;
+    /* +0x11 is the strip count's immediate (mov [ebp-0x18], 30): 40 in the user's game (seen 2026-10-20), written by
+       Enhanced Stock UI's hext at 0057748C, so it is not compared: 0..0x10 and 0x15..0x17 are. */
+    stage_back_site = bytes_are(FN_STAGE_BACKDROP, back, 0x11) && bytes_are(FN_STAGE_BACKDROP + 0x15, back + 0x15, 3) &&
+                      bytes_are(FN_STAGE_BACKDROP + 0x23, lines, 7) &&
+                      bytes_are(SITE_STAGE_BACK_TAIL, tail, 6) && bytes_are(FN_STAGE_PRIM, prim, 10) &&
+                      bytes_are(FN_STAGE_DRAWING, drawing, 10) ? 1 : -1;
+    log_line("backdrop lines: %s (Shadow Flare's backdrop %08lx, its object %08lx, the frame test %08lx; %08lx put back after it)",
+             stage_back_site > 0 ? "on (0057747e, 005775f5, 00667297, 0066c3bf as expected)"
+                                 : "OFF: the game's bytes at 0057747e / 005775f5 / 00667297 / 0066c3bf are not as expected; no fill layer=back is drawn",
+             FN_STAGE_BACKDROP, FN_STAGE_PRIM, FN_STAGE_DRAWING, ADDR_STAGE_BACK_CHAIN);
+    return stage_back_site > 0;
+}
+
+/* (stage fx 3) Each call that draws: the backdrop line on at `frame` (the last in the script), as Shadow Flare draws
+   it each frame: FUN_0057747e(r, g, b) (cdecl: Shadow Flare's own call at 005770fa pops its three arguments), only
+   while a frame is drawing; 00c1ea68 as it was before. */
+static void stage_fx_back(WORD serial, const struct nfx_item *items, int count, int frame, DWORD effect)
+{
+    int rgb[3];
+    DWORD chain;
+
+    if (stage_fx.serial != serial || !nfx_back_at(items, count, frame, rgb))
+        return;
+    if (!stage_back_site_ok() || !((int (__cdecl *)(void))FN_STAGE_DRAWING)())
+        return;
+    chain = *(const DWORD *)ADDR_STAGE_BACK_CHAIN;
+    ((void (__cdecl *)(DWORD, DWORD, DWORD))FN_STAGE_BACKDROP)((DWORD)(rgb[0] & 0xff), (DWORD)(rgb[1] & 0xff), (DWORD)(rgb[2] & 0xff));
+    *(DWORD *)ADDR_STAGE_BACK_CHAIN = chain;
+    if (!stage_fx3.back_said) {
+        stage_fx3.back_said = 1;
+        if (stage_fx_say())
+            log_line("fill: backdrop at native effect %04lx's frame %d: colour %d,%d,%d behind the actors (0057747e, Shadow Flare's)", effect, frame,
+                     rgb[0], rgb[1], rgb[2]);
+    }
+}
+
+/* (stage fx 2) Each call that draws: the fill and flash lines on at `frame`, in the script's order, one quad each;
+   16 lines an update. (The engine draws the added quads of the frame before the laid-over ones, whatever the order.) */
+static void stage_fx_fill(WORD serial, const struct nfx_item *items, int count, int frame, DWORD effect)
+{
+    struct nfx_fill_draw d;
+    int i, a, drawn = 0;
+
+    if (stage_fx.serial != serial)
+        return;
+    stage_fx_back(serial, items, count, frame, effect);    /* (stage fx 3) behind the actors: its own polygon set [4] */
+    for (i = 0; i < count; i++) {
+        if (!nfx_fill_at(&items[i], frame, &d))
+            continue;
+        if (!stage_fill_site_ok() || !((int (__cdecl *)(void))FN_STAGE_DRAWING)())
+            return;                     /* (not drawing a frame: the quad would not be drawn either) */
+        if (drawn == NFX_FILLS_MAX) {
+            if (!stage_fx2.fill_limit_said && stage_fx_say())
+                log_line("fill: more than %d fill or flash lines at native effect %04lx's frame %d: the rest are not drawn (line %d first)",
+                         NFX_FILLS_MAX, effect, frame, items[i].line);
+            stage_fx2.fill_limit_said = 1;
+            return;
+        }
+        a = d.alpha > 255 ? 255 : d.alpha;
+        if (a > 0 && (d.over[0] > 0 || d.over[1] > 0 || d.over[2] > 0))
+            stage_fx_over(a, d.over);
+        else if (a > 0)
+            ((DWORD (__cdecl *)(DWORD, DWORD, DWORD))FN_STAGE_FILL_ALPHA)((DWORD)a, 0, 0);
+        else
+            ((DWORD (__cdecl *)(DWORD, DWORD, DWORD))FN_STAGE_FILL_ADD)((DWORD)(d.add[0] & 0xff), (DWORD)(d.add[1] & 0xff), (DWORD)(d.add[2] & 0xff));
+        drawn++;
+        if (!stage_fx2.fill_said) {
+            stage_fx2.fill_said = 1;
+            if (stage_fx_say()) {
+                if (a > 0 && (d.over[0] > 0 || d.over[1] > 0 || d.over[2] > 0))
+                    log_line("fill: first quad at native effect %04lx's frame %d (line %d): colour %d,%d,%d laid over at alpha %d (005bd473, set 5)",
+                             effect, frame, items[i].line, d.over[0], d.over[1], d.over[2], a);
+                else if (a > 0)
+                    log_line("fill: first quad at native effect %04lx's frame %d (line %d): black laid over at alpha %d (005bd456)",
+                             effect, frame, items[i].line, a);
+                else
+                    log_line("fill: first quad at native effect %04lx's frame %d (line %d): colour %d,%d,%d added (005bd436)",
+                             effect, frame, items[i].line, d.add[0], d.add[1], d.add[2]);
+            }
+        }
+    }
+}
+
+/* native_task's stage call, at each call of the effect's task with native_clock_step's `todo`: each call but the
+   last, the stage and (stage fx 2) shake lines at this call's frame; the last call (NATIVE_DO_END) writes nothing and
+   puts the game's back. Each call that draws (the last one too, when it draws its frame) draws the fills. */
+static void native_task_stage(WORD serial, const struct nfx_item *items, int count, int frame, DWORD effect, int todo)
+{
+    if (!(todo & NATIVE_DO_END)) {
+        stage_fx_step(serial, items, count, frame, effect);
+        stage_fx_shake_step(serial, items, count, frame, effect);
+    } else
+        stage_fx_stop(serial, (todo & NATIVE_END_LENGTH) ? "the effect's length" : (todo & NATIVE_END_GROUP) ? "the effect's files were freed"
+                                                                                                              : "the effect's watchdog");
+    if (todo & NATIVE_DO_DRAW)
+        stage_fx_fill(serial, items, count, frame, effect);
+}
+
+/* (stage fx 3) native_task's actors call, beside native_task_stage, with the cast's caster and targets: each call but
+   the last the actors lines at this call's frame; the last call writes nothing and puts the game's back (as
+   stage_fx_stop does at every other end). */
+static void native_task_actors(WORD serial, const struct nfx_item *items, int count, int frame, DWORD effect, int todo, int caster, int mask)
+{
+    if (!(todo & NATIVE_DO_END))
+        stage_fx_actors_step(serial, items, count, frame, effect, caster, mask);
+    else if (stage_fx.serial == serial)
+        stage_fx_actors_release((todo & NATIVE_END_LENGTH) ? "the effect's length" : (todo & NATIVE_END_GROUP) ? "the effect's files were freed"
+                                                                                                                : "the effect's watchdog");
+}
+/* STAGE FX END */
 
 /* A camera file as read (`data`, `length` bytes, from the game's allocator) -> a
    longer copy with our cameras added, from the same allocator, or NULL to
@@ -35926,6 +44940,7 @@ static int __cdecl kernel_loader_hook(void)
     load_effect_copies();           /* (before the spell file: a spell's `animation = 0x100` is looked up in it) */
     load_spells();
     install_hooks();
+    fields_start();                 /* (field capacity) once: the field tables from the registry, or the game's (off) */
     effect_copies_check_files();    /* (after install_hooks, which indexes the loose files: a copy whose files are missing is dropped) */
     effect_copies_install();        /* (after install_hooks: the effect step must be this DLL's) */
     refresh_materia_table();
@@ -36138,6 +45153,7 @@ BOOL WINAPI DllMain(HINSTANCE self, DWORD reason, LPVOID reserved)
         open_log(self);
         dll_module = self;
         AddVectoredExceptionHandler(1, crash_logger);
+        fields_widen_maplist_block();   /* (field capacity, step 0) before the game reads its maplist; whatever the config */
 #ifndef SPELLEXT_AS_MOD
         log_line("FF7 SpellExt loaded at %08lx; exe at %08lx, original driver at %08lx", (DWORD)self,
                  (DWORD)GetModuleHandleA(NULL), (DWORD)GetModuleHandleA("AF3DN_orig.dll"));
@@ -36151,8 +45167,10 @@ BOOL WINAPI DllMain(HINSTANCE self, DWORD reason, LPVOID reserved)
                      ffnx ? " (FFNx.dll also loaded)" : "", config_dir);
             (void)thread;
             show_tables_to_driver();
-            if (!hook_driver_entry())
+            if (!hook_driver_entry()) {
+                fields_give_back();     /* (field capacity) step 0's push back: an inactive DLL leaves the exe as it was */
                 log_line("NOT active: without the driver's entry there is no safe moment to hook the game");
+            }
         }
 #endif
     } else if (reason == DLL_PROCESS_DETACH) {
