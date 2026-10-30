@@ -48,14 +48,31 @@
   /* ================================================================== state */
   const pool = L.makePool();
   let map = L.emptyMap(), mapFile = null;
+  // the reference keys that were set by loading a file in step 1 (not by a map or by hand): a later file may replace them
+  const autoRefs = new Set();
   const opt = { style: 'pose', follow: true, key: null };
-  let anims = [];                               // files to retarget: [{name, key, kind, bytes, items}]
+  let anims = [];                               // files to retarget: [{name, key, kind, bytes, items}] (items: itemsOf)
   let selSrc = null, selTgt = null, hover = { side: null, bone: null }, pickMode = 'pair', newHow = 'aim', advOpen = false;
   const addRow = { t: '', s: '', how: 'aim' };
   let skel = { src: null, tgt: null };          // {sk, error}
   let refs = { src: null, tgt: null };          // {frame, pose, error}
   let fitSig = { src: '', tgt: '' };
 
+  /* a side's skeleton header counts {body: dword 7, weapon: dword 10} (which record is each body's weapon track: see
+     anim_core layoutOf), or null while that skeleton is not loaded */
+  function countsOf(side) {
+    const name = map[side === 'src' ? 'source_skeleton' : 'target_skeleton'], b = name ? pool.get(name) : null;
+    if (!b || b.length < 52) return null;
+    const hd = A.readHeader(b); return { body: hd[7], weapon: hd[10] };
+  }
+  /* a file loaded to retarget: its animations, each with its own weapon track, by the source skeleton's header as it
+     is now (a skeleton loaded after the file changes the pairing) */
+  function itemsOf(a) {
+    if (a.kind === 'single') return a.items;
+    const c = countsOf('src'), sig = c ? c.body + '+' + c.weapon : '';
+    if (a.sig !== sig) { a.sig = sig; const s = A.sourceList(a.name, a.bytes, c); a.kind = s.kind; a.layout = s.layout; a.items = s.items.map(it => Object.assign(it, { file: a.name, id: a.key + ':' + it.index })); }
+    return a.items;
+  }
   function recordsOf(name) {                    // a loaded animation file's records, cached on its pool entry
     const e = pool.entry(name); if (!e) return null;
     if (e.recs === undefined) { try { e.recs = L.animRecords(e.name, e.bytes); e.recErr = null; } catch (err) { e.recs = null; e.recErr = err.message; } }
@@ -202,6 +219,7 @@
   const pSrc = new StickView($('rt-p-src'), { onHover: b => pSrc.tipText(b === null ? '' : describe('src', b)) });
   const pTgt = new StickView($('rt-p-tgt'), { onHover: b => pTgt.tipText(b === null ? '' : describe('tgt', b)) });
   const allViews = [vSrc, vTgt, pSrc, pTgt];
+  window.SM_STICKVIEW = StickView;               // the Scripts tab's preview uses the same view
   window.addEventListener('sm-tab', () => allViews.forEach(v => v.resize()));
 
   /* ================================================================== the skeletons and reference poses */
@@ -351,11 +369,11 @@
     const ref = map[k], files = pool.list().filter(e => recordsOf(e.name));
     const cur = ref ? L.refFile(ref.file) : null, curLoaded = cur && pool.has(cur);
     const fileSel = h('select', { key: 'ref-f:' + k, style: 'max-width:100%', onchange: guarded(function () {
-      const v = this.value;
+      const v = this.value; autoRefs.delete(k);
       if (!v) { delete map[k]; return; }
       if (v === 'missing' || (cur && L.keyOf(cur) === v)) return;
       const e = pool.entry(v), recs = recordsOf(v), single = /\.anim$/i.test(e.name);
-      const wi = /weapon/.test(k) ? L.weaponRefIndex(recs) : null;
+      const wi = /weapon/.test(k) ? L.weaponRefIndex(recs, countsOf(k.startsWith('source') ? 'src' : 'tgt')) : null;
       map[k] = { file: L.refSpec(e.name, single ? null : (wi === null ? 0 : wi)), frame: 0 };
     }) }, h('option', { value: '' }, '(none)'),
       cur && !curLoaded ? h('option', { value: 'missing', selected: true }, base(cur) + ' (not loaded)') : null,
@@ -364,10 +382,10 @@
     if (ref && curLoaded) {
       const recs = recordsOf(cur) || [], idx = L.refIndex(ref.file);
       if (idx !== null) {
-        row.appendChild(h('select', { key: 'ref-n:' + k, title: 'Which animation of the file', onchange: guarded(function () { map[k] = { file: L.refSpec(cur, Number(this.value)), frame: 0 }; }) },
+        row.appendChild(h('select', { key: 'ref-n:' + k, title: 'Which animation of the file', onchange: guarded(function () { autoRefs.delete(k); map[k] = { file: L.refSpec(cur, Number(this.value)), frame: 0 }; }) },
           recs.map((r, i) => { const hd = L.recordHead(r); return h('option', { value: i, selected: i === idx }, hx(i) + (hd.placeholder ? ' (empty)' : ' (' + hd.frames + ' frames' + (hd.bones === 1 ? ', a weapon track' : '') + ')')); })));
       }
-      row.appendChild(h('label', {}, 'frame ', h('input', { type: 'number', min: 0, value: ref.frame, key: 'ref-fr:' + k, onchange: guarded(function () { ref.frame = intIn(this.value, 'frame'); }) })));
+      row.appendChild(h('label', {}, 'frame ', h('input', { type: 'number', min: 0, value: ref.frame, key: 'ref-fr:' + k, onchange: guarded(function () { autoRefs.delete(k); ref.frame = intIn(this.value, 'frame'); }) })));
     }
     return [h('span', {}, label), row];
   }
@@ -425,7 +443,17 @@
       h('input', { type: 'number', min: 0, value: map.target_weapon_bone === undefined ? '' : map.target_weapon_bone, placeholder: 'none', key: 'wbone', onchange: guarded(function () { if (String(this.value).trim() === '') delete map.target_weapon_bone; else map.target_weapon_bone = intIn(this.value, 'weapon bone'); }) }),
       h('button', { class: pickMode === 'wbone' ? 'primary' : '', onclick: () => setPickMode('wbone') }, pickMode === 'wbone' ? 'Cancel' : 'Pick in the view')));
     g2.append(...refEditor('source_weapon_reference', 'Source weapon reference'), ...refEditor('target_weapon_reference', 'Target weapon reference'));
-    box.appendChild(g2); box.appendChild(helpLine(HELP.weapon));
+    g2.append(h('span', {}, 'Weapon when missing'), h('div', { class: 'row' },
+      h('select', { key: 'w-missing', title: HELP.whenMissing, onchange: guarded(function () { map.weapon_when_missing = this.value; }) },
+        [['feet', 'at the feet (lying on the floor)'], ['idle', 'held as in the target\'s idle'], ['empty', 'empty (the game\'s placeholder)']].map(([v, t]) => h('option', { value: v, selected: ruleOf() === v }, t))),
+      ruleOf() === 'feet' ? h('label', { title: HELP.whenMissing }, 'side front lift ', h('input', { type: 'text', size: 12, key: 'w-feet', value: map.weapon_feet ? map.weapon_feet.join(' ') : '', placeholder: R.FEET_DEFAULT.join(' '),
+        onchange: guarded(function () {
+          const v = String(this.value).trim(); if (v === '') { delete map.weapon_feet; return; }
+          const w = v.replace(/,/g, ' ').split(/\s+/).map(x => numIn(x, 'side front lift')); if (w.length !== 3) throw new Error('side front lift: three numbers, e.g. ' + R.FEET_DEFAULT.join(' '));
+          if (R.feetProblem(w)) throw new Error('side front lift: each a number from -' + R.FEET_LIMIT + ' to ' + R.FEET_LIMIT + ', e.g. ' + R.FEET_DEFAULT.join(' '));
+          map.weapon_feet = w;
+        }) })) : null));
+    box.appendChild(g2); box.appendChild(helpLine(HELP.weapon)); box.appendChild(helpLine(HELP.whenMissing));
 
     // reference poses
     box.appendChild(h('h3', {}, 'Reference poses'));
@@ -494,13 +522,42 @@
         const added = pool.add(f.name, bytes); map[r.key] = L.keepName(map[r.key], f.name);
         say('rt-files-msg', 'Loaded ' + added.name + ' as the ' + r.what + ' (' + R.readSkeleton(bytes).count + ' bones).' + (added.replaced ? ' It replaces an earlier file of the same name.' : ''), 'ok');
       } else {
-        const recs = L.animRecords(f.name, bytes), added = pool.add(f.name, bytes), old = map[r.ref];
-        const sameAsOld = old && L.keyOf(L.refFile(old.file)) === L.keyOf(f.name);
-        if (!sameAsOld) map[r.ref] = { file: L.refSpec(added.name, /\.anim$/i.test(f.name) ? null : 0), frame: 0 };
-        const replacedRef = old && !sameAsOld ? ' The map\'s ' + (r.side === 'src' ? 'source' : 'target') + ' reference was ' + base(old.file) + ' frame ' + old.frame + '; it is now this file.' : '';
-        const w = map[r.wref], wi = L.weaponRefIndex(recs);
-        if (wi !== null && (!w || (old && L.keyOf(L.refFile(w.file)) === L.keyOf(L.refFile(old.file))))) map[r.wref] = { file: L.refSpec(added.name, wi), frame: 0 };
-        say('rt-files-msg', 'Loaded ' + added.name + ' as the ' + r.what + ' (' + recs.length + ' animations); its animation ' + (L.refIndex(map[r.ref].file) === null ? '' : hx(L.refIndex(map[r.ref].file)) + ' ') + 'frame ' + map[r.ref].frame + ' is the reference pose (change it in step 3).' + replacedRef + (added.replaced ? ' It replaces an earlier file of the same name.' : ''), 'ok');
+        const recs = L.animRecords(f.name, bytes), added = pool.add(f.name, bytes), old = map[r.ref], w = map[r.wref];
+        const single = /\.anim$/i.test(f.name), wi = single ? null : L.weaponRefIndex(recs, countsOf(r.side)), side = r.side === 'src' ? 'source' : 'target';
+        const inFile = (ref, name) => !!ref && L.keyOf(L.refFile(ref.file)) === L.keyOf(name);
+        const fresh = { ref: { file: L.refSpec(added.name, single ? null : 0), frame: 0 }, w: wi === null ? null : { file: L.refSpec(added.name, wi), frame: 0 } };
+        const lines = ['Loaded ' + added.name + ' as the ' + r.what + ' (' + recs.length + ' animations).' + (added.replaced ? ' It replaces an earlier file of the same name.' : '')];
+        let offer = null;
+        // the map names this side's OWN xxda (rtda:00 for rtaa, as the map's skeleton implies it) and it is not
+        // loaded: this file, loaded under another name (rtda(1), a rebuilt sada(1)), takes its place, as the page
+        // always did. A reference in a third file (cloud_to_tester.map's sfda:00 for ZAAA), a made .anim reference
+        // (refIndex null, e.g. vincent_to_sephiroth.map's ref/*.anim) or a loaded file is kept below.
+        const sk = map[r.side === 'src' ? 'source_skeleton' : 'target_skeleton'], skk = sk ? L.keyOf(sk).replace(/_?\(\d+\)$/, '') : '', ownDa = /^..aa$/.test(skk) ? skk.slice(0, 2) + 'da' : null;
+        const missing = !!old && !inFile(old, f.name) && L.refIndex(old.file) !== null && !pool.has(L.refFile(old.file)) && ownDa !== null && L.keyOf(L.refFile(old.file)) === ownDa;
+        if (!old || (!inFile(old, f.name) && autoRefs.has(r.ref)) || missing) {
+          // no reference yet, or one an earlier file in this box gave, or one in a file not loaded: this file gives both
+          const wMissing = !!w && !pool.has(L.refFile(w.file));
+          map[r.ref] = fresh.ref; autoRefs.add(r.ref);
+          let wNew = false;
+          if (fresh.w && (!w || autoRefs.has(r.wref) || (old && inFile(w, L.refFile(old.file))) || (missing && wMissing))) { map[r.wref] = fresh.w; autoRefs.add(r.wref); wNew = true; }
+          lines.push('Its ' + (single ? '' : 'animation 00 ') + 'frame 0 is the ' + side + ' reference pose' + (wNew ? ', and its animation ' + hx(wi) + ' the ' + side + ' weapon reference' : '') + ' (change them in step 3).'
+            + (missing ? ' The map\'s ' + side + ' reference' + (wNew && w ? 's' : '') + ' named ' + base(L.refFile(old.file)) + ', which is not loaded: ' + (wNew && w ? 'they are' : 'it is') + ' now this file\'s.' : old ? ' They replace ' + base(old.file) + ', loaded earlier.' : '')
+            + (missing && w && !wNew ? ' The ' + side + ' weapon reference stays ' + base(w.file) + ' frame ' + w.frame + '.' : ''));
+        } else if (inFile(old, f.name)) {
+          // the file the map names: its references stay as the map wrote them (names with folders too)
+          if (!w && wi !== null) { map[r.wref] = { file: L.refSpec(L.refFile(old.file), wi), frame: 0 }; autoRefs.add(r.wref); lines.push('The map names no ' + side + ' weapon reference: its animation ' + hx(wi) + ' is used.'); }
+        } else {
+          // the map (or you) chose references in another file: keep them together, and offer this file's instead
+          lines.push('The ' + side + ' reference pose stays ' + base(old.file) + ' frame ' + old.frame + (w ? ', and the ' + side + ' weapon reference ' + base(w.file) + ' frame ' + w.frame : '') + ', as the map (or step 3) gives them: the body and the weapon are measured from the same pose.');
+          offer = () => {
+            map[r.ref] = fresh.ref; autoRefs.add(r.ref);
+            if (fresh.w) { map[r.wref] = fresh.w; autoRefs.add(r.wref); }
+            say('rt-files-msg', 'The ' + side + ' references are now ' + added.name + ': animation 00 frame 0' + (fresh.w ? ' and the weapon track ' + hx(wi) + ' frame 0' : '; it has no weapon track for its idle (34 in a party model, 16 further on in a model of 16 bodies + 16 weapon tracks), so the weapon reference stays ' + (w ? base(w.file) : 'unset')) + '.', fresh.w ? 'ok' : 'warn');
+            changed();
+          };
+        }
+        say('rt-files-msg', lines, 'ok');
+        if (offer) $('rt-files-msg').appendChild(h('div', { class: 'row' }, h('button', { onclick: offer }, 'Use ' + added.name + '\'s 00 frame 0' + (fresh.w ? ' and its weapon track ' + hx(wi) : '') + ' as the ' + side + ' references instead')));
       }
       selSrc = selTgt = null;
     } catch (e) { say('rt-files-msg', plain(e), 'bad'); }
@@ -512,12 +569,14 @@
     const bad = [], good = [];
     for (const f of Array.from(e.target.files)) {
       try {
-        const bytes = await readFile(f), s = A.sourceList(f.name, bytes);
+        const bytes = await readFile(f), z = L.zipRefusal(f.name, bytes); if (z) { bad.push(z); continue; }
+        const s = A.sourceList(f.name, bytes, countsOf('src'));
         if (!/\.anim$/i.test(f.name)) L.animRecords(f.name, bytes);                    // strict check
         const added = pool.add(f.name, bytes), key = L.keyOf(f.name);
         anims = anims.filter(a => a.key !== key);
-        anims.push({ name: added.name, key, kind: s.kind, bytes, items: s.items.map(it => Object.assign(it, { file: added.name, id: key + ':' + it.index })) });
-        good.push(added.name + ' (' + s.items.length + ' animation' + (s.items.length === 1 ? '' : 's') + (s.kind === 'pack' ? ', a limit pack' : '') + ')');
+        const a = { name: added.name, key, kind: s.kind, bytes, items: s.items.map(it => Object.assign(it, { file: added.name, id: key + ':' + it.index })) };
+        anims.push(a); itemsOf(a);
+        good.push(added.name + ' (' + a.items.length + ' animation' + (a.items.length === 1 ? '' : 's') + (a.kind === 'pack' ? ', a limit pack' : a.kind === 'bodies + weapons' ? ', each with its weapon track ' + a.layout.bodies + ' further on (' + a.layout.bodies + ' bodies + ' + a.layout.weapons + ' weapon tracks)' : '') + ')');
       } catch (err) { bad.push(f.name + ': ' + plain(err)); }
     }
     e.target.value = '';
@@ -525,10 +584,14 @@
     changed();
   };
   $('rt-other').onchange = async e => {
-    const names = [];
-    for (const f of Array.from(e.target.files)) { const added = pool.add(f.name, await readFile(f)); names.push(added.name + (added.replaced ? ' (replaces an earlier one)' : '')); }
+    const names = [], bad = [];
+    for (const f of Array.from(e.target.files)) {
+      const bytes = await readFile(f), z = L.zipRefusal(f.name, bytes);
+      if (z) { bad.push(z); continue; }
+      const added = pool.add(f.name, bytes); names.push(added.name + (added.replaced ? ' (replaces an earlier one)' : ''));
+    }
     e.target.value = '';
-    say('rt-files-msg', names.length ? 'Loaded: ' + names.join(', ') + '.' : '', 'ok');
+    say('rt-files-msg', bad.concat(names.length ? ['Loaded: ' + names.join(', ') + '.'] : []), bad.length ? 'bad' : 'ok');
     changed();
   };
 
@@ -539,7 +602,7 @@
     const rf = k => (map[k] ? h('span', {}, st(L.refFile(map[k].file)), ' ', h('span', { class: 'help' }, (L.refIndex(map[k].file) === null ? '' : 'animation ' + hx(L.refIndex(map[k].file)) + ', ') + 'frame ' + map[k].frame)) : st(null));
     g.append(h('span', {}, 'Source skeleton'), st(map.source_skeleton, sk('src')), h('span', {}, 'Source reference'), rf('source_reference'),
       h('span', {}, 'Target skeleton'), st(map.target_skeleton, sk('tgt')), h('span', {}, 'Target reference'), rf('target_reference'),
-      h('span', {}, 'To retarget'), anims.length ? h('span', {}, anims.map(a => a.name + ' (' + a.items.length + ')').join(', ')) : h('span', { class: 'help' }, 'nothing yet'),
+      h('span', {}, 'To retarget'), anims.length ? h('span', {}, anims.map(a => a.name + ' (' + itemsOf(a).length + ')').join(', ')) : h('span', { class: 'help' }, 'nothing yet'),
       h('span', {}, 'All loaded files'), pool.list().length ? h('span', { class: 'help' }, pool.list().map(e => e.name).join(', ')) : h('span', { class: 'help' }, 'none'));
   }
   function renderNeeds() {
@@ -548,7 +611,8 @@
     else if (names.length) say('rt-needs', 'Every file the map names is loaded.', 'ok');
     else say('rt-needs', '');
   }
-  function currentCheck() { return L.checkMap(map, { srcBones: bonesOf('src'), tgtBones: bonesOf('tgt') }); }
+  function weaponTracksLoaded() { let wt = 0; try { allItems().forEach(g => g.items.forEach(it => { if (it.weapon) wt++; })); } catch (e) { /* listed in step 1 */ } return wt; }
+  function currentCheck() { return L.checkMap(map, { srcBones: bonesOf('src'), tgtBones: bonesOf('tgt'), weaponTracks: weaponTracksLoaded() }); }
   function renderProblems() {
     const c = currentCheck(), box = $('rt-problems'); box.innerHTML = '';
     if (c.problems.length) box.insertAdjacentHTML('beforeend', '<div class="msg bad">' + c.problems.map(esc).join('<br>') + '</div>');
@@ -561,8 +625,16 @@
     try {
       const m = R.parseMap(await readText(f));
       ['pairs', 'loose', 'looseGroups', 'colliders', 'feet', 'source_feet'].forEach(k => { if (!m[k]) m[k] = k === 'pairs' || k === 'loose' ? {} : []; });
-      map = m; mapFile = f.name; selSrc = selTgt = null; pickMode = 'pair'; fitSig = { src: '', tgt: '' };
-      say('rt-map-msg', 'Opened ' + f.name + ': ' + Object.keys(map.pairs).length + ' pairs' + (map.looseGroups.length ? ', ' + map.looseGroups.length + ' loose group(s)' : '') + '.', 'ok');
+      map = m; mapFile = f.name; selSrc = selTgt = null; pickMode = 'pair'; fitSig = { src: '', tgt: '' }; autoRefs.clear();
+      const filled = [];
+      for (const [rk, wk, side] of [['source_reference', 'source_weapon_reference', 'source'], ['target_reference', 'target_weapon_reference', 'target']]) {
+        if (map[wk] || !map[rk] || L.refIndex(map[rk].file) === null) continue;
+        const fn = L.refFile(map[rk].file), recs = pool.has(fn) ? recordsOf(fn) : null, wi = recs ? L.weaponRefIndex(recs, countsOf(side === 'source' ? 'src' : 'tgt')) : null;
+        if (wi === null) continue;
+        map[wk] = { file: L.refSpec(fn, wi), frame: 0 }; autoRefs.add(wk); filled.push(side + ': ' + base(fn) + ' ' + hx(wi));
+      }
+      const noHand = map.target_weapon_bone === undefined && !!(map.source_weapon_reference || map.target_weapon_reference);
+      say('rt-map-msg', 'Opened ' + f.name + ': ' + Object.keys(map.pairs).length + ' pairs' + (map.looseGroups.length ? ', ' + map.looseGroups.length + ' loose group(s)' : '') + '.' + (filled.length ? ' It names no weapon reference; taken from the loaded files (' + filled.join(', ') + ').' : '') + (noHand ? ' It has no target weapon bone: weapon tracks are not retargeted until one is set in step 3.' : ''), noHand ? 'warn' : 'ok');
     } catch (err) { say('rt-map-msg', 'This file cannot be used as a retarget map: ' + plain(err), 'bad'); }
     changed();
   };
@@ -586,10 +658,10 @@
 
   /* ================================================================== steps 4 and 5: preview and export */
   function allItems() {
-    const groups = anims.map(a => ({ name: a.name, items: a.items }));
+    const groups = anims.map(a => ({ name: a.name, items: itemsOf(a) }));
     const sr = map.source_reference && L.refFile(map.source_reference.file);
     if (sr && pool.has(sr) && !anims.some(a => a.key === L.keyOf(sr))) {
-      try { const e = pool.entry(sr), s = A.sourceList(e.name, e.bytes); groups.push({ name: e.name + ' (the source animations)', items: s.items.map(it => Object.assign(it, { file: e.name, id: L.keyOf(e.name) + ':' + it.index })) }); } catch (err) { /* listed in step 1 */ }
+      try { const e = pool.entry(sr), s = A.sourceList(e.name, e.bytes, countsOf('src')); groups.push({ name: e.name + ' (the source animations)', items: s.items.map(it => Object.assign(it, { file: e.name, id: L.keyOf(e.name) + ':' + it.index })) }); } catch (err) { /* listed in step 1 */ }
     }
     return groups;
   }
@@ -617,14 +689,26 @@
   }
 
   const options = () => ({ files: pool.resolver(), style: opt.style, follow: opt.follow, key: opt.key });
+  const RULE_TEXT = { feet: 'lying at the feet', idle: 'held as in the target\'s idle', empty: 'empty' };
+  const ruleOf = () => (map.weapon_when_missing === undefined ? 'feet' : map.weapon_when_missing);
+  /* -> {body, weapon, note, made}: made is the rule that made the weapon track ('feet', 'idle'), '' when it was
+     retargeted, 'empty' when the rule left none, 'none' when the target has no weapon tracks */
   function compute(item) {
     const o = options(), body = R.retarget(map, item.body, o);
-    let weapon = null, note = '';
+    let weapon = null, note = '', made = '';
     if (item.weapon) {
-      if (map.target_weapon_bone === undefined) note = 'This animation has a weapon track, but the map has no target weapon bone: the weapon track is not retargeted (the weapon would be hidden).';
+      if (map.target_weapon_bone === undefined) note = 'This animation has a weapon track, but the map has no target weapon bone: it is not retargeted.';
       else weapon = R.retargetWeapon(map, item.weapon, body, o);
     }
-    return { body, weapon, note };
+    if (!weapon) {
+      const rule = ruleOf();
+      if (!R.targetHasWeapons(map, o)) made = 'none';
+      else { weapon = R.fallbackWeapon(map, body, o); made = weapon ? rule : 'empty'; }
+      if (weapon) note = (note ? note + ' ' : (item.weapon ? '' : 'The source animation has no weapon track. ')) + 'Its weapon track is made ' + RULE_TEXT[rule] + ' (' + weapon.frames.length + ' frames; Weapon when missing, step 3).';
+      else if (made === 'empty') note = (note ? note + ' ' : (item.weapon ? '' : 'The source animation has no weapon track. ')) + 'Weapon when missing is "empty": no weapon track (the weapon is hidden while it plays; KimeraCS cannot show such an animation at a number below 34).';
+      else if (note) note += ' The target has no weapon tracks (no target weapon reference), so none is made.';
+    }
+    return { body, weapon, note, made };
   }
   function ready() {             // -> null, or the reasons nothing can be retargeted yet
     const c = currentCheck(), why = c.problems.slice();
@@ -656,7 +740,7 @@
     const id = item.id + '|' + map.source_skeleton + '|' + map.target_skeleton;
     if (id !== prevFitId) { prevFitId = id; frame = 0; showFrame(0); pSrc.fit(); pTgt.fit(); } else showFrame(Math.min(frame, n - 1));
     restyle();
-    say('rt-prev-msg', [out.body.frames.length + ' frames retargeted' + (out.weapon ? ', with its weapon track' : '') + '. Look for hands through the body, sliding feet and snaps between frames: only your eye can judge the result.'].concat(out.note ? [out.note] : []), out.note ? 'warn' : 'ok');
+    say('rt-prev-msg', [out.body.frames.length + ' frames retargeted' + (out.weapon ? (out.made ? ', with a weapon track ' + RULE_TEXT[out.made] : ', with its weapon track') : '') + '. Look for hands through the body, sliding feet and snaps between frames: only your eye can judge the result.'].concat(out.note ? [out.note] : []), out.note && !(out.made && out.weapon && !item.weapon) ? 'warn' : 'ok');
   }
   function setFrames(n) { const s = $('rt-scrub'); s.max = Math.max(0, n - 1); if (frame > n - 1) frame = 0; s.value = frame; $('rt-frame').textContent = (n ? frame : 0) + ' / ' + Math.max(0, n - 1); if (!n) setPlaying(false); }
   function showFrame(f) {
@@ -683,21 +767,45 @@
     const why = ready(); if (why) throw new Error(why.join(' '));
     return { item, out: compute(item) };
   }
+  /* Every download starts inside its own click, one file a click: a browser may block a second download a page starts
+     by itself, and the page would not know. With a weapon track, Download gives one .zip of the two .anim files. */
   $('rt-dl').onclick = () => {
+    try {
+      const { item, out } = exportItem(), name = L.outName(item.file, item.index, map.target_skeleton), wname = L.outName(item.file, item.index, map.target_skeleton, true);
+      if (out.weapon) {
+        const zname = name.replace(/\.anim$/, '.zip');
+        download(zname, A.writeZip([{ name, bytes: R.encode(out.body) }, { name: wname, bytes: R.encode(out.weapon) }], new Date()));
+        say('rt-exp-msg', ['Downloaded ' + zname + ': one file holding ' + name + ' (the body, ' + out.body.frames.length + ' frames) and ' + wname + ' (its weapon track' + (out.made ? ' made ' + RULE_TEXT[out.made] : '') + ', ' + out.weapon.frames.length + ' frames).',
+          'In Add slots step 2 choose the .zip itself, or unzip it and choose both .anim files together: they pair by themselves, and the Weapon column names ' + wname + '.'].concat(out.note && item.weapon ? [out.note] : []), out.note && item.weapon ? 'warn' : 'ok');
+      } else {
+        download(name, R.encode(out.body));
+        say('rt-exp-msg', ['Downloaded ' + name + ' (' + out.body.frames.length + ' frames).' + (item.weapon ? ' Its weapon track was NOT saved:' : out.made === 'none' ? ' The source animation has no weapon track, and the target has no weapon reference (no weapon tracks): none is made.' : '')].concat(out.note ? [out.note] : []), out.note ? 'warn' : 'ok');
+      }
+    } catch (e) { say('rt-exp-msg', plain(e), 'bad'); }
+  };
+  $('rt-dl-body').onclick = () => {
     try {
       const { item, out } = exportItem(), name = L.outName(item.file, item.index, map.target_skeleton);
       download(name, R.encode(out.body));
-      if (out.weapon) setTimeout(() => download(L.outName(item.file, item.index, map.target_skeleton, true), R.encode(out.weapon)), 400);
-      say('rt-exp-msg', ['Downloaded ' + name + ' (' + out.body.frames.length + ' frames)' + (out.weapon ? ' and its weapon track ' + L.outName(item.file, item.index, map.target_skeleton, true) : '') + '.'].concat(out.note ? [out.note] : []), out.note ? 'warn' : 'ok');
+      say('rt-exp-msg', 'Downloaded ' + name + ' (the body only, ' + out.body.frames.length + ' frames).' + (out.weapon ? ' Its weapon track' + (out.made ? ' (made ' + RULE_TEXT[out.made] + ')' : '') + ' is "Weapon track .anim only".' : ''), 'ok');
+    } catch (e) { say('rt-exp-msg', plain(e), 'bad'); }
+  };
+  $('rt-dl-weapon').onclick = () => {
+    try {
+      const { item, out } = exportItem(), wname = L.outName(item.file, item.index, map.target_skeleton, true);
+      if (!out.weapon) throw new Error(out.note || 'This animation has no weapon track: there is nothing to download.');
+      download(wname, R.encode(out.weapon));
+      say('rt-exp-msg', 'Downloaded ' + wname + ' (the weapon track only' + (out.made ? ', made ' + RULE_TEXT[out.made] : '') + ', ' + out.weapon.frames.length + ' frames). In Add slots choose it together with ' + L.outName(item.file, item.index, map.target_skeleton) + ', or as the Weapon track of an added animation in step 3.', 'ok');
     } catch (e) { say('rt-exp-msg', plain(e), 'bad'); }
   };
   $('rt-send').onclick = () => {
     try {
       const { item, out } = exportItem();
       if (!window.SM_ADD_SLOTS) throw new Error('the Add slots tab did not start: reload the page');
-      window.SM_ADD_SLOTS.addSource({ file: 'retargeted ' + item.file + ' ' + hx(item.index) + ' on ' + base(map.target_skeleton), index: item.index, body: R.encode(out.body), weapon: out.weapon ? R.encode(out.weapon) : null });
+      window.SM_ADD_SLOTS.addSource({ file: 'retargeted ' + item.file + ' ' + hx(item.index) + ' on ' + base(map.target_skeleton), index: item.index, body: R.encode(out.body), weapon: out.weapon ? R.encode(out.weapon) : null,
+        weaponMade: out.made && out.weapon ? out.made : null, weaponRule: out.made === 'empty' ? 'empty' : null });
       $('rt-exp-msg').innerHTML = '';
-      $('rt-exp-msg').appendChild(h('div', { class: 'msg ' + (out.note ? 'warn' : 'ok') }, 'Sent to Add slots (' + out.body.frames.length + ' frames' + (out.weapon ? ', with its weapon track' : '') + '). There, load the target model (' + base(map.target_skeleton) + ' and its xxda) in step 1 if it is not loaded, then pick a number. ', out.note ? out.note + ' ' : '', h('button', { onclick: () => window.SM_SHOW_TAB && window.SM_SHOW_TAB('add') }, 'Go to Add slots')));
+      $('rt-exp-msg').appendChild(h('div', { class: 'msg ' + (out.note ? 'warn' : 'ok') }, 'Sent to Add slots (' + out.body.frames.length + ' frames' + (out.weapon ? (out.made ? ', with a weapon track ' + RULE_TEXT[out.made] : ', with its weapon track') : '') + '). There, load the target model (' + base(map.target_skeleton) + ' and its xxda) in step 1 if it is not loaded, then pick a number. ', out.note ? out.note + ' ' : '', h('button', { onclick: () => window.SM_SHOW_TAB && window.SM_SHOW_TAB('add') }, 'Go to Add slots')));
     } catch (e) { say('rt-exp-msg', plain(e), 'bad'); }
   };
   function exportPack(a) {
@@ -706,7 +814,7 @@
       const res = R.retargetPack(map, a.bytes, options());
       download(a.name, res.bytes);
       const lines = ['Downloaded ' + a.name + ' for the target: ' + res.report.length + ' animation(s) retargeted.'].concat(res.report.map(r => '  ' + r));
-      if (map.target_weapon_bone === undefined) lines.push('The map has no target weapon bone: the pack\'s weapon tracks are empty (the weapon is hidden while it plays).');
+      if (map.target_weapon_bone === undefined) lines.push('The map has no target weapon bone: the pack\'s weapon tracks are not retargeted; ' + (R.targetHasWeapons(map, options()) ? 'each is ' + (ruleOf() === 'empty' ? 'the game\'s placeholder (the weapon is hidden while it plays)' : 'made ' + RULE_TEXT[ruleOf()]) + ' (Weapon when missing, step 3).' : 'they are left empty (the target has no weapon reference).'));
       lines.push('It goes in the magic folder under this name, replacing the pack it was made from: keep the original.');
       say('rt-exp-msg', lines, map.target_weapon_bone === undefined ? 'warn' : 'ok');
     } catch (e) { say('rt-exp-msg', 'The pack was not retargeted: ' + plain(e), 'bad'); }

@@ -73,8 +73,17 @@
   /* ------------------------------------------------------------------ animation files */
 
   // an xxda, a limit pack or a single .anim -> its records (strict: a file that is not one throws)
+  // the .zip the Download gives (or any .zip): this tab does not read it; null when the file is not one
+  function zipRefusal(name, bytes) {
+    bytes = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+    const isZip = /\.zip$/i.test(String(name)) || (bytes.length >= 4 && bytes[0] === 0x50 && bytes[1] === 0x4b && bytes[2] === 0x03 && bytes[3] === 0x04);
+    if (!isZip) return null;
+    const stem = baseName(name).replace(/\.zip$/i, '');
+    return 'The file ' + baseName(name) + ' is a .zip (the kind the Download gives with a weapon track): this tab does not read it. Unzip it and choose ' + stem + '.anim, or save the body with "Body .anim only". (Add slots step 2 reads the .zip itself.)';
+  }
   function animRecords(name, bytes) {
     bytes = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+    { const z = zipRefusal(name, bytes); if (z) throw new Error(z); }
     if (/\.anim$/i.test(name)) {
       if (bytes.length < 12 || bytes.length !== 12 + u32(bytes, 8)) throw new Error(baseName(name) + ' is not a single animation (.anim)');
       return [bytes];
@@ -107,9 +116,19 @@
     if (idx >= recs.length) throw new Error(baseName(spec) + ': ' + baseName(file) + ' has only ' + recs.length + ' animations');
     return recs[idx];
   }
-  // a party xxda has its idle's weapon track at 0x34: the usual weapon reference
-  function weaponRefIndex(records) {
+  /* the idle's weapon track, the usual weapon reference: a party xxda's 0x34; a model of N bodies + M weapon tracks
+     (an enemy with a weapon, 16 + 16 such as mu) has body i's at N + i, so its idle's at N. N and M are the skeleton
+     header's dword 7 and 10 when `counts` ({body, weapon}) is given and fits the file; otherwise read from the file:
+     its bodies first (more than 1 bone each), then only 1-bone records (anim_core layoutOf: the same rule). A limit
+     pack (16 records, 8 on of 1 bone) gives none, as before. */
+  function weaponRefIndex(records, counts) {
     if (records.length > 0x34) { const h = recordHead(records[0x34]); if (h.bones === 1 && !h.placeholder) return 0x34; }
+    if (!records.length || recordHead(records[0]).bones === 1) return null;
+    if (records.length === 16 && records.slice(8).every(r => recordHead(r).bones === 1)) return null;
+    let nb;
+    if (counts && counts.body + counts.weapon === records.length) nb = counts.body;
+    else { nb = 0; while (nb < records.length && recordHead(records[nb]).bones !== 1) nb++; if (!records.slice(nb).every(r => recordHead(r).bones === 1)) return null; }
+    if (nb > 0 && nb < records.length) { const h = recordHead(records[nb]); if (h.bones === 1 && !h.placeholder) return nb; }
     return null;
   }
 
@@ -147,7 +166,8 @@
   }
 
   /* problems (retargeting would fail or do something unintended) and warnings, in plain words.
-     info: {srcBones, tgtBones} (bone counts of the loaded skeletons, or undefined) */
+     info: {srcBones, tgtBones} (bone counts of the loaded skeletons, or undefined), weaponTracks (how many animations
+     loaded to retarget have a weapon track; 0 or left out: none, so missing weapon references are no problem) */
   function checkMap(m, info) {
     info = info || {};
     const problems = [], warnings = [], S = info.srcBones, T = info.tgtBones;
@@ -163,10 +183,17 @@
     sf.filter(outS).forEach(b => problems.push('Source foot ' + b + ' is not a bone of the source skeleton.'));
     tf.filter(outT).forEach(b => problems.push('Target foot ' + b + ' is not a bone of the target skeleton.'));
     if (!!sf.length !== !!tf.length) warnings.push('Feet are used only when both the source and the target feet are given: the ' + (sf.length ? 'target' : 'source') + ' feet are missing.');
+    // weapon tracks to retarget need the hand and both references; an animation that brings none (a model without a
+    // weapon) is retargeted all the same, and its weapon track is made by "weapon when missing"
+    const missing = m.weapon_when_missing === 'idle' ? 'held as in the idle' : m.weapon_when_missing === 'empty' ? 'left empty (the weapon is hidden)' : 'made lying at the feet';
     if (m.target_weapon_bone !== undefined) {
       if (outT(m.target_weapon_bone)) problems.push('The weapon bone ' + m.target_weapon_bone + ' is not a bone of the target skeleton.');
-      if (!m.source_weapon_reference || !m.target_weapon_reference) problems.push('A weapon bone is set: weapon tracks then need both weapon references (source and target).');
-    } else if (m.source_weapon_reference || m.target_weapon_reference) warnings.push('No target weapon bone: weapon tracks are not retargeted (a pack gets empty ones: the weapon is hidden).');
+      if (!m.source_weapon_reference || !m.target_weapon_reference) {
+        if (info.weaponTracks) problems.push('A weapon bone is set and the animations loaded have weapon tracks (' + info.weaponTracks + '): retargeting them needs both weapon references (source and target).');
+        else warnings.push('A weapon bone is set but the map has no ' + (!m.source_weapon_reference ? 'source' : 'target') + ' weapon reference: no weapon track is retargeted. The animations loaded bring none, so each one\'s weapon track is ' + missing + ' (Weapon when missing, step 3).');
+      }
+    } else if (info.weaponTracks) warnings.push('The animations loaded have weapon tracks (' + info.weaponTracks + '), but the map has no target weapon bone: they are not retargeted, and the weapon track of each is ' + missing + ' (Weapon when missing). To keep the weapon\'s own movement, set "Target weapon bone (the hand)" in step 3 (Weapon), or pick it in the view.');
+    else if (m.source_weapon_reference || m.target_weapon_reference) warnings.push('No target weapon bone: weapon tracks are not retargeted (each is ' + missing + ').');
     for (const g of m.looseGroups || []) {
       g.bones.filter(outT).forEach(b => problems.push('Loose bone ' + b + ' is not a bone of the target skeleton.'));
       g.bones.filter(b => m.pairs[b] !== undefined).forEach(b => warnings.push('Loose bone ' + b + ' is also paired: a paired bone follows its source and "loose" does nothing to it.'));
@@ -191,7 +218,7 @@
   function mapFileName(m) { return (m.source_skeleton ? stem(m.source_skeleton) : 'source') + '_to_' + (m.target_skeleton ? stem(m.target_skeleton) : 'target') + '.map'; }
 
   const api = { hex2, baseName, safeName, keyOf, refFile, refIndex, refSpec, keepName, makePool, mapNames, missingNames,
-    animRecords, recordHead, skeletonCheck, itemBytes, weaponRefIndex, emptyMap, setPair, removePair, howName,
+    animRecords, zipRefusal, recordHead, skeletonCheck, itemBytes, weaponRefIndex, emptyMap, setPair, removePair, howName,
     parseBones, formatBones, toggleIn, syncLoose, checkMap, outName, mapFileName };
   if (typeof module !== 'undefined' && module.exports) module.exports = api; else root.SKELETON_MASTER_UI = api;
 })(typeof self !== 'undefined' ? self : this);

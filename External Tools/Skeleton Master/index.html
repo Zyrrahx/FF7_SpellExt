@@ -64,6 +64,8 @@
   .timeline input[type=range] { flex:1 1 160px; min-width:0; }
   .grid2 > *, #tab-retarget .msg, .view .cap { overflow-wrap:anywhere; min-width:0; }
   @media (max-width: 700px) { .views, .files { grid-template-columns: 1fr; } .files label.wide { grid-column:auto; } .view { height:260px; } .grid2 { grid-template-columns: 1fr; } }
+  textarea { width:100%; font:13px/1.4 ui-monospace, monospace; color:var(--text); background:#262a33; border:1px solid var(--line); border-radius:4px; padding:6px; resize:vertical; }
+  .tag.bad { color:var(--bad); }
   @media (max-width: 600px) { header { padding:12px 16px; } main { padding:16px; } }
 </style>
 </head>
@@ -71,7 +73,7 @@
 <header>
   <h1>Skeleton Master <span style="color:var(--dim);font-weight:400;font-size:14px">FF7 battle animation slots</span></h1>
   <p id="tab-intro">Add extra animations to a battle model, with no game files changed: load the model, pick animations, download the two new files.</p>
-  <nav class="tabs"><button id="tab-b-add" class="on">Add slots</button><button id="tab-b-retarget">Retarget</button></nav>
+  <nav class="tabs"><button id="tab-b-add" class="on">Add slots</button><button id="tab-b-retarget">Retarget</button><button id="tab-b-scripts">Scripts (ab)</button></nav>
 </header>
 <main id="tab-add">
   <section>
@@ -84,7 +86,7 @@
 
   <section>
     <h2><span class="n">2</span>Load animations to add</h2>
-    <p class="help">Any <code>xxda</code> (another model's, or this one's own), a limit pack <code>.a00</code>, or a single animation saved as <code>.anim</code> (one record, e.g. from the Retarget tab). The animation must be made for this model's skeleton (the same number of bones). Its weapon track comes with it when the file has one.</p>
+    <p class="help">Any <code>xxda</code> (another model's, or this one's own), a limit pack <code>.a00</code>, a single animation saved as <code>.anim</code> (one record, e.g. from the Retarget tab), or the <code>.zip</code> the Retarget tab's Download gives. The animation must be made for this model's skeleton (the same number of bones). The weapon track comes with it from an <code>xxda</code> (number + 34 in a party model's; 16 further on in a model of 16 bodies + 16 weapon tracks, an enemy with a weapon such as the final-duel Sephiroth <code>mu</code>: its header's two counts, read from the file), a limit pack (number + 8) and the <code>.zip</code>. A single <code>.anim</code> holds a body only: choose <code>NAME.anim</code> and <code>NAME_weapon.anim</code> together (or one after the other) and they pair by themselves; the Weapon column then names the weapon file. Copy names such as <code>NAME(2).anim</code> pair by the name without the number and the time each file was saved (a browser numbers each name on its own, so <code>(2)</code> need not go with <code>_weapon(2)</code>): one body and one weapon file of a name pair unless saved more than a minute apart; with several of a name, a weapon file pairs with the body saved within 2 seconds of it. When that cannot tell, the page says so and leaves them unpaired. Any weapon track can be chosen by hand in step 3.</p>
     <div class="row"><input id="source-files" type="file" multiple></div>
     <div id="source-msg"></div>
     <div class="scroll"><table id="sources"><thead><tr><th>File</th><th>No.</th><th>Frames</th><th>Bones</th><th>Weapon</th></tr></thead><tbody></tbody></table></div>
@@ -97,11 +99,14 @@
   <section class="wide">
     <h2><span class="n">3</span>What will be added</h2>
     <div class="scroll" style="max-height:240px"><table id="adds"><thead><tr><th>Number</th><th>Play it with</th><th>Animation</th><th>Frames</th><th>Weapon track</th><th></th></tr></thead><tbody></tbody></table></div>
-    <div id="build-msg"></div>
+    <div class="row"><label>An added animation with no weapon track of its own gets one <select id="weapon-rule"><option value="feet" selected>at the feet (lying on the floor)</option><option value="idle">held as in this model's idle</option><option value="">empty (the game's placeholder)</option></select></label>
+      <label>at the feet: side front lift <input id="weapon-feet" type="text" size="12" placeholder="250 250 30"></label></div>
+    <p class="help">The <b>Weapon track</b> of each added animation is what the game plays for the weapon while it plays (written at number + 34). It is filled in from the file the animation came from; to change it, choose any weapon track loaded in step 2 (a <code>NAME_weapon.anim</code>, or a 1-bone animation of an <code>xxda</code> or a limit pack), or one made here. An animation that brings none (from a model without a weapon) gets the one chosen above: <b>at the feet</b> (the default) makes a track in which the weapon lies on the floor beside the feet for the whole animation, turning and moving with the model (side front lift place its grip: by default 250 to the model's left, 250 ahead, 30 above the floor; raise lift if the weapon sinks into the floor, lower it if it floats; Barret's gun-arm needs about 450 250 70, and Cloud's sword comes close to his legs when he steps to the side); <b>held as in this model's idle</b> keeps it in the hand as the idle (00 with its weapon track 34) holds it; <b>empty</b> writes the game's placeholder, which hides the weapon while it plays. A made track has exactly the body's frame count. KimeraCS fails showing an animation whose weapon track has fewer frames than it (the placeholder has none), at the numbers it lists (below 34): the build says so when that would happen.</p>
     <div class="row">
-      <button id="b-build" class="primary" disabled>Build and download the two files</button>
-      <span class="help">They keep the names you loaded (e.g. <code>rtaa</code>, <code>rtda</code>). Every animation the model already has stays byte for byte as it was.</span>
+      <button id="b-build" class="primary" disabled>Build the two files</button>
+      <span class="help">Then download each with its own button. They keep the names you loaded (e.g. <code>rtaa</code>, <code>rtda</code>) and belong together: never use the new xxaa with the old xxda. Every animation the model already has stays byte for byte as it was.</span>
     </div>
+    <div id="build-msg"></div>
   </section>
 
   <section class="wide">
@@ -113,10 +118,11 @@
   <section class="wide">
     <h2>How it works</h2>
     <p class="help"><b>Why this was hard.</b> A party model has 52 body animations: 0-2b its own, 2c-33 the limit pack's. The game finds the weapon track of body animation <i>n</i> at <i>n</i>+34 (hex), so the slots after the 52 are taken by weapon tracks, and a new animation cannot simply be added at the end. The free numbers are <b>68-9b</b> and <b>d0-ff</b>; each new animation's weapon track goes 34 further on, and every slot in between is filled with the game's own placeholder. The skeleton file's header is updated so the game makes room for all of them. No DLL is needed.</p>
-    <p class="help"><b>Playing them.</b> In the model's action scripts (the <code>xxab</code> file), a byte from 00 to 8d plays that animation: numbers 68-8d are played by their own byte. Numbers above 8d are played with <code>a7 NN</code>. The table above shows the bytes for each new number. Never use 2c-33 (the limit pack) or 34-67 (weapon tracks) as body animations on a party model.</p>
-    <p class="help"><b>Enemies</b> have no weapon tracks: their new animations are simply added after the last, up to ff. Models with 16 body + 16 weapon tracks are not handled yet.</p>
+    <p class="help"><b>Playing them.</b> In the model's action scripts (the <code>xxab</code> file, edited in the Scripts tab), a byte from 00 to 8d plays that animation: numbers 68-8d are played by their own byte. Numbers above 8d are played with <code>a7 NN</code>. The table above shows the bytes for each new number. Never use 2c-33 (the limit pack) or 34-67 (weapon tracks) as body animations on a party model.</p>
+    <p class="help"><b>Enemies</b> with no weapon tracks (the header's second count 0) have their new animations simply added after the last, up to ff. A model whose header gives 16 bodies + 16 weapon tracks (an enemy with a weapon, such as the final-duel Sephiroth <code>mu</code>) keeps body <i>n</i>'s weapon track at <i>n</i>+10 (hex: 16 further on): its animations come with their own weapon tracks, here in step 2 and in the Retarget tab (where its sword's own movement is retargeted into the target's hand). Adding animations TO such a model is not handled: a new body's weapon track would have to sit 16 further on, where other bodies would go, and KimeraCS reads every record after the 16 bodies as a weapon track.</p>
+    <p class="help"><b>A retargeted animation and its weapon.</b> From the Retarget tab, "Send to Add slots" hands both over at once (for this page session only). Its Download gives one <code>.zip</code> holding <code>NAME.anim</code> (the body) and <code>NAME_weapon.anim</code> (the weapon track): choose the <code>.zip</code> in step 2, or unzip it and choose both <code>.anim</code> files together. Either way the Weapon column of step 2 must show the weapon file, and step 3's Weapon track must not say "none", before you build.</p>
     <p class="help"><b>Testing.</b> Put the two files (and a changed <code>xxab</code>) in a mod. If the log says "ANM ERROR" or the weapon is missing during a new animation, the files do not match the model the game loads. Keep the originals.</p>
-    <p class="help"><b>Other tools.</b> Model editors that read the header's second count as "weapon animations" may not understand the new files; the game does.</p>
+    <p class="help"><b>Other tools.</b> Model editors that read the header's second count as "weapon animations" may not understand the new files; the game does. KimeraCS (read from its source, not tried) lists only the first 52 animations of a party model and draws each one's weapon from its weapon track at number + 34 frame by frame, without checking the track is long enough: a track shorter than its body there (the game's 1-frame placeholder above all) makes it fail showing that animation. The numbers 68-ff are not listed by it, so they never do; a body put into an old placeholder number below 2c needs a weapon track of its own length (at the feet or held, not empty).</p>
   </section>
 </main>
 
@@ -177,10 +183,14 @@
 
     <section>
       <h2><span class="n">5</span>Export</h2>
-      <p class="help">Download the animation shown in the preview for the target model, or send it to the Add slots tab to give it a new number on the target model. A whole limit pack is retargeted at once and keeps its name.</p>
+      <p class="help">Download the animation shown in the preview for the target model, or send it to the Add slots tab to give it a new number on the target model. With a weapon track, Download gives ONE <code>.zip</code> holding both: <code>NAME.anim</code> (the body) and <code>NAME_weapon.anim</code> (the weapon track). Choose that <code>.zip</code> in Add slots step 2 (or unzip it and choose both files together): they pair by themselves. Without one it gives the <code>.anim</code> alone. A whole limit pack is retargeted at once and keeps its name.</p>
       <div class="row">
-        <button id="rt-dl" class="primary">Download as .anim</button>
+        <button id="rt-dl" class="primary">Download (.anim, or .zip with its weapon track)</button>
         <button id="rt-send">Send to Add slots</button>
+      </div>
+      <div class="row"><span class="help">One file at a time:</span>
+        <button id="rt-dl-body">Body .anim only</button>
+        <button id="rt-dl-weapon">Weapon track .anim only</button>
       </div>
       <div id="rt-packs"></div>
       <div id="rt-exp-msg"></div>
@@ -192,8 +202,79 @@
     <p class="help"><b>What it does.</b> Each frame of the source animation, every paired target bone takes the movement of its source bone: how far the source bone has turned away from the source's reference pose, the target bone turns away from the target's reference pose. With <b>aim</b> it is then pointed exactly where the source bone points; with <b>reach</b> it points from the model's origin to where the source bone ends. Bones without a pair keep their reference pose and ride on their parent, or swing behind it if they are loose. The model's position is the source's, scaled, and the feet keep the source's height above the floor.</p>
     <p class="help"><b>Choosing pairs.</b> Pair bones that do the same job: chest to chest, upper arm to upper arm. Limbs are usually <b>aim</b>; a pelvis that points the other way on one model is <b>follow</b>; a bone that only carries a shoulder out from the body is <b>follow</b> or <b>reach</b>. A target with a hand where the source has none can pair the hand with the source's forearm. Check the numbers on the hover label: bone numbers differ from model to model.</p>
     <p class="help"><b>What only your eye can judge.</b> The page measures nothing for you: hands through the body, feet sliding, a snap between frames or an odd twist must be looked for in the preview, and in the game. The preview draws the skeleton only (no model parts), so a pose that looks right as sticks can still show a gap or a crease on the model. Test in the game before you share an animation.</p>
-    <p class="help"><b>Where the results go.</b> A retargeted animation is for the target's skeleton. Add it to the target model with the Add slots tab, or use the .anim with your own tools. A limit pack (<code>.a00</code>) goes in the <code>magic</code> folder under its own name, replacing the one it was made from: keep the original.</p>
+    <p class="help"><b>Where the results go.</b> A retargeted animation is for the target's skeleton. Add it to the target model with the Add slots tab, or use the .anim with your own tools. Its weapon track goes with it: retargeted when the source has one and the map has a target weapon bone (the hand); otherwise, when the target has weapon tracks, made by the map's <b>Weapon when missing</b> (step 3: at the feet, the default; held as in the target's idle; or empty). "Send to Add slots" carries both, and Download's <code>.zip</code> holds both (with "empty", the <code>.anim</code> alone). Loaded back into Add slots, the step 2 Weapon column must name <code>NAME_weapon.anim</code>. A limit pack (<code>.a00</code>) goes in the <code>magic</code> folder under its own name, replacing the one it was made from: keep the original.</p>
     <p class="help"><b>Internet.</b> The 3D views use three.js, loaded from cdn.jsdelivr.net the first time (the browser keeps it afterwards). Without it the views stay empty; maps, retargeting and downloads still work, and bones can be paired by number.</p>
+  </section>
+</main>
+
+<main id="tab-scripts" hidden>
+  <section>
+    <h2><span class="n">1</span>Load the files</h2>
+    <p class="help">Choose the model's action scripts <code>xxab</code> (Cloud: <code>rtab</code>), and with it, for the checks and the preview, its skeleton <code>xxaa</code> and animations <code>xxda</code>: all three at once. Use the files the game actually loads. Party models and enemies share one format; the page tells them apart by the file, or choose below.</p>
+    <div class="row"><input id="ab-files" type="file" multiple>
+      <label>Kind <select id="ab-kind"><option value="">tell from the file</option><option value="party">party model (74 slots)</option><option value="enemy">enemy (32 slots)</option></select></label></div>
+    <div id="ab-msg"></div>
+    <div id="ab-summary" class="summary"></div>
+  </section>
+
+  <section>
+    <h2><span class="n">2</span>The slots</h2>
+    <p class="help">Each slot is one script: which one the game plays, and when, is in the second column (hover a row for more). Slots marked <span class="tag">same as</span> share their bytes. Click a slot to open it in step 3.</p>
+    <div class="scroll" style="max-height:420px"><table id="ab-slots"><thead><tr><th>Slot</th><th>Used for</th><th>Script</th><th>Ends</th></tr></thead><tbody></tbody></table></div>
+  </section>
+
+  <section>
+    <h2><span class="n">3</span>Edit the slot</h2>
+    <h3 id="ab-slot-title" style="margin-top:0"></h3>
+    <p id="ab-when" class="help"></p>
+    <p class="help">The script as hex bytes, one command to a line (spaces and lines are free; <code>#</code> starts a comment). It is checked as you type, and explained line by line below.</p>
+    <textarea id="ab-text" spellcheck="false" rows="7"></textarea>
+    <div id="ab-check"></div>
+    <div class="row">
+      <button id="ab-apply" class="primary">Apply to this slot</button>
+      <button id="ab-apply-all" hidden>Apply to every slot that shares it</button>
+      <button id="ab-revert" title="Put the slot's own bytes back in the box">Put the slot's bytes back</button>
+    </div>
+    <div id="ab-apply-msg"></div>
+    <div class="scroll" style="max-height:260px"><table id="ab-decoded"><thead><tr><th>Byte</th><th>Bytes</th><th>What it does</th></tr></thead><tbody></tbody></table></div>
+    <h3>Copy a script from another model</h3>
+    <div class="row"><label class="row" style="margin:0">Another xxab <input id="ab-from-file" type="file"></label></div>
+    <div class="row"><select id="ab-from-slot" style="max-width:100%"></select><button id="ab-from-copy">Put its script in the box</button></div>
+    <div id="ab-from-msg"></div>
+  </section>
+
+  <section>
+    <h2><span class="n">4</span>Preview</h2>
+    <p class="help">What the script in the box plays, one animation after another, with its waits and loops; a script that ends stops on its last frame. It plays in place: steps, run-ins and effects are not shown. Drag to turn the view, wheel to zoom.</p>
+    <div class="view" id="ab-view"></div>
+    <div class="timeline">
+      <button id="ab-play">Play</button>
+      <input id="ab-scrub" type="range" min="0" max="0" value="0">
+      <span id="ab-frame" class="mono">0 / 0</span>
+      <label>speed <select id="ab-fps"><option value="15" selected>15 frames/s</option><option value="30">30 frames/s</option><option value="5">5 frames/s</option></select></label>
+    </div>
+    <p id="ab-seq" class="help"></p>
+  </section>
+
+  <section class="wide">
+    <h2><span class="n">5</span>Save</h2>
+    <div id="ab-changes"></div>
+    <div class="row">
+      <button id="ab-save" class="primary">Download the xxab</button>
+      <button id="ab-undo">Undo the last change</button>
+      <button id="ab-reset">Undo every change</button>
+      <span class="help">It keeps the name you loaded. Only the changed scripts and their offsets differ from the file you loaded.</span>
+    </div>
+    <div id="ab-save-msg"></div>
+  </section>
+
+  <section class="wide">
+    <h2>How the scripts work</h2>
+    <p class="help"><b>What a script is.</b> A list of bytes the game runs one after another. A byte from 00 to 8d plays that animation of the model; every other byte is a command, some followed by values (a word is two bytes, low byte first). <code>a7 NN</code> plays any animation up to ff. The game moves to the next byte only when the animation playing has reached its last frame. A script can be 256 bytes long at most.</p>
+    <p class="help"><b>How a script must end.</b> <code>ee</code>: finished, back to the idle. <code>f1</code>: finished, holds the last frame (KO, victory). <code>9e</code>: waits for the target to finish, then finished (the 2x-Cut turns). <code>fe c0</code> and <code>c1</code> loop for ever: right for an idle, but in an attack, a limit or a hurt reaction the battle waits for ever. The page warns about that, and refuses the crashes and freezes it knows of: a jump with no mark to land on, a command cut short, a script with no end, a move over 0 frames (a division by zero), a loop that plays nothing within one frame.</p>
+    <p class="help"><b>Saving.</b> The file's other bytes never move: its header, scripts no slot uses, leftover bytes and an enemy's effect data stay where they are. A changed script is written over its old one when it fits and no other slot uses it; otherwise it is added at the end of the file and only its slot's offset changes. When several slots share a script you choose: this slot only, or all of them.</p>
+    <p class="help"><b>What is known, and what is not.</b> Every command's length and the slot list were read from the game's code, and every script in the game's 481 xxab files reads cleanly; nothing here was seen in the game. Several commands' effects are not traced (they say so). For an enemy only slots 0-2 are known (idle, weak, dead): its other slots are chosen by its attack data. The preview shows animations only; test in the game before you share a file. Party slots 46-50 and 52-59 are the game's own scripts: the file's are never read.</p>
+    <p class="help"><b>New animations.</b> An animation added with the Add slots tab is played by the bytes shown there (<code>68</code> to <code>8d</code> by their own byte, others by <code>a7 NN</code>). After building, "Use them in Scripts" hands the new files to this tab, so the numbers are checked and previewed.</p>
   </section>
 </main>
 
@@ -203,7 +284,20 @@
 const A = window.SKELETON_MASTER;
 const $ = id => document.getElementById(id);
 const hx = A.hex;
-let model = null, modelNames = null, sources = [], picked = null, adds = [];
+let model = null, modelNames = null, sources = [], weapons = [], picked = null, adds = [], built = null, version = 0;
+// an added animation with no weapon track gets one by rule: 'feet', 'idle' (made at build, Retarget's core), or 'empty'
+const RULE_TEXT = { feet: 'at the feet', idle: 'held as in the idle', empty: 'empty' };
+const pageRule = () => $('weapon-rule').value || 'empty';
+function feetValues() {           // the "side front lift" field: null = the defaults; throws on anything but three numbers
+  const v = String($('weapon-feet').value || '').trim(); if (!v) return null;
+  const w = v.replace(/,/g, ' ').split(/\s+/).map(Number);
+  if (w.length !== 3 || !w.every(isFinite)) throw new Error('"at the feet: side front lift" needs three numbers, e.g. 250 250 30 (it says "' + v + '")');
+  const R = window.SKELETON_MASTER_RETARGET;
+  if (R && R.feetProblem(w)) throw new Error('"at the feet: side front lift": each number from -' + R.FEET_LIMIT + ' to ' + R.FEET_LIMIT + ', e.g. 250 250 30 (it says "' + v + '")');
+  return w;
+}
+// sources: what step 2 lists (body animations, and weapon-only .anim files not paired yet); weapons: every weapon track
+// loaded (1 bone), to choose by hand in step 3; version: counts changes, so a build made before one is not offered
 
 function msg(box, text, kind) { $(box).innerHTML = text ? '<div class="msg ' + (kind || 'ok') + '">' + text + '</div>' : ''; }
 function esc(s) { return String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
@@ -217,32 +311,52 @@ $('model-files').onchange = async e => {
   try {
     model = A.openModel(await readFile(aa), await readFile(da));
     modelNames = { aa: aa.name, da: da.name };
-    adds = []; picked = null;
-    const kinds = { party: 'a party member (52 body animations + weapon tracks)', enemy: 'an enemy (no weapon tracks)', other: 'a 16 + 16 enemy: not handled yet' };
+    adds = []; picked = null; version++;
+    const kinds = { party: 'a party member (52 body animations + weapon tracks)', enemy: 'an enemy (no weapon tracks)', other: model.header[7] + ' bodies + ' + model.header[10] + ' weapon tracks (an enemy with a weapon): adding to it is not handled' };
     $('model-summary').innerHTML = [['Model', esc(aa.name) + ' + ' + esc(da.name)], ['Kind', kinds[model.kind]], ['Skeleton bones', model.bones],
       ['Animations now', model.count + ' (' + model.header[7] + ' + ' + model.header[10] + ')'], ['Free new numbers', A.freeNumbers(model, new Set()).length]]
       .map(([k, v]) => '<span>' + k + '</span><span>' + v + '</span>').join('');
-    msg('model-msg', model.kind === 'other' ? 'This model has a layout the tool does not handle yet.' : 'Loaded.', model.kind === 'other' ? 'warn' : 'ok');
+    msg('model-msg', model.kind === 'other' ? esc(A.otherText(model).charAt(0).toUpperCase() + A.otherText(model).slice(1)) + '.' : 'Loaded.', model.kind === 'other' ? 'warn' : 'ok');
   } catch (err) { model = null; $('model-summary').innerHTML = ''; msg('model-msg', esc(err.message), 'bad'); }
   refresh();
 };
 
 /* ---------- 2: sources ---------- */
 $('source-files').onchange = async e => {
-  const bad = [];
+  const bad = [], said = [], keep = picked === null ? null : sources[picked];
   for (const f of Array.from(e.target.files)) {
-    try { const s = A.sourceList(f.name, await readFile(f)); s.items.forEach(it => { it.file = f.name; sources.push(it); }); }
-    catch (err) { bad.push(f.name + ': ' + err.message); }
+    try {
+      const s = A.sourceList(f.name, await readFile(f));
+      s.items.forEach(it => { it.time = f.lastModified; sources.push(it); if (it.weapon && !it.weaponLabel) it.weaponLabel = s.kind === 'zip' ? null : f.name + ' ' + hx(it.weaponIndex); });
+      if (s.kind === 'bodies + weapons') said.push(f.name + ': ' + s.layout.bodies + ' bodies + ' + s.layout.weapons + ' weapon tracks (a model with a weapon, such as the final-duel Sephiroth mu): each body comes with its weapon track ' + s.layout.bodies + ' further on (' + hx(s.layout.bodies) + ' for 00).');
+      s.weapons.forEach(w => weapons.push(w));
+      if (s.kind === 'zip') s.items.filter(it => it.weapon).forEach(it => said.push(it.label + ' with its weapon track ' + it.weaponLabel + '.'));
+      if (s.skipped && s.skipped.length) said.push(f.name + ': left out ' + s.skipped.join(', ') + ' (not .anim).');
+    } catch (err) { bad.push(f.name + ': ' + err.message); }
   }
-  msg('source-msg', bad.length ? esc(bad.join(' | ')) : '', 'bad');
+  const p = A.pairByName(sources); sources = p.items;
+  p.pairs.forEach(({ body, weapon }) => {
+    said.push('Paired ' + body.label + ' with its weapon track ' + weapon.label + '.');
+    adds.forEach(a => { if (a.src === body && !a.weapon && !a.weaponSet && model && model.kind === 'party') { a.weapon = body.weapon; a.weaponLabel = body.weaponLabel; version++; said.push('Its added animation ' + hx(a.number) + ' now has it as its weapon track.'); } });
+  });
+  const mins = ms => ms < 120000 ? Math.round(ms / 1000) + ' s' : Math.round(ms / 60000) + ' min';
+  p.unsure.forEach(u => said.push(u.gap !== undefined
+    ? 'Not paired: ' + u.bodies[0].label + ' and ' + u.weapons[0].label + ' were saved ' + mins(u.gap) + ' apart, so they may not belong together. If they do, choose ' + u.weapons[0].label + ' in step 3\'s Weapon track list for that added animation.'
+    : 'Not paired: ' + u.bodies.map(x => x.label).join(', ') + ' and ' + u.weapons.map(x => x.label).join(', ') + ' share a name, and the times they were saved do not tell which weapon file goes with which body (a browser numbers each name on its own, so (1) need not go with (1)). Add each body, then choose its weapon file in step 3\'s Weapon track list.'));
+  const lone = sources.filter(x => x.weaponTrack);
+  if (lone.length) said.push(lone.map(x => x.label).join(', ') + (lone.length === 1 ? ' is a weapon track' : ' are weapon tracks') + ' with no body paired with it (NAME.anim goes with NAME_weapon.anim): load its body too, or choose it in step 3\'s Weapon track column.');
+  picked = keep && sources.includes(keep) ? sources.indexOf(keep) : null;
+  $('source-msg').innerHTML = (bad.length ? '<div class="msg bad">' + esc(bad.join(' | ')) + '</div>' : '') + (said.length ? '<div class="msg ' + (lone.length ? 'warn' : 'ok') + '">' + said.map(esc).join('<br>') + '</div>' : '');
   e.target.value = ''; refresh();
 };
 function renderSources() {
   const tb = $('sources').tBodies[0]; tb.innerHTML = '';
   sources.forEach((s, i) => {
     const h = A.headOf(s.body), tr = document.createElement('tr'); tr.className = 'pick' + (picked === i ? ' sel' : '');
-    const fits = !model || h.bones === model.bodyBones;
-    tr.innerHTML = '<td>' + esc(s.file) + '</td><td class="mono">' + hx(s.index) + '</td><td>' + h.frames + '</td><td>' + h.bones + (fits ? '' : ' <span class="tag ph">other skeleton</span>') + '</td><td>' + (s.weapon ? A.headOf(s.weapon).frames + ' frames' : '<span class="help">none</span>') + '</td>';
+    const fits = !model || h.bones === model.bodyBones || s.weaponTrack;
+    const wcell = s.weaponTrack ? '<span class="tag weapon">this is a weapon track</span> <span class="help">not paired: choose it in step 3</span>'
+      : s.weapon ? A.headOf(s.weapon).frames + ' frames' + (s.weaponLabel ? ' <span class="help">(' + esc(s.weaponLabel) + ')</span>' : '') : '<span class="help">none</span>';
+    tr.innerHTML = '<td>' + esc(s.file) + '</td><td class="mono">' + hx(s.index) + '</td><td>' + h.frames + '</td><td>' + h.bones + (fits ? '' : ' <span class="tag ph">other skeleton</span>') + '</td><td>' + wcell + '</td>';
     tr.onclick = () => { picked = i; refresh(); };
     tb.appendChild(tr);
   });
@@ -259,19 +373,57 @@ function renderTargets() {
 $('b-add').onclick = () => {
   if (!model || picked === null) return;
   const s = sources[picked], n = Number($('target').value);
+  if (s.weaponTrack || (A.headOf(s.body).bones === 1 && model.bodyBones !== 1)) { msg('source-msg', esc(s.label) + ' is a weapon track (1 bone), not a body animation: it cannot be added as one. Add its body animation, then choose this file in step 3, in that row\'s Weapon track column. (NAME.anim and NAME_weapon.anim chosen together pair by themselves.)', 'bad'); return; }
   if (A.headOf(s.body).bones !== model.bodyBones) { msg('source-msg', 'That animation has ' + A.headOf(s.body).bones + ' bones; this model\'s have ' + model.bodyBones + '. It was made for another skeleton.', 'bad'); return; }
-  adds.push({ number: n, body: s.body, weapon: model.kind === 'party' ? s.weapon : null, label: s.file + ' ' + hx(s.index) });
-  adds.sort((a, b) => a.number - b.number);
+  const party = model.kind === 'party';
+  adds.push({ number: n, body: s.body, weapon: party ? s.weapon : null, weaponLabel: party && s.weapon ? s.weaponLabel : null, label: s.file + ' ' + hx(s.index), src: s,
+    weaponRule: s.weaponRule || pageRule(), ruleSet: !!s.weaponRule });
+  adds.sort((a, b) => a.number - b.number); version++;
   msg('source-msg', ''); refresh();
 };
 
 /* ---------- 3: build ---------- */
+function weaponPicker(a) {        // step 3: the weapon track of an added animation, chosen from every one loaded
+  const sel = document.createElement('select'); sel.style.maxWidth = '100%';
+  sel.appendChild(new Option('made here: at the feet (lying on the floor)', 'rule:feet'));
+  sel.appendChild(new Option('made here: held as in this model\'s idle', 'rule:idle'));
+  sel.appendChild(new Option('empty: the game\'s placeholder (the weapon is hidden)', ''));
+  const known = weapons.some(w => w.rec === a.weapon);
+  if (a.weapon && !known) { const o = new Option((a.weaponLabel || 'its own') + ' (' + A.headOf(a.weapon).frames + ' frames)', 'own'); o.selected = true; sel.appendChild(o); }
+  const byFile = new Map(); weapons.forEach((w, i) => { if (!byFile.has(w.file)) byFile.set(w.file, []); byFile.get(w.file).push([w, i]); });
+  byFile.forEach((list, file) => {
+    const g = document.createElement('optgroup'); g.label = file;
+    list.forEach(([w, i]) => { const o = new Option(w.label + ' (' + A.headOf(w.rec).frames + ' frames)', String(i)); if (w.rec === a.weapon) o.selected = true; g.appendChild(o); });
+    sel.appendChild(g);
+  });
+  if (!a.weapon) sel.value = a.weaponRule === 'feet' || a.weaponRule === 'idle' ? 'rule:' + a.weaponRule : '';
+  sel.onchange = () => {
+    const v = sel.value;
+    if (v === 'own') return;
+    if (v === '' || v.startsWith('rule:')) { a.weapon = null; a.weaponLabel = null; a.weaponRule = v ? v.slice(5) : 'empty'; a.ruleSet = true; }
+    else { const w = weapons[Number(v)]; a.weapon = w.rec; a.weaponLabel = w.label; }
+    a.weaponSet = true; version++; refresh();
+  };
+  return sel;
+}
 function renderAdds() {
   const tb = $('adds').tBodies[0]; tb.innerHTML = '';
+  const party = model && model.kind === 'party';
   adds.forEach((a, i) => {
     const tr = document.createElement('tr');
-    tr.innerHTML = '<td class="mono">' + hx(a.number) + '</td><td class="mono">' + A.scriptBytes(a.number) + '</td><td>' + esc(a.label) + '</td><td>' + A.headOf(a.body).frames + '</td><td>' + (model && model.kind === 'party' ? (a.weapon ? A.headOf(a.weapon).frames + ' frames, at ' + hx(a.number + A.WEAPON_OFFSET) : '<span class="help">none: the weapon is hidden</span>') : '<span class="help">enemy: none</span>') + '</td>';
-    const td = document.createElement('td'); const b = document.createElement('button'); b.textContent = 'Remove'; b.onclick = () => { adds.splice(i, 1); refresh(); }; td.appendChild(b); tr.appendChild(td);
+    tr.innerHTML = '<td class="mono">' + hx(a.number) + '</td><td class="mono">' + A.scriptBytes(a.number) + '</td><td>' + esc(a.label) + '</td><td>' + A.headOf(a.body).frames + '</td>';
+    const wtd = document.createElement('td');
+    if (party) {
+      wtd.appendChild(weaponPicker(a));
+      const fb = A.headOf(a.body).frames, fw = a.weapon ? A.headOf(a.weapon).frames : 0, note = document.createElement('span'); note.className = 'help';
+      const kimera = a.number < A.WEAPON_OFFSET ? '; KimeraCS fails showing it' : '';
+      note.textContent = a.weapon ? ' at ' + hx(a.number + A.WEAPON_OFFSET) + (fw < fb ? ': ' + fw + ' frames for ' + fb + ', the weapon disappears for the last frames' + kimera : '')
+        : a.weaponRule === 'feet' || a.weaponRule === 'idle' ? ' at ' + hx(a.number + A.WEAPON_OFFSET) + ': made at build, ' + RULE_TEXT[a.weaponRule] + ', ' + fb + ' frames'
+        : ' the weapon is hidden while it plays' + kimera;
+      wtd.appendChild(note);
+    } else wtd.innerHTML = '<span class="help">enemy: none</span>';
+    tr.appendChild(wtd);
+    const td = document.createElement('td'); const b = document.createElement('button'); b.textContent = 'Remove'; b.onclick = () => { adds.splice(i, 1); version++; refresh(); }; td.appendChild(b); tr.appendChild(td);
     tb.appendChild(tr);
   });
   if (!adds.length) tb.innerHTML = '<tr><td colspan="6" class="help">Nothing added yet.</td></tr>';
@@ -280,14 +432,42 @@ function download(name, bytes) {
   const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([bytes], { type: 'application/octet-stream' })); a.download = name;
   document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 3000);
 }
+/* Build makes the files; each is then saved by its own button, so every download starts inside a click (a browser
+   may block a second download a page starts by itself, and say nothing). */
+/* the additions as build() takes them: an added animation of a party model with no weapon track gets the one its rule
+   makes (Retarget's core, the same as the Python twin anim_retarget.weapon_when_missing) */
+function withWeapons() {
+  const party = model.kind === 'party', R = window.SKELETON_MASTER_RETARGET, feet = feetValues();
+  return adds.map(a => {
+    if (!party || a.weapon || (a.weaponRule !== 'feet' && a.weaponRule !== 'idle')) return a;
+    if (!R) throw new Error('the Retarget tab\'s core (retarget_core.js) did not load: reload the page');
+    const w = R.modelWeapon(a.weaponRule, model.aa, model.records, a.body, { feet });
+    return Object.assign({}, a, { weapon: w, weaponLabel: w ? 'made here, ' + RULE_TEXT[a.weaponRule] : null, made: w ? a.weaponRule : null });
+  });
+}
 $('b-build').onclick = () => {
-  const r = A.build(model, adds);
-  if (r.problems.length) { msg('build-msg', 'Not built:<br>' + r.problems.map(esc).join('<br>'), 'bad'); return; }
-  download(modelNames.aa, r.aa);
-  setTimeout(() => download(modelNames.da, r.da), 400);
-  const list = adds.map(a => hx(a.number) + '  play with: ' + A.scriptBytes(a.number) + '   (' + a.label + ', ' + A.headOf(a.body).frames + ' frames)').join('\n');
-  setTimeout(() => download(modelNames.da + '_added.txt', new TextEncoder().encode(modelNames.aa + ' / ' + modelNames.da + ': ' + r.count + ' animations (was ' + model.count + ')\n\n' + list + '\n' + (r.notes.length ? '\nNotes:\n' + r.notes.join('\n') + '\n' : ''))), 800);
-  msg('build-msg', 'Built: ' + r.count + ' animations (was ' + model.count + '). Downloaded ' + esc(modelNames.aa) + ', ' + esc(modelNames.da) + ' and a list of the new numbers.' + (r.notes.length ? '<br>' + r.notes.map(esc).join('<br>') : ''), r.notes.length ? 'warn' : 'ok');
+  let adds2;
+  try { adds2 = withWeapons(); } catch (err) { built = null; msg('build-msg', 'Not built: ' + esc(err.message), 'bad'); return; }
+  const r = A.build(model, adds2);
+  if (r.problems.length) { built = null; msg('build-msg', 'Not built:<br>' + r.problems.map(esc).join('<br>'), 'bad'); return; }
+  const list = adds2.map(a => hx(a.number) + '  play with: ' + A.scriptBytes(a.number) + '   (' + a.label + ', ' + A.headOf(a.body).frames + ' frames' + (model.kind === 'party' ? '; weapon track at ' + hx(a.number + A.WEAPON_OFFSET) + ': ' + (a.weapon ? (a.weaponLabel || 'its own') + ', ' + A.headOf(a.weapon).frames + ' frames' : 'none (the game\'s placeholder)') : '') + ')').join('\n');
+  const files = [[modelNames.aa, r.aa, 'the skeleton'], [modelNames.da, r.da, 'the animations'],
+    [modelNames.da + '_added.txt', new TextEncoder().encode(modelNames.aa + ' / ' + modelNames.da + ': ' + r.count + ' animations (was ' + model.count + ')\n\n' + list + '\n' + (r.notes.length ? '\nNotes:\n' + r.notes.join('\n') + '\n' : '')), 'the list of the new numbers']];
+  built = { version, files, saved: new Set() };
+  msg('build-msg', 'Built: ' + r.count + ' animations (was ' + model.count + '). Download ' + esc(modelNames.aa) + ' and ' + esc(modelNames.da) + ' with the buttons below: they belong together.' + (r.notes.length ? '<br>' + r.notes.map(esc).join('<br>') : ''), r.notes.length ? 'warn' : 'ok');
+  const row = document.createElement('div'); row.className = 'row'; const state = document.createElement('div'); state.className = 'help';
+  const tell = () => { const left = files.filter(f => !built.saved.has(f[0])).map(f => f[0]); state.textContent = built.saved.size ? 'Saved: ' + files.filter(f => built.saved.has(f[0])).map(f => f[0]).join(', ') + '.' + (left.length ? ' Not yet: ' + left.join(', ') + '.' : '') : 'Nothing downloaded yet.'; };
+  files.forEach(([name, bytes, what]) => {
+    const b = document.createElement('button'); b.textContent = 'Download ' + name; b.title = what; if (name !== files[2][0]) b.className = 'primary';
+    b.onclick = () => { download(name, bytes); built.saved.add(name); tell(); };
+    row.appendChild(b);
+  });
+  $('build-msg').appendChild(row); tell(); $('build-msg').appendChild(state);
+  if (window.SM_SCRIPTS) {   // the Scripts tab: write the scripts that play them
+    const b = document.createElement('button'); b.textContent = 'Use them in Scripts';
+    b.onclick = () => { window.SM_SCRIPTS.useModel(modelNames.aa, r.aa, modelNames.da, r.da); showTab('scripts'); };
+    $('build-msg').appendChild(b);
+  }
 };
 
 /* ---------- the table ---------- */
@@ -300,7 +480,7 @@ function renderSlots() {
   for (let i = 0; i <= last; i++) {
     let kind, frames = '', bones = '', bytes = '';
     if (byNum.has(i)) { const a = byNum.get(i); kind = '<span class="tag new">new: ' + esc(a.label) + '</span>'; frames = A.headOf(a.body).frames; bones = A.headOf(a.body).bones; bytes = A.scriptBytes(i); }
-    else if (weaponOf.has(i)) { const a = weaponOf.get(i); kind = '<span class="tag new">new weapon track of ' + hx(a.number) + '</span>'; frames = a.weapon ? A.headOf(a.weapon).frames : 1; bones = 1; }
+    else if (weaponOf.has(i)) { const a = weaponOf.get(i), mk = !a.weapon && (a.weaponRule === 'feet' || a.weaponRule === 'idle'); kind = '<span class="tag new">new weapon track of ' + hx(a.number) + (mk ? ' (made, ' + RULE_TEXT[a.weaponRule] + ')' : '') + '</span>'; frames = a.weapon ? A.headOf(a.weapon).frames : mk ? A.headOf(a.body).frames : 1; bones = 1; }
     else if (i < model.count) {
       const r = model.records[i], h = A.headOf(r); frames = h.frames; bones = h.bones;
       if (party && i >= 0x2c && i < 0x34) kind = '<span class="tag pack">limit pack (placeholder in the file)</span>';
@@ -313,7 +493,10 @@ function renderSlots() {
     tb.appendChild(tr);
   }
 }
+$('weapon-rule').onchange = () => { adds.forEach(a => { if (!a.weapon && !a.ruleSet) a.weaponRule = pageRule(); }); version++; refresh(); };
+$('weapon-feet').onchange = () => { version++; refresh(); };
 function refresh() {
+  if (built && built.version !== version) { built = null; msg('build-msg', 'Changed since the last build: build again before downloading.', 'warn'); }
   renderSources(); renderTargets(); renderAdds(); renderSlots();
   $('b-add').disabled = !model || picked === null || model.kind === 'other' || !$('target').options.length;
   $('b-build').disabled = !model || !adds.length || model.kind === 'other';
@@ -322,25 +505,31 @@ refresh();
 
 /* ---------- the Retarget tab hands animations over here ---------- */
 window.SM_ADD_SLOTS = {
-  // it: { file, index, body: Uint8Array record, weapon: Uint8Array record | null }
-  addSource(it) { sources.push(it); picked = sources.length - 1; msg('source-msg', 'Received from Retarget: ' + esc(it.file) + '. Load the target model in step 1 if it is not loaded, pick a number and add it.', 'ok'); refresh(); }
+  // it: { file, index, body: Uint8Array record, weapon: Uint8Array record | null, weaponMade: 'feet' | 'idle' | null
+  //       (Retarget made it by its rule), weaponRule: 'empty' | null (Retarget's rule left none: keep it so) }
+  addSource(it) {
+    it.label = it.label || it.file;
+    if (it.weapon) { it.weaponLabel = (it.weaponMade ? 'made ' + RULE_TEXT[it.weaponMade] + ': ' : '') + 'weapon track of ' + it.file; weapons.push({ index: it.index, rec: it.weapon, label: it.weaponLabel, file: it.file }); }
+    sources.push(it); picked = sources.length - 1; msg('source-msg', 'Received from Retarget: ' + esc(it.file) + '. Load the target model in step 1 if it is not loaded, pick a number and add it.', 'ok'); refresh(); }
 };
 
 /* ---------- tabs ---------- */
 const TAB_INTRO = {
   add: 'Add extra animations to a battle model, with no game files changed: load the model, pick animations, download the two new files.',
-  retarget: 'Move animations from one model\'s skeleton to another\'s: load both models, pair their bones, preview, download.'
+  retarget: 'Move animations from one model\'s skeleton to another\'s: load both models, pair their bones, preview, download.',
+  scripts: 'Read and change a battle model\'s action scripts (xxab): which animations each slot plays, and when. Load, edit, preview, download.'
 };
 function showTab(name) {
-  ['add', 'retarget'].forEach(t => { $('tab-' + t).hidden = t !== name; $('tab-b-' + t).classList.toggle('on', t === name); });
+  ['add', 'retarget', 'scripts'].forEach(t => { $('tab-' + t).hidden = t !== name; $('tab-b-' + t).classList.toggle('on', t === name); });
   $('tab-intro').textContent = TAB_INTRO[name];
-  try { history.replaceState(null, '', name === 'retarget' ? '#retarget' : '#'); } catch (e) {}
+  try { history.replaceState(null, '', name === 'add' ? '#' : '#' + name); } catch (e) {}
   window.dispatchEvent(new Event('sm-tab'));
 }
 window.SM_SHOW_TAB = showTab;
 $('tab-b-add').onclick = () => showTab('add');
 $('tab-b-retarget').onclick = () => showTab('retarget');
-if (location.hash === '#retarget') showTab('retarget');
+$('tab-b-scripts').onclick = () => showTab('scripts');
+if (location.hash === '#retarget' || location.hash === '#scripts') showTab(location.hash.slice(1));
 </script>
 <!-- the Retarget tab: three.js for its 3D views (needs the internet once), the retarget core, its page logic -->
 <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/build/three.min.js"></script>
@@ -348,5 +537,8 @@ if (location.hash === '#retarget') showTab('retarget');
 <script src="retarget_core.js"></script>
 <script src="ui_logic.js"></script>
 <script src="retarget_ui.js"></script>
+<!-- the Scripts tab: its core (no display code) and its page logic, which borrows the Retarget tab's 3D view -->
+<script src="ab_core.js"></script>
+<script src="ab_ui.js"></script>
 </body>
 </html>

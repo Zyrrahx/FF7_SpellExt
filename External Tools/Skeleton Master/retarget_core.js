@@ -14,7 +14,12 @@
 
    How the game poses a model (anim_retarget.py's header): each bone has three angles (x, y, z) in steps of 1/4096 of
    a turn; its rotation is Ry(y) * Rx(x) * Rz(z); a bone starts where its parent ends and runs along its own Z axis
-   for its length; entry 0 of an animation turns the whole model; up is negative Y. */
+   for its length; entry 0 of an animation turns the whole model; up is negative Y.
+
+   A weapon track when there is none to retarget (anim_retarget.weapon_when_missing): the map's
+   `weapon_when_missing = feet | idle | empty` (default feet) and `weapon_feet = SIDE FRONT LIFT` (default 250 250 30).
+   KimeraCS fails showing a party model's body whose weapon track has fewer frames than it; both made tracks have the
+   body's frame count. */
 (function (root) {
   'use strict';
 
@@ -382,6 +387,17 @@
     return /inf/i.test(t) ? (t[0] === '-' ? -Infinity : Infinity) : /nan/i.test(t) ? NaN : Number(t);
   }
   const POSE_COPY_KEYS = ['mirror', 'source_sides', 'keep', 'head', 'weapon_bone', 'weapon_reference'];
+  const WEAPON_RULES = ['feet', 'idle', 'empty'];
+  const FEET_DEFAULT = [250.0, 250.0, 30.0];          // weapon_feet: side, front, lift
+  const FEET_REST = [0, 0, 1024];                     // the weapon on its side: its X axis upright, its -Z (the blade) to the back
+  const FEET_LIMIT = 10000;                           // weapon_feet values: positions are stored in 16 bits (+-32767)
+  const FEET_FLAT = 0.05;                             // the root's forward this close to straight up or down (floor length): no heading of its own
+  /* weapon_feet [side, front, lift] -> null, or why it cannot be used */
+  function feetProblem(w) {
+    if (!Array.isArray(w) || w.length !== 3) return 'weapon_feet = SIDE FRONT LIFT (three numbers)';
+    if (!w.every(x => typeof x === 'number' && isFinite(x) && Math.abs(x) <= FEET_LIMIT)) return 'weapon_feet: SIDE FRONT LIFT must each be a number from -' + FEET_LIMIT + ' to ' + FEET_LIMIT;
+    return null;
+  }
 
   /* text of a .map -> mapping. File references stay as written (names); `resolver(name) -> bytes` (or an object
      {name: bytes}) is kept with the mapping for retarget to load them. A reference is "NAME:NN frame F" (animation
@@ -403,6 +419,16 @@
       else if (k === 'source_feet') m.source_feet = v.replace(/,/g, ' ').split(/\s+/).filter(Boolean).map(x => pyInt(x, where));
       else if (k === 'scale') m.scale = pyFloat(v, where);
       else if (k === 'source_weapon_bone' || k === 'target_weapon_bone') m[k] = pyInt(v, where);
+      else if (k === 'weapon_when_missing') {
+        if (!WEAPON_RULES.includes(v)) throw new Error(where + ': weapon_when_missing is one of ' + WEAPON_RULES.join(', ') + ', not "' + v + '"');
+        m[k] = v;
+      }
+      else if (k === 'weapon_feet') {
+        const w = v.replace(/,/g, ' ').split(/\s+/).filter(Boolean).map(x => pyFloat(x, where));
+        if (w.length !== 3) throw new Error(where + ': weapon_feet = SIDE FRONT LIFT (three numbers), not "' + v + '"');
+        const bad = feetProblem(w); if (bad) throw new Error(where + ': ' + bad + ', not "' + v + '"');
+        m[k] = w;
+      }
       else if (k === 'loose') {
         const w = v.split(/\s+/).filter(Boolean), par = Object.assign({}, LOOSE_DEFAULTS), bones = [];
         for (let i = 0; i < w.length;) {
@@ -451,6 +477,8 @@
     if (m.scale !== undefined) L.push('scale = ' + fmtNum(m.scale));
     for (const k of ['source_weapon_reference', 'target_weapon_reference']) if (m[k]) L.push(k + ' = ' + nameOk(m[k].file, k) + ' frame ' + m[k].frame);
     for (const k of ['source_weapon_bone', 'target_weapon_bone']) if (m[k] !== undefined) L.push(k + ' = ' + m[k]);
+    if (m.weapon_when_missing !== undefined) L.push('weapon_when_missing = ' + m.weapon_when_missing);
+    if (m.weapon_feet !== undefined) L.push('weapon_feet = ' + m.weapon_feet.map(fmtNum).join(' '));
     L.push('');
     Object.keys(m.pairs).map(Number).sort((a, b) => a - b).forEach(t => {
       const [s, how] = m.pairs[t];
@@ -617,6 +645,107 @@
     return { bones: 1, key: k, frames: out.map(([p, a]) => [p, a.map(v => pyRound(v / step) * step)]) };
   }
 
+  /* ------------------------------------------------------------------ a weapon track when there is none to retarget
+     (anim_retarget.weapon_hand, weapon_at_feet, weapon_in_hand, weapon_when_missing, target_weapon_reference,
+     fallback_weapon). Bodies and tracks here are raw: {bones, key, frames: [[pos, flat angles]]}. */
+
+  // the bone whose end is nearest the weapon in a reference pose (the lowest number on a tie): the hand that holds it
+  function weaponHand(ts, refFrame, weaponFrame) {
+    const [, world] = poseRaw(ts, refFrame), wp = weaponFrame[0]; let best = null;
+    for (let j = 0; j < world.length; j++) {
+      const d = [world[j][1][0] - wp[0], world[j][1][1] - wp[1], world[j][1][2] - wp[2]], dd = s3(d[0] * d[0], d[1] * d[1], d[2] * d[2]);
+      if (best === null || dd < best[0]) best = [dd, j];
+    }
+    return best[1];
+  }
+  const quantize = (out, k) => { const step = 1 << k; return { bones: 1, key: k, frames: out.map(([p, a]) => [p, a.map(v => pyRound(v / step) * step)]) }; };
+  /* lying on the floor at the feet: beside the root (x, z), turned as the whole model turns about the vertical. The
+     heading is the root's forward (its Z) on the floor; upside down (its up, R0 * [0, -1, 0], pointing down: y > 0,
+     a flip) that forward points back, so the heading is turned half round; with the forward within about 3 degrees
+     of straight up or down (floor length under FEET_FLAT) the heading of the frame before is kept (on the first frame:
+     the way the head points, or the feet when the forward points up) */
+  function feetHeading(R0, before) {
+    const f = app(R0, [0, 0, 1]), u = app(R0, [0, -1, 0]);
+    if (Math.sqrt(f[0] * f[0] + f[2] * f[2]) >= FEET_FLAT) return u[1] > 0 ? atan2(f[0], f[2]) + Math.PI : atan2(f[0], f[2]);
+    if (before !== null) return before;
+    return f[1] > 0 ? atan2(u[0], u[2]) : atan2(-u[0], -u[2]);
+  }
+  function weaponAtFeetRaw(body, feet, key) {
+    const [side, front, lift] = feet || FEET_DEFAULT, rest = fromAngles(FEET_REST[0], FEET_REST[1], FEET_REST[2]), out = [];
+    let prev = null, heading = null;
+    for (const [pos, ang] of body.frames) {
+      heading = feetHeading(fromAngles(ang[0], ang[1], ang[2]), heading);
+      const Ry = rot('y', heading), o = app(Ry, [side, 0, front]);
+      const a = toAngles(mul(Ry, rest), prev); prev = a;
+      out.push([[pyRound(pos[0] + o[0]), pyRound(-lift), pyRound(pos[2] + o[2])], a.map(pyRound)]);
+    }
+    return quantize(out, key === null || key === undefined ? body.key : key);
+  }
+  // in the hand as a reference pose holds it: the same grip on the hand bone's end, turned as the hand turns
+  function weaponInHandRaw(ts, body, hand, refFrame, weaponFrame, key) {
+    const [, twRef] = poseRaw(ts, refFrame), Rt = fromAngles(weaponFrame[1][0], weaponFrame[1][1], weaponFrame[1][2]);
+    const grip = app(tr(Rt), [0, 1, 2].map(k => weaponFrame[0][k] - twRef[hand][1][k])), rel = mul(tr(twRef[hand][0]), Rt), out = [];
+    let prev = null;
+    for (const fr of body.frames) {
+      const [, tw] = poseRaw(ts, fr), W = mul(tw[hand][0], rel), g = app(W, grip);
+      const a = toAngles(W, prev ? prev : weaponFrame[1].slice(0, 3)); prev = a;
+      out.push([[0, 1, 2].map(k => pyRound(tw[hand][1][k] + g[k])), a.map(pyRound)]);
+    }
+    return quantize(out, key === null || key === undefined ? body.key : key);
+  }
+  /* rule 'feet' | 'idle' | 'empty' -> a raw weapon track, or null for 'empty'.
+     a: {feet: [side, front, lift], refFrame, weaponFrame (the target's idle and its weapon track's frame, for 'idle'),
+     hand (null: found from those), key} */
+  function weaponWhenMissingRaw(rule, ts, body, a) {
+    a = a || {};
+    if (!WEAPON_RULES.includes(rule)) throw new Error('weapon_when_missing is one of ' + WEAPON_RULES.join(', ') + ', not "' + rule + '"');
+    if (rule === 'empty') return null;
+    if (rule === 'feet') return weaponAtFeetRaw(body, a.feet, a.key);
+    if (!a.refFrame || !a.weaponFrame) throw new Error('"idle" needs the target\'s idle and its weapon track');
+    const hand = a.hand === undefined || a.hand === null ? weaponHand(ts, a.refFrame, a.weaponFrame) : a.hand;
+    return weaponInHandRaw(ts, body, hand, a.refFrame, a.weaponFrame, a.key);
+  }
+  /* the record of an xxda that holds the idle's weapon track (the weapon reference a model's own files give), or null:
+     a party xxda's 34; a model of N bodies + M weapon tracks (16 + 16: an enemy with a weapon, such as mu) N, the
+     track of body 0. N and M: the skeleton header's dword 7 and 10 (`header`, 13 dwords) when given and they fit the
+     file; else read from the file (its bodies first, then only 1-bone records). A limit pack (16 records, 8 on of 1
+     bone) gives none. The same rule as ui_logic weaponRefIndex and anim_retarget.idle_weapon_index. */
+  function idleWeaponIndex(recs, header) {
+    const one = r => u32(r, 0) === 1, ok = i => i < recs.length && one(recs[i]) && !isPlaceholder(recs[i]);
+    if (recs.length > 0x34 && ok(0x34)) return 0x34;
+    if (!recs.length || one(recs[0])) return null;
+    if (recs.length === 16 && recs.slice(8).every(one)) return null;
+    let nb;
+    if (header && header[7] + header[10] === recs.length) nb = header[7];
+    else { nb = 0; while (nb < recs.length && !one(recs[nb])) nb++; if (!recs.slice(nb).every(one)) return null; }
+    return nb > 0 && ok(nb) ? nb : null;
+  }
+  /* the target's idle weapon track {file, frame}: the map's target_weapon_reference, or, when it names none and its
+     target_reference is animation NN of an xxda, that xxda's idle weapon track (idleWeaponIndex: 34 for a party model,
+     16 for a 16 + 16 one, by the target skeleton's header); null: no weapon tracks */
+  function targetWeaponReference(mapping, files) {
+    if (mapping.target_weapon_reference) return mapping.target_weapon_reference;
+    const ref = mapping.target_reference, spec = ref ? ref.file : '', c = spec.lastIndexOf(':');
+    if (!(c > 0 && /^[0-9a-fA-F]+$/.test(spec.slice(c + 1)))) return null;
+    const recs = readRecords(getFile(files, spec.slice(0, c)));
+    let header = null;
+    try {   // the target skeleton's header, when it is there (a missing one: the counts are read from the file)
+      const b = mapping.target_skeleton ? getFile(files, mapping.target_skeleton) : null;
+      if (b && b.length >= 52) { header = []; for (let k = 0; k < 13; k++) header.push(u32(b, k * 4)); }
+    } catch (e) { header = null; }
+    const i = idleWeaponIndex(recs, header);
+    return i === null ? null : { file: spec.slice(0, c) + ':' + i.toString(16).padStart(2, '0'), frame: 0 };
+  }
+  function fallbackWeaponRaw(mapping, body, o) {
+    const R = o.files, wref = targetWeaponReference(mapping, R);
+    if (wref === null) return null;
+    const rule = mapping.weapon_when_missing === undefined ? 'feet' : mapping.weapon_when_missing;
+    if (rule === 'empty') return null;
+    const a = { feet: mapping.weapon_feet, hand: mapping.target_weapon_bone, key: o.key };
+    if (rule === 'idle') { a.refFrame = refFrame(R, mapping.target_reference, 'target_reference'); a.weaponFrame = refFrame(R, wref, 'target_weapon_reference'); }
+    return weaponWhenMissingRaw(rule, loadSkel(R, mapping.target_skeleton, 'target_skeleton'), body, a);
+  }
+
   /* public:
      retarget(mapping, sourceRecord, options) -> decoded animation for the target skeleton (encode() it for the record)
      options: {files, style: 'pose' | 'offset', follow: true | false, key: null | 0 | 2 | 4} */
@@ -624,6 +753,26 @@
   /* retargetWeapon(mapping, sourceWeaponRecord, targetBody (what retarget returned), options) -> decoded weapon track or null */
   function retargetWeapon(mapping, weaponRecord, targetBody, options) {
     return toPublic(retargetWeaponRaw(mapping, asBytes(weaponRecord), toRaw(targetBody), opts(mapping, options)));
+  }
+  /* fallbackWeapon(mapping, targetBody (what retarget returned), options) -> the decoded weapon track the map's
+     weapon_when_missing makes for it (default feet), or null ('empty', or the target has no weapon tracks) */
+  function fallbackWeapon(mapping, targetBody, options) { return toPublic(fallbackWeaponRaw(mapping, toRaw(targetBody), opts(mapping, options))); }
+  /* targetHasWeapons(mapping, options) -> whether the map's target has weapon tracks (see targetWeaponReference) */
+  function targetHasWeapons(mapping, options) { return targetWeaponReference(mapping, opts(mapping, options).files) !== null; }
+  /* modelWeapon(rule, aaBytes, records, bodyRecord, {hand, feet, key}) -> the record of the weapon track a body added to
+     a party model gets by rule (Add slots), or null ('empty', or a placeholder body). 'idle' holds it as the model's
+     own idle (animation 00 frame 0 with its weapon track 34 frame 0) does, in `hand` or the bone nearest the weapon. */
+  function modelWeapon(rule, aaBytes, records, bodyRecord, a) {
+    a = a || {};
+    const body = decodeRaw(asBytes(bodyRecord)); if (body === null || rule === 'empty') return null;
+    const ts = skelPairs(readSkeleton(asBytes(aaBytes))), x = { feet: a.feet, hand: a.hand, key: a.key };
+    if (rule === 'idle') {
+      const i0 = records[0] ? decodeRaw(records[0]) : null, w0 = records[0x34] ? decodeRaw(records[0x34]) : null;
+      if (!i0 || !w0) throw new Error('"held as in the idle" needs the model\'s idle (00) and its weapon track (34)');
+      x.refFrame = i0.frames[0]; x.weaponFrame = w0.frames[0];
+    }
+    const t = weaponWhenMissingRaw(rule, ts, body, x);
+    return t ? encodeRaw(t) : null;
   }
   /* retargetPack(mapping, packBytes, options) -> {bytes: the new pack, report: [lines]}:
      body animations in the first half, the weapon track for each in the second */
@@ -638,7 +787,8 @@
       report.push(i.toString(16) + ': ' + bodies[i].frames.length + ' frames');
     }
     for (let i = half; i < recs.length; i++) {
-      const w = (bodies[i - half] !== undefined && mapping.target_weapon_bone !== undefined) ? retargetWeaponRaw(mapping, recs[i], bodies[i - half], o) : null;
+      let w = (bodies[i - half] !== undefined && mapping.target_weapon_bone !== undefined) ? retargetWeaponRaw(mapping, recs[i], bodies[i - half], o) : null;
+      if (w === null && bodies[i - half] !== undefined) w = fallbackWeaponRaw(mapping, bodies[i - half], o);     // by weapon_when_missing
       out[i] = w ? encodeRaw(w) : dummy(1);
     }
     let len = 4; out.forEach(r => { len += r.length; });
@@ -657,7 +807,8 @@
     reference: 'Reference poses (source_reference, target_reference): one frame of each model in which both stand the SAME way (usually frame 0 of each one\'s idle). Every movement is measured from these, so choose two that mean the same pose; the target\'s reference also supplies the angles of every unmapped bone and the scale (the ratio of the two root heights).',
     feet: 'Feet (source_feet, target_feet): the foot and toe bones of each skeleton. Each frame the target is moved up or down so its lowest foot is as high above its reference as the source\'s lowest foot is above the source\'s reference. Leave both empty to keep the scaled root height only (feet may float or sink).',
     scale: 'scale: the factor on the model\'s position (root movement). Left out, it is the target\'s root height over the source\'s in the reference poses.',
-    weapon: 'Weapon (source_weapon_reference, target_weapon_reference, target_weapon_bone): the weapon track of each body animation. The target\'s weapon turns as the source\'s turns, starting from how the target holds its own weapon in its reference (its weapon track of the idle, frame 0), and stays gripped at the end of target_weapon_bone (the hand). Without target_weapon_bone, a pack gets empty weapon tracks (the weapon is hidden).',
+    weapon: 'Weapon (source_weapon_reference, target_weapon_reference, target_weapon_bone): the weapon track of each body animation (a party model keeps it 34 further on, hex; a model of 16 bodies + 16 weapon tracks, an enemy with a weapon such as the final-duel Sephiroth mu, 16 further on; each reference is the idle\'s track, frame 0). The target\'s weapon turns as the source\'s turns, starting from how the target holds its own weapon in its reference (its weapon track of the idle, frame 0), and stays gripped at the end of target_weapon_bone (the hand). When there is no weapon track to retarget (the source has none, or there is no target_weapon_bone), "weapon when missing" makes one.',
+    whenMissing: 'Weapon when missing (weapon_when_missing): what a party model\'s weapon does in an animation that brings no weapon track of its own (a model without a weapon, or no weapon hand set). "at the feet" (the default): the weapon lies on the floor beside the feet for the whole animation, turning and moving with the model; "weapon_feet = SIDE FRONT LIFT" places its grip (default 250 to the model\'s left, 250 ahead, 30 above the floor: raise LIFT if the weapon sinks into the floor, lower it if it floats). Weapons differ: Barret\'s gun-arm needs about 450 250 70 to clear the floor and his feet; Cloud\'s sword comes close to his legs when he steps to the side. A flip (the model upside down) does not turn the weapon round. "held as in the idle": the weapon stays in the hand as the target\'s idle holds it. "empty": the game\'s placeholder; the weapon is not drawn while it plays, and KimeraCS cannot show such an animation at a number below 34. Made tracks have the body\'s frame count.',
     loose: 'loose = BONES [hang H] [stiffness S] [damping D] [gravity G] [limit DEG] (advanced): follow-through for unmapped bones (hair, cape). hang 0-1: how far a bone ignores its parent\'s turning and keeps hanging as in the reference pose (0 = carried rigidly). stiffness 0-1: how strongly it is pulled back to the rigid pose each frame (1 = rigid; default 0.3). damping 0-1: how much of its speed it keeps (default 0.6). gravity: how far its tip sinks per frame in model units (default 4). limit: the most it may bend away from the rigid pose, in degrees (default 40). Loose bones settle back to rigid over the last four frames so the animation ends as the next begins.',
     collide: 'collide = BONE RX RY [Y_OFFSET] [BELOW] [ABOVE] (advanced): an elliptical tube round a target bone (the torso) that loose bones are kept out of: RX across, RY front to back, its centre moved Y_OFFSET forward, running BELOW past the bone\'s start and ABOVE past its end.',
     style: 'Option style (advanced): "pose" (the default) uses aim and reach and places the model at the source\'s position times the scale. "offset" ignores aim and reach (every pair only follows the source\'s turning) and moves the model by the source\'s movement from its reference, scaled, starting from the target\'s reference position.',
@@ -674,7 +825,9 @@
     parseMap, writeMap, LOOSE_DEFAULTS,
     // retarget
     retarget, retargetWeapon, retargetPack,
-    HELP, _internal: { PYMATH, poseRaw, retargetRaw, retargetWeaponRaw, toPublic, toRaw }
+    // a weapon track when there is none to retarget
+    fallbackWeapon, targetHasWeapons, modelWeapon, idleWeaponIndex, feetProblem, WEAPON_RULES, FEET_DEFAULT, FEET_LIMIT,
+    HELP, _internal: { PYMATH, poseRaw, retargetRaw, retargetWeaponRaw, toPublic, toRaw, weaponHand, feetHeading, weaponAtFeetRaw, weaponInHandRaw, weaponWhenMissingRaw, targetWeaponReference, fallbackWeaponRaw }
   };
   if (typeof module !== 'undefined' && module.exports) module.exports = api; else root.SKELETON_MASTER_RETARGET = api;
 })(typeof self !== 'undefined' ? self : this);
