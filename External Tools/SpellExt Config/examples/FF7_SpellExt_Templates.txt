@@ -1,0 +1,92 @@
+; FF7 SpellExt Config - your templates. This file is the config tool's; the DLL does not read it.
+;
+; An EXAMPLE file: three templates built on the game's own records only (the bases are KERNEL.BIN's), to show the
+; format. To use them: Import this file on the Library page (Import adds its templates to your own
+; SpellExtConfig\FF7_SpellExt_Templates.txt, which the Library lists as "yours"), or, when you have no such file yet,
+; copy this one there under that name. Your file is edited on the Library page (Save as template, Import, Export,
+; Remove) or as raw text under Other text.
+;
+; A template:
+;   [template ID]                      starts one; the id is letters, digits, _ and -
+;   title = ...                        shown on the card
+;   kind = item                        the section kind of its first part
+;   file = FF7_SpellExt_Items.ini      the file of its first part
+;   note = ...                         (any number of them) shown on the card
+;   warn = ...                         (any number) shown on the preview
+;   placeholder = NAME, type, default, label
+;                                      a default with commas goes in double quotes: "3000, 18000"
+;   derived = NAME = expression; word = number    integers: + - * / min( ) max( ); computed, not asked
+;   position = end                     or after:[header], before:[header], into:[header], into:[header] create
+;   repeat = N                         (a part) emitted N times; NAME# placeholders count the copies
+;   lines                              the body: every line after it indented by four spaces (or a tab);
+;                                      a blank line ends the body (write a blank body line as four spaces)
+;   part = FILE                        another part of the same template: kind, position, repeat, lines
+; In a body <NAME> is a placeholder; any other < is plain text. A comment after a value starts with " ;".
+; Types: id, text31, text95, int(a..b) (with |word for words: int(0..9999)|all), enum(a,b,c), element,
+; elements, status, statuses, status24, target, equip, bonus(2), bonus(4), slots, kernel(weapon|armour|accessory|
+; item|attack|materia), animation, materia_ref, shop_ref, shop_entry, ap, uses, attributes, commands,
+; materia_attr(BASE), materia_grant, kernel_spells, materia_list, count(a..b), value (any one-line value).
+
+[template example_hi_tonic]
+title = Hi-Potion style item
+kind = item
+file = FF7_SpellExt_Items.ini
+note = Copies the Hi-Potion (kernel item 1): in battle 20 HP per point of strength, so 1000 HP is strength 50.
+placeholder = ID, id
+placeholder = NAME, text31, Hi-Tonic, Name
+placeholder = DESC, text95, Restores 1000 HP, Description
+placeholder = HP, int(0..9999), 1000, HP restored (battle and menu)
+placeholder = PRICE, int(0..2147483647), 600, Price
+derived = STRENGTH = min(255, HP / 20)
+lines
+    [<ID>]
+    name = <NAME>
+    description = <DESC>
+    base = 1                ; Hi-Potion
+    strength = <STRENGTH>   ; 20 HP per point
+    menu_hp = <HP>
+    price = <PRICE>
+
+[template example_twin_spells]
+title = Materia with two new spells
+kind = materia
+file = FF7_SpellExt_Materia.ini
+note = A materia and N spells in the spell file (a repeated part); the spells line names them all (a repeat segment).
+note = The spells copy Ice (kernel attack 0x1e).
+note = Spell N is learned at level N: give at least N - 1 AP totals (the default two make 3 levels, for up to 3 spells).
+placeholder = M, id
+placeholder = NAME, text31, Twin Frost, Materia name
+placeholder = AP, ap, "4000, 20000", AP totals
+placeholder = PRICE, int(0..2147483647), 2000, Price
+placeholder = N, count(1..3), 2, Number of spells
+lines
+    [<M>]
+    name = <NAME>
+    kind = magic
+    ap = <AP>
+    kernel_spells = none
+    spells = <S#:#{, }>     ; S1 at level 1, S2 at level 2 ...
+    equip_effect = 11
+    element = ice
+    price = <PRICE>
+part = FF7_SpellExt_Spells.ini
+kind = spell
+placeholder = S#, id
+placeholder = SNAME#, text31, Frost #, Name of spell #
+placeholder = MP#, int(0..999), 6, MP of spell #
+repeat = N
+lines
+    [<S#>]
+    name = <SNAME#>
+    base = 0x1e             ; Ice
+    mp = <MP#>
+
+[template example_sell_potion]
+title = Sell Potions in a shop
+kind = shop
+file = FF7_SpellExt_Shops.ini
+note = Puts the Potion (item 0) on sale in a shop of your choice (the shops file's table lists them).
+placeholder = SHOP, shop_ref, 3, Shop number
+position = into:[<SHOP>] create
+lines
+    add = 0                 ; Potion

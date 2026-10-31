@@ -1,0 +1,8 @@
+{
+  "name": "spellext-config",
+  "productName": "SpellExt Config",
+  "version": "0.8.3",
+  "description": "SpellExt Config: the editor of the SpellExt .ini files, as a desktop app",
+  "main": "main/main.js",
+  "type": "module"
+}

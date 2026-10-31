@@ -1,0 +1,2711 @@
+; FF7 SpellExt Config - the built-in templates. This file is the config tool's; the DLL does not read it.
+; The format is the one of FF7_SpellExt_Templates.txt (the user's): see the tool's README, "Templates".
+;
+; Every template comes from the game's own data only: the bases and their names from KERNEL.BIN (read
+; 2026-10-27/28), the values and words from the readmes and the readers. Optional keys are commented out, so the
+; user turns them on; testing aids are always commented out. A template proves only that the DLL would log nothing
+; new: what the thing does in play is the readme's word, not seen in the game.
+;
+; Placeholders: NAME, type, default, label. A default with commas is written in double quotes.
+
+; ==== Items (FF7_SpellExt_Items.ini) ===============================================================================
+
+[template item_restore_hp]
+title = Restore HP item
+kind = item
+file = FF7_SpellExt_Items.ini
+note = Copies the Potion (kernel item 0). In battle it restores 20 HP per point of strength (a Potion's 5 restores 100), so strength is HP / 20, 255 at most; menu_hp is what it restores from the Item menu.
+note = With HP = all, strength is 255: in battle it then restores 20 x 255 = 5100 HP, not all.
+placeholder = ID, id
+placeholder = NAME, text31, Tonic, Name
+placeholder = DESC, text95, Restores HP, Description
+placeholder = HP, int(0..9999)|all, 500, HP restored in the menu
+placeholder = PRICE, int(0..2147483647), 300, Price
+derived = STRENGTH = min(255, HP / 20); all = 255
+lines
+    [<ID>]
+    name = <NAME>
+    description = <DESC>
+    base = 0                ; Potion: its use in battle, with the strength below
+    strength = <STRENGTH>   ; a Potion's is 5 and restores 100 HP: 20 HP per point, 255 at most
+    menu_hp = <HP>
+    price = <PRICE>
+    ;give_on_load = yes     ; testing aid: one in the stock whenever a save is loaded; remove when done
+
+[template item_restore_mp]
+title = Restore MP item
+kind = item
+file = FF7_SpellExt_Items.ini
+note = Copies the Ether (kernel item 3). In battle it restores 20 MP per point of strength (an Ether's 5 restores 100), so strength is MP / 20, 255 at most; menu_mp is what it restores from the Item menu.
+placeholder = ID, id
+placeholder = NAME, text31, Tincture, Name
+placeholder = DESC, text95, Restores MP, Description
+placeholder = MP, int(0..9999)|all, 200, MP restored in the menu
+placeholder = PRICE, int(0..2147483647), 1500, Price
+derived = STRENGTH = min(255, MP / 20); all = 255
+lines
+    [<ID>]
+    name = <NAME>
+    description = <DESC>
+    base = 3                ; Ether: its use in battle, with the strength below
+    strength = <STRENGTH>   ; an Ether's is 5 and restores 100 MP: 20 MP per point, 255 at most
+    menu_mp = <MP>
+    price = <PRICE>
+    ;give_on_load = yes     ; testing aid: one in the stock whenever a save is loaded; remove when done
+
+[template item_full_restore]
+title = Full restore item
+kind = item
+file = FF7_SpellExt_Items.ini
+note = Copies the Elixir (kernel item 5): all HP and MP, in battle as the Elixir and from the Item menu.
+placeholder = ID, id
+placeholder = NAME, text31, Panacea, Name
+placeholder = DESC, text95, Fully restores HP and MP, Description
+placeholder = PRICE, int(0..2147483647), 5000, Price
+lines
+    [<ID>]
+    name = <NAME>
+    description = <DESC>
+    base = 5                ; Elixir
+    menu_hp = all
+    menu_mp = all
+    price = <PRICE>
+    ;give_on_load = yes     ; testing aid: one in the stock whenever a save is loaded; remove when done
+
+[template item_revive]
+title = Revive item
+kind = item
+file = FF7_SpellExt_Items.ini
+note = Copies the Phoenix Down (kernel item 7) in battle. A menu revive is not available to a new item: from the menu a new item has only menu_hp and menu_mp.
+placeholder = ID, id
+placeholder = NAME, text31, Rising Feather, Name
+placeholder = DESC, text95, Revives a fallen ally, Description
+placeholder = PRICE, int(0..2147483647), 300, Price
+lines
+    [<ID>]
+    name = <NAME>
+    description = <DESC>
+    base = 7                ; Phoenix Down
+    battle = yes
+    price = <PRICE>
+    ;give_on_load = yes     ; testing aid: one in the stock whenever a save is loaded; remove when done
+
+[template item_cure_status]
+title = Cure status item
+kind = item
+file = FF7_SpellExt_Items.ini
+note = Copies the Antidote (kernel item 8) or the Remedy (15) and names the statuses it cures.
+placeholder = ID, id
+placeholder = NAME, text31, Cleanser, Name
+placeholder = DESC, text95, Cures status ailments, Description
+placeholder = BASE, enum(8,15), 8, Base (8 Antidote, 15 Remedy)
+placeholder = STATUSES, statuses, poison, Statuses it cures
+placeholder = PRICE, int(0..2147483647), 80, Price
+lines
+    [<ID>]
+    name = <NAME>
+    description = <DESC>
+    base = <BASE>           ; 8 Antidote, 15 Remedy
+    status = <STATUSES>
+    price = <PRICE>
+    ;give_on_load = yes     ; testing aid: one in the stock whenever a save is loaded; remove when done
+
+[template item_attack]
+title = Attack item
+kind = item
+file = FF7_SpellExt_Items.ini
+note = Copies a battle item that deals damage: 20 Grenade, 30 Fire Fang, 32 Antarctic Wind, 34 Bolt Plume (kernel items).
+placeholder = ID, id
+placeholder = NAME, text31, Blast Shell, Name
+placeholder = DESC, text95, Damages enemies, Description
+placeholder = BASE, enum(20,30,32,34), 20, Base (20 Grenade, 30 Fire Fang, 32 Antarctic Wind, 34 Bolt Plume)
+placeholder = STR, int(0..255), 20, Strength
+placeholder = ELEMENT, elements, fire, Element
+placeholder = PRICE, int(0..2147483647), 150, Price
+lines
+    [<ID>]
+    name = <NAME>
+    description = <DESC>
+    base = <BASE>           ; 20 Grenade, 30 Fire Fang, 32 Antarctic Wind, 34 Bolt Plume
+    strength = <STR>
+    element = <ELEMENT>
+    ;target = selectable enemy multiple
+    ;damage_formula =
+    price = <PRICE>
+    ;give_on_load = yes     ; testing aid: one in the stock whenever a save is loaded; remove when done
+
+[template item_inflict_status]
+title = Inflict status item
+kind = item
+file = FF7_SpellExt_Items.ini
+note = Copies the Dream Powder (kernel item 26) or the Spider Web (25). status_chance is the record's status byte, not a percent.
+placeholder = ID, id
+placeholder = NAME, text31, Sleep Dust, Name
+placeholder = DESC, text95, Inflicts a status on enemies, Description
+placeholder = BASE, enum(26,25), 26, Base (26 Dream Powder, 25 Spider Web)
+placeholder = STATUSES, statuses, sleep, Statuses it inflicts
+placeholder = CHANCE, int(0..255), 255, status_chance (the record's byte)
+placeholder = PRICE, int(0..2147483647), 150, Price
+lines
+    [<ID>]
+    name = <NAME>
+    description = <DESC>
+    base = <BASE>           ; 26 Dream Powder, 25 Spider Web
+    status = <STATUSES>
+    status_chance = <CHANCE> ; the record's status byte, not a percent
+    price = <PRICE>
+    ;give_on_load = yes     ; testing aid: one in the stock whenever a save is loaded; remove when done
+
+[template item_trinket]
+title = Trinket (sold, no use)
+kind = item
+file = FF7_SpellExt_Items.ini
+note = A sellable thing with no use: the Potion's record with battle use off.
+placeholder = ID, id
+placeholder = NAME, text31, Trinket, Name
+placeholder = DESC, text95, A curious keepsake, Description
+placeholder = PRICE, int(0..2147483647), 1000, Price
+lines
+    [<ID>]
+    name = <NAME>
+    description = <DESC>
+    base = 0                ; Potion
+    battle = no
+    sell = yes
+    price = <PRICE>
+    ;give_on_load = yes     ; testing aid: one in the stock whenever a save is loaded; remove when done
+
+; ==== Weapons (FF7_SpellExt_Weapons.ini) ===========================================================================
+; One body; the base decides the battle model, the attack animation, the throw effect and the icon (the Weapons
+; readme), so each class template starts from a kernel weapon of that class.
+
+[template weapon_sword]
+title = Sword (Cloud's class)
+kind = weapon
+file = FF7_SpellExt_Weapons.ini
+note = Base 1 Mythril Saber (kernel weapon 1; 0 Buster Sword cannot be thrown).
+placeholder = ID, id
+placeholder = NAME, text31, Steel Blade, Name
+placeholder = DESC, text95, A sturdy sword, Description
+placeholder = BASE, kernel(weapon), 1, Base (a kernel weapon of the class)
+placeholder = POWER, int(0..255), 30, Power
+placeholder = ACCURACY, int(0..255), 100, Accuracy
+placeholder = GROWTH, enum(0,1,2,3), 1, Growth (0 none, 1 normal, 2 double, 3 triple)
+placeholder = SLOTS, slots, pair single, Materia slots
+placeholder = BONUS, bonus(4), none, Stat bonus
+placeholder = EQUIP, equip, cloud, Who equips it
+placeholder = ICON, enum(sword,glove,gunarm,headdress,staff,spear,shuriken,megaphone,gun), sword, Icon
+placeholder = THROW, enum(yes,no), no, Can be thrown
+placeholder = PRICE, int(0..2147483647), 1000, Price
+lines
+    [<ID>]
+    name = <NAME>
+    description = <DESC>
+    base = <BASE>                ; decides the battle model, the attack animation, the throw effect and the icon
+    power = <POWER>
+    accuracy = <ACCURACY>
+    ;critical =
+    growth = <GROWTH>            ; a NUMBER for weapons: 0 none, 1 normal, 2 double, 3 triple (armour takes words)
+    slots = <SLOTS>
+    bonus = <BONUS>
+    ;element =
+    equip = <EQUIP>
+    ;icon = <ICON>               ; only when it should differ from the base's
+    sell = yes
+    throw = <THROW>
+    ;throw_like = 1              ; needed with throw = yes on a base that has no throw effect
+    price = <PRICE>
+    ;give_on_load = yes          ; testing aid: one in the stock whenever a save is loaded; remove when done
+
+[template weapon_glove]
+title = Glove (Tifa's class)
+kind = weapon
+file = FF7_SpellExt_Weapons.ini
+note = Base 16 Leather Glove (kernel weapon 16).
+placeholder = ID, id
+placeholder = NAME, text31, Steel Knuckle, Name
+placeholder = DESC, text95, A fighting glove, Description
+placeholder = BASE, kernel(weapon), 16, Base (a kernel weapon of the class)
+placeholder = POWER, int(0..255), 30, Power
+placeholder = ACCURACY, int(0..255), 100, Accuracy
+placeholder = GROWTH, enum(0,1,2,3), 1, Growth (0 none, 1 normal, 2 double, 3 triple)
+placeholder = SLOTS, slots, pair single, Materia slots
+placeholder = BONUS, bonus(4), none, Stat bonus
+placeholder = EQUIP, equip, tifa, Who equips it
+placeholder = ICON, enum(sword,glove,gunarm,headdress,staff,spear,shuriken,megaphone,gun), glove, Icon
+placeholder = THROW, enum(yes,no), no, Can be thrown
+placeholder = PRICE, int(0..2147483647), 1000, Price
+lines
+    [<ID>]
+    name = <NAME>
+    description = <DESC>
+    base = <BASE>                ; decides the battle model, the attack animation, the throw effect and the icon
+    power = <POWER>
+    accuracy = <ACCURACY>
+    ;critical =
+    growth = <GROWTH>            ; a NUMBER for weapons: 0 none, 1 normal, 2 double, 3 triple (armour takes words)
+    slots = <SLOTS>
+    bonus = <BONUS>
+    ;element =
+    equip = <EQUIP>
+    ;icon = <ICON>               ; only when it should differ from the base's
+    sell = yes
+    throw = <THROW>
+    ;throw_like = 1              ; needed with throw = yes on a base that has no throw effect
+    price = <PRICE>
+    ;give_on_load = yes          ; testing aid: one in the stock whenever a save is loaded; remove when done
+
+[template weapon_gunarm]
+title = Gun-arm (Barret's class)
+kind = weapon
+file = FF7_SpellExt_Weapons.ini
+note = Base 32 Gatling Gun (kernel weapon 32).
+placeholder = ID, id
+placeholder = NAME, text31, Steel Cannon, Name
+placeholder = DESC, text95, A gun-arm, Description
+placeholder = BASE, kernel(weapon), 32, Base (a kernel weapon of the class)
+placeholder = POWER, int(0..255), 30, Power
+placeholder = ACCURACY, int(0..255), 100, Accuracy
+placeholder = GROWTH, enum(0,1,2,3), 1, Growth (0 none, 1 normal, 2 double, 3 triple)
+placeholder = SLOTS, slots, pair single, Materia slots
+placeholder = BONUS, bonus(4), none, Stat bonus
+placeholder = EQUIP, equip, barret, Who equips it
+placeholder = ICON, enum(sword,glove,gunarm,headdress,staff,spear,shuriken,megaphone,gun), gunarm, Icon
+placeholder = THROW, enum(yes,no), no, Can be thrown
+placeholder = PRICE, int(0..2147483647), 1000, Price
+lines
+    [<ID>]
+    name = <NAME>
+    description = <DESC>
+    base = <BASE>                ; decides the battle model, the attack animation, the throw effect and the icon
+    power = <POWER>
+    accuracy = <ACCURACY>
+    ;critical =
+    growth = <GROWTH>            ; a NUMBER for weapons: 0 none, 1 normal, 2 double, 3 triple (armour takes words)
+    slots = <SLOTS>
+    bonus = <BONUS>
+    ;element =
+    equip = <EQUIP>
+    ;icon = <ICON>               ; only when it should differ from the base's
+    sell = yes
+    throw = <THROW>
+    ;throw_like = 1              ; needed with throw = yes on a base that has no throw effect
+    price = <PRICE>
+    ;give_on_load = yes          ; testing aid: one in the stock whenever a save is loaded; remove when done
+
+[template weapon_clip]
+title = Headdress clip (Red XIII's class)
+kind = weapon
+file = FF7_SpellExt_Weapons.ini
+note = Base 48 Mythril Clip (kernel weapon 48).
+placeholder = ID, id
+placeholder = NAME, text31, Steel Clip, Name
+placeholder = DESC, text95, A headdress clip, Description
+placeholder = BASE, kernel(weapon), 48, Base (a kernel weapon of the class)
+placeholder = POWER, int(0..255), 30, Power
+placeholder = ACCURACY, int(0..255), 100, Accuracy
+placeholder = GROWTH, enum(0,1,2,3), 1, Growth (0 none, 1 normal, 2 double, 3 triple)
+placeholder = SLOTS, slots, pair single, Materia slots
+placeholder = BONUS, bonus(4), none, Stat bonus
+placeholder = EQUIP, equip, red, Who equips it
+placeholder = ICON, enum(sword,glove,gunarm,headdress,staff,spear,shuriken,megaphone,gun), headdress, Icon
+placeholder = THROW, enum(yes,no), no, Can be thrown
+placeholder = PRICE, int(0..2147483647), 1000, Price
+lines
+    [<ID>]
+    name = <NAME>
+    description = <DESC>
+    base = <BASE>                ; decides the battle model, the attack animation, the throw effect and the icon
+    power = <POWER>
+    accuracy = <ACCURACY>
+    ;critical =
+    growth = <GROWTH>            ; a NUMBER for weapons: 0 none, 1 normal, 2 double, 3 triple (armour takes words)
+    slots = <SLOTS>
+    bonus = <BONUS>
+    ;element =
+    equip = <EQUIP>
+    ;icon = <ICON>               ; only when it should differ from the base's
+    sell = yes
+    throw = <THROW>
+    ;throw_like = 1              ; needed with throw = yes on a base that has no throw effect
+    price = <PRICE>
+    ;give_on_load = yes          ; testing aid: one in the stock whenever a save is loaded; remove when done
+
+[template weapon_staff]
+title = Staff (Aeris's class)
+kind = weapon
+file = FF7_SpellExt_Weapons.ini
+note = Base 62 Guard Stick (kernel weapon 62).
+placeholder = ID, id
+placeholder = NAME, text31, Oak Staff, Name
+placeholder = DESC, text95, A wooden staff, Description
+placeholder = BASE, kernel(weapon), 62, Base (a kernel weapon of the class)
+placeholder = POWER, int(0..255), 30, Power
+placeholder = ACCURACY, int(0..255), 100, Accuracy
+placeholder = GROWTH, enum(0,1,2,3), 1, Growth (0 none, 1 normal, 2 double, 3 triple)
+placeholder = SLOTS, slots, pair single, Materia slots
+placeholder = BONUS, bonus(4), none, Stat bonus
+placeholder = EQUIP, equip, aeris, Who equips it
+placeholder = ICON, enum(sword,glove,gunarm,headdress,staff,spear,shuriken,megaphone,gun), staff, Icon
+placeholder = THROW, enum(yes,no), no, Can be thrown
+placeholder = PRICE, int(0..2147483647), 1000, Price
+lines
+    [<ID>]
+    name = <NAME>
+    description = <DESC>
+    base = <BASE>                ; decides the battle model, the attack animation, the throw effect and the icon
+    power = <POWER>
+    accuracy = <ACCURACY>
+    ;critical =
+    growth = <GROWTH>            ; a NUMBER for weapons: 0 none, 1 normal, 2 double, 3 triple (armour takes words)
+    slots = <SLOTS>
+    bonus = <BONUS>
+    ;element =
+    equip = <EQUIP>
+    ;icon = <ICON>               ; only when it should differ from the base's
+    sell = yes
+    throw = <THROW>
+    ;throw_like = 1              ; needed with throw = yes on a base that has no throw effect
+    price = <PRICE>
+    ;give_on_load = yes          ; testing aid: one in the stock whenever a save is loaded; remove when done
+
+[template weapon_spear]
+title = Spear (Cid's class)
+kind = weapon
+file = FF7_SpellExt_Weapons.ini
+note = Base 73 Spear (kernel weapon 73).
+placeholder = ID, id
+placeholder = NAME, text31, Steel Pike, Name
+placeholder = DESC, text95, A long spear, Description
+placeholder = BASE, kernel(weapon), 73, Base (a kernel weapon of the class)
+placeholder = POWER, int(0..255), 30, Power
+placeholder = ACCURACY, int(0..255), 100, Accuracy
+placeholder = GROWTH, enum(0,1,2,3), 1, Growth (0 none, 1 normal, 2 double, 3 triple)
+placeholder = SLOTS, slots, pair single, Materia slots
+placeholder = BONUS, bonus(4), none, Stat bonus
+placeholder = EQUIP, equip, cid, Who equips it
+placeholder = ICON, enum(sword,glove,gunarm,headdress,staff,spear,shuriken,megaphone,gun), spear, Icon
+placeholder = THROW, enum(yes,no), no, Can be thrown
+placeholder = PRICE, int(0..2147483647), 1000, Price
+lines
+    [<ID>]
+    name = <NAME>
+    description = <DESC>
+    base = <BASE>                ; decides the battle model, the attack animation, the throw effect and the icon
+    power = <POWER>
+    accuracy = <ACCURACY>
+    ;critical =
+    growth = <GROWTH>            ; a NUMBER for weapons: 0 none, 1 normal, 2 double, 3 triple (armour takes words)
+    slots = <SLOTS>
+    bonus = <BONUS>
+    ;element =
+    equip = <EQUIP>
+    ;icon = <ICON>               ; only when it should differ from the base's
+    sell = yes
+    throw = <THROW>
+    ;throw_like = 1              ; needed with throw = yes on a base that has no throw effect
+    price = <PRICE>
+    ;give_on_load = yes          ; testing aid: one in the stock whenever a save is loaded; remove when done
+
+[template weapon_shuriken]
+title = Shuriken (Yuffie's class)
+kind = weapon
+file = FF7_SpellExt_Weapons.ini
+note = Base 87 4-point Shuriken (kernel weapon 87).
+placeholder = ID, id
+placeholder = NAME, text31, Steel Star, Name
+placeholder = DESC, text95, A throwing star, Description
+placeholder = BASE, kernel(weapon), 87, Base (a kernel weapon of the class)
+placeholder = POWER, int(0..255), 30, Power
+placeholder = ACCURACY, int(0..255), 100, Accuracy
+placeholder = GROWTH, enum(0,1,2,3), 1, Growth (0 none, 1 normal, 2 double, 3 triple)
+placeholder = SLOTS, slots, pair single, Materia slots
+placeholder = BONUS, bonus(4), none, Stat bonus
+placeholder = EQUIP, equip, yuffie, Who equips it
+placeholder = ICON, enum(sword,glove,gunarm,headdress,staff,spear,shuriken,megaphone,gun), shuriken, Icon
+placeholder = THROW, enum(yes,no), no, Can be thrown
+placeholder = PRICE, int(0..2147483647), 1000, Price
+lines
+    [<ID>]
+    name = <NAME>
+    description = <DESC>
+    base = <BASE>                ; decides the battle model, the attack animation, the throw effect and the icon
+    power = <POWER>
+    accuracy = <ACCURACY>
+    ;critical =
+    growth = <GROWTH>            ; a NUMBER for weapons: 0 none, 1 normal, 2 double, 3 triple (armour takes words)
+    slots = <SLOTS>
+    bonus = <BONUS>
+    ;element =
+    equip = <EQUIP>
+    ;icon = <ICON>               ; only when it should differ from the base's
+    sell = yes
+    throw = <THROW>
+    ;throw_like = 1              ; needed with throw = yes on a base that has no throw effect
+    price = <PRICE>
+    ;give_on_load = yes          ; testing aid: one in the stock whenever a save is loaded; remove when done
+
+[template weapon_megaphone]
+title = Megaphone (Cait Sith's class)
+kind = weapon
+file = FF7_SpellExt_Weapons.ini
+note = Base 101 Yellow M-phone (kernel weapon 101).
+placeholder = ID, id
+placeholder = NAME, text31, Steel M-phone, Name
+placeholder = DESC, text95, A megaphone, Description
+placeholder = BASE, kernel(weapon), 101, Base (a kernel weapon of the class)
+placeholder = POWER, int(0..255), 30, Power
+placeholder = ACCURACY, int(0..255), 100, Accuracy
+placeholder = GROWTH, enum(0,1,2,3), 1, Growth (0 none, 1 normal, 2 double, 3 triple)
+placeholder = SLOTS, slots, pair single, Materia slots
+placeholder = BONUS, bonus(4), none, Stat bonus
+placeholder = EQUIP, equip, caitsith, Who equips it
+placeholder = ICON, enum(sword,glove,gunarm,headdress,staff,spear,shuriken,megaphone,gun), megaphone, Icon
+placeholder = THROW, enum(yes,no), no, Can be thrown
+placeholder = PRICE, int(0..2147483647), 1000, Price
+lines
+    [<ID>]
+    name = <NAME>
+    description = <DESC>
+    base = <BASE>                ; decides the battle model, the attack animation, the throw effect and the icon
+    power = <POWER>
+    accuracy = <ACCURACY>
+    ;critical =
+    growth = <GROWTH>            ; a NUMBER for weapons: 0 none, 1 normal, 2 double, 3 triple (armour takes words)
+    slots = <SLOTS>
+    bonus = <BONUS>
+    ;element =
+    equip = <EQUIP>
+    ;icon = <ICON>               ; only when it should differ from the base's
+    sell = yes
+    throw = <THROW>
+    ;throw_like = 1              ; needed with throw = yes on a base that has no throw effect
+    price = <PRICE>
+    ;give_on_load = yes          ; testing aid: one in the stock whenever a save is loaded; remove when done
+
+[template weapon_gun]
+title = Gun (Vincent's class)
+kind = weapon
+file = FF7_SpellExt_Weapons.ini
+note = Base 114 Quicksilver (kernel weapon 114).
+placeholder = ID, id
+placeholder = NAME, text31, Long Gun, Name
+placeholder = DESC, text95, A long-barrelled gun, Description
+placeholder = BASE, kernel(weapon), 114, Base (a kernel weapon of the class)
+placeholder = POWER, int(0..255), 30, Power
+placeholder = ACCURACY, int(0..255), 100, Accuracy
+placeholder = GROWTH, enum(0,1,2,3), 1, Growth (0 none, 1 normal, 2 double, 3 triple)
+placeholder = SLOTS, slots, pair single, Materia slots
+placeholder = BONUS, bonus(4), none, Stat bonus
+placeholder = EQUIP, equip, vincent, Who equips it
+placeholder = ICON, enum(sword,glove,gunarm,headdress,staff,spear,shuriken,megaphone,gun), gun, Icon
+placeholder = THROW, enum(yes,no), no, Can be thrown
+placeholder = PRICE, int(0..2147483647), 1000, Price
+lines
+    [<ID>]
+    name = <NAME>
+    description = <DESC>
+    base = <BASE>                ; decides the battle model, the attack animation, the throw effect and the icon
+    power = <POWER>
+    accuracy = <ACCURACY>
+    ;critical =
+    growth = <GROWTH>            ; a NUMBER for weapons: 0 none, 1 normal, 2 double, 3 triple (armour takes words)
+    slots = <SLOTS>
+    bonus = <BONUS>
+    ;element =
+    equip = <EQUIP>
+    ;icon = <ICON>               ; only when it should differ from the base's
+    sell = yes
+    throw = <THROW>
+    ;throw_like = 1              ; needed with throw = yes on a base that has no throw effect
+    price = <PRICE>
+    ;give_on_load = yes          ; testing aid: one in the stock whenever a save is loaded; remove when done
+
+[template weapon_new_character]
+title = Weapon for a new character
+kind = weapon
+file = FF7_SpellExt_Weapons.ini
+note = For a character of the characters file. Pick the base from the class its battle_like original wields: the base decides the battle model, the attack animation, the throw effect and the icon (the Weapons readme).
+note = equip takes the new character's name as the characters file has it, or its ID (12 to 43).
+placeholder = ID, id
+placeholder = NAME, text31, Heirloom Blade, Name
+placeholder = DESC, text95, A weapon of its own, Description
+placeholder = BASE, kernel(weapon), 1, Base (a kernel weapon)
+placeholder = POWER, int(0..255), 30, Power
+placeholder = ACCURACY, int(0..255), 100, Accuracy
+placeholder = GROWTH, enum(0,1,2,3), 1, Growth (0 none, 1 normal, 2 double, 3 triple)
+placeholder = SLOTS, slots, pair single, Materia slots
+placeholder = BONUS, bonus(4), none, Stat bonus
+placeholder = CHARACTER, equip, cloud, Who equips it (a name from the characters file, or its ID 12-43)
+placeholder = ICON, enum(sword,glove,gunarm,headdress,staff,spear,shuriken,megaphone,gun), sword, Icon (the class of the base)
+placeholder = THROW, enum(yes,no), no, Can be thrown
+placeholder = PRICE, int(0..2147483647), 1000, Price
+lines
+    [<ID>]
+    name = <NAME>
+    description = <DESC>
+    base = <BASE>                ; decides the battle model, the attack animation, the throw effect and the icon
+    ;model =
+    power = <POWER>
+    accuracy = <ACCURACY>
+    ;critical =
+    growth = <GROWTH>            ; a NUMBER for weapons: 0 none, 1 normal, 2 double, 3 triple (armour takes words)
+    slots = <SLOTS>
+    bonus = <BONUS>
+    ;element =
+    equip = <CHARACTER>
+    icon = <ICON>
+    sell = yes
+    throw = <THROW>
+    ;throw_like = 1              ; needed with throw = yes on a base that has no throw effect
+    price = <PRICE>
+    ;give_on_load = yes          ; testing aid: one in the stock whenever a save is loaded; remove when done
+
+; ==== Armour (FF7_SpellExt_Armour.ini) =============================================================================
+
+[template armour_basic]
+title = Armour
+kind = armour
+file = FF7_SpellExt_Armour.ini
+note = Base 0 Bronze Bangle (kernel armour 0).
+placeholder = ID, id
+placeholder = NAME, text31, Steel Bangle, Name
+placeholder = DESC, text95, A plain armlet, Description
+placeholder = DEF, int(0..255), 30, Defense
+placeholder = MDEF, int(0..255), 20, Magic defense
+placeholder = EVADE, int(0..255), 0, Evade
+placeholder = GROWTH, enum(none,normal,double,triple), normal, Growth
+placeholder = SLOTS, slots, pair single, Materia slots
+placeholder = BONUS, bonus(4), none, Stat bonus
+placeholder = EQUIP, equip, everyone, Who equips it
+placeholder = PRICE, int(0..2147483647), 1000, Price
+lines
+    [<ID>]
+    name = <NAME>
+    description = <DESC>
+    base = 0                     ; Bronze Bangle
+    defense = <DEF>
+    magic_defense = <MDEF>
+    evade = <EVADE>
+    ;magic_evade =
+    growth = <GROWTH>            ; words for armour: none, normal, double, triple
+    slots = <SLOTS>
+    bonus = <BONUS>
+    equip = <EQUIP>
+    price = <PRICE>
+    ;give_on_load = yes          ; testing aid: one in the stock whenever a save is loaded; remove when done
+
+[template armour_slots]
+title = Armour with many slots
+kind = armour
+file = FF7_SpellExt_Armour.ini
+note = Base 21 Four Slots (kernel armour 21): low defense, linked slots.
+placeholder = ID, id
+placeholder = NAME, text31, Linked Band, Name
+placeholder = DESC, text95, Low defense but many linked slots, Description
+placeholder = DEF, int(0..255), 10, Defense
+placeholder = MDEF, int(0..255), 10, Magic defense
+placeholder = EVADE, int(0..255), 0, Evade
+placeholder = GROWTH, enum(none,normal,double,triple), normal, Growth
+placeholder = SLOTS, slots, chain4, Materia slots
+placeholder = BONUS, bonus(4), none, Stat bonus
+placeholder = EQUIP, equip, everyone, Who equips it
+placeholder = PRICE, int(0..2147483647), 1000, Price
+lines
+    [<ID>]
+    name = <NAME>
+    description = <DESC>
+    base = 21                    ; Four Slots
+    defense = <DEF>
+    magic_defense = <MDEF>
+    evade = <EVADE>
+    ;magic_evade =
+    growth = <GROWTH>            ; words for armour: none, normal, double, triple
+    slots = <SLOTS>
+    bonus = <BONUS>
+    equip = <EQUIP>
+    price = <PRICE>
+    ;give_on_load = yes          ; testing aid: one in the stock whenever a save is loaded; remove when done
+
+[template armour_element_guard]
+title = Armour that guards against elements
+kind = armour
+file = FF7_SpellExt_Armour.ini
+note = Base 0 Bronze Bangle. element and element_effect are written together (the readme: give both).
+placeholder = ID, id
+placeholder = NAME, text31, Flame Guard, Name
+placeholder = DESC, text95, Halves an element, Description
+placeholder = DEF, int(0..255), 30, Defense
+placeholder = MDEF, int(0..255), 20, Magic defense
+placeholder = EVADE, int(0..255), 0, Evade
+placeholder = GROWTH, enum(none,normal,double,triple), normal, Growth
+placeholder = SLOTS, slots, pair single, Materia slots
+placeholder = BONUS, bonus(4), none, Stat bonus
+placeholder = ELEMENTS, elements, fire, Elements
+placeholder = EFFECT, enum(absorb,nullify,halve), halve, What it does to them
+placeholder = EQUIP, equip, everyone, Who equips it
+placeholder = PRICE, int(0..2147483647), 1000, Price
+lines
+    [<ID>]
+    name = <NAME>
+    description = <DESC>
+    base = 0                     ; Bronze Bangle
+    defense = <DEF>
+    magic_defense = <MDEF>
+    evade = <EVADE>
+    ;magic_evade =
+    growth = <GROWTH>            ; words for armour: none, normal, double, triple
+    slots = <SLOTS>
+    bonus = <BONUS>
+    element = <ELEMENTS>
+    element_effect = <EFFECT>    ; give both lines
+    equip = <EQUIP>
+    price = <PRICE>
+    ;give_on_load = yes          ; testing aid: one in the stock whenever a save is loaded; remove when done
+
+[template armour_status_guard]
+title = Armour that guards against a status
+kind = armour
+file = FF7_SpellExt_Armour.ini
+note = Base 0 Bronze Bangle. The armour reader takes one status for status_defense.
+placeholder = ID, id
+placeholder = NAME, text31, Calm Band, Name
+placeholder = DESC, text95, Protects against a status, Description
+placeholder = DEF, int(0..255), 30, Defense
+placeholder = MDEF, int(0..255), 20, Magic defense
+placeholder = EVADE, int(0..255), 0, Evade
+placeholder = GROWTH, enum(none,normal,double,triple), normal, Growth
+placeholder = SLOTS, slots, pair single, Materia slots
+placeholder = BONUS, bonus(4), none, Stat bonus
+placeholder = STATUS, status, confusion, The status it guards against
+placeholder = EQUIP, equip, everyone, Who equips it
+placeholder = PRICE, int(0..2147483647), 1000, Price
+lines
+    [<ID>]
+    name = <NAME>
+    description = <DESC>
+    base = 0                     ; Bronze Bangle
+    defense = <DEF>
+    magic_defense = <MDEF>
+    evade = <EVADE>
+    ;magic_evade =
+    growth = <GROWTH>            ; words for armour: none, normal, double, triple
+    slots = <SLOTS>
+    bonus = <BONUS>
+    status_defense = <STATUS>    ; one status (the armour reader takes one)
+    equip = <EQUIP>
+    price = <PRICE>
+    ;give_on_load = yes          ; testing aid: one in the stock whenever a save is loaded; remove when done
+
+; ==== Accessories (FF7_SpellExt_Accessories.ini) ===================================================================
+; Every template writes bonus, special and status_defense, so nothing of the base (0 Power Wrist) leaks through.
+
+[template accessory_stat_boost]
+title = Accessory that raises stats
+kind = accessory
+file = FF7_SpellExt_Accessories.ini
+note = Base 0 Power Wrist (kernel accessory 0); its own bonus is replaced.
+placeholder = ID, id
+placeholder = NAME, text31, Vigour Ring, Name
+placeholder = DESC, text95, Raises a stat, Description
+placeholder = BONUS, bonus(2), strength 10, Stat bonus (two pairs at most)
+placeholder = EQUIP, equip, everyone, Who equips it
+placeholder = PRICE, int(0..2147483647), 7500, Price
+lines
+    [<ID>]
+    name = <NAME>
+    description = <DESC>
+    base = 0                     ; Power Wrist
+    bonus = <BONUS>
+    special = none
+    status_defense = none
+    equip = <EQUIP>
+    price = <PRICE>
+    ;give_on_load = yes          ; testing aid: one in the stock whenever a save is loaded; remove when done
+
+[template accessory_status_guard]
+title = Accessory that guards against statuses
+kind = accessory
+file = FF7_SpellExt_Accessories.ini
+note = Base 0 Power Wrist; an accessory may guard against a list of statuses.
+placeholder = ID, id
+placeholder = NAME, text31, Clear Charm, Name
+placeholder = DESC, text95, Protects against statuses, Description
+placeholder = STATUSES, statuses, poison sleep, Statuses it guards against
+placeholder = EQUIP, equip, everyone, Who equips it
+placeholder = PRICE, int(0..2147483647), 5000, Price
+lines
+    [<ID>]
+    name = <NAME>
+    description = <DESC>
+    base = 0                     ; Power Wrist
+    bonus = none
+    special = none
+    status_defense = <STATUSES>
+    equip = <EQUIP>
+    price = <PRICE>
+    ;give_on_load = yes          ; testing aid: one in the stock whenever a save is loaded; remove when done
+
+[template accessory_element_guard]
+title = Accessory that guards against elements
+kind = accessory
+file = FF7_SpellExt_Accessories.ini
+note = Base 0 Power Wrist. element and element_effect are written together (the readme: give both).
+placeholder = ID, id
+placeholder = NAME, text31, Frost Ring, Name
+placeholder = DESC, text95, Nullifies an element, Description
+placeholder = ELEMENTS, elements, ice, Elements
+placeholder = EFFECT, enum(absorb,nullify,halve), nullify, What it does to them
+placeholder = EQUIP, equip, everyone, Who equips it
+placeholder = PRICE, int(0..2147483647), 5000, Price
+lines
+    [<ID>]
+    name = <NAME>
+    description = <DESC>
+    base = 0                     ; Power Wrist
+    bonus = none
+    special = none
+    status_defense = none
+    element = <ELEMENTS>
+    element_effect = <EFFECT>    ; give both lines
+    equip = <EQUIP>
+    price = <PRICE>
+    ;give_on_load = yes          ; testing aid: one in the stock whenever a save is loaded; remove when done
+
+[template accessory_effect]
+title = Accessory with a special effect
+kind = accessory
+file = FF7_SpellExt_Accessories.ini
+note = Base 0 Power Wrist; special is one of the game's accessory effects.
+placeholder = ID, id
+placeholder = NAME, text31, Swift Band, Name
+placeholder = DESC, text95, A lasting effect, Description
+placeholder = SPECIAL, enum(haste,berserk,curse,reflect,steal,manipulate,wall), haste, Effect
+placeholder = EQUIP, equip, everyone, Who equips it
+placeholder = PRICE, int(0..2147483647), 10000, Price
+lines
+    [<ID>]
+    name = <NAME>
+    description = <DESC>
+    base = 0                     ; Power Wrist
+    bonus = none
+    special = <SPECIAL>
+    status_defense = none
+    equip = <EQUIP>
+    price = <PRICE>
+    ;give_on_load = yes          ; testing aid: one in the stock whenever a save is loaded; remove when done
+
+; ==== Materia (FF7_SpellExt_Materia.ini) ===========================================================================
+; Every template sets ap and price (else: never grows, cannot be sold).
+
+[template materia_magic_new_spells]
+title = Magic materia with new spells
+kind = materia
+file = FF7_SpellExt_Materia.ini
+note = A bundle: the materia and N new spells in the spell file, one per level (spells = S1:1, S2:2 ...). The link is written on the materia side, which is what the DLL checks.
+note = Each spell copies Fire (kernel attack 0x1b): one target or all. Edit a spell's element, animation and target on the Spells page afterwards.
+note = equip_effect 11 is what the game's magic materia use (Str -1, Mag +1, MaxHP -2%, MaxMP +2%).
+placeholder = M, id
+placeholder = NAME, text31, Tempest, Materia name
+placeholder = DESC, text95, Grants new magic, Materia description
+placeholder = AP, ap, "3000, 18000, 35000", AP totals (one per level after the first)
+placeholder = EFFECT, int(0..16)|none, 11, Equip effect (0-16)
+placeholder = ELEMENT, element, none, Element (for Elemental pairing)
+placeholder = STATUS, status24, none, Status (for Added Effect pairing)
+placeholder = PRICE, int(0..2147483647), 1600, Price
+placeholder = N, count(1..5), 3, Number of spells
+lines
+    [<M>]
+    name = <NAME>
+    description = <DESC>
+    kind = magic
+    ap = <AP>                    ; AP totals, one per level after the first, rising, 19 at most
+    kernel_spells = none
+    spells = <S#:#{, }>          ; one per spell of the bundle, at levels 1, 2, 3 ...
+    equip_effect = <EFFECT>      ; 0-16; the game's magic materia use 11
+    element = <ELEMENT>          ; one element, for Elemental pairing, or none
+    status = <STATUS>            ; one of the first 24 statuses, for Added Effect pairing, or none
+    price = <PRICE>
+    ;give_on_load = yes          ; testing aid: one in the stock whenever a save is loaded; remove when done
+part = FF7_SpellExt_Spells.ini
+kind = spell
+placeholder = S#, id
+placeholder = SNAME#, text31, Spell #, Name of spell #
+placeholder = SDESC#, text95, A new spell, Description of spell #
+placeholder = STR#, int(0..255), 8, Strength of spell #
+placeholder = MP#, int(0..999), 4, MP of spell #
+position = end
+repeat = N
+lines
+    [<S#>]
+    name = <SNAME#>
+    description = <SDESC#>
+    base = 0x1b                  ; Fire (one target or all, toggle)
+    strength = <STR#>
+    mp = <MP#>
+    ;element = fire
+    ;animation = 0x1b
+    ;animation_all =
+
+[template materia_magic_kernel_spells]
+title = Magic materia with the game's spells
+kind = materia
+file = FF7_SpellExt_Materia.ini
+note = Teaches kernel spells (attack IDs 0 to 254), one per level in level order; none for a level that teaches none.
+placeholder = ID, id
+placeholder = NAME, text31, Ember, Name
+placeholder = DESC, text95, Fire magic, Description
+placeholder = AP, ap, "2000, 18000, 35000", AP totals (one per level after the first)
+placeholder = KS, kernel_spells, "0x1b, 0x1c, 0x1d", Kernel spells (one per level)
+placeholder = EFFECT, int(0..16)|none, 11, Equip effect (0-16)
+placeholder = ELEMENT, element, fire, Element (for Elemental pairing)
+placeholder = STATUS, status24, none, Status (for Added Effect pairing)
+placeholder = PRICE, int(0..2147483647), 600, Price
+lines
+    [<ID>]
+    name = <NAME>
+    description = <DESC>
+    kind = magic
+    ap = <AP>                    ; AP totals, one per level after the first, rising, 19 at most
+    kernel_spells = <KS>         ; one per level, in level order (0x1b Fire, 0x1c Fire2, 0x1d Fire3)
+    equip_effect = <EFFECT>      ; 0-16; the game's magic materia use 11
+    element = <ELEMENT>          ; one element, for Elemental pairing, or none
+    status = <STATUS>            ; one of the first 24 statuses, for Added Effect pairing, or none
+    price = <PRICE>
+    ;give_on_load = yes          ; testing aid: one in the stock whenever a save is loaded; remove when done
+
+[template materia_summon_new]
+title = Summon materia with a new summon
+kind = materia
+file = FF7_SpellExt_Materia.ini
+note = A bundle: the materia and one summon (a spell with list = summon) in the spell file.
+note = The summon copies Fire's record (kernel attack 0x1b); give it its animation and strength.
+placeholder = M, id
+placeholder = NAME, text31, Phantom, Materia name
+placeholder = DESC, text95, Summons a new ally, Materia description
+placeholder = AP, ap, "20000, 50000, 80000, 120000", AP totals (one per level after the first)
+placeholder = EFFECT, int(0..16)|none, 12, Equip effect (0-16)
+placeholder = ELEMENT, element, none, Element (for Elemental pairing)
+placeholder = STATUS, status24, none, Status (for Added Effect pairing)
+placeholder = PRICE, int(0..2147483647), 10000, Price
+lines
+    [<M>]
+    name = <NAME>
+    description = <DESC>
+    kind = summon
+    ap = <AP>                    ; AP totals, one per level after the first
+    kernel_spells = none
+    spells = <S>                 ; the summon of the bundle
+    uses = 1, 2, 3, 4, 5         ; uses per battle at each level
+    equip_effect = <EFFECT>
+    element = <ELEMENT>
+    status = <STATUS>
+    price = <PRICE>
+    ;give_on_load = yes          ; testing aid: one in the stock whenever a save is loaded; remove when done
+part = FF7_SpellExt_Spells.ini
+kind = spell
+placeholder = S, id
+placeholder = SNAME, text31, Phantom, Summon name
+placeholder = SDESC, text95, A new summon, Summon description
+placeholder = SELEMENT, elements, none, Summon element
+placeholder = STR, int(0..255), 40, Summon strength
+placeholder = MP, int(0..999), 40, Summon MP
+placeholder = ANIM, animation, 0x1b, Animation (0-255, or an effect copy of the effects file)
+position = end
+lines
+    [<S>]
+    name = <SNAME>
+    description = <SDESC>
+    list = summon                ; granted only through a summon materia
+    base = 0x1b                  ; Fire's record
+    element = <SELEMENT>
+    strength = <STR>
+    mp = <MP>
+    animation = <ANIM>
+    ;party_vanishes = yes
+
+[template materia_summon_game]
+title = Summon materia with a game summon
+kind = materia
+file = FF7_SpellExt_Materia.ini
+note = Holds one of the game's summons: its kernel attack ID (0x38 Choco/Mog to 0x47 Knights of Round) then the uses at each level.
+placeholder = ID, id
+placeholder = NAME, text31, Second Ifrit, Name
+placeholder = DESC, text95, Summons a game summon, Description
+placeholder = AP, ap, "5000, 15000, 25000, 60000", AP totals (one per level after the first)
+placeholder = SUMMON, int(0x38..0x47), 0x3a, The game summon (0x38 Choco/Mog .. 0x47 Knights of Round)
+placeholder = PRICE, int(0..2147483647), 5000, Price
+lines
+    [<ID>]
+    name = <NAME>
+    description = <DESC>
+    kind = summon
+    ap = <AP>                    ; AP totals, one per level after the first
+    attributes = <SUMMON>, 1, 2, 3, 4, 5   ; the summon's kernel attack ID, then the uses at each level
+    uses = 1, 2, 3, 4, 5
+    price = <PRICE>
+    ;give_on_load = yes          ; testing aid: one in the stock whenever a save is loaded; remove when done
+
+[template materia_command]
+title = Command materia
+kind = materia
+file = FF7_SpellExt_Materia.ini
+note = The command each level adds (the Materia readme's table): 0x05 Steal, 0x11 Mug, 0x06 Sense, 0x08 Throw, 0x07 Coin, 0x09 Morph, 0x0a Deathblow, 0x0b Manipulate, 0x0c Mime.
+note = Levels past 5 add nothing to a command materia.
+placeholder = ID, id
+placeholder = NAME, text31, Thief Kit, Name
+placeholder = DESC, text95, Adds commands, Description
+placeholder = AP, ap, "10000, 40000", AP totals (one per level after the first)
+placeholder = COMMANDS, commands, "0x05, 0x11", Command IDs (one per level, up to 6)
+placeholder = PRICE, int(0..2147483647), 1200, Price
+lines
+    [<ID>]
+    name = <NAME>
+    description = <DESC>
+    kind = command
+    ap = <AP>                    ; AP totals, one per level after the first
+    attributes = <COMMANDS>      ; the command each level adds
+    price = <PRICE>
+    ;give_on_load = yes          ; testing aid: one in the stock whenever a save is loaded; remove when done
+
+[template materia_command_copy]
+title = Copy of a game command materia
+kind = materia
+file = FF7_SpellExt_Materia.ini
+note = Starts from one of the game's command materia (base): every key left out is taken from it.
+placeholder = ID, id
+placeholder = NAME, text31, Steal II, Name
+placeholder = BASE, enum(0x24,0x25,0x27,0x28,0x29,0x2a,0x2b), 0x24, Base (0x24 Steal, 0x25 Sense, 0x27 Throw, 0x28 Morph, 0x29 Deathblow, 0x2a Manipulate, 0x2b Mime)
+placeholder = AP, ap, "10000, 40000", AP totals (one per level after the first)
+placeholder = PRICE, int(0..2147483647), 1200, Price
+lines
+    [<ID>]
+    name = <NAME>
+    base = <BASE>                ; a game command materia: what is left out comes from it
+    ap = <AP>
+    price = <PRICE>
+    ;give_on_load = yes          ; testing aid: one in the stock whenever a save is loaded; remove when done
+
+[template materia_support_more_levels]
+title = Support materia with more levels
+kind = materia
+file = FF7_SpellExt_Materia.ini
+note = Starts from one of the game's support materia (base). The first attribute byte (the support effect) is the base's own, from KERNEL.BIN (or the Materia readme's table): you give the value at each level.
+warn = All, Final Attack and Quadra Magic are type 0x35: counted in uses; Mega All's level number stops at 5.
+placeholder = ID, id
+placeholder = NAME, text31, Counter II, Name
+placeholder = BASE, enum(0x17,0x1a,0x18,0x19,0x1b,0x1c,0x21,0x1f,0x20,0x23), 0x18, Base (0x17 All, 0x1a MP Turbo, 0x18 Counter, 0x19 Magic Counter, 0x1b MP Absorb, 0x1c HP Absorb, 0x21 Added Cut, 0x1f Sneak Attack, 0x20 Final Attack, 0x23 Quadra Magic)
+placeholder = AP, ap, "10000, 20000, 30000, 50000, 80000, 120000", AP totals (one per level after the first)
+placeholder = ATTR, materia_attr(BASE), "30, 40, 60, 80, 100, 100, 100", The value at each level
+placeholder = PRICE, int(0..2147483647), 8000, Price
+lines
+    [<ID>]
+    name = <NAME>
+    base = <BASE>                ; a game support materia
+    ap = <AP>
+    attributes = <ATTR>          ; the base's effect byte, then the value at each level
+    price = <PRICE>
+    ;give_on_load = yes          ; testing aid: one in the stock whenever a save is loaded; remove when done
+
+[template materia_independent_stat]
+title = Independent stat materia with more levels
+kind = materia
+file = FF7_SpellExt_Materia.ini
+note = Starts from one of the game's stat materia (base). The first attribute byte (the stat) is the base's own, from KERNEL.BIN (or the Materia readme's table): MP Plus 0x09, HP Plus 0x08, Speed Plus 0x04, Magic Plus 0x02, Luck Plus 0x05.
+note = The Materia readme's [102] example: an HP Plus with eight levels.
+placeholder = ID, id
+placeholder = NAME, text31, HP Plus II, Name
+placeholder = BASE, enum(0x01,0x00,0x03,0x02,0x04), 0x01, Base (0x01 HP Plus, 0x00 MP Plus, 0x03 Magic Plus, 0x02 Speed Plus, 0x04 Luck Plus)
+placeholder = AP, ap, "10000, 20000, 30000, 50000, 80000, 120000, 160000", AP totals (one per level after the first)
+placeholder = ATTR, materia_attr(BASE), "10, 20, 30, 40, 50, 60, 70, 80", The amount at each level (percent)
+placeholder = PRICE, int(0..2147483647), 8000, Price
+lines
+    [<ID>]
+    name = <NAME>
+    base = <BASE>                ; a game stat materia
+    ap = <AP>
+    attributes = <ATTR>          ; the base's stat byte, then the amount at each level
+    price = <PRICE>
+    ;give_on_load = yes          ; testing aid: one in the stock whenever a save is loaded; remove when done
+
+[template materia_test_line]
+title = Test line: give a materia on load
+kind = test
+file = FF7_SpellExt_Materia.ini
+note = A line of the [test] section (made when the file has none): the materia is put in the stock at every load of a save that does not have it. A testing aid: remove when done. The DLL takes 16 entries at most.
+placeholder = REF, materia_ref, 49, Materia ID (0-95 the game's, 96-254 the file's)
+placeholder = GRANT, materia_grant, , With AP (:AP or :master; empty for none)
+position = into:[test] create
+lines
+    give_materia = <REF><GRANT>   ; testing aid: remove when done
+
+; ==== Spells (FF7_SpellExt_Spells.ini) =============================================================================
+; materia = names the materia that grant the spell (ID[:level] up to 4, any, or none). A bundle's spells do not
+; have it: the materia side carries the link.
+
+[template spell_element]
+title = Elemental attack spell
+kind = spell
+file = FF7_SpellExt_Spells.ini
+note = Copies Fire (kernel attack 0x1b): one target or all (toggle).
+placeholder = ID, id
+placeholder = NAME, text31, Searing Bolt, Name
+placeholder = DESC, text95, Elemental damage, Description
+placeholder = ELEMENT, elements, fire, Element
+placeholder = STR, int(0..255), 8, Strength
+placeholder = MP, int(0..999), 4, MP
+placeholder = ANIM, animation, 0x1b, Animation (0-255, or an effect copy of the effects file)
+placeholder = GRANT, materia_list, none, Granted by (materia IDs, optionally :level)
+lines
+    [<ID>]
+    name = <NAME>
+    description = <DESC>
+    base = 0x1b                  ; Fire (one target or all, toggle)
+    element = <ELEMENT>
+    strength = <STR>
+    mp = <MP>
+    animation = <ANIM>
+    ;animation_all =
+    materia = <GRANT>
+
+[template spell_element_all]
+title = Elemental attack spell on all enemies
+kind = spell
+file = FF7_SpellExt_Spells.ini
+note = Copies Fire (kernel attack 0x1b), targeting all enemies: target = selectable enemy multiple (0x07, without toggle).
+placeholder = ID, id
+placeholder = NAME, text31, Searing Wave, Name
+placeholder = DESC, text95, Elemental damage to all enemies, Description
+placeholder = ELEMENT, elements, fire, Element
+placeholder = STR, int(0..255), 8, Strength
+placeholder = MP, int(0..999), 8, MP
+placeholder = ANIM, animation, 0x1b, Animation (0-255, or an effect copy of the effects file)
+placeholder = GRANT, materia_list, none, Granted by (materia IDs, optionally :level)
+lines
+    [<ID>]
+    name = <NAME>
+    description = <DESC>
+    base = 0x1b                  ; Fire
+    target = selectable enemy multiple
+    element = <ELEMENT>
+    strength = <STR>
+    mp = <MP>
+    animation = <ANIM>
+    ;animation_all =
+    materia = <GRANT>
+
+[template spell_cure]
+title = Healing spell
+kind = spell
+file = FF7_SpellExt_Spells.ini
+note = Copies Cure (kernel attack 0x00) or Cure2 (0x01).
+placeholder = ID, id
+placeholder = NAME, text31, Mend, Name
+placeholder = DESC, text95, Restores HP, Description
+placeholder = BASE, enum(0x00,0x01), 0x00, Base (0x00 Cure, 0x01 Cure2)
+placeholder = STR, int(0..255), 10, Strength
+placeholder = MP, int(0..999), 5, MP
+placeholder = GRANT, materia_list, none, Granted by (materia IDs, optionally :level)
+lines
+    [<ID>]
+    name = <NAME>
+    description = <DESC>
+    base = <BASE>                ; 0x00 Cure, 0x01 Cure2
+    strength = <STR>
+    mp = <MP>
+    materia = <GRANT>
+
+[template spell_revive]
+title = Revive spell
+kind = spell
+file = FF7_SpellExt_Spells.ini
+note = Copies Life (kernel attack 0x07) or Life2 (0x08).
+placeholder = ID, id
+placeholder = NAME, text31, Rekindle, Name
+placeholder = DESC, text95, Revives a fallen ally, Description
+placeholder = BASE, enum(0x07,0x08), 0x07, Base (0x07 Life, 0x08 Life2)
+placeholder = MP, int(0..999), 34, MP
+placeholder = GRANT, materia_list, none, Granted by (materia IDs, optionally :level)
+lines
+    [<ID>]
+    name = <NAME>
+    description = <DESC>
+    base = <BASE>                ; 0x07 Life, 0x08 Life2
+    mp = <MP>
+    materia = <GRANT>
+
+[template spell_inflict_status]
+title = Inflict status spell
+kind = spell
+file = FF7_SpellExt_Spells.ini
+note = Copies Sleepel (kernel attack 0x0b) or Silence (0x0d). status_chance is a percentage, kept in steps of 4 ((n + 2) / 4), or always.
+warn = Inflicting dual_drain without dual crashes the game (the Spells readme).
+placeholder = ID, id
+placeholder = NAME, text31, Drowse, Name
+placeholder = DESC, text95, Inflicts a status, Description
+placeholder = BASE, enum(0x0b,0x0d), 0x0b, Base (0x0b Sleepel, 0x0d Silence)
+placeholder = STATUSES, statuses, sleep, Statuses it inflicts
+placeholder = CHANCE, int(0..100)|always, 72, Chance (percent, or always)
+placeholder = MP, int(0..999), 8, MP
+placeholder = GRANT, materia_list, none, Granted by (materia IDs, optionally :level)
+lines
+    [<ID>]
+    name = <NAME>
+    description = <DESC>
+    base = <BASE>                ; 0x0b Sleepel, 0x0d Silence
+    status = <STATUSES>
+    status_mode = inflict
+    status_chance = <CHANCE>     ; a percentage (kept in steps of 4), or always
+    mp = <MP>
+    materia = <GRANT>
+
+[template spell_cure_status]
+title = Cure status spell
+kind = spell
+file = FF7_SpellExt_Spells.ini
+note = Copies Esuna (kernel attack 0x05).
+placeholder = ID, id
+placeholder = NAME, text31, Purify, Name
+placeholder = DESC, text95, Cures status ailments, Description
+placeholder = STATUSES, statuses, poison, Statuses it cures
+placeholder = MP, int(0..999), 15, MP
+placeholder = GRANT, materia_list, none, Granted by (materia IDs, optionally :level)
+lines
+    [<ID>]
+    name = <NAME>
+    description = <DESC>
+    base = 0x05                  ; Esuna
+    status = <STATUSES>
+    status_mode = cure
+    mp = <MP>
+    materia = <GRANT>
+
+[template spell_buff]
+title = Buff spell
+kind = spell
+file = FF7_SpellExt_Spells.ini
+note = Copies Haste (kernel attack 0x13) or Barrier (0x0f).
+placeholder = ID, id
+placeholder = NAME, text31, Quicken, Name
+placeholder = DESC, text95, Grants a status, Description
+placeholder = BASE, enum(0x13,0x0f), 0x13, Base (0x13 Haste, 0x0f Barrier)
+placeholder = STATUSES, statuses, haste, Statuses it grants
+placeholder = MP, int(0..999), 18, MP
+placeholder = GRANT, materia_list, none, Granted by (materia IDs, optionally :level)
+lines
+    [<ID>]
+    name = <NAME>
+    description = <DESC>
+    base = <BASE>                ; 0x13 Haste, 0x0f Barrier
+    status = <STATUSES>
+    mp = <MP>
+    materia = <GRANT>
+
+[template spell_summon]
+title = Summon (a spell for a summon materia)
+kind = spell
+file = FF7_SpellExt_Spells.ini
+note = A spell with list = summon: granted only through a summon materia (its spells line). The materia bundle "Summon materia with a new summon" makes both.
+placeholder = ID, id
+placeholder = NAME, text31, Phantom, Name
+placeholder = DESC, text95, A new summon, Description
+placeholder = ELEMENT, elements, none, Element
+placeholder = STR, int(0..255), 40, Strength
+placeholder = MP, int(0..999), 40, MP
+placeholder = ANIM, animation, 0x1b, Animation (0-255, or an effect copy of the effects file)
+lines
+    [<ID>]
+    name = <NAME>
+    description = <DESC>
+    list = summon                ; granted only through a summon materia
+    base = 0x1b                  ; Fire's record
+    element = <ELEMENT>
+    strength = <STR>
+    mp = <MP>
+    animation = <ANIM>
+    ;party_vanishes = yes
+
+[template spell_drain]
+title = Draining spell
+kind = spell
+file = FF7_SpellExt_Spells.ini
+note = Copies Fire (kernel attack 0x1b) and adds drain_hp: the caster gains the HP it takes.
+placeholder = ID, id
+placeholder = NAME, text31, Drain, Name
+placeholder = DESC, text95, Drains HP, Description
+placeholder = ELEMENT, elements, none, Element
+placeholder = STR, int(0..255), 8, Strength
+placeholder = MP, int(0..999), 10, MP
+placeholder = ANIM, animation, 0x1b, Animation (0-255, or an effect copy of the effects file)
+placeholder = GRANT, materia_list, none, Granted by (materia IDs, optionally :level)
+lines
+    [<ID>]
+    name = <NAME>
+    description = <DESC>
+    base = 0x1b                  ; Fire (one target or all, toggle)
+    element = <ELEMENT>
+    strength = <STR>
+    mp = <MP>
+    animation = <ANIM>
+    special = +drain_hp
+    ;animation_all =
+    materia = <GRANT>
+
+[template spell_multi_hit]
+title = Multi-hit spell
+kind = spell
+file = FF7_SpellExt_Spells.ini
+note = Copies Fire (kernel attack 0x1b) and hits several times: additional_effect 0 with the number of hits as additional_modifier, and not reflectable (the three go together: the DLL warns of a reflectable spell that hits more than once).
+placeholder = ID, id
+placeholder = NAME, text31, Flurry, Name
+placeholder = DESC, text95, Strikes several times, Description
+placeholder = ELEMENT, elements, fire, Element
+placeholder = STR, int(0..255), 4, Strength
+placeholder = MP, int(0..999), 12, MP
+placeholder = ANIM, animation, 0x1b, Animation (0-255, or an effect copy of the effects file)
+placeholder = HITS, int(2..16), 3, Hits
+placeholder = GRANT, materia_list, none, Granted by (materia IDs, optionally :level)
+lines
+    [<ID>]
+    name = <NAME>
+    description = <DESC>
+    base = 0x1b                  ; Fire (one target or all, toggle)
+    element = <ELEMENT>
+    strength = <STR>
+    mp = <MP>
+    animation = <ANIM>
+    additional_effect = 0
+    additional_modifier = <HITS> ; the number of hits
+    special = -reflectable       ; with more than one hit: never reflectable
+    ;animation_all =
+    materia = <GRANT>
+
+[template spell_fixed_damage]
+title = Fixed damage spell
+kind = spell
+file = FF7_SpellExt_Spells.ini
+note = Copies Fire (kernel attack 0x1b) and deals a fixed amount in place of the strength formula.
+placeholder = ID, id
+placeholder = NAME, text31, Edict, Name
+placeholder = DESC, text95, Deals fixed damage, Description
+placeholder = ELEMENT, elements, none, Element
+placeholder = DMG, int(1..9999999), 1000, Damage
+placeholder = MP, int(0..999), 20, MP
+placeholder = ANIM, animation, 0x1b, Animation (0-255, or an effect copy of the effects file)
+placeholder = GRANT, materia_list, none, Granted by (materia IDs, optionally :level)
+lines
+    [<ID>]
+    name = <NAME>
+    description = <DESC>
+    base = 0x1b                  ; Fire (one target or all, toggle)
+    element = <ELEMENT>
+    fixed_damage = <DMG>
+    mp = <MP>
+    animation = <ANIM>
+    ;animation_all =
+    materia = <GRANT>
+
+; ==== Shop line (FF7_SpellExt_Shops.ini) ===========================================================================
+
+[template shop_add_line]
+title = Put something on sale in a shop
+kind = shop
+file = FF7_SpellExt_Shops.ini
+note = An add line in a shop's section (made when the file has none). The shop numbers and what each holds are in the shops file's own table; a shop holds 32 entries.
+note = The entry: an item ID (0-127 items, 128-255 weapons, 256-287 armour, 288-319 accessories, 320-447 new gear, 105-127 and 448-511 new items) or m and a materia ID (m49 = Fire).
+placeholder = SHOP, shop_ref, 0, Shop number (0-79)
+placeholder = REF, shop_entry, 0, What it sells (an item ID, or m and a materia ID)
+position = into:[<SHOP>] create
+lines
+    add = <REF>
+
+; ==== Characters (FF7_SpellExt_Characters.ini, with parts in Limits.ini and Weapons.ini) ==========================
+; Generated by tools/make_character_templates.py from data/character_reference.json and
+; data/vanilla_limits.json: do not edit by hand (a test fails when this part differs from the generator).
+; Every value is vanilla: the kernel characters 0-10 (the nine, Young Cloud, Sephiroth), the exe's model
+; table, the Characters and Limits readmes. Limit names and descriptions are read from KERNEL.BIN when used.
+
+[template character_cloud]
+title = Cloud (kernel character 0)
+kind = character
+file = FF7_SpellExt_Characters.ini
+note = A new party member built on Cloud: battle model 0, files rt (38 files, 23 bones), its animations, the weapons its kernel equip mask allows, its growth and its limits.
+note = No base and no copy_of: the DLL builds the record from this sheet at the chosen level (level = party: the average level of the party).
+note = Limits: borrowed whole (limits = cloud: the set, its thresholds and gauge), or with "Limits: an editable copy" also a copy of the set in the limits file at the same positions, its names and descriptions read from your KERNEL.BIN. The level-4 limit is learned only through that copy's limit item (or learn_all_on_load, a testing aid).
+warn = AI_LIKE: Cloud's kernel AI only changes the Gold Saucer date scores.
+placeholder = ID, id
+placeholder = NAME, text11, New, Name
+placeholder = LEVEL, level, party, Level
+placeholder = WEAPON, gear_id(weapon, cloud), 128, Weapon
+placeholder = ARMOUR, gear_id(armour), 256, Armour
+placeholder = ACCESSORY, gear_id(accessory)|none, none, Accessory
+placeholder = FIELD, switch, on, Field model (AAAA: 21 bones, usable)
+placeholder = PORTRAIT_ON, switch, off, Own portrait file
+placeholder = PORTRAIT, portrait, cloud, Portrait name (files\<name>.png or .tex)
+placeholder = FILES_ON, switch, off, Own battle files (a full renamed set)
+placeholder = PREFIX, battle_prefix, zz, Battle file prefix (two letters)
+placeholder = AI_LIKE, switch, off, AI: the kernel's entry 0 (date scores)
+placeholder = AI_WHO, ai_word(cloud), cloud, Kernel AI
+placeholder = AI_FILE, switch, off, AI: a file of the ai folder (a library AI)
+placeholder = AI_NAME, ai_ref, , Library AI
+placeholder = KEEP_SEAT, switch, off, keep_seat
+placeholder = JOIN_LOAD, switch, off, join = load (testing aid)
+placeholder = OWN_LIMITS, switch, off, Limits: an editable copy in the limits file (Option B)
+placeholder = STARTER_WEAPON, switch, off, A starter weapon of its own in the weapons file
+exclusive = AI_LIKE, AI_FILE
+lines
+    [<ID>]
+    name          = <NAME>
+    battle_like   = cloud                ; model 0, files rt
+    equip_like    = cloud                ; the weapons of kernel character 0's class
+    limits        = cloud                ; the set of kernel character 0, its thresholds and gauge
+    level         = <LEVEL>
+    <?!STARTER_WEAPON>weapon        = <WEAPON>
+    <?STARTER_WEAPON>weapon        = <W>                  ; the starter weapon below
+    armour        = <ARMOUR>
+    accessory     = <ACCESSORY>
+    <?FIELD>field_model   = AAAA                 ; needs field_entities = party or seats in the game file
+    <?PORTRAIT_ON>portrait      = <PORTRAIT>           ; SpellExtConfig\files\<name>.png or .tex
+    <?FILES_ON>battle_files  = <PREFIX>             ; the FULL renamed set, in a 7th Heaven mod
+    <?AI_LIKE>ai_like       = <AI_WHO>
+    <?AI_FILE>ai            = <AI_NAME>            ; SpellExtConfig\ai\<name>.ai
+    <?KEEP_SEAT>keep_seat     = yes
+    <?JOIN_LOAD>join          = load                 ; testing aid
+part = FF7_SpellExt_Limits.ini
+kind = character
+when = OWN_LIMITS
+placeholder = LIMIT_ITEM, switch, off, A limit item that teaches the level-4 limit
+placeholder = LITEM, limit_item_id, , Limit item ID (105-127)
+placeholder = LITEM_NAME, text24, Limit Manual, Limit item name
+lines
+    [<ID>]
+    gauge         = 140 324 435 506      ; kernel character 0's: how slowly each level fills
+    <?LIMIT_ITEM>limit_item    = <LITEM>
+    <?LIMIT_ITEM>limit_item_name = <LITEM_NAME>
+    ;limit_item_description =
+    ;learn_all_on_load = yes              ; testing aid: every limit learned at each load
+part = FF7_SpellExt_Limits.ini
+kind = limit
+when = OWN_LIMITS
+placeholder = N_1_1, kernel_name(128), , Limit 1-1 name
+placeholder = D_1_1, kernel_desc(128), , Limit 1-1 description
+placeholder = N_1_2, kernel_name(129), , Limit 1-2 name
+placeholder = D_1_2, kernel_desc(129), , Limit 1-2 description
+placeholder = N_2_1, kernel_name(130), , Limit 2-1 name
+placeholder = D_2_1, kernel_desc(130), , Limit 2-1 description
+placeholder = N_2_2, kernel_name(131), , Limit 2-2 name
+placeholder = D_2_2, kernel_desc(131), , Limit 2-2 description
+placeholder = N_3_1, kernel_name(132), , Limit 3-1 name
+placeholder = D_3_1, kernel_desc(132), , Limit 3-1 description
+placeholder = N_3_2, kernel_name(133), , Limit 3-2 name
+placeholder = D_3_2, kernel_desc(133), , Limit 3-2 description
+placeholder = N_4_1, kernel_name(134), , Limit 4-1 name
+placeholder = D_4_1, kernel_desc(134), , Limit 4-1 description
+lines
+    [<ID> 1-1]
+    name          = <N_1_1>
+    description   = <D_1_1>
+    base          = 128                  ; the game's limit 128
+    effect        = base
+    ; learned when the character is made
+    
+    [<ID> 1-2]
+    name          = <N_1_2>
+    description   = <D_1_2>
+    base          = 129                  ; the game's limit 129
+    effect        = base
+    uses          = 8                    ; uses of 1-1 that teach it
+    
+    [<ID> 2-1]
+    name          = <N_2_1>
+    description   = <D_2_1>
+    base          = 130                  ; the game's limit 130
+    effect        = base
+    kills         = 120                  ; kills that teach it
+    
+    [<ID> 2-2]
+    name          = <N_2_2>
+    description   = <D_2_2>
+    base          = 131                  ; the game's limit 131
+    effect        = base
+    uses          = 7                    ; uses of 2-1 that teach it
+    
+    [<ID> 3-1]
+    name          = <N_3_1>
+    description   = <D_3_1>
+    base          = 132                  ; the game's limit 132
+    effect        = base
+    kills         = 320                  ; kills that teach it
+    
+    [<ID> 3-2]
+    name          = <N_3_2>
+    description   = <D_3_2>
+    base          = 133                  ; the game's limit 133
+    effect        = base
+    uses          = 6                    ; uses of 3-1 that teach it
+    
+    [<ID> 4-1]
+    name          = <N_4_1>
+    description   = <D_4_1>
+    base          = 134                  ; the game's limit 134
+    effect        = base
+    ;learned       = yes                  ; else taught by the limit item only
+part = FF7_SpellExt_Weapons.ini
+kind = weapon
+when = STARTER_WEAPON
+placeholder = W, id
+placeholder = WNAME, text31, Buster Sword II, Starter weapon name
+lines
+    [<W>]
+    name          = <WNAME>
+    base          = 0                    ; kernel weapon 0: model, animation, icon
+    equip         = <ID>                 ; the new character, by number
+    ;give_on_load  = yes                  ; testing aid
+
+[template character_barret]
+title = Barret (kernel character 1)
+kind = character
+file = FF7_SpellExt_Characters.ini
+note = A new party member built on Barret: battle model 1, files sb (38 files, 22 bones; arm variants sc, sd, se (models 11-13, by weapon)), its animations, the weapons its kernel equip mask allows, its growth and its limits.
+note = No base and no copy_of: the DLL builds the record from this sheet at the chosen level (level = party: the average level of the party).
+note = Limits: borrowed whole (limits = barret: the set, its thresholds and gauge), or with "Limits: an editable copy" also a copy of the set in the limits file at the same positions, its names and descriptions read from your KERNEL.BIN. The level-4 limit is learned only through that copy's limit item (or learn_all_on_load, a testing aid).
+warn = AI_LIKE: Barret's kernel AI only changes the Gold Saucer date scores.
+placeholder = ID, id
+placeholder = NAME, text11, New, Name
+placeholder = LEVEL, level, party, Level
+placeholder = WEAPON, gear_id(weapon, barret), 160, Weapon
+placeholder = ARMOUR, gear_id(armour), 256, Armour
+placeholder = ACCESSORY, gear_id(accessory)|none, none, Accessory
+placeholder = FIELD, switch, on, Field model (ACGD: 21 bones, usable)
+placeholder = PORTRAIT_ON, switch, off, Own portrait file
+placeholder = PORTRAIT, portrait, barre, Portrait name (files\<name>.png or .tex)
+placeholder = FILES_ON, switch, off, Own battle files (a full renamed set)
+placeholder = PREFIX, battle_prefix, zz, Battle file prefix (two letters)
+placeholder = AI_LIKE, switch, off, AI: the kernel's entry 1 (date scores; its script links to entry 3 (Aeris))
+placeholder = AI_WHO, ai_word(barret), barret, Kernel AI
+placeholder = AI_FILE, switch, off, AI: a file of the ai folder (a library AI)
+placeholder = AI_NAME, ai_ref, , Library AI
+placeholder = KEEP_SEAT, switch, off, keep_seat
+placeholder = JOIN_LOAD, switch, off, join = load (testing aid)
+placeholder = OWN_LIMITS, switch, off, Limits: an editable copy in the limits file (Option B)
+placeholder = STARTER_WEAPON, switch, off, A starter weapon of its own in the weapons file
+exclusive = AI_LIKE, AI_FILE
+lines
+    [<ID>]
+    name          = <NAME>
+    battle_like   = barret               ; model 1, files sb
+    equip_like    = barret               ; the weapons of kernel character 1's class
+    limits        = barret               ; the set of kernel character 1, its thresholds and gauge
+    level         = <LEVEL>
+    <?!STARTER_WEAPON>weapon        = <WEAPON>
+    <?STARTER_WEAPON>weapon        = <W>                  ; the starter weapon below
+    armour        = <ARMOUR>
+    accessory     = <ACCESSORY>
+    <?FIELD>field_model   = ACGD                 ; needs field_entities = party or seats in the game file
+    <?PORTRAIT_ON>portrait      = <PORTRAIT>           ; SpellExtConfig\files\<name>.png or .tex
+    <?FILES_ON>battle_files  = <PREFIX>             ; the FULL renamed set, in a 7th Heaven mod
+    <?AI_LIKE>ai_like       = <AI_WHO>
+    <?AI_FILE>ai            = <AI_NAME>            ; SpellExtConfig\ai\<name>.ai
+    <?KEEP_SEAT>keep_seat     = yes
+    <?JOIN_LOAD>join          = load                 ; testing aid
+part = FF7_SpellExt_Limits.ini
+kind = character
+when = OWN_LIMITS
+placeholder = LIMIT_ITEM, switch, off, A limit item that teaches the level-4 limit
+placeholder = LITEM, limit_item_id, , Limit item ID (105-127)
+placeholder = LITEM_NAME, text24, Limit Manual, Limit item name
+lines
+    [<ID>]
+    gauge         = 129 240 374 450      ; kernel character 1's: how slowly each level fills
+    <?LIMIT_ITEM>limit_item    = <LITEM>
+    <?LIMIT_ITEM>limit_item_name = <LITEM_NAME>
+    ;limit_item_description =
+    ;learn_all_on_load = yes              ; testing aid: every limit learned at each load
+part = FF7_SpellExt_Limits.ini
+kind = limit
+when = OWN_LIMITS
+placeholder = N_1_1, kernel_name(135), , Limit 1-1 name
+placeholder = D_1_1, kernel_desc(135), , Limit 1-1 description
+placeholder = N_1_2, kernel_name(137), , Limit 1-2 name
+placeholder = D_1_2, kernel_desc(137), , Limit 1-2 description
+placeholder = N_2_1, kernel_name(136), , Limit 2-1 name
+placeholder = D_2_1, kernel_desc(136), , Limit 2-1 description
+placeholder = N_2_2, kernel_name(138), , Limit 2-2 name
+placeholder = D_2_2, kernel_desc(138), , Limit 2-2 description
+placeholder = N_3_1, kernel_name(139), , Limit 3-1 name
+placeholder = D_3_1, kernel_desc(139), , Limit 3-1 description
+placeholder = N_3_2, kernel_name(140), , Limit 3-2 name
+placeholder = D_3_2, kernel_desc(140), , Limit 3-2 description
+placeholder = N_4_1, kernel_name(141), , Limit 4-1 name
+placeholder = D_4_1, kernel_desc(141), , Limit 4-1 description
+lines
+    [<ID> 1-1]
+    name          = <N_1_1>
+    description   = <D_1_1>
+    base          = 135                  ; the game's limit 135
+    effect        = base
+    ; learned when the character is made
+    
+    [<ID> 1-2]
+    name          = <N_1_2>
+    description   = <D_1_2>
+    base          = 137                  ; the game's limit 137
+    effect        = base
+    uses          = 9                    ; uses of 1-1 that teach it
+    
+    [<ID> 2-1]
+    name          = <N_2_1>
+    description   = <D_2_1>
+    base          = 136                  ; the game's limit 136
+    effect        = base
+    kills         = 80                   ; kills that teach it
+    
+    [<ID> 2-2]
+    name          = <N_2_2>
+    description   = <D_2_2>
+    base          = 138                  ; the game's limit 138
+    effect        = base
+    uses          = 8                    ; uses of 2-1 that teach it
+    
+    [<ID> 3-1]
+    name          = <N_3_1>
+    description   = <D_3_1>
+    base          = 139                  ; the game's limit 139
+    effect        = base
+    kills         = 160                  ; kills that teach it
+    
+    [<ID> 3-2]
+    name          = <N_3_2>
+    description   = <D_3_2>
+    base          = 140                  ; the game's limit 140
+    effect        = base
+    uses          = 6                    ; uses of 3-1 that teach it
+    
+    [<ID> 4-1]
+    name          = <N_4_1>
+    description   = <D_4_1>
+    base          = 141                  ; the game's limit 141
+    effect        = base
+    ;learned       = yes                  ; else taught by the limit item only
+part = FF7_SpellExt_Weapons.ini
+kind = weapon
+when = STARTER_WEAPON
+placeholder = W, id
+placeholder = WNAME, text31, Gatling Gun II, Starter weapon name
+lines
+    [<W>]
+    name          = <WNAME>
+    base          = 32                   ; kernel weapon 32: model, animation, icon
+    equip         = <ID>                 ; the new character, by number
+    ;give_on_load  = yes                  ; testing aid
+
+[template character_tifa]
+title = Tifa (kernel character 2)
+kind = character
+file = FF7_SpellExt_Characters.ini
+note = A new party member built on Tifa: battle model 2, files ru (44 files, 32 bones), its animations, the weapons its kernel equip mask allows, its growth and its limits.
+note = No base and no copy_of: the DLL builds the record from this sheet at the chosen level (level = party: the average level of the party).
+note = Limits: borrowed whole (limits = tifa: the set, its thresholds and gauge), or with "Limits: an editable copy" also a copy of the set in the limits file at the same positions, its names and descriptions read from your KERNEL.BIN. The level-4 limit is learned only through that copy's limit item (or learn_all_on_load, a testing aid).
+note = No field model: Tifa's field skeleton AAGB has 24 bones; a field model needs Cloud's 21 in his order.
+warn = AI_LIKE: Tifa's kernel AI only changes the Gold Saucer date scores.
+warn = The limit reels are untried on a new character.
+placeholder = ID, id
+placeholder = NAME, text11, New, Name
+placeholder = LEVEL, level, party, Level
+placeholder = WEAPON, gear_id(weapon, tifa), 144, Weapon
+placeholder = ARMOUR, gear_id(armour), 256, Armour
+placeholder = ACCESSORY, gear_id(accessory)|none, none, Accessory
+placeholder = PORTRAIT_ON, switch, off, Own portrait file
+placeholder = PORTRAIT, portrait, tifa, Portrait name (files\<name>.png or .tex)
+placeholder = FILES_ON, switch, off, Own battle files (a full renamed set)
+placeholder = PREFIX, battle_prefix, zz, Battle file prefix (two letters)
+placeholder = AI_LIKE, switch, off, AI: the kernel's entry 2 (date scores; its script links to entry 3 (Aeris))
+placeholder = AI_WHO, ai_word(tifa), tifa, Kernel AI
+placeholder = AI_FILE, switch, off, AI: a file of the ai folder (a library AI)
+placeholder = AI_NAME, ai_ref, , Library AI
+placeholder = KEEP_SEAT, switch, off, keep_seat
+placeholder = JOIN_LOAD, switch, off, join = load (testing aid)
+placeholder = OWN_LIMITS, switch, off, Limits: an editable copy in the limits file (Option B)
+placeholder = STARTER_WEAPON, switch, off, A starter weapon of its own in the weapons file
+exclusive = AI_LIKE, AI_FILE
+lines
+    [<ID>]
+    name          = <NAME>
+    battle_like   = tifa                 ; model 2, files ru
+    equip_like    = tifa                 ; the weapons of kernel character 2's class
+    limits        = tifa                 ; the set of kernel character 2, its thresholds and gauge
+    level         = <LEVEL>
+    <?!STARTER_WEAPON>weapon        = <WEAPON>
+    <?STARTER_WEAPON>weapon        = <W>                  ; the starter weapon below
+    armour        = <ARMOUR>
+    accessory     = <ACCESSORY>
+    field_model   = none                 ; AAGB has 24 bones: not usable
+    <?PORTRAIT_ON>portrait      = <PORTRAIT>           ; SpellExtConfig\files\<name>.png or .tex
+    <?FILES_ON>battle_files  = <PREFIX>             ; the FULL renamed set, in a 7th Heaven mod
+    <?AI_LIKE>ai_like       = <AI_WHO>
+    <?AI_FILE>ai            = <AI_NAME>            ; SpellExtConfig\ai\<name>.ai
+    <?KEEP_SEAT>keep_seat     = yes
+    <?JOIN_LOAD>join          = load                 ; testing aid
+part = FF7_SpellExt_Limits.ini
+kind = character
+when = OWN_LIMITS
+placeholder = LIMIT_ITEM, switch, off, A limit item that teaches the level-4 limit
+placeholder = LITEM, limit_item_id, , Limit item ID (105-127)
+placeholder = LITEM_NAME, text24, Limit Manual, Limit item name
+lines
+    [<ID>]
+    gauge         = 120 334 509 566      ; kernel character 2's: how slowly each level fills
+    <?LIMIT_ITEM>limit_item    = <LITEM>
+    <?LIMIT_ITEM>limit_item_name = <LITEM_NAME>
+    ;limit_item_description =
+    ;learn_all_on_load = yes              ; testing aid: every limit learned at each load
+part = FF7_SpellExt_Limits.ini
+kind = limit
+when = OWN_LIMITS
+placeholder = N_1_1, kernel_name(149), , Limit 1-1 name
+placeholder = D_1_1, kernel_desc(149), , Limit 1-1 description
+placeholder = N_1_2, kernel_name(150), , Limit 1-2 name
+placeholder = D_1_2, kernel_desc(150), , Limit 1-2 description
+placeholder = N_2_1, kernel_name(151), , Limit 2-1 name
+placeholder = D_2_1, kernel_desc(151), , Limit 2-1 description
+placeholder = N_2_2, kernel_name(152), , Limit 2-2 name
+placeholder = D_2_2, kernel_desc(152), , Limit 2-2 description
+placeholder = N_3_1, kernel_name(153), , Limit 3-1 name
+placeholder = D_3_1, kernel_desc(153), , Limit 3-1 description
+placeholder = N_3_2, kernel_name(154), , Limit 3-2 name
+placeholder = D_3_2, kernel_desc(154), , Limit 3-2 description
+placeholder = N_4_1, kernel_name(155), , Limit 4-1 name
+placeholder = D_4_1, kernel_desc(155), , Limit 4-1 description
+lines
+    [<ID> 1-1]
+    name          = <N_1_1>
+    description   = <D_1_1>
+    base          = 149                  ; the game's limit 149
+    effect        = base
+    ; learned when the character is made
+    
+    [<ID> 1-2]
+    name          = <N_1_2>
+    description   = <D_1_2>
+    base          = 150                  ; the game's limit 150
+    effect        = base
+    uses          = 9                    ; uses of 1-1 that teach it
+    
+    [<ID> 2-1]
+    name          = <N_2_1>
+    description   = <D_2_1>
+    base          = 151                  ; the game's limit 151
+    effect        = base
+    kills         = 96                   ; kills that teach it
+    
+    [<ID> 2-2]
+    name          = <N_2_2>
+    description   = <D_2_2>
+    base          = 152                  ; the game's limit 152
+    effect        = base
+    uses          = 7                    ; uses of 2-1 that teach it
+    
+    [<ID> 3-1]
+    name          = <N_3_1>
+    description   = <D_3_1>
+    base          = 153                  ; the game's limit 153
+    effect        = base
+    kills         = 192                  ; kills that teach it
+    
+    [<ID> 3-2]
+    name          = <N_3_2>
+    description   = <D_3_2>
+    base          = 154                  ; the game's limit 154
+    effect        = base
+    uses          = 6                    ; uses of 3-1 that teach it
+    
+    [<ID> 4-1]
+    name          = <N_4_1>
+    description   = <D_4_1>
+    base          = 155                  ; the game's limit 155
+    effect        = base
+    ;learned       = yes                  ; else taught by the limit item only
+part = FF7_SpellExt_Weapons.ini
+kind = weapon
+when = STARTER_WEAPON
+placeholder = W, id
+placeholder = WNAME, text31, Leather Glove II, Starter weapon name
+lines
+    [<W>]
+    name          = <WNAME>
+    base          = 16                   ; kernel weapon 16: model, animation, icon
+    equip         = <ID>                 ; the new character, by number
+    ;give_on_load  = yes                  ; testing aid
+
+[template character_aerith]
+title = Aerith (kernel character 3)
+kind = character
+file = FF7_SpellExt_Characters.ini
+note = A new party member built on Aerith: battle model 3, files rv (44 files, 31 bones), its animations, the weapons its kernel equip mask allows, its growth and its limits.
+note = No base and no copy_of: the DLL builds the record from this sheet at the chosen level (level = party: the average level of the party).
+note = Limits: borrowed whole (limits = aeris: the set, its thresholds and gauge), or with "Limits: an editable copy" also a copy of the set in the limits file at the same positions, its names and descriptions read from your KERNEL.BIN. The level-4 limit is learned only through that copy's limit item (or learn_all_on_load, a testing aid).
+note = No field model: Aerith's field skeleton AUFF has 23 bones; a field model needs Cloud's 21 in his order.
+warn = AI_LIKE: Aerith's kernel AI only changes the Gold Saucer date scores.
+placeholder = ID, id
+placeholder = NAME, text11, New, Name
+placeholder = LEVEL, level, party, Level
+placeholder = WEAPON, gear_id(weapon, aeris), 190, Weapon
+placeholder = ARMOUR, gear_id(armour), 256, Armour
+placeholder = ACCESSORY, gear_id(accessory)|none, none, Accessory
+placeholder = PORTRAIT_ON, switch, off, Own portrait file
+placeholder = PORTRAIT, portrait, earith, Portrait name (files\<name>.png or .tex)
+placeholder = FILES_ON, switch, off, Own battle files (a full renamed set)
+placeholder = PREFIX, battle_prefix, zz, Battle file prefix (two letters)
+placeholder = AI_LIKE, switch, off, AI: the kernel's entry 3 (date scores)
+placeholder = AI_WHO, ai_word(aeris), aeris, Kernel AI
+placeholder = AI_FILE, switch, off, AI: a file of the ai folder (a library AI)
+placeholder = AI_NAME, ai_ref, , Library AI
+placeholder = KEEP_SEAT, switch, off, keep_seat
+placeholder = JOIN_LOAD, switch, off, join = load (testing aid)
+placeholder = OWN_LIMITS, switch, off, Limits: an editable copy in the limits file (Option B)
+placeholder = STARTER_WEAPON, switch, off, A starter weapon of its own in the weapons file
+exclusive = AI_LIKE, AI_FILE
+lines
+    [<ID>]
+    name          = <NAME>
+    battle_like   = aerith               ; model 3, files rv
+    equip_like    = aeris                ; the weapons of kernel character 3's class
+    limits        = aeris                ; the set of kernel character 3, its thresholds and gauge
+    level         = <LEVEL>
+    <?!STARTER_WEAPON>weapon        = <WEAPON>
+    <?STARTER_WEAPON>weapon        = <W>                  ; the starter weapon below
+    armour        = <ARMOUR>
+    accessory     = <ACCESSORY>
+    field_model   = none                 ; AUFF has 23 bones: not usable
+    <?PORTRAIT_ON>portrait      = <PORTRAIT>           ; SpellExtConfig\files\<name>.png or .tex
+    <?FILES_ON>battle_files  = <PREFIX>             ; the FULL renamed set, in a 7th Heaven mod
+    <?AI_LIKE>ai_like       = <AI_WHO>
+    <?AI_FILE>ai            = <AI_NAME>            ; SpellExtConfig\ai\<name>.ai
+    <?KEEP_SEAT>keep_seat     = yes
+    <?JOIN_LOAD>join          = load                 ; testing aid
+part = FF7_SpellExt_Limits.ini
+kind = character
+when = OWN_LIMITS
+placeholder = LIMIT_ITEM, switch, off, A limit item that teaches the level-4 limit
+placeholder = LITEM, limit_item_id, , Limit item ID (105-127)
+placeholder = LITEM_NAME, text24, Limit Manual, Limit item name
+lines
+    [<ID>]
+    gauge         = 200 284 322 436      ; kernel character 3's: how slowly each level fills
+    <?LIMIT_ITEM>limit_item    = <LITEM>
+    <?LIMIT_ITEM>limit_item_name = <LITEM_NAME>
+    ;limit_item_description =
+    ;learn_all_on_load = yes              ; testing aid: every limit learned at each load
+part = FF7_SpellExt_Limits.ini
+kind = limit
+when = OWN_LIMITS
+placeholder = N_1_1, kernel_name(142), , Limit 1-1 name
+placeholder = D_1_1, kernel_desc(142), , Limit 1-1 description
+placeholder = N_1_2, kernel_name(143), , Limit 1-2 name
+placeholder = D_1_2, kernel_desc(143), , Limit 1-2 description
+placeholder = N_2_1, kernel_name(144), , Limit 2-1 name
+placeholder = D_2_1, kernel_desc(144), , Limit 2-1 description
+placeholder = N_2_2, kernel_name(145), , Limit 2-2 name
+placeholder = D_2_2, kernel_desc(145), , Limit 2-2 description
+placeholder = N_3_1, kernel_name(146), , Limit 3-1 name
+placeholder = D_3_1, kernel_desc(146), , Limit 3-1 description
+placeholder = N_3_2, kernel_name(147), , Limit 3-2 name
+placeholder = D_3_2, kernel_desc(147), , Limit 3-2 description
+placeholder = N_4_1, kernel_name(148), , Limit 4-1 name
+placeholder = D_4_1, kernel_desc(148), , Limit 4-1 description
+lines
+    [<ID> 1-1]
+    name          = <N_1_1>
+    description   = <D_1_1>
+    base          = 142                  ; the game's limit 142
+    effect        = base
+    ; learned when the character is made
+    
+    [<ID> 1-2]
+    name          = <N_1_2>
+    description   = <D_1_2>
+    base          = 143                  ; the game's limit 143
+    effect        = base
+    uses          = 8                    ; uses of 1-1 that teach it
+    
+    [<ID> 2-1]
+    name          = <N_2_1>
+    description   = <D_2_1>
+    base          = 144                  ; the game's limit 144
+    effect        = base
+    kills         = 80                   ; kills that teach it
+    
+    [<ID> 2-2]
+    name          = <N_2_2>
+    description   = <D_2_2>
+    base          = 145                  ; the game's limit 145
+    effect        = base
+    uses          = 6                    ; uses of 2-1 that teach it
+    
+    [<ID> 3-1]
+    name          = <N_3_1>
+    description   = <D_3_1>
+    base          = 146                  ; the game's limit 146
+    effect        = base
+    kills         = 160                  ; kills that teach it
+    
+    [<ID> 3-2]
+    name          = <N_3_2>
+    description   = <D_3_2>
+    base          = 147                  ; the game's limit 147
+    effect        = base
+    uses          = 5                    ; uses of 3-1 that teach it
+    
+    [<ID> 4-1]
+    name          = <N_4_1>
+    description   = <D_4_1>
+    base          = 148                  ; the game's limit 148
+    effect        = base
+    ;learned       = yes                  ; else taught by the limit item only
+part = FF7_SpellExt_Weapons.ini
+kind = weapon
+when = STARTER_WEAPON
+placeholder = W, id
+placeholder = WNAME, text31, Guard Stick II, Starter weapon name
+lines
+    [<W>]
+    name          = <WNAME>
+    base          = 62                   ; kernel weapon 62: model, animation, icon
+    equip         = <ID>                 ; the new character, by number
+    ;give_on_load  = yes                  ; testing aid
+
+[template character_red]
+title = Red XIII (kernel character 4)
+kind = character
+file = FF7_SpellExt_Characters.ini
+note = A new party member built on Red XIII: battle model 4, files rw (58 files, 46 bones), its animations, the weapons its kernel equip mask allows, its growth and its limits.
+note = No base and no copy_of: the DLL builds the record from this sheet at the chosen level (level = party: the average level of the party).
+note = Limits: borrowed whole (limits = red: the set, its thresholds and gauge), or with "Limits: an editable copy" also a copy of the set in the limits file at the same positions, its names and descriptions read from your KERNEL.BIN. The level-4 limit is learned only through that copy's limit item (or learn_all_on_load, a testing aid).
+note = No field model: Red XIII's field skeleton ADDA has 29 bones; a field model needs Cloud's 21 in his order.
+placeholder = ID, id
+placeholder = NAME, text11, New, Name
+placeholder = LEVEL, level, party, Level
+placeholder = WEAPON, gear_id(weapon, red), 176, Weapon
+placeholder = ARMOUR, gear_id(armour), 256, Armour
+placeholder = ACCESSORY, gear_id(accessory)|none, none, Accessory
+placeholder = PORTRAIT_ON, switch, off, Own portrait file
+placeholder = PORTRAIT, portrait, red, Portrait name (files\<name>.png or .tex)
+placeholder = FILES_ON, switch, off, Own battle files (a full renamed set)
+placeholder = PREFIX, battle_prefix, zz, Battle file prefix (two letters)
+placeholder = AI_FILE, switch, off, AI: a file of the ai folder (a library AI)
+placeholder = AI_NAME, ai_ref, , Library AI
+placeholder = KEEP_SEAT, switch, off, keep_seat
+placeholder = JOIN_LOAD, switch, off, join = load (testing aid)
+placeholder = OWN_LIMITS, switch, off, Limits: an editable copy in the limits file (Option B)
+placeholder = STARTER_WEAPON, switch, off, A starter weapon of its own in the weapons file
+lines
+    [<ID>]
+    name          = <NAME>
+    battle_like   = red                  ; model 4, files rw
+    equip_like    = red                  ; the weapons of kernel character 4's class
+    limits        = red                  ; the set of kernel character 4, its thresholds and gauge
+    level         = <LEVEL>
+    <?!STARTER_WEAPON>weapon        = <WEAPON>
+    <?STARTER_WEAPON>weapon        = <W>                  ; the starter weapon below
+    armour        = <ARMOUR>
+    accessory     = <ACCESSORY>
+    field_model   = none                 ; ADDA has 29 bones: not usable
+    <?PORTRAIT_ON>portrait      = <PORTRAIT>           ; SpellExtConfig\files\<name>.png or .tex
+    <?FILES_ON>battle_files  = <PREFIX>             ; the FULL renamed set, in a 7th Heaven mod
+    <?AI_FILE>ai            = <AI_NAME>            ; SpellExtConfig\ai\<name>.ai
+    <?KEEP_SEAT>keep_seat     = yes
+    <?JOIN_LOAD>join          = load                 ; testing aid
+part = FF7_SpellExt_Limits.ini
+kind = character
+when = OWN_LIMITS
+placeholder = LIMIT_ITEM, switch, off, A limit item that teaches the level-4 limit
+placeholder = LITEM, limit_item_id, , Limit item ID (105-127)
+placeholder = LITEM_NAME, text24, Limit Manual, Limit item name
+lines
+    [<ID>]
+    gauge         = 195 300 389 486      ; kernel character 4's: how slowly each level fills
+    <?LIMIT_ITEM>limit_item    = <LITEM>
+    <?LIMIT_ITEM>limit_item_name = <LITEM_NAME>
+    ;limit_item_description =
+    ;learn_all_on_load = yes              ; testing aid: every limit learned at each load
+part = FF7_SpellExt_Limits.ini
+kind = limit
+when = OWN_LIMITS
+placeholder = N_1_1, kernel_name(163), , Limit 1-1 name
+placeholder = D_1_1, kernel_desc(163), , Limit 1-1 description
+placeholder = N_1_2, kernel_name(167), , Limit 1-2 name
+placeholder = D_1_2, kernel_desc(167), , Limit 1-2 description
+placeholder = N_2_1, kernel_name(165), , Limit 2-1 name
+placeholder = D_2_1, kernel_desc(165), , Limit 2-1 description
+placeholder = N_2_2, kernel_name(166), , Limit 2-2 name
+placeholder = D_2_2, kernel_desc(166), , Limit 2-2 description
+placeholder = N_3_1, kernel_name(164), , Limit 3-1 name
+placeholder = D_3_1, kernel_desc(164), , Limit 3-1 description
+placeholder = N_3_2, kernel_name(168), , Limit 3-2 name
+placeholder = D_3_2, kernel_desc(168), , Limit 3-2 description
+placeholder = N_4_1, kernel_name(169), , Limit 4-1 name
+placeholder = D_4_1, kernel_desc(169), , Limit 4-1 description
+lines
+    [<ID> 1-1]
+    name          = <N_1_1>
+    description   = <D_1_1>
+    base          = 163                  ; the game's limit 163
+    effect        = base
+    ; learned when the character is made
+    
+    [<ID> 1-2]
+    name          = <N_1_2>
+    description   = <D_1_2>
+    base          = 167                  ; the game's limit 167
+    effect        = base
+    uses          = 8                    ; uses of 1-1 that teach it
+    
+    [<ID> 2-1]
+    name          = <N_2_1>
+    description   = <D_2_1>
+    base          = 165                  ; the game's limit 165
+    effect        = base
+    kills         = 72                   ; kills that teach it
+    
+    [<ID> 2-2]
+    name          = <N_2_2>
+    description   = <D_2_2>
+    base          = 166                  ; the game's limit 166
+    effect        = base
+    uses          = 7                    ; uses of 2-1 that teach it
+    
+    [<ID> 3-1]
+    name          = <N_3_1>
+    description   = <D_3_1>
+    base          = 164                  ; the game's limit 164
+    effect        = base
+    kills         = 144                  ; kills that teach it
+    
+    [<ID> 3-2]
+    name          = <N_3_2>
+    description   = <D_3_2>
+    base          = 168                  ; the game's limit 168
+    effect        = base
+    uses          = 6                    ; uses of 3-1 that teach it
+    
+    [<ID> 4-1]
+    name          = <N_4_1>
+    description   = <D_4_1>
+    base          = 169                  ; the game's limit 169
+    effect        = base
+    ;learned       = yes                  ; else taught by the limit item only
+part = FF7_SpellExt_Weapons.ini
+kind = weapon
+when = STARTER_WEAPON
+placeholder = W, id
+placeholder = WNAME, text31, Mythril Clip II, Starter weapon name
+lines
+    [<W>]
+    name          = <WNAME>
+    base          = 48                   ; kernel weapon 48: model, animation, icon
+    equip         = <ID>                 ; the new character, by number
+    ;give_on_load  = yes                  ; testing aid
+
+[template character_yuffie]
+title = Yuffie (kernel character 5)
+kind = character
+file = FF7_SpellExt_Characters.ini
+note = A new party member built on Yuffie: battle model 5, files rx (42 files, 31 bones), its animations, the weapons its kernel equip mask allows, its growth and its limits.
+note = No base and no copy_of: the DLL builds the record from this sheet at the chosen level (level = party: the average level of the party).
+note = Limits: borrowed whole (limits = yuffie: the set, its thresholds and gauge), or with "Limits: an editable copy" also a copy of the set in the limits file at the same positions, its names and descriptions read from your KERNEL.BIN. The level-4 limit is learned only through that copy's limit item (or learn_all_on_load, a testing aid).
+note = No field model: Yuffie's field skeleton ABJB has 24 bones; a field model needs Cloud's 21 in his order.
+warn = AI_LIKE: Yuffie's kernel AI only changes the Gold Saucer date scores.
+placeholder = ID, id
+placeholder = NAME, text11, New, Name
+placeholder = LEVEL, level, party, Level
+placeholder = WEAPON, gear_id(weapon, yuffie), 215, Weapon
+placeholder = ARMOUR, gear_id(armour), 256, Armour
+placeholder = ACCESSORY, gear_id(accessory)|none, none, Accessory
+placeholder = PORTRAIT_ON, switch, off, Own portrait file
+placeholder = PORTRAIT, portrait, yufi, Portrait name (files\<name>.png or .tex)
+placeholder = FILES_ON, switch, off, Own battle files (a full renamed set)
+placeholder = PREFIX, battle_prefix, zz, Battle file prefix (two letters)
+placeholder = AI_LIKE, switch, off, AI: the kernel's entry 5 (date scores; its script links to entry 3 (Aeris))
+placeholder = AI_WHO, ai_word(yuffie), yuffie, Kernel AI
+placeholder = AI_FILE, switch, off, AI: a file of the ai folder (a library AI)
+placeholder = AI_NAME, ai_ref, , Library AI
+placeholder = KEEP_SEAT, switch, off, keep_seat
+placeholder = JOIN_LOAD, switch, off, join = load (testing aid)
+placeholder = OWN_LIMITS, switch, off, Limits: an editable copy in the limits file (Option B)
+placeholder = STARTER_WEAPON, switch, off, A starter weapon of its own in the weapons file
+exclusive = AI_LIKE, AI_FILE
+lines
+    [<ID>]
+    name          = <NAME>
+    battle_like   = yuffie               ; model 5, files rx
+    equip_like    = yuffie               ; the weapons of kernel character 5's class
+    limits        = yuffie               ; the set of kernel character 5, its thresholds and gauge
+    level         = <LEVEL>
+    <?!STARTER_WEAPON>weapon        = <WEAPON>
+    <?STARTER_WEAPON>weapon        = <W>                  ; the starter weapon below
+    armour        = <ARMOUR>
+    accessory     = <ACCESSORY>
+    field_model   = none                 ; ABJB has 24 bones: not usable
+    <?PORTRAIT_ON>portrait      = <PORTRAIT>           ; SpellExtConfig\files\<name>.png or .tex
+    <?FILES_ON>battle_files  = <PREFIX>             ; the FULL renamed set, in a 7th Heaven mod
+    <?AI_LIKE>ai_like       = <AI_WHO>
+    <?AI_FILE>ai            = <AI_NAME>            ; SpellExtConfig\ai\<name>.ai
+    <?KEEP_SEAT>keep_seat     = yes
+    <?JOIN_LOAD>join          = load                 ; testing aid
+part = FF7_SpellExt_Limits.ini
+kind = character
+when = OWN_LIMITS
+placeholder = LIMIT_ITEM, switch, off, A limit item that teaches the level-4 limit
+placeholder = LITEM, limit_item_id, , Limit item ID (105-127)
+placeholder = LITEM_NAME, text24, Limit Manual, Limit item name
+lines
+    [<ID>]
+    gauge         = 200 300 400 480      ; kernel character 5's: how slowly each level fills
+    <?LIMIT_ITEM>limit_item    = <LITEM>
+    <?LIMIT_ITEM>limit_item_name = <LITEM_NAME>
+    ;limit_item_description =
+    ;learn_all_on_load = yes              ; testing aid: every limit learned at each load
+part = FF7_SpellExt_Limits.ini
+kind = limit
+when = OWN_LIMITS
+placeholder = N_1_1, kernel_name(177), , Limit 1-1 name
+placeholder = D_1_1, kernel_desc(177), , Limit 1-1 description
+placeholder = N_1_2, kernel_name(178), , Limit 1-2 name
+placeholder = D_1_2, kernel_desc(178), , Limit 1-2 description
+placeholder = N_2_1, kernel_name(179), , Limit 2-1 name
+placeholder = D_2_1, kernel_desc(179), , Limit 2-1 description
+placeholder = N_2_2, kernel_name(180), , Limit 2-2 name
+placeholder = D_2_2, kernel_desc(180), , Limit 2-2 description
+placeholder = N_3_1, kernel_name(181), , Limit 3-1 name
+placeholder = D_3_1, kernel_desc(181), , Limit 3-1 description
+placeholder = N_3_2, kernel_name(182), , Limit 3-2 name
+placeholder = D_3_2, kernel_desc(182), , Limit 3-2 description
+placeholder = N_4_1, kernel_name(183), , Limit 4-1 name
+placeholder = D_4_1, kernel_desc(183), , Limit 4-1 description
+lines
+    [<ID> 1-1]
+    name          = <N_1_1>
+    description   = <D_1_1>
+    base          = 177                  ; the game's limit 177
+    effect        = base
+    ; learned when the character is made
+    
+    [<ID> 1-2]
+    name          = <N_1_2>
+    description   = <D_1_2>
+    base          = 178                  ; the game's limit 178
+    effect        = base
+    uses          = 8                    ; uses of 1-1 that teach it
+    
+    [<ID> 2-1]
+    name          = <N_2_1>
+    description   = <D_2_1>
+    base          = 179                  ; the game's limit 179
+    effect        = base
+    kills         = 64                   ; kills that teach it
+    
+    [<ID> 2-2]
+    name          = <N_2_2>
+    description   = <D_2_2>
+    base          = 180                  ; the game's limit 180
+    effect        = base
+    uses          = 7                    ; uses of 2-1 that teach it
+    
+    [<ID> 3-1]
+    name          = <N_3_1>
+    description   = <D_3_1>
+    base          = 181                  ; the game's limit 181
+    effect        = base
+    kills         = 128                  ; kills that teach it
+    
+    [<ID> 3-2]
+    name          = <N_3_2>
+    description   = <D_3_2>
+    base          = 182                  ; the game's limit 182
+    effect        = base
+    uses          = 6                    ; uses of 3-1 that teach it
+    
+    [<ID> 4-1]
+    name          = <N_4_1>
+    description   = <D_4_1>
+    base          = 183                  ; the game's limit 183
+    effect        = base
+    ;learned       = yes                  ; else taught by the limit item only
+part = FF7_SpellExt_Weapons.ini
+kind = weapon
+when = STARTER_WEAPON
+placeholder = W, id
+placeholder = WNAME, text31, 4-point Shuriken II, Starter weapon name
+lines
+    [<W>]
+    name          = <WNAME>
+    base          = 87                   ; kernel weapon 87: model, animation, icon
+    equip         = <ID>                 ; the new character, by number
+    ;give_on_load  = yes                  ; testing aid
+
+[template character_caitsith]
+title = Cait Sith (kernel character 6)
+kind = character
+file = FF7_SpellExt_Characters.ini
+note = A new party member built on Cait Sith: battle model 6, files ry (49 files, 46 bones), its animations, the weapons its kernel equip mask allows, its growth and its limits.
+note = No base and no copy_of: the DLL builds the record from this sheet at the chosen level (level = party: the average level of the party).
+note = Limits: borrowed whole (limits = caitsith: the set, its thresholds and gauge), or with "Limits: an editable copy" also a copy of the set in the limits file at the same positions, its names and descriptions read from your KERNEL.BIN. The level-4 limit is learned only through that copy's limit item (or learn_all_on_load, a testing aid).
+note = No field model: Cait Sith's field skeleton AEBC has 28 bones; a field model needs Cloud's 21 in his order.
+warn = Dice and Slots are untried on a new character.
+placeholder = ID, id
+placeholder = NAME, text11, New, Name
+placeholder = LEVEL, level, party, Level
+placeholder = WEAPON, gear_id(weapon, caitsith), 229, Weapon
+placeholder = ARMOUR, gear_id(armour), 256, Armour
+placeholder = ACCESSORY, gear_id(accessory)|none, none, Accessory
+placeholder = PORTRAIT_ON, switch, off, Own portrait file
+placeholder = PORTRAIT, portrait, ketc, Portrait name (files\<name>.png or .tex)
+placeholder = FILES_ON, switch, off, Own battle files (a full renamed set)
+placeholder = PREFIX, battle_prefix, zz, Battle file prefix (two letters)
+placeholder = AI_FILE, switch, off, AI: a file of the ai folder (a library AI)
+placeholder = AI_NAME, ai_ref, , Library AI
+placeholder = KEEP_SEAT, switch, off, keep_seat
+placeholder = JOIN_LOAD, switch, off, join = load (testing aid)
+placeholder = OWN_LIMITS, switch, off, Limits: an editable copy in the limits file (Option B)
+placeholder = STARTER_WEAPON, switch, off, A starter weapon of its own in the weapons file
+lines
+    [<ID>]
+    name          = <NAME>
+    battle_like   = caitsith             ; model 6, files ry
+    equip_like    = caitsith             ; the weapons of kernel character 6's class
+    limits        = caitsith             ; the set of kernel character 6, its thresholds and gauge
+    level         = <LEVEL>
+    <?!STARTER_WEAPON>weapon        = <WEAPON>
+    <?STARTER_WEAPON>weapon        = <W>                  ; the starter weapon below
+    armour        = <ARMOUR>
+    accessory     = <ACCESSORY>
+    field_model   = none                 ; AEBC has 28 bones: not usable
+    <?PORTRAIT_ON>portrait      = <PORTRAIT>           ; SpellExtConfig\files\<name>.png or .tex
+    <?FILES_ON>battle_files  = <PREFIX>             ; the FULL renamed set, in a 7th Heaven mod
+    <?AI_FILE>ai            = <AI_NAME>            ; SpellExtConfig\ai\<name>.ai
+    <?KEEP_SEAT>keep_seat     = yes
+    <?JOIN_LOAD>join          = load                 ; testing aid
+part = FF7_SpellExt_Limits.ini
+kind = character
+when = OWN_LIMITS
+placeholder = LIMIT_ITEM, switch, off, A limit item that teaches the level-4 limit
+placeholder = LITEM, limit_item_id, , Limit item ID (105-127)
+placeholder = LITEM_NAME, text24, Limit Manual, Limit item name
+lines
+    [<ID>]
+    gauge         = 160 180 9590 12760   ; kernel character 6's: how slowly each level fills
+    <?LIMIT_ITEM>limit_item    = <LITEM>
+    <?LIMIT_ITEM>limit_item_name = <LITEM_NAME>
+    ;limit_item_description =
+    ;learn_all_on_load = yes              ; testing aid: every limit learned at each load
+part = FF7_SpellExt_Limits.ini
+kind = limit
+when = OWN_LIMITS
+placeholder = N_1_1, kernel_name(170), , Limit 1-1 name
+placeholder = D_1_1, kernel_desc(170), , Limit 1-1 description
+placeholder = N_2_1, kernel_name(172), , Limit 2-1 name
+placeholder = D_2_1, kernel_desc(172), , Limit 2-1 description
+lines
+    [<ID> 1-1]
+    name          = <N_1_1>
+    description   = <D_1_1>
+    base          = 170                  ; the game's limit 170
+    effect        = base
+    ; learned when the character is made
+    
+    [<ID> 2-1]
+    name          = <N_2_1>
+    description   = <D_2_1>
+    base          = 172                  ; the game's limit 172
+    effect        = base
+    kills         = 40                   ; kills that teach it
+part = FF7_SpellExt_Weapons.ini
+kind = weapon
+when = STARTER_WEAPON
+placeholder = W, id
+placeholder = WNAME, text31, Yellow M-phone II, Starter weapon name
+lines
+    [<W>]
+    name          = <WNAME>
+    base          = 101                  ; kernel weapon 101: model, animation, icon
+    equip         = <ID>                 ; the new character, by number
+    ;give_on_load  = yes                  ; testing aid
+
+[template character_vincent]
+title = Vincent (kernel character 7)
+kind = character
+file = FF7_SpellExt_Characters.ini
+note = A new party member built on Vincent: battle model 7, files sf (55 files, 47 bones; guns sg, sh (models 14, 15); beast forms sj, sk, sl, sm), its animations, the weapons its kernel equip mask allows, its growth and its limits.
+note = No base and no copy_of: the DLL builds the record from this sheet at the chosen level (level = party: the average level of the party).
+note = Limits: none by default; "Limits: borrow" writes limits = vincent (the transformations, their thresholds and gauge), and then "Limits: an editable copy" may add a copy of the set in the limits file, its names and descriptions read from your KERNEL.BIN.
+note = No field model: Vincent's field skeleton AEHD has 25 bones; a field model needs Cloud's 21 in his order.
+warn = BORROW_LIMITS !AI_LIKE: Vincent's limits are transformations: a transformed character acts by itself and needs ai_like = vincent, or it stands idle.
+warn = BORROW_LIMITS: The transformations are untried on a new character.
+placeholder = ID, id
+placeholder = NAME, text11, New, Name
+placeholder = LEVEL, level, party, Level
+placeholder = WEAPON, gear_id(weapon, vincent), 242, Weapon
+placeholder = ARMOUR, gear_id(armour), 256, Armour
+placeholder = ACCESSORY, gear_id(accessory)|none, none, Accessory
+placeholder = PORTRAIT_ON, switch, off, Own portrait file
+placeholder = PORTRAIT, portrait, bins, Portrait name (files\<name>.png or .tex)
+placeholder = FILES_ON, switch, off, Own battle files (a full renamed set)
+placeholder = PREFIX, battle_prefix, zz, Battle file prefix (two letters)
+placeholder = AI_LIKE, switch, on, AI: the kernel's entry 7 (the beast forms' attacks)
+placeholder = AI_WHO, ai_word(vincent), vincent, Kernel AI
+placeholder = AI_FILE, switch, off, AI: a file of the ai folder (a library AI)
+placeholder = AI_NAME, ai_ref, , Library AI
+placeholder = KEEP_SEAT, switch, off, keep_seat
+placeholder = JOIN_LOAD, switch, off, join = load (testing aid)
+placeholder = BORROW_LIMITS, switch, off, Limits: borrow Vincent's (limits = vincent)
+placeholder = OWN_LIMITS, switch(BORROW_LIMITS), off, Limits: an editable copy in the limits file (Option B)
+placeholder = STARTER_WEAPON, switch, off, A starter weapon of its own in the weapons file
+exclusive = AI_LIKE, AI_FILE
+lines
+    [<ID>]
+    name          = <NAME>
+    battle_like   = vincent              ; model 7, files sf
+    equip_like    = vincent              ; the weapons of kernel character 7's class
+    <?BORROW_LIMITS>limits        = vincent              ; the transformations, thresholds and gauge
+    <?!BORROW_LIMITS>limits        = none
+    level         = <LEVEL>
+    <?!STARTER_WEAPON>weapon        = <WEAPON>
+    <?STARTER_WEAPON>weapon        = <W>                  ; the starter weapon below
+    armour        = <ARMOUR>
+    accessory     = <ACCESSORY>
+    field_model   = none                 ; AEHD has 25 bones: not usable
+    <?PORTRAIT_ON>portrait      = <PORTRAIT>           ; SpellExtConfig\files\<name>.png or .tex
+    <?FILES_ON>battle_files  = <PREFIX>             ; the FULL renamed set, in a 7th Heaven mod
+    <?AI_LIKE>ai_like       = <AI_WHO>
+    <?AI_FILE>ai            = <AI_NAME>            ; SpellExtConfig\ai\<name>.ai
+    <?KEEP_SEAT>keep_seat     = yes
+    <?JOIN_LOAD>join          = load                 ; testing aid
+part = FF7_SpellExt_Limits.ini
+kind = character
+when = OWN_LIMITS
+placeholder = LIMIT_ITEM, switch, off, A limit item that teaches the level-4 limit
+placeholder = LITEM, limit_item_id, , Limit item ID (105-127)
+placeholder = LITEM_NAME, text24, Limit Manual, Limit item name
+lines
+    [<ID>]
+    gauge         = 202 244 319 426      ; kernel character 7's: how slowly each level fills
+    <?LIMIT_ITEM>limit_item    = <LITEM>
+    <?LIMIT_ITEM>limit_item_name = <LITEM_NAME>
+    ;limit_item_description =
+    ;learn_all_on_load = yes              ; testing aid: every limit learned at each load
+part = FF7_SpellExt_Limits.ini
+kind = limit
+when = OWN_LIMITS
+placeholder = N_1_1, kernel_name(173), , Limit 1-1 name
+placeholder = D_1_1, kernel_desc(173), , Limit 1-1 description
+placeholder = N_2_1, kernel_name(174), , Limit 2-1 name
+placeholder = D_2_1, kernel_desc(174), , Limit 2-1 description
+placeholder = N_3_1, kernel_name(175), , Limit 3-1 name
+placeholder = D_3_1, kernel_desc(175), , Limit 3-1 description
+placeholder = N_4_1, kernel_name(176), , Limit 4-1 name
+placeholder = D_4_1, kernel_desc(176), , Limit 4-1 description
+lines
+    [<ID> 1-1]
+    name          = <N_1_1>
+    description   = <D_1_1>
+    base          = 173                  ; the game's limit 173
+    effect        = base
+    ; learned when the character is made
+    
+    [<ID> 2-1]
+    name          = <N_2_1>
+    description   = <D_2_1>
+    base          = 174                  ; the game's limit 174
+    effect        = base
+    kills         = 40                   ; kills that teach it
+    
+    [<ID> 3-1]
+    name          = <N_3_1>
+    description   = <D_3_1>
+    base          = 175                  ; the game's limit 175
+    effect        = base
+    kills         = 96                   ; kills that teach it
+    
+    [<ID> 4-1]
+    name          = <N_4_1>
+    description   = <D_4_1>
+    base          = 176                  ; the game's limit 176
+    effect        = base
+    ;learned       = yes                  ; else taught by the limit item only
+part = FF7_SpellExt_Weapons.ini
+kind = weapon
+when = STARTER_WEAPON
+placeholder = W, id
+placeholder = WNAME, text31, Quicksilver II, Starter weapon name
+lines
+    [<W>]
+    name          = <WNAME>
+    base          = 114                  ; kernel weapon 114: model, animation, icon
+    equip         = <ID>                 ; the new character, by number
+    ;give_on_load  = yes                  ; testing aid
+
+[template character_cid]
+title = Cid (kernel character 8)
+kind = character
+file = FF7_SpellExt_Characters.ini
+note = A new party member built on Cid: battle model 8, files rz (41 files, 29 bones), its animations, the weapons its kernel equip mask allows, its growth and its limits.
+note = No base and no copy_of: the DLL builds the record from this sheet at the chosen level (level = party: the average level of the party).
+note = Limits: borrowed whole (limits = cid: the set, its thresholds and gauge), or with "Limits: an editable copy" also a copy of the set in the limits file at the same positions, its names and descriptions read from your KERNEL.BIN. The level-4 limit is learned only through that copy's limit item (or learn_all_on_load, a testing aid).
+placeholder = ID, id
+placeholder = NAME, text11, New, Name
+placeholder = LEVEL, level, party, Level
+placeholder = WEAPON, gear_id(weapon, cid), 201, Weapon
+placeholder = ARMOUR, gear_id(armour), 256, Armour
+placeholder = ACCESSORY, gear_id(accessory)|none, none, Accessory
+placeholder = FIELD, switch, on, Field model (ABDA: 21 bones, usable)
+placeholder = PORTRAIT_ON, switch, off, Own portrait file
+placeholder = PORTRAIT, portrait, cido, Portrait name (files\<name>.png or .tex)
+placeholder = FILES_ON, switch, off, Own battle files (a full renamed set)
+placeholder = PREFIX, battle_prefix, zz, Battle file prefix (two letters)
+placeholder = AI_FILE, switch, off, AI: a file of the ai folder (a library AI)
+placeholder = AI_NAME, ai_ref, , Library AI
+placeholder = KEEP_SEAT, switch, off, keep_seat
+placeholder = JOIN_LOAD, switch, off, join = load (testing aid)
+placeholder = OWN_LIMITS, switch, off, Limits: an editable copy in the limits file (Option B)
+placeholder = STARTER_WEAPON, switch, off, A starter weapon of its own in the weapons file
+lines
+    [<ID>]
+    name          = <NAME>
+    battle_like   = cid                  ; model 8, files rz
+    equip_like    = cid                  ; the weapons of kernel character 8's class
+    limits        = cid                  ; the set of kernel character 8, its thresholds and gauge
+    level         = <LEVEL>
+    <?!STARTER_WEAPON>weapon        = <WEAPON>
+    <?STARTER_WEAPON>weapon        = <W>                  ; the starter weapon below
+    armour        = <ARMOUR>
+    accessory     = <ACCESSORY>
+    <?FIELD>field_model   = ABDA                 ; needs field_entities = party or seats in the game file
+    <?PORTRAIT_ON>portrait      = <PORTRAIT>           ; SpellExtConfig\files\<name>.png or .tex
+    <?FILES_ON>battle_files  = <PREFIX>             ; the FULL renamed set, in a 7th Heaven mod
+    <?AI_FILE>ai            = <AI_NAME>            ; SpellExtConfig\ai\<name>.ai
+    <?KEEP_SEAT>keep_seat     = yes
+    <?JOIN_LOAD>join          = load                 ; testing aid
+part = FF7_SpellExt_Limits.ini
+kind = character
+when = OWN_LIMITS
+placeholder = LIMIT_ITEM, switch, off, A limit item that teaches the level-4 limit
+placeholder = LITEM, limit_item_id, , Limit item ID (105-127)
+placeholder = LITEM_NAME, text24, Limit Manual, Limit item name
+lines
+    [<ID>]
+    gauge         = 200 280 380 480      ; kernel character 8's: how slowly each level fills
+    <?LIMIT_ITEM>limit_item    = <LITEM>
+    <?LIMIT_ITEM>limit_item_name = <LITEM_NAME>
+    ;limit_item_description =
+    ;learn_all_on_load = yes              ; testing aid: every limit learned at each load
+part = FF7_SpellExt_Limits.ini
+kind = limit
+when = OWN_LIMITS
+placeholder = N_1_1, kernel_name(156), , Limit 1-1 name
+placeholder = D_1_1, kernel_desc(156), , Limit 1-1 description
+placeholder = N_1_2, kernel_name(159), , Limit 1-2 name
+placeholder = D_1_2, kernel_desc(159), , Limit 1-2 description
+placeholder = N_2_1, kernel_name(158), , Limit 2-1 name
+placeholder = D_2_1, kernel_desc(158), , Limit 2-1 description
+placeholder = N_2_2, kernel_name(157), , Limit 2-2 name
+placeholder = D_2_2, kernel_desc(157), , Limit 2-2 description
+placeholder = N_3_1, kernel_name(160), , Limit 3-1 name
+placeholder = D_3_1, kernel_desc(160), , Limit 3-1 description
+placeholder = N_3_2, kernel_name(161), , Limit 3-2 name
+placeholder = D_3_2, kernel_desc(161), , Limit 3-2 description
+placeholder = N_4_1, kernel_name(162), , Limit 4-1 name
+placeholder = D_4_1, kernel_desc(162), , Limit 4-1 description
+lines
+    [<ID> 1-1]
+    name          = <N_1_1>
+    description   = <D_1_1>
+    base          = 156                  ; the game's limit 156
+    effect        = base
+    ; learned when the character is made
+    
+    [<ID> 1-2]
+    name          = <N_1_2>
+    description   = <D_1_2>
+    base          = 159                  ; the game's limit 159
+    effect        = base
+    uses          = 7                    ; uses of 1-1 that teach it
+    
+    [<ID> 2-1]
+    name          = <N_2_1>
+    description   = <D_2_1>
+    base          = 158                  ; the game's limit 158
+    effect        = base
+    kills         = 60                   ; kills that teach it
+    
+    [<ID> 2-2]
+    name          = <N_2_2>
+    description   = <D_2_2>
+    base          = 157                  ; the game's limit 157
+    effect        = base
+    uses          = 6                    ; uses of 2-1 that teach it
+    
+    [<ID> 3-1]
+    name          = <N_3_1>
+    description   = <D_3_1>
+    base          = 160                  ; the game's limit 160
+    effect        = base
+    kills         = 136                  ; kills that teach it
+    
+    [<ID> 3-2]
+    name          = <N_3_2>
+    description   = <D_3_2>
+    base          = 161                  ; the game's limit 161
+    effect        = base
+    uses          = 5                    ; uses of 3-1 that teach it
+    
+    [<ID> 4-1]
+    name          = <N_4_1>
+    description   = <D_4_1>
+    base          = 162                  ; the game's limit 162
+    effect        = base
+    ;learned       = yes                  ; else taught by the limit item only
+part = FF7_SpellExt_Weapons.ini
+kind = weapon
+when = STARTER_WEAPON
+placeholder = W, id
+placeholder = WNAME, text31, Spear II, Starter weapon name
+lines
+    [<W>]
+    name          = <WNAME>
+    base          = 73                   ; kernel weapon 73: model, animation, icon
+    equip         = <ID>                 ; the new character, by number
+    ;give_on_load  = yes                  ; testing aid
+
+[template character_youngcloud]
+title = Young Cloud (kernel character 9)
+kind = character
+file = FF7_SpellExt_Characters.ini
+note = A new party member built on Young Cloud: battle model 9, files rt (38 files, 23 bones; the same files as Cloud (CLOUD.DAT)), its animations, the weapons its kernel equip mask allows, its growth and its limits.
+note = No base and no copy_of: the DLL builds the record from this sheet at the chosen level (level = party: the average level of the party).
+note = Limits: borrowed whole (limits = cloud: the set, its thresholds and gauge), or with "Limits: an editable copy" also a copy of the set in the limits file at the same positions, its names and descriptions read from your KERNEL.BIN. The level-4 limit is learned only through that copy's limit item (or learn_all_on_load, a testing aid).
+note = The guest record in KERNEL.BIN (its level and stats, read at run time) can be written with "Stats of the guest record".
+note = With "Own portrait file" on, portrait = pcloud shows the game's own portrait, read from menu_us.lgp: no file is needed (a mod's replacement of it applies). A file SpellExtConfig\files\pcloud.png or .tex, if there is one, is used instead.
+placeholder = ID, id
+placeholder = NAME, text11, New, Name
+placeholder = LEVEL, level, party, Level
+placeholder = WEAPON, gear_id(weapon, cloud), 128, Weapon
+placeholder = ARMOUR, gear_id(armour), 257, Armour
+placeholder = ACCESSORY, gear_id(accessory)|none, 288, Accessory
+placeholder = FIELD, switch, on, Field model (AAAA: 21 bones, usable)
+placeholder = PORTRAIT_ON, switch, off, Own portrait file
+placeholder = PORTRAIT, portrait, pcloud, Portrait name (files\<name>.png or .tex)
+placeholder = FILES_ON, switch, off, Own battle files (a full renamed set)
+placeholder = PREFIX, battle_prefix, zz, Battle file prefix (two letters)
+placeholder = AI_FILE, switch, off, AI: a file of the ai folder (a library AI)
+placeholder = AI_NAME, ai_ref, , Library AI
+placeholder = KEEP_SEAT, switch, off, keep_seat
+placeholder = JOIN_LOAD, switch, off, join = load (testing aid)
+placeholder = GUEST_STATS, switch, off, Stats of the guest record (KERNEL.BIN)
+placeholder = GLEVEL, kernel_stat(9, level), , level
+placeholder = GSTR, kernel_stat(9, str), , strength
+placeholder = GVIT, kernel_stat(9, vit), , vitality
+placeholder = GMAG, kernel_stat(9, mag), , magic
+placeholder = GSPR, kernel_stat(9, spr), , spirit
+placeholder = GDEX, kernel_stat(9, dex), , dexterity
+placeholder = GLCK, kernel_stat(9, lck), , luck
+placeholder = GHP, kernel_stat(9, hp), , hp
+placeholder = GMP, kernel_stat(9, mp), , mp
+placeholder = OWN_LIMITS, switch, off, Limits: an editable copy in the limits file (Option B)
+placeholder = STARTER_WEAPON, switch, off, A starter weapon of its own in the weapons file
+lines
+    [<ID>]
+    name          = <NAME>
+    battle_like   = youngcloud           ; model 9, files rt
+    equip_like    = cloud                ; the weapons of kernel character 0's class
+    limits        = cloud                ; the set of kernel character 0, its thresholds and gauge
+    <?!GUEST_STATS>level         = <LEVEL>
+    <?GUEST_STATS>level         = <GLEVEL>             ; the guest record's
+    <?GUEST_STATS>strength      = <GSTR>
+    <?GUEST_STATS>vitality      = <GVIT>
+    <?GUEST_STATS>magic         = <GMAG>
+    <?GUEST_STATS>spirit        = <GSPR>
+    <?GUEST_STATS>dexterity     = <GDEX>
+    <?GUEST_STATS>luck          = <GLCK>
+    <?GUEST_STATS>hp            = <GHP>
+    <?GUEST_STATS>mp            = <GMP>
+    <?!STARTER_WEAPON>weapon        = <WEAPON>
+    <?STARTER_WEAPON>weapon        = <W>                  ; the starter weapon below
+    armour        = <ARMOUR>
+    accessory     = <ACCESSORY>
+    <?FIELD>field_model   = AAAA                 ; needs field_entities = party or seats in the game file
+    <?PORTRAIT_ON>portrait      = <PORTRAIT>           ; SpellExtConfig\files\<name>.png or .tex
+    <?FILES_ON>battle_files  = <PREFIX>             ; the FULL renamed set, in a 7th Heaven mod
+    <?AI_FILE>ai            = <AI_NAME>            ; SpellExtConfig\ai\<name>.ai
+    <?KEEP_SEAT>keep_seat     = yes
+    <?JOIN_LOAD>join          = load                 ; testing aid
+part = FF7_SpellExt_Limits.ini
+kind = character
+when = OWN_LIMITS
+placeholder = LIMIT_ITEM, switch, off, A limit item that teaches the level-4 limit
+placeholder = LITEM, limit_item_id, , Limit item ID (105-127)
+placeholder = LITEM_NAME, text24, Limit Manual, Limit item name
+lines
+    [<ID>]
+    gauge         = 140 324 435 506      ; kernel character 0's: how slowly each level fills
+    <?LIMIT_ITEM>limit_item    = <LITEM>
+    <?LIMIT_ITEM>limit_item_name = <LITEM_NAME>
+    ;limit_item_description =
+    ;learn_all_on_load = yes              ; testing aid: every limit learned at each load
+part = FF7_SpellExt_Limits.ini
+kind = limit
+when = OWN_LIMITS
+placeholder = N_1_1, kernel_name(128), , Limit 1-1 name
+placeholder = D_1_1, kernel_desc(128), , Limit 1-1 description
+placeholder = N_1_2, kernel_name(129), , Limit 1-2 name
+placeholder = D_1_2, kernel_desc(129), , Limit 1-2 description
+placeholder = N_2_1, kernel_name(130), , Limit 2-1 name
+placeholder = D_2_1, kernel_desc(130), , Limit 2-1 description
+placeholder = N_2_2, kernel_name(131), , Limit 2-2 name
+placeholder = D_2_2, kernel_desc(131), , Limit 2-2 description
+placeholder = N_3_1, kernel_name(132), , Limit 3-1 name
+placeholder = D_3_1, kernel_desc(132), , Limit 3-1 description
+placeholder = N_3_2, kernel_name(133), , Limit 3-2 name
+placeholder = D_3_2, kernel_desc(133), , Limit 3-2 description
+placeholder = N_4_1, kernel_name(134), , Limit 4-1 name
+placeholder = D_4_1, kernel_desc(134), , Limit 4-1 description
+lines
+    [<ID> 1-1]
+    name          = <N_1_1>
+    description   = <D_1_1>
+    base          = 128                  ; the game's limit 128
+    effect        = base
+    ; learned when the character is made
+    
+    [<ID> 1-2]
+    name          = <N_1_2>
+    description   = <D_1_2>
+    base          = 129                  ; the game's limit 129
+    effect        = base
+    uses          = 8                    ; uses of 1-1 that teach it
+    
+    [<ID> 2-1]
+    name          = <N_2_1>
+    description   = <D_2_1>
+    base          = 130                  ; the game's limit 130
+    effect        = base
+    kills         = 120                  ; kills that teach it
+    
+    [<ID> 2-2]
+    name          = <N_2_2>
+    description   = <D_2_2>
+    base          = 131                  ; the game's limit 131
+    effect        = base
+    uses          = 7                    ; uses of 2-1 that teach it
+    
+    [<ID> 3-1]
+    name          = <N_3_1>
+    description   = <D_3_1>
+    base          = 132                  ; the game's limit 132
+    effect        = base
+    kills         = 320                  ; kills that teach it
+    
+    [<ID> 3-2]
+    name          = <N_3_2>
+    description   = <D_3_2>
+    base          = 133                  ; the game's limit 133
+    effect        = base
+    uses          = 6                    ; uses of 3-1 that teach it
+    
+    [<ID> 4-1]
+    name          = <N_4_1>
+    description   = <D_4_1>
+    base          = 134                  ; the game's limit 134
+    effect        = base
+    ;learned       = yes                  ; else taught by the limit item only
+part = FF7_SpellExt_Weapons.ini
+kind = weapon
+when = STARTER_WEAPON
+placeholder = W, id
+placeholder = WNAME, text31, Buster Sword II, Starter weapon name
+lines
+    [<W>]
+    name          = <WNAME>
+    base          = 0                    ; kernel weapon 0: model, animation, icon
+    equip         = <ID>                 ; the new character, by number
+    ;give_on_load  = yes                  ; testing aid
+
+[template character_sephiroth]
+title = Sephiroth (kernel character 10)
+kind = character
+file = FF7_SpellExt_Characters.ini
+note = A new party member built on Sephiroth: battle model 10, files sa (56 files, 47 bones; SEFIROS.DAT), its animations, the weapons its kernel equip mask allows, its growth.
+note = No base and no copy_of: the DLL builds the record from this sheet at the chosen level (level = party: the average level of the party).
+note = No limits: no vanilla limit fits his skeleton (47 bones). The Masamune (weapon 255) is reachable through the starter weapon part (base 127, equip = this character's ID).
+note = No field model: Sephiroth's field skeleton BKHD/ERHA/BGJC has 23 bones; a field model needs Cloud's 21 in his order.
+note = The guest record in KERNEL.BIN (its level and stats, read at run time) can be written with "Stats of the guest record".
+note = With "Own portrait file" on, portrait = pcefi shows the game's own portrait, read from menu_us.lgp: no file is needed (a mod's replacement of it applies). A file SpellExtConfig\files\pcefi.png or .tex, if there is one, is used instead.
+warn = Sephiroth as a party member has never been seen in battle; his model lacks animations: hurt plays idle, no KO pose, Item/Throw/Coin/Defend are placeholders, several command strikes play idle, no Cover.
+warn = AI_LIKE: ai_like = sephiroth makes the character invulnerable to physical and magic damage and take every turn itself.
+placeholder = ID, id
+placeholder = NAME, text11, New, Name
+placeholder = LEVEL, level, party, Level
+placeholder = WEAPON, gear_id(weapon, cloud), 128, Weapon
+placeholder = ARMOUR, gear_id(armour), 262, Armour
+placeholder = ACCESSORY, gear_id(accessory)|none, 296, Accessory
+placeholder = PORTRAIT_ON, switch, off, Own portrait file
+placeholder = PORTRAIT, portrait, pcefi, Portrait name (files\<name>.png or .tex)
+placeholder = FILES_ON, switch, off, Own battle files (a full renamed set)
+placeholder = PREFIX, battle_prefix, zz, Battle file prefix (two letters)
+placeholder = AI_LIKE, switch, off, AI: the kernel's entry 10 (AI-controlled: invulnerable to physical and magic damage, takes every turn itself)
+placeholder = AI_WHO, ai_word(sephiroth), sephiroth, Kernel AI
+placeholder = AI_FILE, switch, off, AI: a file of the ai folder (a library AI)
+placeholder = AI_NAME, ai_ref, , Library AI
+placeholder = KEEP_SEAT, switch, off, keep_seat
+placeholder = JOIN_LOAD, switch, off, join = load (testing aid)
+placeholder = GUEST_STATS, switch, off, Stats of the guest record (KERNEL.BIN)
+placeholder = GLEVEL, kernel_stat(10, level), , level
+placeholder = GSTR, kernel_stat(10, str), , strength
+placeholder = GVIT, kernel_stat(10, vit), , vitality
+placeholder = GMAG, kernel_stat(10, mag), , magic
+placeholder = GSPR, kernel_stat(10, spr), , spirit
+placeholder = GDEX, kernel_stat(10, dex), , dexterity
+placeholder = GLCK, kernel_stat(10, lck), , luck
+placeholder = GHP, kernel_stat(10, hp), , hp
+placeholder = GMP, kernel_stat(10, mp), , mp
+placeholder = STARTER_WEAPON, switch, off, A starter weapon of its own in the weapons file
+exclusive = AI_LIKE, AI_FILE
+lines
+    [<ID>]
+    name          = <NAME>
+    battle_like   = sephiroth            ; model 10, files sa
+    equip_like    = cloud                ; the weapons of kernel character 0's class
+    limits        = none                 ; no vanilla limit fits this model
+    <?!GUEST_STATS>level         = <LEVEL>
+    <?GUEST_STATS>level         = <GLEVEL>             ; the guest record's
+    <?GUEST_STATS>strength      = <GSTR>
+    <?GUEST_STATS>vitality      = <GVIT>
+    <?GUEST_STATS>magic         = <GMAG>
+    <?GUEST_STATS>spirit        = <GSPR>
+    <?GUEST_STATS>dexterity     = <GDEX>
+    <?GUEST_STATS>luck          = <GLCK>
+    <?GUEST_STATS>hp            = <GHP>
+    <?GUEST_STATS>mp            = <GMP>
+    <?!STARTER_WEAPON>weapon        = <WEAPON>
+    <?STARTER_WEAPON>weapon        = <W>                  ; the starter weapon below
+    armour        = <ARMOUR>
+    accessory     = <ACCESSORY>
+    field_model   = none                 ; BKHD has 23 bones: not usable
+    <?PORTRAIT_ON>portrait      = <PORTRAIT>           ; SpellExtConfig\files\<name>.png or .tex
+    <?FILES_ON>battle_files  = <PREFIX>             ; the FULL renamed set, in a 7th Heaven mod
+    <?AI_LIKE>ai_like       = <AI_WHO>
+    <?AI_FILE>ai            = <AI_NAME>            ; SpellExtConfig\ai\<name>.ai
+    <?KEEP_SEAT>keep_seat     = yes
+    <?JOIN_LOAD>join          = load                 ; testing aid
+part = FF7_SpellExt_Weapons.ini
+kind = weapon
+when = STARTER_WEAPON
+placeholder = W, id
+placeholder = WNAME, text31, Masamune II, Starter weapon name
+lines
+    [<W>]
+    name          = <WNAME>
+    base          = 127                  ; kernel weapon 127: model, animation, icon
+    equip         = <ID>                 ; the new character, by number
+    ;give_on_load  = yes                  ; testing aid
+
+; ==== end of the generated character templates =====================================================================

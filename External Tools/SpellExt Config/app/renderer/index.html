@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'none'">
+<title>SpellExt Config</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header class="top">
+  <img class="brandicon" src="icon.svg" alt="">
+  <div class="brand">SpellExt Config</div>
+  <button id="foldername" class="foldername" title="click: open another folder"></button>
+  <div class="spacer"></div>
+  <button id="saveall" hidden title="Save every changed file (one backup folder for all of them is made first)">Save all</button>
+  <details id="settingsmenu" class="settingsmenu">
+    <summary>Settings</summary>
+    <div class="menubox">
+      <label><input type="checkbox" id="set_confirm"> Show the changes before Save (Ctrl+S)</label>
+      <label><input type="checkbox" id="set_openlast"> Open the last folder at start</label>
+      <div class="muted" id="set_versions"></div>
+    </div>
+  </details>
+</header>
+<div id="banners"></div>
+<main>
+  <nav id="nav" class="sidebar" hidden aria-label="kinds"></nav>
+  <section id="page-open" class="page"></section>
+
+  <section id="page-files" class="page">
+    <div class="editor">
+      <div class="filebar">
+        <span id="filetitle" class="filetitle">Pick a kind on the left</span>
+        <span id="fileinfo" class="muted"></span>
+        <div class="spacer"></div>
+        <div class="tabs" id="filetabs">
+          <button data-tab="form" class="on">Form</button>
+          <button data-tab="raw">Raw</button>
+          <button data-tab="diff">Changes</button>
+        </div>
+        <button id="revert" title="Drop the unsaved edits of this file and read it from disk again">Reload</button>
+        <button id="save" class="primary" title="Ctrl+S: back up, then write this file">Save</button>
+      </div>
+      <div id="tab-form" class="tab on">
+        <div class="formsplit" id="formsplit">
+          <div id="sections" class="sections"></div>
+          <div id="form" class="form"></div>
+        </div>
+        <div id="gamepage" class="gamepage" hidden>
+          <p class="muted">Each option is the file's own line; changing one changes only that line (or adds one). "Not in the file" means the DLL uses its default.</p>
+          <div id="gameopts"></div>
+        </div>
+      </div>
+      <div id="tab-raw" class="tab">
+        <div class="rawbar"><button id="rawapply">Apply</button> <span class="muted">The text is applied when you switch tab or press Apply; nothing is written until Save.</span></div>
+        <div class="rawwrap"><pre id="gutter" class="gutter"></pre><textarea id="raw" spellcheck="false" wrap="off"></textarea></div>
+      </div>
+      <div id="tab-diff" class="tab"><pre id="diff" class="diff"></pre></div>
+      <div id="fileprobs" class="probstrip"></div>
+    </div>
+  </section>
+
+  <section id="page-problems" class="page">
+    <div class="pagehead">
+      <h2>Problems</h2>
+      <div class="tabs" id="probtabs">
+        <button data-tab="forecast" class="on">Forecast (this tool)</button>
+        <button data-tab="log">Game log (the DLL)</button>
+      </div>
+      <div class="spacer"></div>
+      <button id="probrefresh">Refresh</button>
+    </div>
+    <div id="ptab-forecast" class="tab on"><div id="forecast"></div></div>
+    <div id="ptab-log" class="tab"><div id="gamelog"></div></div>
+  </section>
+
+  <section id="page-ai" class="page">
+    <aside class="tree aitree" id="ailist"></aside>
+    <div class="editor">
+      <div class="filebar">
+        <span id="aititle" class="filetitle">Battle AI</span>
+        <span id="aiinfo" class="muted"></span>
+        <div class="spacer"></div>
+        <div class="tabs" id="aitabs">
+          <button data-tab="cards" class="on">Sections</button>
+          <button data-tab="raw">Whole file</button>
+        </div>
+        <span id="ainame"></span>
+        <button id="ailib" title="recipes, instructions and variables for writing AI">Library</button>
+        <button id="aicheck">Check</button>
+        <button id="aisave" class="primary" title="Assemble, check, back up, then write NAME.txt and NAME.ai">Save</button>
+      </div>
+      <div id="aitab-cards" class="tab on"><div id="aicards" class="aicards"><p class="muted">Open an AI file, or look at the game's AI, on the left.</p></div></div>
+      <div id="aitab-raw" class="tab">
+        <div class="rawwrap"><pre id="aigutter" class="gutter"></pre><textarea id="aitext" spellcheck="false" wrap="off"></textarea></div>
+      </div>
+      <div id="aiprobs" class="probstrip"></div>
+    </div>
+    <aside id="libdrawer" class="libdrawer" hidden></aside>
+  </section>
+
+  <section id="page-library" class="page">
+    <div class="pagewrap">
+      <div class="pagehead"><h2>Library</h2></div>
+      <div id="librarynote"></div>
+    </div>
+  </section>
+
+  <section id="page-live" class="page">
+    <div class="livepage">
+      <div class="pagehead livehead">
+        <h2>Live tables <span class="muted">read from the running game's memory; nothing is written</span></h2>
+        <div class="spacer"></div>
+        <label title="Reads the shown window again every 2 seconds; stops when a read fails or the game stops"><input type="checkbox" id="liveauto"> Auto-refresh (2 s)</label>
+        <button id="liverefresh">Refresh</button>
+      </div>
+      <div id="livestatus" class="livestatus"></div>
+      <div class="livesplit">
+        <aside id="livelist" class="tree"></aside>
+        <div id="liveview" class="editor liveview"></div>
+      </div>
+    </div>
+  </section>
+</main>
+<div id="modal" class="modal" hidden>
+  <div class="modalbox" role="dialog" aria-modal="true" aria-labelledby="modaltitle">
+    <h3 id="modaltitle"></h3>
+    <div id="modalbody" class="modalbody"></div>
+    <div id="modalbtns" class="modalbtns"></div>
+  </div>
+</div>
+<div id="toast" class="toast"></div>
+<script src="kinds.js"></script>
+<script src="library.js"></script>
+<script src="live.js"></script>
+<script src="open.js"></script>
+<script src="templates.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'none'">
+<title>AI section</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body class="aiwin">
+<header class="top">
+  <div class="brand" id="wtitle">AI section</div>
+  <span id="wsub" class="muted"></span>
+  <div class="spacer"></div>
+  <span id="wstate" class="muted"></span>
+  <button id="wlibbtn" title="recipes, instructions and variables">Library</button>
+</header>
+<div id="wbanner"></div>
+<main class="wsplit">
+  <section class="wcode">
+    <div class="wcodewrap">
+      <pre id="wgutter" class="gutter"></pre>
+      <div class="wedit">
+        <pre id="wback" class="wback" aria-hidden="true"></pre>
+        <textarea id="wtext" spellcheck="false" wrap="off"></textarea>
+      </div>
+    </div>
+  </section>
+  <aside id="wlib" class="wlib" hidden></aside>
+  <section class="wexplain">
+    <div id="wlegend" class="wlegend"></div>
+    <div id="wlines" class="wlines"></div>
+  </section>
+</main>
+<div id="toast" class="toast"></div>
+<script src="library.js"></script>
+<script src="aiwin.js"></script>
+</body>
+</html>

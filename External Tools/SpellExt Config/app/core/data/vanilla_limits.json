@@ -1,0 +1,364 @@
+{
+ "about": [
+  "The nine game characters' limit sets, by level and position, with the counters that teach them and the gauge: FF7_SpellExt_Limits_README.txt's table 'The game's limits (for base)' (kills = [level 2, level 3] on 2-1 and 3-1; uses = [1-2, 2-2, 3-2]; 65535 'never' left out). Read by tools/make_character_templates.py. Names and descriptions are NOT here: the templates read them from the user's KERNEL.BIN at run time (attack names and descriptions 128-183)."
+ ],
+ "sets": [
+  {
+   "who": "cloud",
+   "gauge": [
+    140,
+    324,
+    435,
+    506
+   ],
+   "limits": [
+    {
+     "at": "1-1",
+     "base": 128
+    },
+    {
+     "at": "1-2",
+     "base": 129,
+     "uses": 8
+    },
+    {
+     "at": "2-1",
+     "base": 130,
+     "kills": 120
+    },
+    {
+     "at": "2-2",
+     "base": 131,
+     "uses": 7
+    },
+    {
+     "at": "3-1",
+     "base": 132,
+     "kills": 320
+    },
+    {
+     "at": "3-2",
+     "base": 133,
+     "uses": 6
+    },
+    {
+     "at": "4-1",
+     "base": 134
+    }
+   ]
+  },
+  {
+   "who": "barret",
+   "gauge": [
+    129,
+    240,
+    374,
+    450
+   ],
+   "limits": [
+    {
+     "at": "1-1",
+     "base": 135
+    },
+    {
+     "at": "1-2",
+     "base": 137,
+     "uses": 9
+    },
+    {
+     "at": "2-1",
+     "base": 136,
+     "kills": 80
+    },
+    {
+     "at": "2-2",
+     "base": 138,
+     "uses": 8
+    },
+    {
+     "at": "3-1",
+     "base": 139,
+     "kills": 160
+    },
+    {
+     "at": "3-2",
+     "base": 140,
+     "uses": 6
+    },
+    {
+     "at": "4-1",
+     "base": 141
+    }
+   ]
+  },
+  {
+   "who": "tifa",
+   "gauge": [
+    120,
+    334,
+    509,
+    566
+   ],
+   "limits": [
+    {
+     "at": "1-1",
+     "base": 149
+    },
+    {
+     "at": "1-2",
+     "base": 150,
+     "uses": 9
+    },
+    {
+     "at": "2-1",
+     "base": 151,
+     "kills": 96
+    },
+    {
+     "at": "2-2",
+     "base": 152,
+     "uses": 7
+    },
+    {
+     "at": "3-1",
+     "base": 153,
+     "kills": 192
+    },
+    {
+     "at": "3-2",
+     "base": 154,
+     "uses": 6
+    },
+    {
+     "at": "4-1",
+     "base": 155
+    }
+   ]
+  },
+  {
+   "who": "aeris",
+   "gauge": [
+    200,
+    284,
+    322,
+    436
+   ],
+   "limits": [
+    {
+     "at": "1-1",
+     "base": 142
+    },
+    {
+     "at": "1-2",
+     "base": 143,
+     "uses": 8
+    },
+    {
+     "at": "2-1",
+     "base": 144,
+     "kills": 80
+    },
+    {
+     "at": "2-2",
+     "base": 145,
+     "uses": 6
+    },
+    {
+     "at": "3-1",
+     "base": 146,
+     "kills": 160
+    },
+    {
+     "at": "3-2",
+     "base": 147,
+     "uses": 5
+    },
+    {
+     "at": "4-1",
+     "base": 148
+    }
+   ]
+  },
+  {
+   "who": "red",
+   "gauge": [
+    195,
+    300,
+    389,
+    486
+   ],
+   "limits": [
+    {
+     "at": "1-1",
+     "base": 163
+    },
+    {
+     "at": "1-2",
+     "base": 167,
+     "uses": 8
+    },
+    {
+     "at": "2-1",
+     "base": 165,
+     "kills": 72
+    },
+    {
+     "at": "2-2",
+     "base": 166,
+     "uses": 7
+    },
+    {
+     "at": "3-1",
+     "base": 164,
+     "kills": 144
+    },
+    {
+     "at": "3-2",
+     "base": 168,
+     "uses": 6
+    },
+    {
+     "at": "4-1",
+     "base": 169
+    }
+   ]
+  },
+  {
+   "who": "yuffie",
+   "gauge": [
+    200,
+    300,
+    400,
+    480
+   ],
+   "limits": [
+    {
+     "at": "1-1",
+     "base": 177
+    },
+    {
+     "at": "1-2",
+     "base": 178,
+     "uses": 8
+    },
+    {
+     "at": "2-1",
+     "base": 179,
+     "kills": 64
+    },
+    {
+     "at": "2-2",
+     "base": 180,
+     "uses": 7
+    },
+    {
+     "at": "3-1",
+     "base": 181,
+     "kills": 128
+    },
+    {
+     "at": "3-2",
+     "base": 182,
+     "uses": 6
+    },
+    {
+     "at": "4-1",
+     "base": 183
+    }
+   ]
+  },
+  {
+   "who": "caitsith",
+   "gauge": [
+    160,
+    180,
+    9590,
+    12760
+   ],
+   "limits": [
+    {
+     "at": "1-1",
+     "base": 170
+    },
+    {
+     "at": "2-1",
+     "base": 172,
+     "kills": 40
+    }
+   ]
+  },
+  {
+   "who": "vincent",
+   "gauge": [
+    202,
+    244,
+    319,
+    426
+   ],
+   "limits": [
+    {
+     "at": "1-1",
+     "base": 173
+    },
+    {
+     "at": "2-1",
+     "base": 174,
+     "kills": 40
+    },
+    {
+     "at": "3-1",
+     "base": 175,
+     "kills": 96
+    },
+    {
+     "at": "4-1",
+     "base": 176
+    }
+   ]
+  },
+  {
+   "who": "cid",
+   "gauge": [
+    200,
+    280,
+    380,
+    480
+   ],
+   "limits": [
+    {
+     "at": "1-1",
+     "base": 156
+    },
+    {
+     "at": "1-2",
+     "base": 159,
+     "uses": 7
+    },
+    {
+     "at": "2-1",
+     "base": 158,
+     "kills": 60
+    },
+    {
+     "at": "2-2",
+     "base": 157,
+     "uses": 6
+    },
+    {
+     "at": "3-1",
+     "base": 160,
+     "kills": 136
+    },
+    {
+     "at": "3-2",
+     "base": 161,
+     "uses": 5
+    },
+    {
+     "at": "4-1",
+     "base": 162
+    }
+   ]
+  }
+ ]
+}
