@@ -3244,6 +3244,89 @@ static const DWORD item_operands[] = {
     0x00419419, 0x004332ca, 0x004332dd, 0x005c9b7d, 0x005d15b9, 0x005d15cd, 0x006c50f4,
 };
 
+/* ---- (kernel overrides) The game's own weapons, armour and accessories changed from the gear files ----
+   A section numbered for one of the game's own pieces ([128]-[255] in the weapon file, [256]-[287] in
+   the armour file, [288]-[319] in the accessory file) changes THAT entry of the kernel the game loaded:
+   each key the section gives replaces that field, each one it does not give keeps the kernel's value.
+   Nothing else in the game is touched: the records are the DLL's copies the game reads already (the
+   tables are moved: a section is refused when its table is not), the names and descriptions are
+   answered by the text hook that serves the new pieces, prices are the DLL's price table, the throw
+   tables the DLL's. The kernel's own values are KEPT, here, every time the files are read (after a
+   kernel load, after "Re-init .ini files", both of which put the kernel's records back first), so:
+     - a section taken out gives the kernel's value back at the next read;
+     - `base` of a new or wide piece copies the KERNEL's record (and its price, its throw effect),
+       never an override of it, whatever order the sections are in.
+   kernel_override_* [kind][index]: kind 0 weapon (index 0-127), 1 armour, 2 accessory (0-31). */
+#define KERNEL_OVERRIDE_KINDS   3
+static BYTE kernel_weapon_kept[WEAPON_COUNT_ORIGINAL * WEAPON_RECORD_SIZE];        /* the kernel's records, as loaded */
+static BYTE kernel_armour_kept[GEAR_COUNT_ORIGINAL * ARMOUR_RECORD_SIZE];
+static BYTE kernel_accessory_kept[GEAR_COUNT_ORIGINAL * ACCESSORY_RECORD_SIZE];
+#define KERNEL_PRICE_FIRST      ITEM_ID_WEAPON_BASE
+#define KERNEL_PRICE_COUNT      (ITEM_ID_ACCESSORY_BASE + GEAR_COUNT_ORIGINAL - ITEM_ID_WEAPON_BASE)     /* item IDs 128-319 */
+static DWORD kernel_price_kept[KERNEL_PRICE_COUNT];         /* as the price table had them at the first read of the files */
+static LONG kernel_price_kept_taken;
+static short kernel_throw_effect_kept[WEAPON_COUNT_ORIGINAL];
+static DWORD kernel_throw_model_kept[WEAPON_COUNT_ORIGINAL];
+static LONG kernel_throw_kept_taken;
+static BYTE kernel_override_on[KERNEL_OVERRIDE_KINDS][WEAPON_COUNT_ORIGINAL];        /* a section of the file changed it in this read */
+static BYTE kernel_override_name[KERNEL_OVERRIDE_KINDS][WEAPON_COUNT_ORIGINAL][32];  /* first byte ff: the kernel's text */
+static BYTE kernel_override_description[KERNEL_OVERRIDE_KINDS][WEAPON_COUNT_ORIGINAL][96];
+static DWORD kernel_override_roster[KERNEL_OVERRIDE_KINDS][WEAPON_COUNT_ORIGINAL];   /* the file's characters its `equip` names, as *_roster_equip */
+static BYTE kernel_weapon_icon_override[WEAPON_COUNT_ORIGINAL];                     /* as weapon_icon[]; KERNEL_ICON_KEPT: the kernel's */
+#define KERNEL_ICON_KEPT        0xff
+
+static BOOL is_kernel_gear_item(int kind, int id)       /* kind 0 weapon, 1 armour, 2 accessory: one of the game's own of that kind */
+{
+    return kind == 0 ? id >= ITEM_ID_WEAPON_BASE && id < ITEM_ID_WEAPON_BASE + WEAPON_COUNT_ORIGINAL
+         : kind == 1 ? id >= ITEM_ID_ARMOUR_BASE && id < ITEM_ID_ARMOUR_BASE + GEAR_COUNT_ORIGINAL
+         : kind == 2 ? id >= ITEM_ID_ACCESSORY_BASE && id < ITEM_ID_ACCESSORY_BASE + GEAR_COUNT_ORIGINAL : FALSE;
+}
+
+/* Nothing of a kind is changed: called as the kind's records are refreshed from the kernel, which
+   also keeps the kernel's records (kept: the table's first records as they are at that moment). */
+static void kernel_overrides_forget(int kind, const BYTE *records)
+{
+    int i;
+
+    if (kind == 0)
+        copy_bytes(kernel_weapon_kept, records, sizeof kernel_weapon_kept);
+    else if (kind == 1)
+        copy_bytes(kernel_armour_kept, records, sizeof kernel_armour_kept);
+    else
+        copy_bytes(kernel_accessory_kept, records, sizeof kernel_accessory_kept);
+    for (i = 0; i < WEAPON_COUNT_ORIGINAL; i++) {
+        kernel_override_on[kind][i] = 0;
+        kernel_override_name[kind][i][0] = kernel_override_description[kind][i][0] = 0xff;
+        kernel_override_roster[kind][i] = 0;
+        if (kind == 0)
+            kernel_weapon_icon_override[i] = KERNEL_ICON_KEPT;
+    }
+}
+
+/* (kernel overrides) The name (description FALSE) or description of a game piece a section changed,
+   for the text hook: section is the text section asked for, index the piece's own index in it. NULL:
+   not changed (the kernel's text). */
+static const BYTE *kernel_override_text(int section, int index)
+{
+    int kind;
+
+    if (index < 0 || index >= WEAPON_COUNT_ORIGINAL)
+        return NULL;
+    for (kind = 0; kind < KERNEL_OVERRIDE_KINDS; kind++) {
+        int type = kind == 0 ? 0x0a : kind == 1 ? TEXT_TYPE_ARMOUR : TEXT_TYPE_ACCESSORY;     /* 0x0a: TEXT_TYPE_WEAPON */
+        int descriptions = *(const BYTE *)(ADDR_TEXT_SECTION_BASE + type);
+
+        if (section != descriptions && section != descriptions + TEXT_NAME_OFFSET)
+            continue;
+        if (index >= (kind == 0 ? WEAPON_COUNT_ORIGINAL : GEAR_COUNT_ORIGINAL) || !kernel_override_on[kind][index])
+            return NULL;
+        if (section == descriptions)
+            return kernel_override_description[kind][index][0] != 0xff ? kernel_override_description[kind][index] : NULL;
+        return kernel_override_name[kind][index][0] != 0xff ? kernel_override_name[kind][index] : NULL;
+    }
+    return NULL;
+}
+
 /* A new item's place in the DLL's lists (0-22 for IDs 105-127, 23-86 for 448-511), or -1. */
 static int new_item_slot(int id)
 {
@@ -3772,6 +3855,7 @@ static void refresh_weapon_table(void)
        (see move_weapon_table), and the game's own table is no longer current. */
     if (*(DWORD *)ADDR_KERNEL_WEAPON_POINTER != (DWORD)weapon_table)
         copy_bytes(weapon_table, (const BYTE *)ADDR_WEAPON_TABLE, WEAPON_COUNT_ORIGINAL * WEAPON_RECORD_SIZE);
+    kernel_overrides_forget(0, weapon_table);   /* (kernel overrides) the kernel's 128 as they are now: kept, and none changed */
     for (i = WEAPON_COUNT_ORIGINAL * WEAPON_RECORD_SIZE; i < WEAPON_COUNT_EXTENDED * WEAPON_RECORD_SIZE; i++)
         weapon_table[i] = 0xff;
     for (i = WEAPON_COUNT_ORIGINAL; i < WEAPON_COUNT_EXTENDED; i++) {
@@ -4043,6 +4127,13 @@ static const BYTE *__cdecl text_fetch_hook(int section, int index, int zero)
         if (section == item || section == item + TEXT_NAME_OFFSET)
             return wide_item_text(index, section == item, zero);
     }
+    if (index >= 0 && index < WEAPON_COUNT_ORIGINAL) {
+        /* (kernel overrides) a game piece whose section gives it a name or description: that text; the kernel's otherwise */
+        const BYTE *text = kernel_override_text(section, index);
+
+        if (text)
+            return text;
+    }
     if (index >= 0x80 + LIMIT_LENT_FIRST && index < 0x80 + LIMIT_LENT_FIRST + LIMIT_NEW_COUNT
         && (section == magic || section == magic + TEXT_NAME_OFFSET)) {
         const BYTE *text = limit_text(index - 0x80, section == magic);
@@ -4206,6 +4297,9 @@ static int icon_item_id(int id)
         return ITEM_ID_ACCESSORY_BASE;
     if (id >= NEW_ARMOUR_FIRST_ITEM)
         return ITEM_ID_ARMOUR_BASE;
+    if (is_kernel_gear_item(0, id) && kernel_override_on[0][id - ITEM_ID_WEAPON_BASE]
+        && kernel_weapon_icon_override[id - ITEM_ID_WEAPON_BASE] != KERNEL_ICON_KEPT)      /* (the arrays are zero before the first refresh: `on` first) */
+        return weapon_icon_item_id(kernel_weapon_icon_override[id - ITEM_ID_WEAPON_BASE]);     /* (kernel overrides) a game weapon's section gives icon = */
     return is_new_weapon_item(id) ? weapon_icon_item_id(weapon_icon[id - NEW_WEAPON_FIRST_ITEM]) : id;
 }
 
@@ -4517,6 +4611,8 @@ static void refresh_gear_tables(void)
         copy_bytes(armour_table, (const BYTE *)ADDR_ARMOUR_TABLE, GEAR_COUNT_ORIGINAL * ARMOUR_RECORD_SIZE);
     if (*(DWORD *)ADDR_KERNEL_ACCESSORY_POINTER != (DWORD)accessory_table)
         copy_bytes(accessory_table, (const BYTE *)ADDR_ACCESSORY_TABLE, GEAR_COUNT_ORIGINAL * ACCESSORY_RECORD_SIZE);
+    kernel_overrides_forget(1, armour_table);   /* (kernel overrides) the kernel's 32 of each as they are now: kept, and none changed */
+    kernel_overrides_forget(2, accessory_table);
     for (i = GEAR_COUNT_ORIGINAL * ARMOUR_RECORD_SIZE; i < ARMOUR_COUNT_EXTENDED * ARMOUR_RECORD_SIZE; i++)
         armour_table[i] = 0xff;
     for (i = GEAR_COUNT_ORIGINAL; i < ARMOUR_COUNT_EXTENDED; i++) {      /* nobody can equip a blank; no slots */
@@ -27939,20 +28035,23 @@ static void seat_equipment(void)
     for (i = 0; i < WEAPON_COUNT_EXTENDED; i++) {
         mask = (WORD *)(weapon_table + i * WEAPON_RECORD_SIZE + WEAPON_EQUIP_MASK);
         if (i >= WEAPON_COUNT_ORIGINAL || *mask != 0xffff)
-            *mask = seat_mask_bits(*mask, i >= NEW_WEAPON_FIRST ? weapon_roster_equip[i - NEW_WEAPON_FIRST] : 0);
+            *mask = seat_mask_bits(*mask, i >= NEW_WEAPON_FIRST ? weapon_roster_equip[i - NEW_WEAPON_FIRST]
+                                        : i < WEAPON_COUNT_ORIGINAL ? kernel_override_roster[0][i] : 0);     /* (kernel overrides) a game weapon's `equip` list */
     }
     /* the game's own tables until the DLL's are live; the DLL's hold the same 32 records and the new ones */
     for (i = 0; i < (armour_table_live ? ARMOUR_COUNT_EXTENDED : GEAR_COUNT_ORIGINAL); i++) {
         mask = (WORD *)((armour_table_live ? armour_table : (BYTE *)ADDR_ARMOUR_TABLE) + i * ARMOUR_RECORD_SIZE
                         + ARMOUR_EQUIP_MASK);
         if (i >= GEAR_COUNT_ORIGINAL || *mask != 0xffff)
-            *mask = seat_mask_bits(*mask, i >= NEW_ARMOUR_FIRST ? armour_roster_equip[i - NEW_ARMOUR_FIRST] : 0);
+            *mask = seat_mask_bits(*mask, i >= NEW_ARMOUR_FIRST ? armour_roster_equip[i - NEW_ARMOUR_FIRST]
+                                        : i < GEAR_COUNT_ORIGINAL ? kernel_override_roster[1][i] : 0);
     }
     for (i = 0; i < (accessory_table_live ? ACCESSORY_COUNT_EXTENDED : GEAR_COUNT_ORIGINAL); i++) {
         mask = (WORD *)((accessory_table_live ? accessory_table : (BYTE *)ADDR_ACCESSORY_TABLE)
                         + i * ACCESSORY_RECORD_SIZE + ACCESSORY_EQUIP_MASK);
         if (i >= GEAR_COUNT_ORIGINAL || *mask != 0xffff)
-            *mask = seat_mask_bits(*mask, i >= NEW_ACCESSORY_FIRST ? accessory_roster_equip[i - NEW_ACCESSORY_FIRST] : 0);
+            *mask = seat_mask_bits(*mask, i >= NEW_ACCESSORY_FIRST ? accessory_roster_equip[i - NEW_ACCESSORY_FIRST]
+                                        : i < GEAR_COUNT_ORIGINAL ? kernel_override_roster[2][i] : 0);
     }
     mirror_new_gear();
     mirror_new_weapons();
@@ -29614,7 +29713,8 @@ static BOOL character_may_equip_weapon(const struct new_character *c, int w)
     if (w >= WEAPON_COUNT_ORIGINAL && (w < NEW_WEAPON_FIRST || defined_new_kind(ITEM_ID_WEAPON_BASE + w) != 1))
         return FALSE;           /* a lent slot (128-191) or a weapon the weapon file does not define */
     mask = *(const WORD *)(weapon_table + w * WEAPON_RECORD_SIZE + WEAPON_EQUIP_MASK);
-    return equip_like_allows(c, mask) || (w >= NEW_WEAPON_FIRST && (weapon_roster_equip[w - NEW_WEAPON_FIRST] & character_equip_names(c)));
+    return equip_like_allows(c, mask) || (w >= NEW_WEAPON_FIRST && (weapon_roster_equip[w - NEW_WEAPON_FIRST] & character_equip_names(c)))
+        || (w < WEAPON_COUNT_ORIGINAL && (kernel_override_roster[0][w] & character_equip_names(c)));      /* (kernel overrides) a game weapon's `equip` list names it */
 }
 
 static int character_first_weapon(const struct new_character *c)
@@ -37089,6 +37189,13 @@ static const char *apply_weapon_key(struct weapon_draft *draft, char *key, char 
     char *p = value, *word_end;
     int i;
 
+    if (is_kernel_gear_item(0, draft->id)) {
+        /* (kernel overrides) a section of one of the game's own weapons: two keys of a new weapon do not apply */
+        if (word_is(key, key_end, "base"))
+            return "base is not used in a section of one of the game's own weapons ([128] to [255]): the section changes that weapon itself, and every key it does not give keeps the kernel's value. The line is not read";
+        if (word_is(key, key_end, "give_on_load"))
+            return "give_on_load is for the weapon file's new weapons; one of the game's own weapons ([128] to [255]) is not given by it. The line is not read";
+    }
     for (i = 0; fields[i].name; i++) {
         if (word_is(key, key_end, fields[i].name)) {
             if (!parse_number(&p, end, &n) || p != end || n > fields[i].limit)
@@ -37213,6 +37320,85 @@ static void start_weapon_draft(struct weapon_draft *draft, int id, int line)
     draft->name[0] = draft->description[0] = 0xff;
 }
 
+/* ---- (kernel overrides) the kernel's prices and throw tables, kept ---- */
+
+/* The first time the files are read: the price table's entries of item IDs 128-319 and the throw
+   tables' entries of the 128 weapons, as they are then (the game's: nothing has changed them yet).
+   Every read after that (and that one): put back, so a section taken out gives the kernel's again. */
+static void kernel_prices_restore(int first_id, int count)
+{
+    int i;
+
+    if (!InterlockedExchange(&kernel_price_kept_taken, 1))
+        for (i = 0; i < KERNEL_PRICE_COUNT; i++)
+            kernel_price_kept[i] = price_table[KERNEL_PRICE_FIRST + i];
+    for (i = first_id; i < first_id + count; i++)
+        if (i >= KERNEL_PRICE_FIRST && i < KERNEL_PRICE_FIRST + KERNEL_PRICE_COUNT)
+            price_table[i] = kernel_price_kept[i - KERNEL_PRICE_FIRST];
+}
+
+static void kernel_throw_restore(void)
+{
+    int i;
+
+    if (!InterlockedExchange(&kernel_throw_kept_taken, 1))
+        for (i = 0; i < WEAPON_COUNT_ORIGINAL; i++)
+            kernel_throw_effect_kept[i] = throw_effects[i], kernel_throw_model_kept[i] = throw_models[i];
+    for (i = 0; i < WEAPON_COUNT_ORIGINAL; i++)
+        throw_effects[i] = kernel_throw_effect_kept[i], throw_models[i] = kernel_throw_model_kept[i];
+}
+
+/* The kernel's price of item ID 128-319 (a base's price), never a section's change of it. */
+static DWORD kernel_price(int id)
+{
+    return kernel_price_kept_taken && id >= KERNEL_PRICE_FIRST && id < KERNEL_PRICE_FIRST + KERNEL_PRICE_COUNT
+         ? kernel_price_kept[id - KERNEL_PRICE_FIRST] : price_table[id];
+}
+
+static short kernel_throw_effect(int w)
+{
+    return kernel_throw_kept_taken && w >= 0 && w < WEAPON_COUNT_ORIGINAL ? kernel_throw_effect_kept[w] : throw_effects[w];
+}
+
+static DWORD kernel_throw_model(int w)
+{
+    return kernel_throw_kept_taken && w >= 0 && w < WEAPON_COUNT_ORIGINAL ? kernel_throw_model_kept[w] : throw_models[w];
+}
+
+/* A section [128] to [255] of the weapon file is finished: the keys it gave are laid over THAT game
+   weapon's record in the table the game reads (the kernel's record is there: refresh_weapon_table),
+   its texts, icon, price and throw effect if given; everything else stays the kernel's. */
+static int finish_kernel_weapon(struct weapon_draft *draft)
+{
+    int k = draft->id - ITEM_ID_WEAPON_BASE, i;
+    BYTE *record = weapon_table + k * WEAPON_RECORD_SIZE;
+    WORD restrictions;
+
+    for (i = 0; i < WEAPON_RECORD_SIZE; i++)
+        if (draft->is_set[i])
+            record[i] = draft->value[i];
+    restrictions = *(WORD *)(record + WEAPON_RESTRICTIONS);
+    if (draft->sell >= 0)
+        restrictions = (WORD)(draft->sell ? restrictions & ~1 : restrictions | 1);
+    if (draft->throwable >= 0)
+        restrictions = (WORD)(draft->throwable ? restrictions & ~8 : restrictions | 8);
+    *(WORD *)(record + WEAPON_RESTRICTIONS) = restrictions;
+    copy_bytes(kernel_override_name[0][k], draft->name, sizeof draft->name);
+    copy_bytes(kernel_override_description[0][k], draft->description, sizeof draft->description);
+    if (draft->icon >= 0)
+        kernel_weapon_icon_override[k] = (BYTE)draft->icon;
+    kernel_override_roster[0][k] = draft->roster_equip;
+    if (draft->price >= 0)
+        price_table[draft->id] = (DWORD)draft->price;
+    if (draft->throw_like >= 0) {
+        throw_effects[k] = kernel_throw_effect(draft->throw_like);
+        throw_models[k] = kernel_throw_model(draft->throw_like);
+    }
+    kernel_override_on[0][k] = 1;
+    draft->id = -1;
+    return 1;
+}
+
 /* (The box, stage B5.) The section of a wide WEAPON ([10000] to [15999]) is finished: its
    definition goes into the catalogue of wide gear (the record of its base with the keys laid
    over it, exactly as a `[320]` section's), and nowhere else: its record is copied into the
@@ -37228,7 +37414,7 @@ static int finish_wide_weapon(struct weapon_draft *draft)
         draft->id = -1;
         return 0;
     }
-    copy_bytes(g->record, weapon_table + draft->base * WEAPON_RECORD_SIZE, WEAPON_RECORD_SIZE);
+    copy_bytes(g->record, kernel_weapon_kept + draft->base * WEAPON_RECORD_SIZE, WEAPON_RECORD_SIZE);     /* (kernel overrides) the kernel's record, never a section's change of it */
     for (i = 0; i < WEAPON_RECORD_SIZE; i++)
         if (draft->is_set[i])
             g->record[i] = draft->value[i];
@@ -37245,7 +37431,7 @@ static int finish_wide_weapon(struct weapon_draft *draft)
     g->base = (BYTE)draft->base;
     g->given = draft->give == 1;
     g->roster_equip = draft->roster_equip;
-    g->price = draft->price >= 0 ? (DWORD)draft->price : price_table[draft->base + ITEM_ID_WEAPON_BASE];
+    g->price = draft->price >= 0 ? (DWORD)draft->price : kernel_price(draft->base + ITEM_ID_WEAPON_BASE);
     draft->id = -1;
     return 1;
 }
@@ -37258,6 +37444,8 @@ static int finish_weapon(struct weapon_draft *draft)
 
     if (draft->id < 0)
         return 0;
+    if (is_kernel_gear_item(0, draft->id))
+        return finish_kernel_weapon(draft);     /* (kernel overrides) [128] to [255]: that game weapon's own entry */
     if (draft->base < 0) {
         log_line("weapon file line %d: weapon %d has no base; skipped", draft->line, draft->id);
         return 0;
@@ -37266,7 +37454,7 @@ static int finish_weapon(struct weapon_draft *draft)
         return finish_wide_weapon(draft);       /* (the box, stage B5) [10000] to [15999]: into the catalogue */
     w = draft->id - NEW_WEAPON_FIRST_ITEM;
     record = weapon_table + (NEW_WEAPON_FIRST + w) * WEAPON_RECORD_SIZE;
-    copy_bytes(record, weapon_table + draft->base * WEAPON_RECORD_SIZE, WEAPON_RECORD_SIZE);
+    copy_bytes(record, kernel_weapon_kept + draft->base * WEAPON_RECORD_SIZE, WEAPON_RECORD_SIZE);       /* (kernel overrides) the kernel's record, never a section's change of it */
     for (i = 0; i < WEAPON_RECORD_SIZE; i++)
         if (draft->is_set[i])
             record[i] = draft->value[i];
@@ -37282,10 +37470,10 @@ static int finish_weapon(struct weapon_draft *draft)
     weapon_icon[w] = (BYTE)(draft->icon >= 0 ? draft->icon : draft->base);
     weapon_given[w] = draft->give == 1;
     weapon_roster_equip[w] = draft->roster_equip;
-    price_table[draft->id] = draft->price >= 0 ? (DWORD)draft->price : price_table[draft->base + ITEM_ID_WEAPON_BASE];
+    price_table[draft->id] = draft->price >= 0 ? (DWORD)draft->price : kernel_price(draft->base + ITEM_ID_WEAPON_BASE);
     i = draft->throw_like >= 0 ? draft->throw_like : draft->base;
-    throw_effects[NEW_WEAPON_FIRST + w] = throw_effects[i];
-    throw_models[NEW_WEAPON_FIRST + w] = throw_models[i];
+    throw_effects[NEW_WEAPON_FIRST + w] = kernel_throw_effect(i);
+    throw_models[NEW_WEAPON_FIRST + w] = kernel_throw_model(i);
     draft->id = -1;
     return 1;
 }
@@ -37366,6 +37554,27 @@ static const char *section_refusal(int kind, DWORD id)
     return text;
 }
 
+/* (kernel overrides) The one line of a file's sections of the game's own pieces: how many were
+   changed, which (the first 24 item IDs), and the lines of those sections with problems. Nothing at
+   all when the file has no such section (the log as before). */
+static void kernel_overrides_report(int kind, const char *what, int changed, int problems)
+{
+    char list[24 * 5 + 8];
+    int i, n = 0, base = kind == 0 ? ITEM_ID_WEAPON_BASE : kind == 1 ? ITEM_ID_ARMOUR_BASE : ITEM_ID_ACCESSORY_BASE;
+
+    if (!changed && !problems)
+        return;
+    list[0] = 0;
+    for (i = 0; i < (kind == 0 ? WEAPON_COUNT_ORIGINAL : GEAR_COUNT_ORIGINAL); i++)
+        if (kernel_override_on[kind][i] && n++ < 24)
+            wsprintfA(list + lstrlenA(list), "%s%d", n > 1 ? " " : "", base + i);
+    if (n > 24)
+        lstrcatA(list, " ...");
+    log_line("%s file: %d of the game's own %s changed by their sections ([%d] to [%d])%s%s; %d line(s) of those sections with problems (each said above)",
+             what, changed, kind == 0 ? "weapons" : kind == 1 ? "armour" : "accessories", base,
+             base + (kind == 0 ? WEAPON_COUNT_ORIGINAL : GEAR_COUNT_ORIGINAL) - 1, n ? ": " : "", list, problems);
+}
+
 /* Loads the new weapons (item IDs 320-383) from the weapon file. Called after
    every kernel load, once the DLL's tables hold the kernel's own data. */
 static void load_weapons(void)
@@ -37376,7 +37585,10 @@ static void load_weapons(void)
     HANDLE file;
     DWORD size, got = 0;
     int line_number = 0, errors = 0, loaded = 0, i;
+    int kernel_sections = 0, kernel_problems = 0, in_kernel = 0;    /* (kernel overrides) sections [128] to [255], and their lines with problems */
 
+    kernel_prices_restore(ITEM_ID_WEAPON_BASE, WEAPON_COUNT_ORIGINAL);     /* (kernel overrides) the game weapons' prices and throw effects: the kernel's again */
+    kernel_throw_restore();
     for (i = 0; i < NEW_WEAPON_COUNT; i++) {
         price_table[NEW_WEAPON_FIRST_ITEM + i] = 0;
         throw_effects[NEW_WEAPON_FIRST + i] = 0;
@@ -37420,10 +37632,24 @@ static void load_weapons(void)
             char *p = start + 1;
             DWORD id;
 
-            loaded += finish_weapon(&draft);
+            if (is_kernel_gear_item(0, draft.id))
+                kernel_sections += finish_weapon(&draft);     /* (kernel overrides) counted apart: not a new weapon */
+            else
+                loaded += finish_weapon(&draft);
             draft.id = -1;
+            in_kernel = 0;
             if (!parse_number(&p, stop, &id) || p + 1 != stop || *p != ']')
                 problem = "a section must be an item ID in brackets, like [320]. The section is not read";
+            else if (is_kernel_gear_item(0, (int)id)) {
+                /* (kernel overrides) [128] to [255]: that game weapon's own entry is changed by the keys that follow */
+                in_kernel = 1;
+                if (!weapon_table_live)
+                    problem = "the game's own weapons cannot be changed in this run: the weapon table was not moved (see the start of the log). The section is not read";
+                else if (kernel_override_on[0][id - ITEM_ID_WEAPON_BASE])
+                    problem = section_used;
+                else
+                    start_weapon_draft(&draft, (int)id, line_number);
+            }
             else if (gear_wide_sections() && id >= WIDE_GEAR_FIRST && id <= WIDE_GEAR_LAST) {
                 /* (the box, stage B5) a wide weapon's section, read only with box = on in the game file (otherwise the next line, as before) */
                 if (gear_wide_kind((int)id) != 0)
@@ -37459,12 +37685,17 @@ static void load_weapons(void)
         }
         if (problem) {
             errors++;
+            kernel_problems += in_kernel;
             log_line("weapon file line %d: %s", line_number, problem);
         }
     }
-    loaded += finish_weapon(&draft);
+    if (is_kernel_gear_item(0, draft.id))
+        kernel_sections += finish_weapon(&draft);
+    else
+        loaded += finish_weapon(&draft);
     VirtualFree(text, 0, MEM_RELEASE);
     log_line("weapon file: %d weapons loaded, %d line(s) with problems", loaded, errors);
+    kernel_overrides_report(0, "weapon", kernel_sections, kernel_problems);
 }
 
 /* ---- Armour, accessory and item files ---------------------------------------- */
@@ -37574,6 +37805,15 @@ static const char *apply_gear_key(struct gear_draft *draft, char *key, char *key
     char *p = value, *word_end;
     DWORD n;
 
+    if (kind != GEAR_ITEM && is_kernel_gear_item(kind + 1, draft->id)) {
+        /* (kernel overrides) a section of one of the game's own pieces: two keys of a new one do not apply */
+        if (word_is(key, key_end, "base"))
+            return kind == GEAR_ARMOUR ? "base is not used in a section of one of the game's own armour ([256] to [287]): the section changes that armour itself, and every key it does not give keeps the kernel's value. The line is not read"
+                                       : "base is not used in a section of one of the game's own accessories ([288] to [319]): the section changes that accessory itself, and every key it does not give keeps the kernel's value. The line is not read";
+        if (word_is(key, key_end, "give_on_load"))
+            return kind == GEAR_ARMOUR ? "give_on_load is for the armour file's new armour; one of the game's own ([256] to [287]) is not given by it. The line is not read"
+                                       : "give_on_load is for the accessory file's new accessories; one of the game's own ([288] to [319]) is not given by it. The line is not read";
+    }
     for (i = 0; numbers[i].name; i++)
         if (numbers[i].kind == kind && word_is(key, key_end, numbers[i].name)) {
             if (!parse_number(&p, end, &n) || p != end || n > 255)
@@ -37706,6 +37946,45 @@ static BYTE *gear_record(int kind, int index)
          : item_record(index);
 }
 
+/* (kernel overrides) The record a `base` copies: the KERNEL's armour or accessory (kept by
+   refresh_gear_tables before the files are read), never a section's change of it; an item's as before. */
+static const BYTE *gear_base_record(int kind, int index)
+{
+    return kind == GEAR_ARMOUR ? kernel_armour_kept + index * ARMOUR_RECORD_SIZE
+         : kind == GEAR_ACCESSORY ? kernel_accessory_kept + index * ACCESSORY_RECORD_SIZE
+         : item_record(index);
+}
+
+/* (kernel overrides) A section [256] to [287] of the armour file, or [288] to [319] of the accessory
+   file, is finished: the keys it gave are laid over THAT game piece's record in the table the game
+   reads, its texts and price if given; everything else stays the kernel's. */
+static int finish_kernel_gear(struct gear_draft *draft)
+{
+    int kind = draft->kind == GEAR_ACCESSORY ? GEAR_ACCESSORY : GEAR_ARMOUR, k, size = gear_kinds[kind].record_size, i;
+    int restriction_offset = kind == GEAR_ARMOUR ? ARMOUR_RESTRICTIONS : ACCESSORY_RESTRICTIONS;
+    BYTE *record;
+    WORD restrictions;
+
+    k = draft->id - gear_kinds[kind].base_id;       /* (the caller: draft->kind is armour or accessory, and the ID one of its kind's game pieces) */
+    record = gear_record(kind, k);
+
+    for (i = 0; i < size; i++)
+        if (draft->is_set[i])
+            record[i] = draft->value[i];
+    restrictions = *(WORD *)(record + restriction_offset);
+    if (draft->sell >= 0)
+        restrictions = (WORD)(draft->sell ? restrictions & ~1 : restrictions | 1);
+    *(WORD *)(record + restriction_offset) = restrictions;
+    copy_bytes(kernel_override_name[kind + 1][k], draft->name, sizeof draft->name);
+    copy_bytes(kernel_override_description[kind + 1][k], draft->description, sizeof draft->description);
+    kernel_override_roster[kind + 1][k] = draft->roster_equip;
+    if (draft->price >= 0)
+        price_table[draft->id] = (DWORD)draft->price;
+    kernel_override_on[kind + 1][k] = 1;
+    draft->id = -1;
+    return 1;
+}
+
 /* (Wide items.) The section of a wide item is finished: its definition goes into the catalogue, its
    record into the flat item table at its own number, its price into the price table. Everything
    else is finish_gear's, for an item. */
@@ -37758,7 +38037,7 @@ static int finish_wide_gear(struct gear_draft *draft)
         draft->id = -1;
         return 0;
     }
-    copy_bytes(g->record, gear_record(kind, draft->base), size);
+    copy_bytes(g->record, gear_base_record(kind, draft->base), size);
     for (i = 0; i < size; i++)
         if (draft->is_set[i])
             g->record[i] = draft->value[i];
@@ -37771,7 +38050,7 @@ static int finish_wide_gear(struct gear_draft *draft)
     g->base = (BYTE)draft->base;
     g->given = draft->give == 1;
     g->roster_equip = draft->roster_equip;
-    g->price = draft->price >= 0 ? (DWORD)draft->price : price_table[draft->base + gear_kinds[kind].base_id];
+    g->price = draft->price >= 0 ? (DWORD)draft->price : kernel_price(draft->base + gear_kinds[kind].base_id);
     draft->id = -1;
     return 1;
 }
@@ -37786,6 +38065,8 @@ static int finish_gear(struct gear_draft *draft)
 
     if (draft->id < 0)
         return 0;
+    if (kind != GEAR_ITEM && is_kernel_gear_item(kind + 1, draft->id))
+        return finish_kernel_gear(draft);       /* (kernel overrides) that game piece's own entry */
     if (draft->base < 0) {
         log_line("%s file line %d: %s %d has no base; skipped", gear_kinds[kind].what, draft->line, gear_kinds[kind].what,
                  draft->id);
@@ -37797,7 +38078,7 @@ static int finish_gear(struct gear_draft *draft)
         return finish_wide_item(draft);     /* (wide items) [1024] to [9999] */
     n = kind == GEAR_ITEM ? new_item_slot(draft->id) : draft->id - gear_kinds[kind].first_id;
     record = gear_record(kind, draft->id - gear_kinds[kind].base_id);
-    copy_bytes(record, gear_record(kind, draft->base), size);
+    copy_bytes(record, gear_base_record(kind, draft->base), size);
     for (i = 0; i < size; i++)
         if (draft->is_set[i])
             record[i] = draft->value[i];
@@ -37829,7 +38110,8 @@ static int finish_gear(struct gear_draft *draft)
         accessory_roster_equip[n] = draft->roster_equip;
     if (draft->id < PRICE_COUNT_ITEMS || price_first_materia == PRICE_MATERIA_MOVED)
         price_table[draft->id] = draft->price >= 0 ? (DWORD)draft->price
-                                                   : price_table[draft->base + gear_kinds[kind].base_id];
+                                                   : kind == GEAR_ITEM ? price_table[draft->base + gear_kinds[kind].base_id]
+                                                                       : kernel_price(draft->base + gear_kinds[kind].base_id);
     draft->id = -1;
     return 1;
 }
@@ -37841,7 +38123,10 @@ static void load_gear_file(int kind)
     char *text, *line, *end, *file_end;
     DWORD size;
     int line_number = 0, errors = 0, loaded = 0, i, wide_before = wide_item_count;
+    int kernel_sections = 0, kernel_problems = 0, in_kernel = 0;    /* (kernel overrides) sections of the game's own pieces, and their lines with problems */
 
+    if (kind != GEAR_ITEM)
+        kernel_prices_restore(gear_kinds[kind].base_id, GEAR_COUNT_ORIGINAL);     /* (kernel overrides) the game pieces' prices: the kernel's again */
     for (i = 0; i < gear_kinds[kind].count && (kind == GEAR_ITEM || price_first_materia == PRICE_MATERIA_MOVED); i++)
         price_table[gear_kinds[kind].first_id + i] = 0;
     for (i = 0; i < NEW_ITEM_HIGH_COUNT && kind == GEAR_ITEM && price_first_materia == PRICE_MATERIA_MOVED; i++)
@@ -37875,8 +38160,12 @@ static void load_gear_file(int kind)
             char *p = start + 1;
             DWORD id;
 
-            loaded += finish_gear(&draft);
+            if (kind != GEAR_ITEM && is_kernel_gear_item(kind + 1, draft.id))
+                kernel_sections += finish_gear(&draft);       /* (kernel overrides) counted apart: not a new piece */
+            else
+                loaded += finish_gear(&draft);
             draft.id = -1;
+            in_kernel = 0;
             if (kind == GEAR_ITEM && parse_number(&p, stop, &id) && p + 1 == stop && *p == ']' && id >= ITEM_COUNT_EXTENDED) {
                 /* (wide items) a number from 512 up: a wide item's, [1024] to [9999], or refused with its reason */
                 if (id < WIDE_ITEM_FIRST || id > WIDE_ITEM_LAST)
@@ -37912,6 +38201,23 @@ static void load_gear_file(int kind)
                         draft.value[i] = draft.is_set[i] = 0;
                     encode_text(draft.name, "?");
                     draft.description[0] = 0xff;
+                }
+            } else if (kind != GEAR_ITEM && ((p = start + 1), parse_number(&p, stop, &id)) && p + 1 == stop && *p == ']' && is_kernel_gear_item(kind + 1, (int)id)) {
+                /* (kernel overrides) [256] to [287] (armour), [288] to [319] (accessories): that game piece's own entry is
+                   changed by the keys that follow (this file is read only with its table moved: see the start of this routine) */
+                in_kernel = 1;
+                if (kernel_override_on[kind + 1][id - gear_kinds[kind].base_id])
+                    problem = section_used;
+                else {
+                    draft.id = (int)id;
+                    draft.line = line_number;
+                    draft.base = -1;
+                    draft.price = draft.menu_hp = draft.menu_mp = -1;
+                    draft.sell = draft.give = draft.battle = -1;
+                    draft.roster_equip = 0;
+                    for (i = 0; i < GEAR_RECORD_MAX; i++)
+                        draft.value[i] = draft.is_set[i] = 0;
+                    draft.name[0] = draft.description[0] = 0xff;      /* not given: the kernel's texts (a new piece's name starts as "?") */
                 }
             } else if ((p = start + 1), !parse_number(&p, stop, &id) || p + 1 != stop || *p != ']'
                 || (kind == GEAR_ITEM ? new_item_slot((int)id) < 0
@@ -37960,12 +38266,18 @@ static void load_gear_file(int kind)
         }
         if (problem) {
             errors++;
+            kernel_problems += in_kernel;
             log_line("%s file line %d: %s", what, line_number, problem);
         }
     }
-    loaded += finish_gear(&draft);
+    if (kind != GEAR_ITEM && is_kernel_gear_item(kind + 1, draft.id))
+        kernel_sections += finish_gear(&draft);
+    else
+        loaded += finish_gear(&draft);
     VirtualFree(text, 0, MEM_RELEASE);
     log_line("%s file: %d loaded, %d line(s) with problems", what, loaded, errors);
+    if (kind != GEAR_ITEM)
+        kernel_overrides_report(kind + 1, what, kernel_sections, kernel_problems);
     if (kind == GEAR_ITEM && wide_item_count > wide_before)
         log_line("item file: %d of them are WIDE ITEMS (sections [%d] to [%d]; the first defined: %d \"%s\"): whether they can enter the item list in this run is said in the \"wide items:\" line",
                  wide_item_count - wide_before, WIDE_ITEM_FIRST, WIDE_ITEM_LAST, wide_items[wide_before].number, wide_item_log_name(wide_items[wide_before].number));
@@ -46582,6 +46894,10 @@ static const BYTE *character_item_name(int kind, int index)
         return index < ARMOUR_COUNT_EXTENDED ? armour_names[index - NEW_ARMOUR_FIRST] : none;
     if (kind == 2 && index >= NEW_ACCESSORY_FIRST)
         return index < ACCESSORY_COUNT_EXTENDED ? accessory_names[index - NEW_ACCESSORY_FIRST] : none;
+    name = kernel_override_text(*(const BYTE *)(ADDR_TEXT_SECTION_BASE + (kind == 0 ? TEXT_TYPE_WEAPON : kind == 1 ? TEXT_TYPE_ARMOUR : TEXT_TYPE_ACCESSORY))
+                                    + TEXT_NAME_OFFSET, index);     /* (kernel overrides) a game piece's section gives it a name */
+    if (name)
+        return name;
     name = ((const BYTE *(__cdecl *)(int, int, int))FN_TEXT_FETCH)(
         *(const BYTE *)(ADDR_TEXT_SECTION_BASE + (kind == 0 ? TEXT_TYPE_WEAPON : kind == 1 ? TEXT_TYPE_ARMOUR : TEXT_TYPE_ACCESSORY))
             + TEXT_NAME_OFFSET, index, 0);

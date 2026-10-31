@@ -10,9 +10,11 @@ For more accessories, number them from 22000: WIDE ACCESSORIES, [22000] to
 [27999] (box = on or auto and wide_items = on in the game file; see
 FF7_SpellExt_Box_README.txt, "WIDE GEAR"). Do NOT add 10000 to an accessory
 number: 10000-15999 are weapons. A section numbered for another kind (a
-weapon's, an armour's 384-415, an item's 448-511, the game's own 288-319,
-512-1023, 28000 and up) is NOT read, and the log says whose number it is (the
-table of numbers is in FF7_SpellExt_Weapons_README.txt).
+weapon's, an armour's 384-415, an item's 448-511, 512-1023, 28000 and up) is
+NOT read, and the log says whose number it is (the table of numbers is in
+FF7_SpellExt_Weapons_README.txt). A section numbered for one of the game's own
+accessories, [288] to [319], CHANGES that accessory: see "The game's own
+accessories" below.
 
     [416]
     name = Test Charm
@@ -23,11 +25,43 @@ Problems are reported in FF7_SpellExt.log with the line number. The file is
 read every time the game loads its kernel data (at start-up).
 
 
-Required
---------
+The game's own accessories: [288] to [319]
+------------------------------------------
+A section numbered for one of the game's own accessories (its item ID, 288
+to 319: the accessory number + 288) changes THAT accessory as the kernel the
+game loaded has it. Each key the section gives replaces that one thing;
+everything it does not give stays the kernel's. No base is needed.
+
+    [288]               ; the Power Wrist (accessory 0)
+    equip = everyone 12
+
+equip REPLACES the list of who may equip it: name everyone who is to keep
+it.
+- Every key of this readme can be used, except base and give_on_load: a
+  line with either is not read (the log says so) and the rest of the
+  section is. Where a key says "Default: the base's" or "as the base", for
+  the game's own accessory read "the kernel's".
+- name and description change the texts the game shows for it.
+- special gives the accessory one of the built-in effects listed below; the
+  game's own accessories that do something by their item number (not by
+  their record) keep doing it whatever the section says.
+- Each of the game's accessories can have one section; a second is not read.
+- base of a new accessory (and of a wide one) always copies the KERNEL's
+  accessory, never the changed one.
+- Takes effect at start-up and at "Re-init .ini files". Take the section
+  out and the kernel's values are back at the next of either.
+- The log says after the file's own line how many of the game's
+  accessories were changed and which ("accessory file: 1 of the game's own
+  accessories changed by their sections ([288] to [319]): 288; 0 line(s) of
+  those sections with problems (each said above)").
+
+
+Required (for a new accessory)
+------------------------------
 base            The game's accessory to copy everything from: its number
                 (0-31) or its item ID (288-319). 0 is the Power Wrist. Every
-                key below overrides one thing from that copy.
+                key below overrides one thing from that copy. Not used in a
+                section of one of the game's own accessories.
 
 
 Text
@@ -96,6 +130,7 @@ Testing aid
 give_on_load    yes = whenever a save is loaded, one is put in the stock
                 unless the save already has one (in stock or equipped).
                 Remove the line once the item is handed out another way.
+                New accessories only.
 
 
 Raw record bytes

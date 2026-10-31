@@ -202,7 +202,9 @@ equip_like      One of the nine (name or 0-8): the character may equip
                 what all nine can (armour and accessories every one of the
                 nine may wear; no original character's own weapons), and
                 whatever an `equip` list of the weapon, armour or accessory
-                file names it for (equip = 12, or its name). A piece only
+                file names it for (equip = 12, or its name; a section of
+                one of the game's own pieces, [128] to [319], can name it
+                too). A piece only
                 some of the nine may wear (in the game: Escort Guard, the
                 men's; Minerva Band, the women's) is not for it unless a
                 list names it. Default: the base, or the battle_like

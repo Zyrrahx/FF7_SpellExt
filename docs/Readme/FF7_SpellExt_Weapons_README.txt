@@ -28,8 +28,8 @@ NOT read: the log says whose number it is and where weapons are numbered, e.g.
     1024-9999 wide items            10000-15999 wide weapons
     16000-21999 wide armour         22000-27999 wide accessories
     28000 and up: not given to anything.
-The game's own weapons (128-255) cannot be changed from this file; a new weapon
-can copy one with base.
+A section numbered for one of the game's own weapons, [128] to [255], CHANGES
+that weapon: see "The game's own weapons" below.
 
     [320]
     name = Test Blade
@@ -38,13 +38,50 @@ can copy one with base.
 A comment starts with ; or # at the start of a line or after a space.
 
 
-Required
---------
+The game's own weapons: [128] to [255]
+--------------------------------------
+A section numbered for one of the game's own weapons (its item ID, 128 to
+255: the weapon number + 128) changes THAT weapon as the kernel the game
+loaded has it (the game's own KERNEL.BIN, or a mod's such as New Threat's).
+Each key the section gives replaces that one thing; everything it does not
+give stays the kernel's. No base is needed.
+
+    [128]               ; the Buster Sword (weapon 0)
+    equip = cloud 12
+
+lets Cloud and character 12 of the character file equip the Buster Sword.
+equip REPLACES the list of who may equip it: name everyone who is to keep
+it (here Cloud).
+
+- Every key of this readme can be used, except base and give_on_load: a
+  line with either is not read (the log says so) and the rest of the
+  section is. Where a key says "Default: as the base", for the game's own
+  weapon read "the kernel's".
+- name and description change the texts the game shows for the weapon.
+- Each of the game's weapons can have one section; a second is not read.
+- base of a new weapon (and of a wide one) always copies the KERNEL's
+  weapon, never the changed one, wherever the sections are in the file.
+- Takes effect at start-up and at "Re-init .ini files". Take the section
+  out and the kernel's values are back at the next of either.
+- The log says after the file's own line how many of the game's weapons
+  were changed, which, and how many lines of those sections had problems:
+    weapon file: 1 of the game's own weapons changed by their sections
+    ([128] to [255]): 128; 0 line(s) of those sections with problems
+    (each said above)
+- The game's sort by name keeps a renamed weapon at the game's place for
+  it.
+- If the weapon table could not be moved (the start of the log says so),
+  these sections are not read.
+
+
+Required (for a new weapon)
+---------------------------
 base            The kernel weapon to copy everything from: its weapon number
                 (0-127) or its item ID (128-255). Every key below overrides
                 one thing from that copy. Choose a base that belongs to the
                 character who will use the weapon: the battle model and
-                attack animation come from the base.
+                attack animation come from the base. Not used in a section
+                of one of the game's own weapons.
 
 
 Text
@@ -134,6 +171,7 @@ Testing aid
 give_on_load    yes puts one of the weapon in the stock whenever a save is
                 loaded that does not already have it (in stock or equipped).
                 Remove it once the weapon is handed out by a field script.
+                New weapons only.
 
 
 Known limits
@@ -143,3 +181,5 @@ Known limits
 - The equip menu's Optimize-style search ignores new weapons.
 - A save that contains a new weapon needs the DLL and the weapon file to
   load correctly.
+- Changing the slots of one of the game's weapons that a character wears
+  with materia in it is not tested: take the materia off first.

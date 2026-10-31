@@ -9,9 +9,10 @@ For more armour, number it from 16000: WIDE ARMOUR, [16000] to [21999] (box = on
 or auto and wide_items = on in the game file; see FF7_SpellExt_Box_README.txt,
 "WIDE GEAR"). Do NOT add 10000 to an armour number: 10000-15999 are weapons.
 A section numbered for another kind (a weapon's 320-383, an accessory's
-416-447, an item's, the game's own 256-287, 512-1023, 28000 and up) is NOT read,
-and the log says whose number it is (the table of numbers is in
-FF7_SpellExt_Weapons_README.txt).
+416-447, an item's, 512-1023, 28000 and up) is NOT read, and the log says whose
+number it is (the table of numbers is in FF7_SpellExt_Weapons_README.txt).
+A section numbered for one of the game's own armour, [256] to [287], CHANGES
+that armour: see "The game's own armour" below.
 
     [384]
     name = Test Bangle
@@ -22,11 +23,43 @@ Problems are reported in FF7_SpellExt.log with the line number. The file is
 read every time the game loads its kernel data (at start-up).
 
 
-Required
---------
+The game's own armour: [256] to [287]
+-------------------------------------
+A section numbered for one of the game's own armour (its item ID, 256 to
+287: the armour number + 256) changes THAT armour as the kernel the game
+loaded has it. Each key the section gives replaces that one thing;
+everything it does not give stays the kernel's. No base is needed.
+
+    [256]               ; the Bronze Bangle (armour 0)
+    defense = 20
+    equip = everyone 12
+
+equip REPLACES the list of who may equip it: name everyone who is to keep
+it.
+- Every key of this readme can be used, except base and give_on_load: a
+  line with either is not read (the log says so) and the rest of the
+  section is. Where a key says "Default: the base's" or "as the base", for
+  the game's own armour read "the kernel's".
+- name and description change the texts the game shows for it.
+- Each of the game's armour can have one section; a second is not read.
+- base of a new armour (and of a wide one) always copies the KERNEL's
+  armour, never the changed one.
+- Takes effect at start-up and at "Re-init .ini files". Take the section
+  out and the kernel's values are back at the next of either.
+- The log says after the file's own line how many of the game's armour
+  were changed and which ("armour file: 1 of the game's own armour changed
+  by their sections ([256] to [287]): 256; 0 line(s) of those sections with
+  problems (each said above)").
+- Changing the slots of an armour a character wears with materia in it is
+  not tested: take the materia off first.
+
+
+Required (for a new armour)
+---------------------------
 base            The game's armour to copy everything from: its number (0-31)
                 or its item ID (256-287). 0 is the Bronze Bangle. Every key
-                below overrides one thing from that copy.
+                below overrides one thing from that copy. Not used in a
+                section of one of the game's own armour.
 
 
 Text
@@ -105,6 +138,7 @@ Testing aid
 give_on_load    yes = whenever a save is loaded, one is put in the stock
                 unless the save already has one (in stock or equipped).
                 Remove the line once the item is handed out another way.
+                New armour only.
 
 
 Raw record bytes
