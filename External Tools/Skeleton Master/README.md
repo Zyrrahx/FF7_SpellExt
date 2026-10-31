@@ -11,7 +11,8 @@ Retarget and Scripts tabs' 3D views need the internet once (see below).
 ## Add slots
 
 1. **Load the model**: choose its skeleton `xxaa` and animations `xxda` together (Cloud: `rtaa`, `rtda`), the files the
-   game actually loads (a model mod has its own).
+   game actually loads (a model mod has its own). The page shows the model's **kind**, its **empty slots** and its
+   **free new numbers** (see "Which numbers" below).
 2. **Load animations to add**: any `xxda`, a limit pack `.a00`, a single animation saved as `.anim` (one record), or
    the `.zip` the Retarget tab's Download gives. They must be made for the model's skeleton (same bone count). The
    **Weapon** column says which weapon track comes with each:
@@ -30,7 +31,8 @@ Retarget and Scripts tabs' 3D views need the internet once (see below).
 3. **Pick a number and add**; repeat. Each added animation's **Weapon track** (step 3) can be changed by hand: any
    weapon track loaded in step 2 (a `_weapon.anim`, or a 1-bone animation of an `xxda` or a pack), or one made here
    (at the feet, or held as in this model's idle), or empty (the game's placeholder: the weapon is hidden while it
-   plays). It is written at number + 34. See "An animation with no weapon track" below.
+   plays). It is written at number + 34 (party), 16 further on (an enemy with a weapon); a model with no weapon tracks
+   gets none. See "An animation with no weapon track" below.
 4. **Build**, then download each file with its own button: the `xxaa`, the `xxda` (they belong together) and a list of
    the new numbers with the script bytes that play them and the weapon track each got. Every download is its own
    click: a browser may block a second download a page starts by itself, without a word.
@@ -52,7 +54,7 @@ Retarget and Scripts tabs' 3D views need the internet once (see below).
   `.zip`: there, unzip it and choose `NAME.anim`, or save with **Body .anim only**.
 
 ### An animation with no weapon track (from a model without a weapon)
-A party model plays a weapon track beside every body animation. An animation that brings none (one retargeted from an
+A party model (and an enemy with a weapon, 16 + 16) plays a weapon track beside every body animation. An animation that brings none (one retargeted from an
 enemy model without a weapon, or a body `.anim` saved alone) gets one by the rule in step 3, **An added animation with no weapon track
 of its own gets one**:
 - **at the feet** (the default): the weapon lies on the floor beside the feet for the whole animation, turning and
@@ -63,7 +65,7 @@ of its own gets one**:
   `450 250 70` (measured over all his animations: clear of the floor and at least 24 from his bones); Cloud's sword
   comes close to his legs when he steps to the side. A flip (the model upside down) does not turn the weapon round.
 - **held as in this model's idle**: the weapon stays in the hand as the idle (animation 00, frame 0, with its weapon
-  track 34) holds it; the hand is the bone whose end is nearest the weapon there.
+  track 34; 10 on a 16 + 16 model) holds it; the hand is the bone whose end is nearest the weapon there.
 - **empty**: the game's 1-frame placeholder. The game then draws the weapon only on frame 0, if at all (it draws a
   weapon frame only while the animation's frame is below the track's frame count: read from its code, not seen).
 A made track has exactly the body's frame count, which matters to **KimeraCS**: read from its source (version 1.8z;
@@ -72,10 +74,32 @@ not run), it lists a party model's first 52 animations and draws each one's weap
 (the placeholder above all) makes it fail: it shows "Error Drawing current model: Index was out of range" again at
 every redraw. The new numbers 68-ff are not listed by KimeraCS and never do; a body put
 into an old placeholder number below 2c does, unless its weapon track is as long as it: the build says so when one is
-not. The slots the page fills between new numbers stay the game's placeholders (KimeraCS never pairs them with an
+not. On a 16 + 16 model the same holds below 10 (KimeraCS lists its first 16 bodies), not for the bands from 20 on. The slots the page fills between new numbers stay the game's placeholders (KimeraCS never pairs them with an
 animation it lists).
 The Retarget tab does the same with the map's `weapon_when_missing` (see below), so its Download carries the made
 track; with "empty" it carries the body alone, and Send to Add slots keeps "empty" for it.
+
+### Which numbers, by the model's kind
+| Kind (the `xxaa` header) | Examples | New bodies go | Weapon track | Header after |
+|---|---|---|---|---|
+| party member: dword 7 = 52, dword 10 > 0 | `rt`..`si`, your own party models | 68-9b, d0-ff; or an empty slot below 2c | number + 34 | 52 + the rest |
+| no weapon tracks: dword 10 = 0 | 356 of the 391 vanilla models (every enemy without a weapon, the 1-bone ones), `rs` `sj` `sk` `sl` `sm`, a party-sized model that carries no weapon | after the last, up to ff; or an empty slot | none | the count + 0 |
+| an enemy with a weapon: dword 7 = 16, dword 10 > 0 | `mu` (final-duel Sephiroth, the Masamune), `np`..`nu`, `aq` `ci` `dq` `gr` `jp` `jq` `jr` `ob`..`of` | first its **empty bodies below 10** (`mu` 0d-0f, `np`..`nu` 0e-0f, the others 0a-0f); then the bands 20-2f, 40-4f, 60-6f, 80-8f, a0-af, c0-cf, e0-ef | number + 10 (16 further on: 1d-1f, 30-3f, ..) | 16 + the rest |
+| any other N bodies + M weapon tracks | none among the vanilla models | refused | | |
+
+- A **character's skeleton** without weapon tracks (dword 0 = 2, e.g. `rs`) is not offered 2c-33: played as a party
+  member, those numbers play its limit pack.
+- An **enemy with a weapon**: the game draws an enemy's weapon from body + 0x10 (0043076b, hard-coded) and KimeraCS
+  from the header's dword 7 + n: both are 16 further on only when the model has 16 bodies, so every new body keeps
+  its track 16 further on. The empty bodies below 10 are the safest: the game and KimeraCS both show them (give each a
+  weapon track of its own length: KimeraCS fails showing a body whose track is shorter). The bands from 20 on are
+  played by the game with their own tracks, but KimeraCS reads every record after the first 16 as a weapon track: it
+  does not list them, and saving the model from KimeraCS turns them into 1-bone tracks (they are lost); the build says
+  so. It is the same limit as a party model's 68-ff. "Held as in the idle" uses the model's idle 00 with its track 10.
+- Header dword 8 (dword 7 + 2 in the vanilla models) is left as it is: the game does not read it (read from the code)
+  and KimeraCS copies it.
+- The Python twin does the same: `anim_tool.py add XXAA XXDA` lists the kind and numbers, `anim_tool.py add XXAA XXDA
+  OUT_AA OUT_DA NN=ITEM[,WEAPON] ...` builds the same two files byte for byte (see `FF7_SpellExt/tools/README_tools.txt`).
 
 ### Why it works
 A party model has 52 body animations (0-2b its own, 2c-33 the limit pack). The game finds body animation n's weapon
@@ -84,13 +108,13 @@ further on; every slot between is filled with the game's own placeholder, and th
 so the game makes room for them all. Every existing animation stays byte for byte as it was. No DLL is needed.
 
 In the model's action scripts (`xxab`, edited in the Scripts tab), bytes 00-8d play that animation; numbers above 8d are played with `a7 NN`.
-Never use 2c-33 or 34-67 as body animations on a party model. Enemies with no weapon tracks (the header's second count
+Never use 2c-33 or 34-67 as body animations on a party model. Models with no weapon tracks (the header's second count
 0) are extended after their last animation, up to ff. A model whose header gives 16 bodies + 16 weapon tracks (an
 enemy with a weapon, such as the final-duel Sephiroth `mu`: body n's weapon track is n + 16, hex 10; KimeraCS pairs
-them by the header, dword 7 + n, and the game draws an enemy's weapon from n + 0x10) is not extended: a new body's
-weapon track would have to sit 16 further on, where other bodies would go, and KimeraCS reads every record after the
-16 bodies as a weapon track. Its animations come with their own weapon tracks wherever they are used (Add slots step
-2, the Retarget tab, where the sword's own movement is retargeted into the target's hand).
+them by the header, dword 7 + n, and the game draws an enemy's weapon from n + 0x10) has its empty bodies below 10
+filled first, then bands of 16 bodies each followed by their 16 tracks (see "Which numbers"). Its animations come with
+their own weapon tracks wherever they are used (Add slots step 2, the Retarget tab, where the sword's own movement is
+retargeted into the target's hand), also from a file Add slots built (bands of 16: body n with n + 16).
 
 All of this was read from the game's code (ff7_en.exe, Steam 2013) and checked by building and reading back test files;
 please report what you find in the game.
@@ -351,8 +375,12 @@ and changed again is rewritten where it is.
   `make_noweapon_expected.py` from the Python tools), `pair16_tests.js` (a model of 16 bodies + 16 weapon tracks: which
   record is each body's weapon track in every battle model, by all three copies of the rule and the Python twin, the
   same as before for every other file; mu's own sword retargeted onto sa through Retarget and Add slots; mu as a
-  model refused; 'at the feet' through flips; `weapon_feet` refusals; against `pair16_expected/`, made by
-  `make_pair16_expected.py`; the four `make_*_expected.py` take `--py DIR` to use a changed copy of the Python tools),
+  model taken, 17 + 15 refused; 'at the feet' through flips; `weapon_feet` refusals; against `pair16_expected/`, made by
+  `make_pair16_expected.py`), `addslots_tests.js` (Add slots on a sample of every kind of battle model: the core =
+  the Python twin `anim_tool.py add` byte for byte, with the same refusals and notes; every built pair read back by the
+  page's reader, by the game's rules and by KimeraCS's; the page itself on mu, am, rs and a 17 + 15 model; against
+  `addslots_expected/`, made by `make_addslots_expected.py`; the five `make_*_expected.py` take `--py DIR` to use a
+  changed copy of the Python tools),
   `ab_tests.js` (the
   scripts core: every xxab of an extracted battle.lgp read and saved back byte for byte, every script decoded and
   checked, edits on real files; the folder is its first argument, by default the project's `Battle.lgp Files`).

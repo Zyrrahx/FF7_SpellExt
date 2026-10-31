@@ -120,8 +120,12 @@
      (an enemy with a weapon, 16 + 16 such as mu) has body i's at N + i, so its idle's at N. N and M are the skeleton
      header's dword 7 and 10 when `counts` ({body, weapon}) is given and fits the file; otherwise read from the file:
      its bodies first (more than 1 bone each), then only 1-bone records (anim_core layoutOf: the same rule). A limit
-     pack (16 records, 8 on of 1 bone) gives none, as before. */
+     pack (16 records, 8 on of 1 bone) gives none, as before. A file of more than 32 records in bands of 16 (what Add
+     slots makes of a 16 + 16 model: by the header 16 + M, or by the file, even bands bodies, odd bands 1 bone; anim_core
+     isBands16) gives 0x10, checked first. */
   function weaponRefIndex(records, counts) {
+    if (records.length > 32 && recordHead(records[0]).bones !== 1 && (counts && counts.body + counts.weapon === records.length ? counts.body === 16
+      : records.every((r, i) => (recordHead(r).bones === 1) !== (Math.floor(i / 16) % 2 === 0)))) { const h = recordHead(records[0x10]); return h.bones === 1 && !h.placeholder ? 0x10 : null; }
     if (records.length > 0x34) { const h = recordHead(records[0x34]); if (h.bones === 1 && !h.placeholder) return 0x34; }
     if (!records.length || recordHead(records[0]).bones === 1) return null;
     if (records.length === 16 && records.slice(8).every(r => recordHead(r).bones === 1)) return null;

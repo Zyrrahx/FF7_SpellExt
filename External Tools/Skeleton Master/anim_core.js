@@ -14,11 +14,30 @@
    - A model whose header gives N bodies + M weapon tracks (dword 7 = N, dword 10 = M, not a party model: every vanilla
      one is an enemy with a weapon, 16 + 16, e.g. the final-duel Sephiroth mu) keeps body i's weapon track at N + i.
      KimeraCS pairs them so (dword 7 + i); the game draws an enemy's weapon from body + 0x10 (0043076b, hard-coded),
-     the same number for every such vanilla model. */
+     the same number for every such vanilla model.
+   Add slots, by the model's kind (openModel):
+   - 'party' (dword 7 = 52, dword 10 > 0): new bodies in 68-9b and d0-ff (or an empty slot below 2c), each with its
+     weapon track at n + 34; dword 7 stays 52, dword 10 = the rest.
+   - 'enemy' (dword 10 = 0: no weapon tracks): new bodies after the last, up to ff (or an empty slot); dword 7 = the
+     count, dword 10 = 0. A character's skeleton (dword 0 = 2) is not offered 2c-33: played as a party member, those
+     are its limit pack.
+   - 'paired' (dword 7 = 16, dword 10 > 0: an enemy with a weapon, 16 + 16 in every vanilla one): body n's weapon
+     track is n + 10 (the game's + 0x10 and KimeraCS's dword 7 + n agree only for 16 bodies). Its empty bodies below
+     10 are filled first (the game and KimeraCS both show them); new bodies go in bands of 16, 20-2f, 40-4f, .. e0-ef,
+     each band followed by its 16 weapon tracks (30-3f, .. f0-ff); dword 7 stays 16, dword 10 = the rest. KimeraCS
+     reads every record after the first 16 as a weapon track, so it does not list the band bodies (and a model saved
+     from KimeraCS loses them), as it does not list a party model's 68-ff.
+   - 'other' (dword 10 > 0 and dword 7 neither 52 nor 16): refused (otherText). None among the 391 vanilla models.
+   Header dword 8 (dword 7 + 2 in vanilla models) is left as it is: the game does not read it (read from the code: the
+   xxaa is read by read_battle_hrc_005e0fc0, used by model_battle_load_005e149a, which reads dwords 1, 2, 3, 6, 7, 9, 10,
+   and freed), and KimeraCS copies it unchanged. */
 (function (root) {
   'use strict';
 
   const PARTY_BODY = 52, WEAPON_OFFSET = 0x34;
+  const PAIR_BODY = 16, PAIR_OFFSET = 0x10;          // an enemy with a weapon: the game's + 0x10 (0043076b)
+  const PAIR_BANDS = [[0x20, 0x2f], [0x40, 0x4f], [0x60, 0x6f], [0x80, 0x8f], [0xa0, 0xaf], [0xc0, 0xcf], [0xe0, 0xef]];
+  const LIMIT_PACK = [0x2c, 0x33];                   // a party member's limit pack numbers
   const PARTY_BANDS = [[0x68, 0x9b], [0xd0, 0xff]];
   const MAX_INDEX = 0xff;                          // the highest number a script can play (a7 NN)
   const DUMMY_DATA = [0x30, 0x1a, 0x00, 0x00];     // the game's own placeholder data
@@ -70,51 +89,79 @@
     return h;
   }
 
-  /* The model: what kind it is, and which numbers are free. */
+  /* The model: what kind it is, and which numbers are free (see the kinds above). */
   function openModel(aaBytes, daBytes) {
     const aa = new Uint8Array(aaBytes), h = readHeader(aa), da = readAnimFile(daBytes);
     const count = da.records.length, bones = h[3];
     if (h[7] + h[10] !== count) throw new Error('the skeleton says ' + h[7] + ' + ' + h[10] + ' = ' + (h[7] + h[10]) + ' animations, the animation file holds ' + count + ': are these two files of the same model?');
+    if (!count) throw new Error('the animation file holds no animation');
     const bodyBones = headOf(da.records[0]).bones;
     let kind;
     if (h[7] === PARTY_BODY && h[10] > 0) kind = 'party';
     else if (h[10] === 0) kind = 'enemy';
+    else if (h[7] === PAIR_BODY && bodyBones !== 1) kind = 'paired';
     else kind = 'other';
-    return { aa, header: h, records: da.records, tail: da.tail, kind, bones, bodyBones, count };
+    const character = kind === 'enemy' && h[0] === 2;          // a character's skeleton type, no weapon tracks
+    const offset = kind === 'party' ? WEAPON_OFFSET : kind === 'paired' ? PAIR_OFFSET : null;
+    return { aa, header: h, records: da.records, tail: da.tail, kind, bones, bodyBones, count, character, offset };
   }
 
-  /* why a model of N bodies + M weapon tracks (kind 'other') is not extended: a new body's weapon track would have to
-     sit 16 further on (the game's 0043076b), where other bodies would go, and KimeraCS, which takes every record after
-     the first dword-7 ones as a weapon track, would read the added bodies as weapon tracks */
+  /* why a model of N bodies + M weapon tracks, N neither 52 nor 16 (kind 'other'), is not extended */
   function otherText(model) {
-    return 'this model has ' + model.header[7] + ' bodies + ' + model.header[10] + ' weapon tracks (an enemy with a weapon: body n\'s weapon track is ' + model.header[7] + ' + n): adding animations to it is not handled. Its animations can be added to another model (load its xxda in step 2) or retargeted';
+    const h = model.header;
+    return 'this model has ' + h[7] + ' bodies + ' + h[10] + ' weapon tracks: adding animations to it is not handled. The game takes an enemy\'s weapon track at body + 10 (hex, 16 further on) and KimeraCS at body + ' + h[7] + ': the two agree only for 16 bodies (every vanilla enemy with a weapon has 16 + 16). Its animations can be added to another model (load its xxda in step 2) or retargeted';
   }
+  /* what the page says about the model's kind */
+  function kindText(model) {
+    const h = model.header;
+    if (model.kind === 'party') return 'a party member (52 body animations, each with its weapon track at number + 34)';
+    if (model.kind === 'paired') return 'an enemy with a weapon (' + h[7] + ' bodies + ' + h[10] + ' weapon tracks: body n\'s weapon track is n + 10, hex)';
+    if (model.kind === 'other') return h[7] + ' bodies + ' + h[10] + ' weapon tracks: adding to it is not handled';
+    return 'no weapon tracks (' + h[7] + ' bodies): new animations go after the last' + (model.character ? '; a character\'s skeleton (type 2): 2c-33 are not offered, as a party member plays its limit pack there' : '');
+  }
+  /* warnings about the model itself (shown when it is loaded, and with every build) */
+  function modelWarnings(model) {
+    const h = model.header, out = [];
+    if (model.kind === 'enemy' && h[9] > 0) out.push('the skeleton names ' + h[9] + ' weapon model' + (h[9] > 1 ? 's' : '') + ' but has no weapon tracks: if the game draws that weapon it takes record n + 10 (hex) as body n\'s weapon track, which can be another body (no vanilla model is so)');
+    return out;
+  }
+  function inBands(bands, i) { return bands.some(([lo, hi]) => i >= lo && i <= hi); }
+  function isPairBody(i) { return Math.floor(i / 16) % 2 === 0; }          // 00-0f, 20-2f, .. e0-ef
   function isWeaponSlot(model, i) {
+    if (model.kind === 'paired') return !isPairBody(i);
     if (model.kind !== 'party') return false;
     if (i < PARTY_BODY) return false;
-    return !PARTY_BANDS.some(([lo, hi]) => i >= lo && i <= hi);
+    return !inBands(PARTY_BANDS, i);
   }
+  function inLimitPack(i) { return i >= LIMIT_PACK[0] && i <= LIMIT_PACK[1]; }
 
   /* Numbers a new body animation may take, in order: placeholders below 0x2c first (the old stopgap) are offered
      separately; these are the NEW numbers. */
   function freeNumbers(model, taken) {
     const out = [];
-    if (model.kind === 'party') {
-      for (const [lo, hi] of PARTY_BANDS) for (let n = lo; n <= hi; n++) {
+    if (model.kind === 'party' || model.kind === 'paired') {
+      for (const [lo, hi] of model.kind === 'party' ? PARTY_BANDS : PAIR_BANDS) for (let n = lo; n <= hi; n++) {
         if (taken.has(n)) continue;
         if (n < model.count && !isDummy(model.records[n])) continue;          // already used by an earlier addition saved in the file
         out.push(n);
       }
-    } else {
-      for (let n = model.count; n <= MAX_INDEX; n++) if (!taken.has(n)) out.push(n);
+    } else if (model.kind === 'enemy') {
+      for (let n = model.count; n <= MAX_INDEX; n++) if (!taken.has(n) && !(model.character && inLimitPack(n))) out.push(n);
     }
     return out;
   }
   /* placeholder slots of the model's own range a script can reach (the old stopgap: overwrite one) */
   function placeholderNumbers(model) {
-    const out = [], limit = model.kind === 'party' ? 0x2c : model.count;
-    for (let n = 0; n < Math.min(limit, model.count); n++) if (isDummy(model.records[n])) out.push(n);
+    if (model.kind === 'other') return [];
+    const out = [], limit = model.kind === 'party' ? 0x2c : model.kind === 'paired' ? PAIR_BODY : model.count;
+    for (let n = 0; n < Math.min(limit, model.count); n++) if (isDummy(model.records[n]) && !(model.character && inLimitPack(n))) out.push(n);
     return out;
+  }
+  /* [0x68, .., 0x9b, 0xd0, ..] -> '68-9b, d0-ff' */
+  function rangeText(list) {
+    const out = []; let i = 0;
+    while (i < list.length) { let j = i; while (j + 1 < list.length && list[j + 1] === list[j] + 1) j++; out.push(j > i ? hex(list[i]) + '-' + hex(list[j]) : hex(list[i])); i = j + 1; }
+    return out.join(', ');
   }
   function scriptBytes(n) { return n <= 0x8d ? hex(n) : 'a7 ' + hex(n); }
 
@@ -125,14 +172,16 @@
     const problems = [], notes = [];
     if (model.kind === 'other') return { problems: [otherText(model)], notes };
     const table = model.records.map(r => r);
-    const party = model.kind === 'party';
+    const party = model.kind === 'party', paired = model.kind === 'paired', tracks = party || paired, offset = model.offset;
     const numbers = new Set();
     for (const a of additions) {
       if (numbers.has(a.number)) problems.push('number ' + hex(a.number) + ' is used twice');
       numbers.add(a.number);
       if (a.number > MAX_INDEX) problems.push(hex(a.number) + ': a script can play numbers up to ff only');
       if (party && a.number >= 0x2c && a.number <= 0x67) problems.push(hex(a.number) + ': 2c-33 are the limit pack and 34-67 the weapon tracks of a party model');
-      if (party && a.number >= PARTY_BODY && !PARTY_BANDS.some(([lo, hi]) => a.number >= lo && a.number <= hi)) problems.push(hex(a.number) + ' is a weapon track number: use 68-9b or d0-ff');
+      if (party && a.number >= PARTY_BODY && !inBands(PARTY_BANDS, a.number)) problems.push(hex(a.number) + ' is a weapon track number: use 68-9b or d0-ff');
+      if (paired && a.number <= MAX_INDEX && !isPairBody(a.number)) problems.push(hex(a.number) + ' is a weapon track number of this model (body n\'s track is n + 10): use an empty body below 10, or 20-2f, 40-4f, 60-6f, 80-8f, a0-af, c0-cf, e0-ef');
+      if (model.character && inLimitPack(a.number)) notes.push(hex(a.number) + ' (' + a.label + '): this is a character\'s skeleton: played as a party member, 2c-33 are its limit pack (the game plays the limit\'s animations there)');
       const hb = headOf(a.body);
       if (hb.bones === 1 && model.bodyBones !== 1) problems.push(a.label + ' is a weapon track (1 bone), not a body animation: choose it as the weapon track of an added animation');
       else if (hb.bones !== model.bodyBones) problems.push(a.label + ': ' + hb.bones + ' bones, this model\'s animations have ' + model.bodyBones + ' (it was made for another skeleton)');
@@ -141,36 +190,41 @@
     }
     if (problems.length) return { problems, notes };
     let count = model.count;
-    for (const a of additions) count = Math.max(count, a.number + 1, party ? a.number + WEAPON_OFFSET + 1 : 0);
-    if (count > 0x134) { problems.push('the file would need ' + count + ' entries'); return { problems, notes }; }
+    for (const a of additions) count = Math.max(count, a.number + 1, tracks ? a.number + offset + 1 : 0);
+    if (count > (party ? 0x134 : MAX_INDEX + 1)) { problems.push('the file would need ' + count + ' entries'); return { problems, notes }; }
+    modelWarnings(model).forEach(w => notes.push(w));
     // every slot gets a placeholder of its kind first
     while (table.length < count) {
       const i = table.length;
       table.push(dummy(isWeaponSlot(model, i) ? 1 : model.bodyBones));
     }
+    const hidden = [];
     for (const a of additions) {
       table[a.number] = a.body;
-      if (party) {
+      if (tracks) {
         const w = a.weapon || dummy(1);
-        table[a.number + WEAPON_OFFSET] = w;
+        table[a.number + offset] = w;
         const fb = headOf(a.body).frames, fw = headOf(w).frames;
-        // KimeraCS lists a party model's first 52 animations and draws each one's weapon from its track frame by frame
-        // with no bound check: a body it lists (below 34) with a shorter track (the placeholder has no frames) fails there
-        const kimera = a.number < WEAPON_OFFSET;
+        // KimeraCS lists a model's first dword-7 animations and draws each one's weapon from its track frame by frame
+        // with no bound check: a body it lists (party: below 34; paired: below 10) with a shorter track (the placeholder
+        // has no frames) fails there
+        const kimera = a.number < offset;
+        if (paired && !kimera) hidden.push(hex(a.number));
         if (!a.weapon) notes.push(hex(a.number) + ' (' + a.label + '): no weapon track (the game\'s placeholder): the weapon is not drawn while it plays' + (kimera ? '. KimeraCS fails showing this animation (its weapon track has no frames there): give it a weapon track made at the feet or held as in the idle' : ''));
         else if (fw < fb) notes.push(hex(a.number) + ' (' + a.label + '): the weapon track has ' + fw + ' frames for ' + fb + ': the weapon disappears for the last frames' + (kimera ? '. KimeraCS fails showing this animation past frame ' + (fw - 1) : ''));
       }
     }
+    if (hidden.length) notes.push(hidden.join(' ') + ': KimeraCS does not list ' + (hidden.length > 1 ? 'these' : 'this') + ' (it reads every record after the first 16 as a weapon track), and a model saved from KimeraCS loses ' + (hidden.length > 1 ? 'them' : 'it') + '; the game plays ' + (hidden.length > 1 ? 'them' : 'it') + ' with ' + (hidden.length > 1 ? 'their' : 'its') + ' weapon track 16 further on');
     // every slot of the right kind
     table.forEach((r, i) => {
       const want = isWeaponSlot(model, i) ? 1 : model.bodyBones, got = headOf(r).bones;
-      if (got !== want && !(model.kind !== 'party')) problems.push('slot ' + hex(i) + ' has ' + got + ' bones, it wants ' + want);
+      if (got !== want && tracks) problems.push('slot ' + hex(i) + ' has ' + got + ' bones, it wants ' + want);
     });
     if (problems.length) return { problems, notes };
     const aa = model.aa.slice();
     const body = model.header[7];
-    put32(aa, 7 * 4, party ? body : count);
-    put32(aa, 10 * 4, party ? count - body : 0);
+    put32(aa, 7 * 4, tracks ? body : count);
+    put32(aa, 10 * 4, tracks ? count - body : 0);
     return { aa, da: writeAnimFile(table, model.tail), count, notes, problems };
   }
 
@@ -298,10 +352,21 @@
        when `counts` ({body, weapon}, from the model's xxaa) is given and fits the file (N + M records); otherwise they
        are read from the file itself: its bodies first (more than 1 bone each), then only 1-bone records (for every
        vanilla battle model these are the header's counts).
-     -> { kind: 'pack' | 'party model' | 'bodies + weapons' | 'animations', bodies, weapons, from: 'header' | 'file' } */
+     - more than 32 records in bands of 16 (what Add slots makes of a 16 + 16 model: 00-0f bodies, 10-1f their tracks,
+       20-2f bodies, 30-3f their tracks, ..): body i (in an even band) with i + 16. By the header (16 + M, M > 16) or,
+       without it, by the file: every record of an even band has more than 1 bone, every one of an odd band 1 bone.
+       Checked before the party rule; no vanilla file is so (isBands16).
+     -> { kind: 'pack' | 'party model' | 'bodies + weapons' | 'animations', bodies, weapons, from: 'header' | 'file',
+          bands?: true } */
+  function isBands16(recs, counts) {
+    if (recs.length <= 2 * PAIR_BODY || headOf(recs[0]).bones === 1) return false;
+    if (counts && counts.body + counts.weapon === recs.length) return counts.body === PAIR_BODY;
+    return recs.every((r, i) => (headOf(r).bones === 1) !== isPairBody(i));
+  }
   function layoutOf(recs, counts) {
     const bodyBones = recs.length ? headOf(recs[0]).bones : 0;
     if (recs.length === 16 && recs.slice(8).every(r => headOf(r).bones === 1)) return { kind: 'pack', bodies: 8, weapons: 8, from: 'file' };
+    if (isBands16(recs, counts)) return { kind: 'bodies + weapons', bodies: PAIR_BODY, weapons: recs.length - PAIR_BODY, from: counts && counts.body + counts.weapon === recs.length ? 'header' : 'file', bands: true };
     if (recs.length > PARTY_BODY && recs.slice(PARTY_BODY, PARTY_BODY + 4).every(r => headOf(r).bones === 1)) return { kind: 'party model', bodies: PARTY_BODY, weapons: recs.length - PARTY_BODY, from: 'file' };
     const plain = { kind: 'animations', bodies: recs.length, weapons: 0, from: 'file' };
     if (bodyBones === 1) return plain;
@@ -338,6 +403,7 @@
       let wi = -1;
       if (lay.kind === 'pack') { if (i < 8) wi = i + 8; }
       else if (lay.kind === 'party model') { if (bodyOfParty(i) && track(i + WEAPON_OFFSET)) wi = i + WEAPON_OFFSET; }
+      else if (lay.bands) { if (isPairBody(i) && track(i + PAIR_OFFSET)) wi = i + PAIR_OFFSET; }
       else if (lay.kind === 'bodies + weapons') { if (i < lay.bodies && i < lay.weapons && track(lay.bodies + i)) wi = lay.bodies + i; }
       const it = { index: i, body: r, weapon: wi < 0 ? null : recs[wi], label: fileName + ' ' + hex(i), file: fileName, name: fileName };
       if (wi >= 0) it.weaponIndex = wi;
@@ -346,7 +412,7 @@
     return { kind: lay.kind, items, weapons, layout: lay };
   }
 
-  const api = { PARTY_BODY, WEAPON_OFFSET, PARTY_BANDS, MAX_INDEX, hex, headOf, isDummy, dummy, readAnimFile, writeAnimFile, readSingle,
-    readHeader, openModel, otherText, isWeaponSlot, freeNumbers, placeholderNumbers, scriptBytes, build, layoutOf, sourceList, crc32, writeZip, readZip, animKey, pairByName, PAIR_MS, PAIR_ONE_MS };
+  const api = { PARTY_BODY, WEAPON_OFFSET, PARTY_BANDS, PAIR_BODY, PAIR_OFFSET, PAIR_BANDS, LIMIT_PACK, MAX_INDEX, hex, headOf, isDummy, dummy, readAnimFile, writeAnimFile, readSingle,
+    readHeader, openModel, otherText, kindText, modelWarnings, isWeaponSlot, isPairBody, isBands16, freeNumbers, placeholderNumbers, rangeText, scriptBytes, build, layoutOf, sourceList, crc32, writeZip, readZip, animKey, pairByName, PAIR_MS, PAIR_ONE_MS };
   if (typeof module !== 'undefined' && module.exports) module.exports = api; else root.SKELETON_MASTER = api;
 })(typeof self !== 'undefined' ? self : this);

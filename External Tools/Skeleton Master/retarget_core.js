@@ -709,9 +709,13 @@
      a party xxda's 34; a model of N bodies + M weapon tracks (16 + 16: an enemy with a weapon, such as mu) N, the
      track of body 0. N and M: the skeleton header's dword 7 and 10 (`header`, 13 dwords) when given and they fit the
      file; else read from the file (its bodies first, then only 1-bone records). A limit pack (16 records, 8 on of 1
-     bone) gives none. The same rule as ui_logic weaponRefIndex and anim_retarget.idle_weapon_index. */
+     bone) gives none. A file of more than 32 records in bands of 16 (what Add slots makes of a 16 + 16 model: by the
+     header 16 + M, or by the file, even bands bodies, odd bands 1 bone; anim_core isBands16) gives 0x10, checked
+     first. The same rule as ui_logic weaponRefIndex and anim_retarget.idle_weapon_index. */
   function idleWeaponIndex(recs, header) {
     const one = r => u32(r, 0) === 1, ok = i => i < recs.length && one(recs[i]) && !isPlaceholder(recs[i]);
+    if (recs.length > 32 && !one(recs[0]) && (header && header[7] + header[10] === recs.length ? header[7] === 16
+      : recs.every((r, i) => one(r) !== (Math.floor(i / 16) % 2 === 0)))) return ok(0x10) ? 0x10 : null;
     if (recs.length > 0x34 && ok(0x34)) return 0x34;
     if (!recs.length || one(recs[0])) return null;
     if (recs.length === 16 && recs.slice(8).every(one)) return null;
@@ -759,16 +763,19 @@
   function fallbackWeapon(mapping, targetBody, options) { return toPublic(fallbackWeaponRaw(mapping, toRaw(targetBody), opts(mapping, options))); }
   /* targetHasWeapons(mapping, options) -> whether the map's target has weapon tracks (see targetWeaponReference) */
   function targetHasWeapons(mapping, options) { return targetWeaponReference(mapping, opts(mapping, options).files) !== null; }
-  /* modelWeapon(rule, aaBytes, records, bodyRecord, {hand, feet, key}) -> the record of the weapon track a body added to
-     a party model gets by rule (Add slots), or null ('empty', or a placeholder body). 'idle' holds it as the model's
-     own idle (animation 00 frame 0 with its weapon track 34 frame 0) does, in `hand` or the bone nearest the weapon. */
+  /* modelWeapon(rule, aaBytes, records, bodyRecord, {hand, feet, key, weaponIndex}) -> the record of the weapon track a
+     body added to a model with weapon tracks gets by rule (Add slots), or null ('empty', or a placeholder body). 'idle'
+     holds it as the model's own idle (animation 00 frame 0 with its weapon track frame 0: record `weaponIndex`, 34 when
+     not given (a party model); 10 for a model of 16 bodies + 16 weapon tracks) does, in `hand` or the bone nearest the
+     weapon. */
   function modelWeapon(rule, aaBytes, records, bodyRecord, a) {
     a = a || {};
     const body = decodeRaw(asBytes(bodyRecord)); if (body === null || rule === 'empty') return null;
     const ts = skelPairs(readSkeleton(asBytes(aaBytes))), x = { feet: a.feet, hand: a.hand, key: a.key };
     if (rule === 'idle') {
-      const i0 = records[0] ? decodeRaw(records[0]) : null, w0 = records[0x34] ? decodeRaw(records[0x34]) : null;
-      if (!i0 || !w0) throw new Error('"held as in the idle" needs the model\'s idle (00) and its weapon track (34)');
+      const wi = a.weaponIndex === undefined || a.weaponIndex === null ? 0x34 : a.weaponIndex;   // the idle's track: 34 (party), 10 (16 + 16)
+      const i0 = records[0] ? decodeRaw(records[0]) : null, w0 = records[wi] ? decodeRaw(records[wi]) : null;
+      if (!i0 || !w0) throw new Error('"held as in the idle" needs the model\'s idle (00) and its weapon track (' + wi.toString(16).padStart(2, '0') + ')');
       x.refFrame = i0.frames[0]; x.weaponFrame = w0.frames[0];
     }
     const t = weaponWhenMissingRaw(rule, ts, body, x);

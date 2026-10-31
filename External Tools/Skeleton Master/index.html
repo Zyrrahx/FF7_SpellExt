@@ -101,7 +101,7 @@
     <div class="scroll" style="max-height:240px"><table id="adds"><thead><tr><th>Number</th><th>Play it with</th><th>Animation</th><th>Frames</th><th>Weapon track</th><th></th></tr></thead><tbody></tbody></table></div>
     <div class="row"><label>An added animation with no weapon track of its own gets one <select id="weapon-rule"><option value="feet" selected>at the feet (lying on the floor)</option><option value="idle">held as in this model's idle</option><option value="">empty (the game's placeholder)</option></select></label>
       <label>at the feet: side front lift <input id="weapon-feet" type="text" size="12" placeholder="250 250 30"></label></div>
-    <p class="help">The <b>Weapon track</b> of each added animation is what the game plays for the weapon while it plays (written at number + 34). It is filled in from the file the animation came from; to change it, choose any weapon track loaded in step 2 (a <code>NAME_weapon.anim</code>, or a 1-bone animation of an <code>xxda</code> or a limit pack), or one made here. An animation that brings none (from a model without a weapon) gets the one chosen above: <b>at the feet</b> (the default) makes a track in which the weapon lies on the floor beside the feet for the whole animation, turning and moving with the model (side front lift place its grip: by default 250 to the model's left, 250 ahead, 30 above the floor; raise lift if the weapon sinks into the floor, lower it if it floats; Barret's gun-arm needs about 450 250 70, and Cloud's sword comes close to his legs when he steps to the side); <b>held as in this model's idle</b> keeps it in the hand as the idle (00 with its weapon track 34) holds it; <b>empty</b> writes the game's placeholder, which hides the weapon while it plays. A made track has exactly the body's frame count. KimeraCS fails showing an animation whose weapon track has fewer frames than it (the placeholder has none), at the numbers it lists (below 34): the build says so when that would happen.</p>
+    <p class="help">The <b>Weapon track</b> of each added animation is what the game plays for the weapon while it plays (written at number + 34 on a party model; 16 further on, number + 10 in hex, on an enemy with a weapon: 16 bodies + 16 weapon tracks, such as <code>mu</code>; a model with no weapon tracks gets none). It is filled in from the file the animation came from; to change it, choose any weapon track loaded in step 2 (a <code>NAME_weapon.anim</code>, or a 1-bone animation of an <code>xxda</code> or a limit pack), or one made here. An animation that brings none (from a model without a weapon) gets the one chosen above: <b>at the feet</b> (the default) makes a track in which the weapon lies on the floor beside the feet for the whole animation, turning and moving with the model (side front lift place its grip: by default 250 to the model's left, 250 ahead, 30 above the floor; raise lift if the weapon sinks into the floor, lower it if it floats; Barret's gun-arm needs about 450 250 70, and Cloud's sword comes close to his legs when he steps to the side); <b>held as in this model's idle</b> keeps it in the hand as the idle (00 with its weapon track: 34, or 10 on a 16 + 16 model) holds it; <b>empty</b> writes the game's placeholder, which hides the weapon while it plays. A made track has exactly the body's frame count. KimeraCS fails showing an animation whose weapon track has fewer frames than it (the placeholder has none), at the numbers it lists (below 34; below 10 on a 16 + 16 model): the build says so when that would happen.</p>
     <div class="row">
       <button id="b-build" class="primary" disabled>Build the two files</button>
       <span class="help">Then download each with its own button. They keep the names you loaded (e.g. <code>rtaa</code>, <code>rtda</code>) and belong together: never use the new xxaa with the old xxda. Every animation the model already has stays byte for byte as it was.</span>
@@ -111,7 +111,7 @@
 
   <section class="wide">
     <h2>The model's animation table</h2>
-    <p class="help"><span class="tag body">body</span> plays as the model's own animation &nbsp; <span class="tag weapon">weapon</span> the weapon track of body animation (number &minus; 34) &nbsp; <span class="tag pack">limit pack</span> numbers 2c-33: a party member's limit animations &nbsp; <span class="tag ph">placeholder</span> empty &nbsp; <span class="tag new">new</span> added here</p>
+    <p class="help"><span class="tag body">body</span> plays as the model's own animation &nbsp; <span class="tag weapon">weapon</span> the weapon track of body animation (number &minus; 34; &minus; 10 on a 16 + 16 model) &nbsp; <span class="tag pack">limit pack</span> numbers 2c-33: a party member's limit animations &nbsp; <span class="tag ph">placeholder</span> empty &nbsp; <span class="tag new">new</span> added here</p>
     <div class="scroll"><table id="slots"><thead><tr><th>No.</th><th>Kind</th><th>Frames</th><th>Bones</th><th>Script byte</th></tr></thead><tbody></tbody></table></div>
   </section>
 
@@ -119,10 +119,11 @@
     <h2>How it works</h2>
     <p class="help"><b>Why this was hard.</b> A party model has 52 body animations: 0-2b its own, 2c-33 the limit pack's. The game finds the weapon track of body animation <i>n</i> at <i>n</i>+34 (hex), so the slots after the 52 are taken by weapon tracks, and a new animation cannot simply be added at the end. The free numbers are <b>68-9b</b> and <b>d0-ff</b>; each new animation's weapon track goes 34 further on, and every slot in between is filled with the game's own placeholder. The skeleton file's header is updated so the game makes room for all of them. No DLL is needed.</p>
     <p class="help"><b>Playing them.</b> In the model's action scripts (the <code>xxab</code> file, edited in the Scripts tab), a byte from 00 to 8d plays that animation: numbers 68-8d are played by their own byte. Numbers above 8d are played with <code>a7 NN</code>. The table above shows the bytes for each new number. Never use 2c-33 (the limit pack) or 34-67 (weapon tracks) as body animations on a party model.</p>
-    <p class="help"><b>Enemies</b> with no weapon tracks (the header's second count 0) have their new animations simply added after the last, up to ff. A model whose header gives 16 bodies + 16 weapon tracks (an enemy with a weapon, such as the final-duel Sephiroth <code>mu</code>) keeps body <i>n</i>'s weapon track at <i>n</i>+10 (hex: 16 further on): its animations come with their own weapon tracks, here in step 2 and in the Retarget tab (where its sword's own movement is retargeted into the target's hand). Adding animations TO such a model is not handled: a new body's weapon track would have to sit 16 further on, where other bodies would go, and KimeraCS reads every record after the 16 bodies as a weapon track.</p>
+    <p class="help"><b>Models with no weapon tracks</b> (the header's second count 0: most enemies, and any model that carries no weapon) have their new animations simply added after the last, up to ff, or put into an empty slot; the header's first count becomes the new total. A character's skeleton (type 2) is not offered 2c-33, since a party member plays its limit pack there.</p>
+    <p class="help"><b>An enemy with a weapon</b>: a model whose header gives 16 bodies + 16 weapon tracks (19 vanilla enemies, and the final-duel Sephiroth <code>mu</code> with his sword) keeps body <i>n</i>'s weapon track at <i>n</i>+10 (hex: 16 further on): the game draws an enemy's weapon from that number, and KimeraCS from the header's 16 + <i>n</i>, which is the same. Step 1 lists its <b>empty bodies</b> (0d-0f on <code>mu</code>, 0a-0f or 0e-0f on the others): fill those first; their weapon tracks are 1d-1f and so on, and both the game and KimeraCS show them. Beyond those, new bodies go in <b>bands of 16</b>: 20-2f, 40-4f, 60-6f, 80-8f, a0-af, c0-cf and e0-ef, each band followed by its 16 weapon tracks (30-3f .. f0-ff), so every body's track stays 16 further on; the gaps are filled with placeholders. The header keeps 16 bodies, and its second count becomes the rest. KimeraCS reads every record after the first 16 as a weapon track: it does not list the band bodies, and saving the model from KimeraCS turns them into 1-bone tracks (they are lost), as it does with a party model's 68-ff. Its animations also come with their own weapon tracks in step 2 and in the Retarget tab (where its sword's own movement is retargeted into the target's hand). A model of some other N bodies + M weapon tracks is not handled: the game's 16 further on and KimeraCS's N further on would disagree (no vanilla model is so).</p>
     <p class="help"><b>A retargeted animation and its weapon.</b> From the Retarget tab, "Send to Add slots" hands both over at once (for this page session only). Its Download gives one <code>.zip</code> holding <code>NAME.anim</code> (the body) and <code>NAME_weapon.anim</code> (the weapon track): choose the <code>.zip</code> in step 2, or unzip it and choose both <code>.anim</code> files together. Either way the Weapon column of step 2 must show the weapon file, and step 3's Weapon track must not say "none", before you build.</p>
     <p class="help"><b>Testing.</b> Put the two files (and a changed <code>xxab</code>) in a mod. If the log says "ANM ERROR" or the weapon is missing during a new animation, the files do not match the model the game loads. Keep the originals.</p>
-    <p class="help"><b>Other tools.</b> Model editors that read the header's second count as "weapon animations" may not understand the new files; the game does. KimeraCS (read from its source, not tried) lists only the first 52 animations of a party model and draws each one's weapon from its weapon track at number + 34 frame by frame, without checking the track is long enough: a track shorter than its body there (the game's 1-frame placeholder above all) makes it fail showing that animation. The numbers 68-ff are not listed by it, so they never do; a body put into an old placeholder number below 2c needs a weapon track of its own length (at the feet or held, not empty).</p>
+    <p class="help"><b>Other tools.</b> Model editors that read the header's second count as "weapon animations" may not understand the new files; the game does. KimeraCS (read from its source, not tried) lists only the first 52 animations of a party model and draws each one's weapon from its weapon track at number + 34 frame by frame, without checking the track is long enough: a track shorter than its body there (the game's 1-frame placeholder above all) makes it fail showing that animation. The numbers 68-ff are not listed by it, so they never do; a body put into an old placeholder number below 2c needs a weapon track of its own length (at the feet or held, not empty). The same holds for an enemy with a weapon (16 + 16): it lists bodies below 10 (an empty body filled there needs a weapon track of its own length), not the bands from 20 on.</p>
   </section>
 </main>
 
@@ -299,6 +300,8 @@ function feetValues() {           // the "side front lift" field: null = the def
 // sources: what step 2 lists (body animations, and weapon-only .anim files not paired yet); weapons: every weapon track
 // loaded (1 bone), to choose by hand in step 3; version: counts changes, so a build made before one is not offered
 
+// the model has weapon tracks (a party model: at number + 34; an enemy with a weapon, 16 + 16: at number + 10)
+const hasTracks = () => !!model && (model.kind === 'party' || model.kind === 'paired');
 function msg(box, text, kind) { $(box).innerHTML = text ? '<div class="msg ' + (kind || 'ok') + '">' + text + '</div>' : ''; }
 function esc(s) { return String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
 function readFile(f) { return new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(new Uint8Array(r.result)); r.onerror = () => rej(r.error); r.readAsArrayBuffer(f); }); }
@@ -312,11 +315,17 @@ $('model-files').onchange = async e => {
     model = A.openModel(await readFile(aa), await readFile(da));
     modelNames = { aa: aa.name, da: da.name };
     adds = []; picked = null; version++;
-    const kinds = { party: 'a party member (52 body animations + weapon tracks)', enemy: 'an enemy (no weapon tracks)', other: model.header[7] + ' bodies + ' + model.header[10] + ' weapon tracks (an enemy with a weapon): adding to it is not handled' };
-    $('model-summary').innerHTML = [['Model', esc(aa.name) + ' + ' + esc(da.name)], ['Kind', kinds[model.kind]], ['Skeleton bones', model.bones],
-      ['Animations now', model.count + ' (' + model.header[7] + ' + ' + model.header[10] + ')'], ['Free new numbers', A.freeNumbers(model, new Set()).length]]
-      .map(([k, v]) => '<span>' + k + '</span><span>' + v + '</span>').join('');
-    msg('model-msg', model.kind === 'other' ? esc(A.otherText(model).charAt(0).toUpperCase() + A.otherText(model).slice(1)) + '.' : 'Loaded.', model.kind === 'other' ? 'warn' : 'ok');
+    const free = A.freeNumbers(model, new Set()), ph = A.placeholderNumbers(model), cap = t => t.charAt(0).toUpperCase() + t.slice(1);
+    const rows = [['Model', esc(aa.name) + ' + ' + esc(da.name)], ['Kind', esc(A.kindText(model))], ['Skeleton bones', model.bones],
+      ['Animations now', model.count + ' (' + model.header[7] + ' + ' + model.header[10] + ')']];
+    if (model.kind !== 'other') {
+      rows.push([model.kind === 'paired' ? 'Empty bodies (fill these first)' : 'Empty slots', ph.length ? A.rangeText(ph) + (model.kind === 'paired' ? ' (weapon tracks ' + A.rangeText(ph.map(n => n + model.offset)) + ')' : '') : 'none']);
+      rows.push(['Free new numbers', free.length ? A.rangeText(free) + ' (' + free.length + ')' + (model.kind === 'party' || model.kind === 'paired' ? '; each with its weapon track at + ' + hx(model.offset) : '') : 'none']);
+    }
+    $('model-summary').innerHTML = rows.map(([k, v]) => '<span>' + k + '</span><span>' + v + '</span>').join('');
+    const warns = A.modelWarnings(model).map(cap);
+    if (model.kind === 'other') msg('model-msg', esc(cap(A.otherText(model))) + '.', 'warn');
+    else msg('model-msg', warns.length ? 'Loaded. ' + warns.map(esc).join('. ') + '.' : 'Loaded.', warns.length ? 'warn' : 'ok');
   } catch (err) { model = null; $('model-summary').innerHTML = ''; msg('model-msg', esc(err.message), 'bad'); }
   refresh();
 };
@@ -328,7 +337,8 @@ $('source-files').onchange = async e => {
     try {
       const s = A.sourceList(f.name, await readFile(f));
       s.items.forEach(it => { it.time = f.lastModified; sources.push(it); if (it.weapon && !it.weaponLabel) it.weaponLabel = s.kind === 'zip' ? null : f.name + ' ' + hx(it.weaponIndex); });
-      if (s.kind === 'bodies + weapons') said.push(f.name + ': ' + s.layout.bodies + ' bodies + ' + s.layout.weapons + ' weapon tracks (a model with a weapon, such as the final-duel Sephiroth mu): each body comes with its weapon track ' + s.layout.bodies + ' further on (' + hx(s.layout.bodies) + ' for 00).');
+      if (s.kind === 'bodies + weapons' && s.layout.bands) said.push(f.name + ': bodies and weapon tracks in bands of 16 (a model with a weapon that Add slots added to: 00-0f bodies, 10-1f their tracks, 20-2f bodies, ..): each body comes with its weapon track 16 further on (10 for 00).');
+      else if (s.kind === 'bodies + weapons') said.push(f.name + ': ' + s.layout.bodies + ' bodies + ' + s.layout.weapons + ' weapon tracks (a model with a weapon, such as the final-duel Sephiroth mu): each body comes with its weapon track ' + s.layout.bodies + ' further on (' + hx(s.layout.bodies) + ' for 00).');
       s.weapons.forEach(w => weapons.push(w));
       if (s.kind === 'zip') s.items.filter(it => it.weapon).forEach(it => said.push(it.label + ' with its weapon track ' + it.weaponLabel + '.'));
       if (s.skipped && s.skipped.length) said.push(f.name + ': left out ' + s.skipped.join(', ') + ' (not .anim).');
@@ -337,7 +347,7 @@ $('source-files').onchange = async e => {
   const p = A.pairByName(sources); sources = p.items;
   p.pairs.forEach(({ body, weapon }) => {
     said.push('Paired ' + body.label + ' with its weapon track ' + weapon.label + '.');
-    adds.forEach(a => { if (a.src === body && !a.weapon && !a.weaponSet && model && model.kind === 'party') { a.weapon = body.weapon; a.weaponLabel = body.weaponLabel; version++; said.push('Its added animation ' + hx(a.number) + ' now has it as its weapon track.'); } });
+    adds.forEach(a => { if (a.src === body && !a.weapon && !a.weaponSet && hasTracks()) { a.weapon = body.weapon; a.weaponLabel = body.weaponLabel; version++; said.push('Its added animation ' + hx(a.number) + ' now has it as its weapon track.'); } });
   });
   const mins = ms => ms < 120000 ? Math.round(ms / 1000) + ' s' : Math.round(ms / 60000) + ' min';
   p.unsure.forEach(u => said.push(u.gap !== undefined
@@ -366,8 +376,13 @@ function renderTargets() {
   const sel = $('target'); sel.innerHTML = '';
   if (!model) return;
   const taken = new Set(adds.map(a => a.number));
-  A.freeNumbers(model, taken).forEach(n => sel.add(new Option(hx(n) + '  (play with ' + A.scriptBytes(n) + ')', n)));
-  const ph = A.placeholderNumbers(model).filter(n => !taken.has(n));
+  const free = A.freeNumbers(model, taken), ph = A.placeholderNumbers(model).filter(n => !taken.has(n));
+  if (model.kind === 'paired') {   // its empty bodies first: the game and KimeraCS both show them
+    if (ph.length) { const g = document.createElement('optgroup'); g.label = 'Fill an empty body (weapon track 16 further on)'; ph.forEach(n => g.appendChild(new Option(hx(n) + '  (empty, play with ' + A.scriptBytes(n) + '; weapon track ' + hx(n + model.offset) + ')', n))); sel.appendChild(g); }
+    if (free.length) { const g = document.createElement('optgroup'); g.label = 'New numbers (KimeraCS does not list them)'; free.forEach(n => g.appendChild(new Option(hx(n) + '  (play with ' + A.scriptBytes(n) + '; weapon track ' + hx(n + model.offset) + ')', n))); sel.appendChild(g); }
+    return;
+  }
+  free.forEach(n => sel.add(new Option(hx(n) + '  (play with ' + A.scriptBytes(n) + ')', n)));
   if (ph.length) { const g = document.createElement('optgroup'); g.label = 'Replace an empty slot (the old way)'; ph.forEach(n => g.appendChild(new Option(hx(n) + '  (placeholder, play with ' + A.scriptBytes(n) + ')', n))); sel.appendChild(g); }
 }
 $('b-add').onclick = () => {
@@ -375,7 +390,7 @@ $('b-add').onclick = () => {
   const s = sources[picked], n = Number($('target').value);
   if (s.weaponTrack || (A.headOf(s.body).bones === 1 && model.bodyBones !== 1)) { msg('source-msg', esc(s.label) + ' is a weapon track (1 bone), not a body animation: it cannot be added as one. Add its body animation, then choose this file in step 3, in that row\'s Weapon track column. (NAME.anim and NAME_weapon.anim chosen together pair by themselves.)', 'bad'); return; }
   if (A.headOf(s.body).bones !== model.bodyBones) { msg('source-msg', 'That animation has ' + A.headOf(s.body).bones + ' bones; this model\'s have ' + model.bodyBones + '. It was made for another skeleton.', 'bad'); return; }
-  const party = model.kind === 'party';
+  const party = hasTracks();
   adds.push({ number: n, body: s.body, weapon: party ? s.weapon : null, weaponLabel: party && s.weapon ? s.weaponLabel : null, label: s.file + ' ' + hx(s.index), src: s,
     weaponRule: s.weaponRule || pageRule(), ruleSet: !!s.weaponRule });
   adds.sort((a, b) => a.number - b.number); version++;
@@ -408,7 +423,7 @@ function weaponPicker(a) {        // step 3: the weapon track of an added animat
 }
 function renderAdds() {
   const tb = $('adds').tBodies[0]; tb.innerHTML = '';
-  const party = model && model.kind === 'party';
+  const party = hasTracks(), off = party ? model.offset : 0;
   adds.forEach((a, i) => {
     const tr = document.createElement('tr');
     tr.innerHTML = '<td class="mono">' + hx(a.number) + '</td><td class="mono">' + A.scriptBytes(a.number) + '</td><td>' + esc(a.label) + '</td><td>' + A.headOf(a.body).frames + '</td>';
@@ -416,12 +431,12 @@ function renderAdds() {
     if (party) {
       wtd.appendChild(weaponPicker(a));
       const fb = A.headOf(a.body).frames, fw = a.weapon ? A.headOf(a.weapon).frames : 0, note = document.createElement('span'); note.className = 'help';
-      const kimera = a.number < A.WEAPON_OFFSET ? '; KimeraCS fails showing it' : '';
-      note.textContent = a.weapon ? ' at ' + hx(a.number + A.WEAPON_OFFSET) + (fw < fb ? ': ' + fw + ' frames for ' + fb + ', the weapon disappears for the last frames' + kimera : '')
-        : a.weaponRule === 'feet' || a.weaponRule === 'idle' ? ' at ' + hx(a.number + A.WEAPON_OFFSET) + ': made at build, ' + RULE_TEXT[a.weaponRule] + ', ' + fb + ' frames'
+      const kimera = a.number < off ? '; KimeraCS fails showing it' : '';
+      note.textContent = a.weapon ? ' at ' + hx(a.number + off) + (fw < fb ? ': ' + fw + ' frames for ' + fb + ', the weapon disappears for the last frames' + kimera : '')
+        : a.weaponRule === 'feet' || a.weaponRule === 'idle' ? ' at ' + hx(a.number + off) + ': made at build, ' + RULE_TEXT[a.weaponRule] + ', ' + fb + ' frames'
         : ' the weapon is hidden while it plays' + kimera;
       wtd.appendChild(note);
-    } else wtd.innerHTML = '<span class="help">enemy: none</span>';
+    } else wtd.innerHTML = '<span class="help">none (the model has no weapon tracks)</span>';
     tr.appendChild(wtd);
     const td = document.createElement('td'); const b = document.createElement('button'); b.textContent = 'Remove'; b.onclick = () => { adds.splice(i, 1); version++; refresh(); }; td.appendChild(b); tr.appendChild(td);
     tb.appendChild(tr);
@@ -434,14 +449,15 @@ function download(name, bytes) {
 }
 /* Build makes the files; each is then saved by its own button, so every download starts inside a click (a browser
    may block a second download a page starts by itself, and say nothing). */
-/* the additions as build() takes them: an added animation of a party model with no weapon track gets the one its rule
-   makes (Retarget's core, the same as the Python twin anim_retarget.weapon_when_missing) */
+/* the additions as build() takes them: an added animation of a model with weapon tracks (party, or 16 + 16) with no
+   weapon track gets the one its rule makes (Retarget's core, the same as the Python twin anim_retarget.
+   weapon_when_missing; 'idle' from the model's idle 00 and its track, 34 or 10) */
 function withWeapons() {
-  const party = model.kind === 'party', R = window.SKELETON_MASTER_RETARGET, feet = feetValues();
+  const party = hasTracks(), R = window.SKELETON_MASTER_RETARGET, feet = feetValues();
   return adds.map(a => {
     if (!party || a.weapon || (a.weaponRule !== 'feet' && a.weaponRule !== 'idle')) return a;
     if (!R) throw new Error('the Retarget tab\'s core (retarget_core.js) did not load: reload the page');
-    const w = R.modelWeapon(a.weaponRule, model.aa, model.records, a.body, { feet });
+    const w = R.modelWeapon(a.weaponRule, model.aa, model.records, a.body, { feet, weaponIndex: model.offset });
     return Object.assign({}, a, { weapon: w, weaponLabel: w ? 'made here, ' + RULE_TEXT[a.weaponRule] : null, made: w ? a.weaponRule : null });
   });
 }
@@ -450,7 +466,7 @@ $('b-build').onclick = () => {
   try { adds2 = withWeapons(); } catch (err) { built = null; msg('build-msg', 'Not built: ' + esc(err.message), 'bad'); return; }
   const r = A.build(model, adds2);
   if (r.problems.length) { built = null; msg('build-msg', 'Not built:<br>' + r.problems.map(esc).join('<br>'), 'bad'); return; }
-  const list = adds2.map(a => hx(a.number) + '  play with: ' + A.scriptBytes(a.number) + '   (' + a.label + ', ' + A.headOf(a.body).frames + ' frames' + (model.kind === 'party' ? '; weapon track at ' + hx(a.number + A.WEAPON_OFFSET) + ': ' + (a.weapon ? (a.weaponLabel || 'its own') + ', ' + A.headOf(a.weapon).frames + ' frames' : 'none (the game\'s placeholder)') : '') + ')').join('\n');
+  const list = adds2.map(a => hx(a.number) + '  play with: ' + A.scriptBytes(a.number) + '   (' + a.label + ', ' + A.headOf(a.body).frames + ' frames' + (hasTracks() ? '; weapon track at ' + hx(a.number + model.offset) + ': ' + (a.weapon ? (a.weaponLabel || 'its own') + ', ' + A.headOf(a.weapon).frames + ' frames' : 'none (the game\'s placeholder)') : '') + ')').join('\n');
   const files = [[modelNames.aa, r.aa, 'the skeleton'], [modelNames.da, r.da, 'the animations'],
     [modelNames.da + '_added.txt', new TextEncoder().encode(modelNames.aa + ' / ' + modelNames.da + ': ' + r.count + ' animations (was ' + model.count + ')\n\n' + list + '\n' + (r.notes.length ? '\nNotes:\n' + r.notes.join('\n') + '\n' : '')), 'the list of the new numbers']];
   built = { version, files, saved: new Set() };
@@ -474,9 +490,9 @@ $('b-build').onclick = () => {
 function renderSlots() {
   const tb = $('slots').tBodies[0]; tb.innerHTML = '';
   if (!model) { tb.innerHTML = '<tr><td colspan="5" class="help">Load a model first.</td></tr>'; return; }
-  const party = model.kind === 'party', byNum = new Map(adds.map(a => [a.number, a]));
-  const weaponOf = new Map(); if (party) adds.forEach(a => weaponOf.set(a.number + A.WEAPON_OFFSET, a));
-  let last = model.count - 1; adds.forEach(a => { last = Math.max(last, a.number + (party ? A.WEAPON_OFFSET : 0)); });
+  const party = model.kind === 'party', off = hasTracks() ? model.offset : 0, byNum = new Map(adds.map(a => [a.number, a]));
+  const weaponOf = new Map(); if (off) adds.forEach(a => weaponOf.set(a.number + off, a));
+  let last = model.count - 1; adds.forEach(a => { last = Math.max(last, a.number + off); });
   for (let i = 0; i <= last; i++) {
     let kind, frames = '', bones = '', bytes = '';
     if (byNum.has(i)) { const a = byNum.get(i); kind = '<span class="tag new">new: ' + esc(a.label) + '</span>'; frames = A.headOf(a.body).frames; bones = A.headOf(a.body).bones; bytes = A.scriptBytes(i); }
@@ -484,10 +500,11 @@ function renderSlots() {
     else if (i < model.count) {
       const r = model.records[i], h = A.headOf(r); frames = h.frames; bones = h.bones;
       if (party && i >= 0x2c && i < 0x34) kind = '<span class="tag pack">limit pack (placeholder in the file)</span>';
-      else if (A.isWeaponSlot(model, i)) kind = '<span class="tag weapon">weapon of ' + hx(i - A.WEAPON_OFFSET) + '</span>';
+      else if (model.character && i >= 0x2c && i < 0x34) { kind = '<span class="tag pack">' + (A.isDummy(r) ? 'placeholder; ' : 'body; ') + 'limit pack when played as a party member</span>'; bytes = A.scriptBytes(i); }
+      else if (A.isWeaponSlot(model, i)) kind = '<span class="tag weapon">weapon of ' + hx(i - off) + '</span>';
       else if (A.isDummy(r)) { kind = '<span class="tag ph">placeholder</span>'; bytes = A.scriptBytes(i); }
       else { kind = '<span class="tag body">body</span>'; bytes = A.scriptBytes(i); }
-    } else { kind = '<span class="tag ph">placeholder (will be added)</span>'; frames = 1; }
+    } else { kind = A.isWeaponSlot(model, i) ? '<span class="tag ph">placeholder weapon track (will be added)</span>' : '<span class="tag ph">placeholder (will be added)</span>'; frames = 1; }
     const tr = document.createElement('tr');
     tr.innerHTML = '<td class="mono">' + hx(i) + '</td><td>' + kind + '</td><td>' + frames + '</td><td>' + bones + '</td><td class="mono">' + bytes + '</td>';
     tb.appendChild(tr);
