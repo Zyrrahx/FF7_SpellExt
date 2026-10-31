@@ -7,14 +7,37 @@ game file on disk: everything happens in memory.
 Expect bugs and issues not everything has been tested.
 
 ## What it adds
+**Items and gear**
 - New spells, materia (up to 254 kinds), items, weapons, armour and accessories, defined in `.ini` files.
-- A wider item list: item numbers 1024-9999 and an item list of up to 510 rows.
+- A much larger item list: item numbers 1024-9999, and an item list of up to **3,350 rows** (`wide_rows`, default 510).
+  Arrange sorts only the rows in use, and long lists cost nothing noticeable in battle or at a save.
 - The Box: storage beyond the item list (12,000 kinds), and weapons / armour / accessories numbered 10000-27999
-  that live in the box or on a character.
+  that live in the item list, in the box or on a character.
+- **Change the game's own gear**: a section numbered for a game weapon, armour or accessory (`[128]`-`[319]`)
+  changes that piece in whatever kernel the game loaded; only the keys it gives replace the game's values
+  (e.g. `[128]` `equip = cloud 12` lets Cloud and new character 12 wear the Buster Sword).
+
+**Characters and limits**
 - New party members (up to 32 defined, four seated at a time) with their own limit breaks, battle models,
-  portraits and battle cameras.
+  portraits, battle cameras, growth and equipment rules (`equip_like = none` keeps them off the original
+  characters' weapons).
+- Limits built from up to **24 steps**: game magic effects, game limit effects, native effects and bare `hit:FRAME`
+  steps, so a limit can show many hits (e.g. 21) on its own timing.
+
+**Effects and cameras**
 - Effect copies: a spell can play its own copy of a game magic effect with files of your own (a recoloured Fire
   beside the original), numbered from 0x100 (`FF7_SpellExt_Effects.ini`).
+- The native effect player: effects the DLL plays itself from a script (models, sprites, sounds, stage and actor
+  effects), used for effects converted from FF8. See `FF7_SpellExt_EffectsPlayer_README.txt`.
+- Battle cameras of your own (`SpellExtConfig/cameras/`), including FF8-style cameras (`engine = ff8`) that can run
+  on a limit's or spell's own clock (`clock = action`) through all of its steps.
+
+**Engine limits**
+- Breaking Limits (`breaking_limits = on`): battle models of more than 48 bones (up to 127).
+- More fields than the game ships: up to 32,767 field ids from a registry file (`fields_file`).
+- New characters can have a body in the field (`field_entities`).
+
+**Saves and fixes**
 - A companion file beside each save for everything the game's own save cannot hold; the game's save stays loadable
   by the unmodified game.
 - Fixes: MP costs above 255, damage caps, more than 256 texts in a field, and others.
@@ -78,9 +101,13 @@ What the high numbers need, in `FF7_SpellExt_Game.ini`:
 
 Where they live in the game:
 - High-numbered items go in the item list like any item: up to 510 kinds at once with `wide_rows = 510` (the
-  default), 99 of each; when the list is full, more go to the box.
-- High-numbered weapons, armour and accessories live only in the box or on a character, never in the item list.
-  The box holds up to 12,000 kinds, up to 65,535 of each; the Equip menu offers them straight from the box.
+  default), or up to 3,350 with `wide_rows` set higher (320, or an even number from 510 to 3350), 99 of each;
+  when the list is full, more go to the box.
+- High-numbered weapons, armour and accessories live in the item list, in the box or on a character. In the item
+  list they are greyed in the Item menu and are not thrown or sold. The box holds up to 12,000 kinds, up to 65,535
+  of each; the Equip menu offers them from the item list and the box.
+- A save whose list uses rows past 509 needs a build with the 3,350-row list (or a later one): do not open it with
+  an older build.
 
 They can be given by field scripts (Add Item), enemy drops, steal and morph, shops, and the testing aids. A section
 numbered in the wrong range is not read, and `FF7_SpellExt.log` names the range to use instead.
@@ -109,10 +136,14 @@ Firefox, Chrome or Edge; nothing to install.
 - [**CAMMY**](External%20Tools/CAMMY/): a battle camera editor. Shows a camera in 3D, opens any of the game's cameras
   to start from, and saves the camera files SpellExt loads (`SpellExtConfig/cameras/`). Guide:
   [`docs/Cameras_Guide.md`](docs/Cameras_Guide.md).
-- [**Skeleton Master**](External%20Tools/Skeleton%20Master/): two tabs. **Add slots** adds extra animations to a battle
-  model (up to about 100 more on a party member), keeping every existing one as it was, and tells you the script byte
-  that plays each. **Retarget** moves animations from one model's skeleton to another's: pair the bones in 3D, watch
-  the result, export it or give it a new slot.
+- [**Skeleton Master**](External%20Tools/Skeleton%20Master/): three tabs.
+  - **Add slots** adds extra animations to a battle model (up to about 100 more on a party member; enemies, including
+    those that carry a weapon), keeping every existing one as it was, and tells you the script byte that plays each.
+    A body and its weapon track are added together.
+  - **Retarget** moves animations from one model's skeleton to another's: pair the bones in 3D, watch the result,
+    export it (one `.zip` with the body and its weapon track) or give it a new slot. A source with no weapon track
+    can be given one (at the feet, held as in the idle, or empty) so KimeraCS does not fail on it.
+  - **Scripts** edits a model's battle action scripts.
 
 ## Source
 `src/spellext.c` is the whole DLL. Each hook is commented with the game addresses it works on.
