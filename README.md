@@ -1,7 +1,7 @@
 # FF7 SpellExt
 
 A DLL mod for **Final Fantasy VII** (Steam 2013 PC release, `ff7_en.exe`) that lifts limits the engine imposes,
-driven entirely by plain text files. It runs as a 7th Heaven mod beside FFNx and Enhanced Stock UI, and changes no
+driven entirely by plain text files. It runs as a 7th Heaven mod beside FFNx, and changes no
 game file on disk: everything happens in memory.
 
 Expect bugs and issues not everything has been tested.
