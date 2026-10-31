@@ -328,7 +328,17 @@ What a state does:
     when their target dies (hits, commands, retarget, the attack scripts);
   - it gives the character a standing pose of its own (idle_script);
   - it keeps a model at one of the character's bones for as long as it
-    lasts: a second weapon in the other hand (prop).
+    lasts: a second weapon in the other hand (prop);
+  - it sends each attack at every enemy at once, with an element and a
+    range of its own (attack_targets, attack_element, long_range);
+  - it makes every physical hit on the character miss (physical_evade);
+  - it replaces some of the model's scripts while it lasts: its
+    reactions to being hit, its casting (script_NN);
+  - it raises the battle's resting view while it lasts, so a body held
+    up in the air stays in the picture (view_raise, view_back);
+  - it raises the yellow pointer over the character when its command
+    menu is open, so it stays above a body held up in the air
+    (pointer_raise).
 Every part is optional: a state may be only a pose, or only a prop.
 
 Two words first. A TURN is one attack of an action: Attack has one turn,
@@ -351,7 +361,11 @@ hits            N, 2 to 4. While the state lasts, each turn of one of the
                 no second flinch. A new target is only ever chosen per
                 turn (retarget, below). Counter attacks, Mime, and attacks
                 made while Berserk or Confused are the same commands and
-                hit N times too. Default 1: no change.
+                hit N times too. Default 1: no change to the hits. A state
+                with hits = 1 still gives the listed attacks its attack
+                scripts and its attack_targets, attack_element and
+                long_range (until 2026-10-22 a state with hits = 1 played
+                the model's own attack scripts).
                 A turn gets its N hits only when it goes at ONE ENEMY:
                   - a command that picks one of several enemies for each
                     attack (4x-Cut) picks one per turn, and all N hits of
@@ -609,6 +623,147 @@ prop_hide       When the prop is NOT drawn although the state lasts: none
                 same way while its own is there.
                 While the game is paused the prop stays where it was.
 
+attack_targets  as_chosen or all_enemies. Default as_chosen: the attack goes
+                at the targets it was given. all_enemies: each turn of a
+                listed attack goes at EVERY living enemy it can be aimed at,
+                as one record with one animation (the game's own way for
+                Slash-All): the one-turn script (attack_script_only, or the
+                model's own Attack) plays once and its f7 shows every
+                enemy's number, one frame apart. The enemies are counted
+                again at each turn: the dead and those out of reach (below)
+                are left out; nobody left after a first turn ends the
+                action. It goes only with hits = 1 (with more, the line is
+                ignored and the log says so) and only to Attack, 2x-Cut and
+                4x-Cut; an attack aimed at the party's side (Confusion,
+                Manipulate) is left as the game has it.
+                The game's rule for several targets applies: each enemy
+                takes 2/3 of the damage one target would (FUN_005de8f4), as
+                with Slash-All or a spell cast on all.
+                A script with a 9e in it waits for THE target to finish,
+                and a record at several targets has none: so an action
+                whose script has a byte 9e anywhere (the model's own 2x-Cut
+                and 4x-Cut scripts end in one) keeps its own targets, and
+                the log says "every enemy NOT applied". End the state's
+                scripts with e5 ee:
+                    attack_targets     = all_enemies
+                    attack_script_only = fc 29 2a 2a f7 04 2b e5 ee
+                In the battle menu, the target cursor of an attack that
+                will go at every enemy sits on EVERY enemy at once, as for
+                Slash-All or a spell cast on all: there is no single target
+                to choose, no switch to the party's side and no L1/R1
+                toggle (with Mega-All too); the confirm button issues it.
+                It shows the enemies the attack can reach: every one that
+                can be aimed at, or only those no other stands in front of
+                when the attack stays short range (no long_range and a
+                short-range weapon). With every enemy hidden the confirm
+                button only buzzes, as for a spell on all: choose another
+                command. An attack that keeps its own targets (a 9e, above;
+                a command not listed; a frog) keeps the game's cursor.
+attack_element  weapon, or element words as a spell's `element` (fire, ice,
+                lightning, earth, poison, gravity, water, wind, holy,
+                restorative, cut, hit, punch, shoot, shout, hidden; several
+                together; none = no element). Default weapon: the weapon's
+                element and the Elemental materia's, as always. Anything
+                else REPLACES both for the listed attacks while the state
+                lasts:
+                    attack_element = hidden
+                An element without cut, hit and punch also frees the
+                attack from the reach rule (enemies flying out of a short
+                weapon's reach can be hit).
+long_range      yes or no. Default no. yes: the listed attacks are long
+                range: no damage halving for a back row (the attacker's or
+                the target's), and enemies standing behind others can be
+                aimed at (the short-range bit of the weapon's targeting is
+                taken off). The reach rule for flying enemies is the Long
+                Range materia's and the element's (above), not this key's.
+physical_evade  normal or 100. Default normal. 100: while the state lasts
+                EVERY physical hit on the character misses: a weapon-type
+                hit, the enemies' and a confused ally's alike, whatever the
+                attacker's luck, the character's status or the element (the
+                game's physical hit check is answered with its own miss for
+                the character). Magic, and the attacks that never roll to
+                hit (fixed-damage and "always hits" specials), hit as
+                always. A miss plays the character's own miss reaction
+                (its dodge, script 08). Not while the character
+                is a frog. A party member covering the character is hit by
+                the usual rule.
+                    physical_evade = 100
+script_NN       While the state lasts, the character's model script NN (two
+                hexadecimal digits) is replaced by these bytes, as idle_script
+                replaces script 00. A reaction is a model script: 05 hurt,
+                06 hurt while defending, 07 the knock-out fall, 08 the dodge,
+                0a the big recoil, 0b the two-part recoil; casting is a
+                model script too: 1d Magic and W-Magic, 1e Enemy Skill, 1f
+                Summon, 20 and 21 Item (20 at the party's side, 21 at the
+                enemies'), 21 also Throw and Coin; 13 is the Defend pose,
+                03 / 04 the row change, 10 an interrupted cast (ab_tool.py
+                dump lists the model's own). Up to 16 lines a state, up to
+                32 bytes each; a later line for the same NN replaces it:
+                    script_05 = 22 f2 e5 ee
+                    script_08 = 23 e5 ee
+                    script_07 = 25 f2 e5 ee
+                    script_1d = e8 fc e6 ea 29 2a 2a ec 2d 2d 2d 2d 2d e5 ee
+                (the hurt, the dodge and the fall played from animations
+                0x22, 0x23, 0x25; Magic as a wind-up, a hold twice, the
+                spell's effect step ec, then animation 0x2d five times while
+                the spell plays.) Not taken: 00 and 01 (idle_script,
+                idle_weak_script), 18 to 1b (the attack scripts' slots),
+                2e-32 and 34-3b (the game takes those from its exe for every
+                model), 33 and 3c up (the limits and transformations).
+                A script that the battle waits for (every one but 02, 0c,
+                0d, 0e and 13, the standing poses) must END: one that ends
+                in fe c0 is refused, because it would never say it has
+                finished and the battle would wait for ever. A long one is
+                safe: the action is over when the effect has finished AND
+                the character has, whichever is later. Like idle_script, a
+                script that loops (fe c0) is started again from its first
+                byte as its animation's number.
+                The scripts are lent when the state begins and given back
+                when it ends; a script the character is playing at that
+                moment (the knock-out fall that ends the state with
+                `ends = ko`) plays to its end first, and only then is the
+                model's own put back. Animations 0x2c-0x33 are the loaded
+                limit pack's: a script that names them needs that pack
+                still loaded (a state with limit_gauge = frozen keeps it).
+view_raise      0 to 6000. Default 0. While the character is in the state,
+                the battle's RESTING view (between actions, the command
+                menu, choosing a target: the scene's own camera, wherever
+                the game shows it) is raised by this many units, the point
+                it looks at with it: a body held up in the air (an idle
+                whose animation lifts the root) stays in the picture. The
+                cameras of actions (attacks, spells, limits, the enemies')
+                are their own, except that their first moments carry the
+                fading lift: the view glides from the raised one into an
+                action's camera and back, a fifth of the way each frame
+                (gone after about 37 frames), so nothing jumps. Several
+                characters in such states: the largest value. The view is the game's again
+                while the character is knocked out, a frog, in the victory
+                or escape pose, and after the state ends (it glides back
+                down). FFNx's analogue camera (the right stick) works as
+                before, on top of the raised view. A battle model stands
+                about 1,300 to 1,800 units tall; a scene's camera stands
+                about 12,000 to 17,000 units from the point it looks at.
+                    view_raise = 800
+view_back       0 to 100 (a % may follow). Default 0. With view_raise or
+                alone: the resting view also moves this many per cent
+                farther back from the point it looks at, so the floor and
+                the enemies' feet stay in the picture when it is raised.
+                    view_back = 20
+pointer_raise   0 to 6000. Default 0. While the character is in the state,
+                the yellow pyramid that turns over it when its command menu
+                is open is this many units higher. The game puts the
+                pyramid at a fixed height for each model (from the model's
+                own data), not at its head, so a body held up by its
+                animations would have it below or inside it: give the same
+                number of units as the animations lift the body. It is at
+                the game's height again while the character is knocked
+                out, a frog, in the victory or escape pose, and when the
+                state ends. The target hand (when the character is chosen
+                as a target) and the damage numbers follow the body's bones
+                and need nothing; the status marks over the head (sleep,
+                silence, a countdown) are not moved.
+                    pointer_raise = 1563
+
 A section written for the older meaning (hits = 2 and three scripts, each
 with one f7) still loads and gives the same numbers of hits: Attack 2, 2x-Cut
 4, 4x-Cut 8. Attack plays the model's own Attack script once (there is no
@@ -662,6 +817,38 @@ early: "state akimbo actor 0: ENDED: knocked out (ends = ko), as it was
 shown (frame 812 of the state); its prop ZACK.RSD was drawn on 800 of 812
 frames; idle slots 0 1 put back; attack script slots not lent; the actor's
 attacks are the game's again".
+The keys attack_targets, attack_element, long_range, physical_evade,
+script_NN, view_raise, view_back and pointer_raise, when a state has any: one
+line when the file is read
+("character 13 state aloft: attack_targets all_enemies, attack_element 8000,
+long_range, physical_evade 100, scripts lent: 05 07 08 0a 1d"), the same
+after "ON" when it begins, "scripts lent (the state is entered): slots 05 07
+08 0a 1d", and on each attack's line what was changed ("; every enemy each
+turn (target flags 23 -> 27); element 2001 -> 8000; long range (short-range
+bit 0x20 cleared)", then "turn 1 of 1 goes at every living enemy: 0010 ->
+00f0"). The first physical hit it makes miss in a battle: "state aloft actor
+1: physical_evade: a physical hit on it by actor 4 is a miss (said once a
+battle)". At start-up: "limit states: the physical hit check (hit-step table
+entry 007b77a8 -> 005ddbb0) is followed" and "limit states: the battle
+menu's target set-up (006d95ba, 006d95fe -> 006e5c52) is followed". The first
+time in a battle the menu aims such an attack: "state aloft actor 1: the
+battle menu's target cursor for attack is every enemy (target flags 23 -> 26,
+the pool every enemy, not only the uncovered): the attack goes at every
+enemy". With view_raise or view_back, when the state begins: "state aloft
+actor 1: view_raise 800, view_back 20%: the battle's home view is lifted while
+the actor stands in the state (the camera's build at 0041bda4 is followed)",
+then at most 20 lines a battle: "home view: lifting (view_raise 800,
+view_back 20%): the game shows its home view (camera -1)", "home view: lifted
+whole ...", "home view: the game's own again ...". With pointer_raise, when
+the state begins: "state aloft actor 1: pointer_raise 1563: the pointer over
+the acting actor is raised while the actor stands in the state ...", then at
+most 12 lines a battle: "pointer raised 1563 units (its height -200 ->
+-1763)", "pointer at the game's height again (-200): the state ended" (or
+"... the actor does not stand in the state"), "the game wrote the pointer's
+height again ...: taken as its own" (the model was loaded again). When the state ends, the ENDED
+line says "scripts put back: ..." and "; when the actor no longer plays it:
+07" for a script still playing, then "the script slots it was playing at the
+state's end are put back".
 The SpellExt screen's limit page shows "state" in the More column of a limit
 that has one.
 effect          The visual effect (game code, one routine per limit):
@@ -741,14 +928,15 @@ limit's). It can instead run a SPELL's effect for each of its hits:
     spell_effects = 0x1b:41, 0x1e:65, 0x21:105
     hit_elements  = fire, ice, lightning
 
-spell_effects   Up to eight of  animation:frame , one for each hit in order.
+spell_effects   Up to 24 of  animation:frame , one for each hit in order
+                (an older DLL takes 8).
                 animation is a magic animation number as in the spell file
                 (0x1b Fire, 0x1e Ice, 0x21 Bolt ...; enemy attack effects
                 are scene effect + 0x4e). frame counts from the limit's
                 effect step (the ec in its script), which is frame 0 of the
                 animation the script plays next. Each effect is shown on its
                 hit's own target and shows that hit's damage.
-hit_elements    Up to eight element sets separated by commas, one for each
+hit_elements    Up to 24 element sets separated by commas, one for each
                 hit: its element in place of the limit's own. The last one
                 is used for any hits beyond the list.
                     hit_elements = fire, ice lightning, none
@@ -769,7 +957,89 @@ An entry of spell_effects may also be written with these words:
     spell_effects = limit 178:34 all visual skip 59, 0x0f:97 all
         Clear Tranquil's effect on the party at frame 34 for show, Barrier's
         at frame 97, which shows the limit's result.
-Effects may overlap or start on the same frame.
+    effect N:frame    a NATIVE effect: an [effect N] section of
+                      FF7_SpellExt_Effects.ini with `play =` (a script of
+                      the effect player, FF7_SpellExt_EffectsPlayer_README.txt;
+                      N = 0x100 up). It plays as it does for a spell: the
+                      limit's camera, if one of your own with a [roll] or
+                      engine = ff8, on the effect's frames (an engine = ff8
+                      camera with clock = action plays on the limit's own
+                      clock instead, from its effect step through every
+                      step, and does not start over at each native effect:
+                      FF7_SpellExt_Cameras_README.txt); its stage and
+                      actors lines, sounds and pictures; and its `hit` lines
+                      show the limit's results (each target once; one not hit
+                      when it ends is hit then). Takes `all`, not `visual` or
+                      `skip`.
+    spell_effects = effect 0x28f:0 all
+        Native effect 0x28f on all the limit's targets from the effect step
+        (frame 0): one hit on every target, shown at the script's hit frame.
+    hit:frame         a BARE HIT: no effect at all. At its frame the entry's
+                      own hit (the Nth entry shows the Nth hit, on that hit's
+                      target) is shown as an effect shows it: the damage number,
+                      the target's reaction, and the limit's impact_effect /
+                      impact_sound if it has them (all read from the code, not
+                      yet seen in the game). Nothing after it (no all, visual
+                      or skip). A hit with no target (fewer hits than entries)
+                      is passed over, with a line in the log.
+    spell_effects = effect 0x290:29, hit:39, hit:47, hit:55
+        Native effect 0x290 from frame 29 shows hit 1 (its hit line); hits 2,
+        3 and 4 are shown at frames 39, 47 and 55 while it plays on. Use bare
+        hits for the hits of a flurry that one long effect draws: a second
+        native effect would end the first, and a game effect would draw its
+        own flash over it.
+Effects may overlap or start on the same frame. Only one NATIVE effect plays
+at a time: a second `effect` entry that starts while the first still plays
+ends the first (its hits are shown then).
+A limit of more than eight entries (read from the code, not yet seen in the
+game):
+- At most eight entries start in one frame; the rest start on the next frames,
+  eight a frame (one line in the log). The game keeps at most 15 hits waiting
+  to be shown between two frames.
+- An entry from the ninth on also waits for the next frame while eight hits or
+  more may still be shown in this one (those already waiting, and the hits
+  still to come of this limit's one-target spell and `limit` effects, not
+  `all` or `visual` ones, as long as other effect tasks still run): 300 frames
+  at most in all, then the rest start when due. A bare hit or
+  a native effect also waits while the battle's list of 60 small tasks is
+  nearly full: 60 frames at most in all. One line in the log each.
+- What a shown hit costs the game: one task in its list of effect tasks for a
+  frame, up to three in its list of 60 small tasks (the damage number for about
+  13 frames, the HP / MP bar for 4, one more for a frame), and for a killing hit
+  a second effect task, the target's death (read from the code).
+- A spell or `limit` entry from the ninth on starts only while the battle's
+  list of effect tasks has 16 free places; otherwise it is passed over, with a
+  line in the log, and its hit is shown at once if that list has two free
+  places for each of its targets and for each hit shown at once in the same
+  frame, and one for each hit shown in the frame before (a `visual` entry's
+  hit is never shown). With
+  fewer its hit is not shown (its damage was worked out with the action's), and
+  a target it kills is not started dying by it (what the battle does then was
+  not seen in the game). Native effects and bare hits are not held back this
+  way.
+- So keep bare hits a frame or more apart beyond the eighth entry: hits on one
+  frame are spread over the next frames.
+- The hits need results to show: the Nth entry shows the Nth hit, so give the
+  limit as many hits (additional_modifier) as the place of its last entry that
+  shows one (a `visual` entry before it still takes its number).
+
+A limit with a native effect (its target, damage and the rest as any limit's;
+here a limit with one hit on all its targets):
+
+    effect        = none             no limit effect of its own
+    spell_effects = effect 0x28f:0 all
+    camera_single = 0x1d7            (a camera of your own: an engine = ff8
+    camera_multi  = 0x1d7             one plays on the effect's frames)
+    script        = e8 fc 00 e0 ea f4 19 f3 ec 2c e5 ee
+
+The script's `ec` is frame 0 of the entry; its `2c` (the pack's first
+animation) plays while the effect runs, and the battle waits for the effect to
+end before the next action. With `clock = action` in the camera's file (an
+engine = ff8 camera), the camera plays from that `ec` on the limit's own
+frames, with or without native effects in spell_effects, through all of them. Do not give such a script an `f7`: the effect's
+hit lines show the results. If the native effect cannot be played (no such
+section, its script refused, its files or a task slot not to be had: the log
+says which), the step's targets are hit at once, so the action always ends.
 
 The hits' targets follow the limit's `target` as usual (Meteorain's, 0x97,
 picks a random enemy for each hit).

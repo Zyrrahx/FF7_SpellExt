@@ -10,8 +10,8 @@ That is the number to use when giving the item from a field script.
 (Inside the game the weapon's own number is the item ID minus 128.)
 
 For more weapons, number them from 10000: WIDE WEAPONS, [10000] to [15999]. They
-need box = on or auto and wide_items = on in the game file, and live in the box
-or on a character (read FF7_SpellExt_Box_README.txt, "WIDE GEAR").
+need box = on or auto and wide_items = on in the game file, and live in the item
+list, in the box or on a character (read FF7_SpellExt_Box_README.txt, "WIDE GEAR").
 
 The numbers belong to one kind each, and a section numbered for another kind is
 NOT read: the log says whose number it is and where weapons are numbered, e.g.
@@ -107,7 +107,11 @@ sell            yes or no. Default: as the base.
 throw           yes or no. Default: as the base.
 price           Buying price in gil; selling pays half. Default: as the base.
 icon            Item icon: sword glove gunarm headdress staff spear shuriken
-                megaphone gun, or a kernel weapon number. Default: as the base.
+                megaphone gun, or a kernel weapon number; or armour (also
+                armor), accessory or item for that kind's icon (e.g. for a
+                character who has no weapon of their own). Only the icon
+                changes: the weapon is still equipped and used as a weapon.
+                Also for wide weapons. Default: as the base.
 throw_like      Kernel weapon whose thrown model and effect to use.
                 Default: the base. Kernel weapons 0, 16-31, 48-61 and 127
                 have no throw effect; name another one here if the weapon

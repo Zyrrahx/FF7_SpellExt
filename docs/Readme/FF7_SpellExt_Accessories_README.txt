@@ -69,7 +69,8 @@ Who
 equip           Who can equip it: cloud barret tifa aeris red yuffie
                 caitsith vincent cid youngcloud sephiroth, or everyone,
                 or none. Default: as the base. A new character can equip
-                whatever the character named in its `equip_like` can.
+                whatever the character named in its `equip_like` can
+                (equip_like = none: whatever all nine can).
                 A character can also be given by its ID number: 0 Cloud,
                 1 Barret, 2 Tifa, 3 Aeris, 4 Red XIII, 5 Yuffie, 6 Cait Sith,
                 7 Vincent, 8 Cid; and 12 to 43 for the characters of the

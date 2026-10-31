@@ -11,8 +11,10 @@ With box = auto the box is not there until a game needs it:
     as with box = off: everything you receive goes to the item list as the game does it.
   * It WAKES for that save the moment something arrives that the item list has NO ROW for (it
     would be lost: a chest, an event, a shop, the spoils of a battle, a testing aid at a load, a
-    piece taken off in the Equip menu), or a piece of WIDE gear (numbers from 10000) arrives or
-    is given (it can live nowhere else). The thing goes into the box instead of being lost.
+    piece taken off in the Equip menu). The thing goes into the box instead of being lost.
+    WIDE gear (numbers from 10000) wakes it the same way and only that way: a wide piece lives
+    in the item list like any thing, and the box does NOT wake because one arrived, was given at
+    a load, was made by a character's sheet or is worn (see "WIDE GEAR" below).
   * You are told: the log says "box: WAKES (box = auto): ..." at once; on the screen, the next
     time you open the main menu the row "Box new" is there, in yellow, under Quit, and it stays
     "Box new" until you open the Box screen (in that save, also after saving and loading). The
@@ -23,7 +25,7 @@ With box = auto the box is not there until a game needs it:
   * Under ESUI's Left Menu option there is no Box row (see below): the main menu shows no
     "Box new", and the only notice of a wake is the log line "box: WAKES (box = auto)". Press
     [SWITCH] on the main menu's list to open the box.
-  * Once awake it takes only the OVERFLOW: what the item list has no row for, and wide gear.
+  * Once awake it takes only the OVERFLOW: what the item list has no row for (wide gear too).
     Gear you receive goes on arriving in the item list as before (no gear is sent to the box by
     itself); you can still move anything by hand in the Box screen (Store gear, Put in, Take
     out). The Equip menu offers pieces from both stores (taking from the item list first);
@@ -39,8 +41,10 @@ With box = auto the box is not there until a game needs it:
   * A held kind at 99 is not a wake: a 100th potion is dropped as the game drops it (box = on
     does the same). Things stolen or morphed IN a battle with no row are lost by the game inside
     the battle, as with box = on.
-  * With give_on_load = yes on any wide piece (gear files), every save that does not own it wakes
-    at its load: "new gear wakes it".
+  * give_on_load = yes on a wide piece (gear files) gives one into a free row of the item list
+    at a load when the save owns none (in the item list, the box, worn or kept); it wakes the box
+    only when the item list has no row for it. While the box is LOCKED (below) it gives none: the
+    missing box may hold one.
 
 What it is
 ----------
@@ -61,7 +65,8 @@ whatever you put away by hand: gear, items, wide items. The Box screen's command
                  item list and goes to the box. Throwable weapons, items and wide items stay.
   Take all out   everything in the box goes back to the item list, as far as it fits (99 a row).
                  What does not fit stays in the box, and the line at the bottom says how much.
-                 (Wide gear, numbers from 10000, always stays: it lives in the box.)
+                 Wide gear (numbers from 10000) comes out too: on a big box this can fill the
+                 item list to its last row, and every later arrival then overflows into the box.
 
 A grey row cannot move now (the list holds 99 of it, the list is full, nothing defines the
 thing any more, or this run cannot save it in the item list: see the known limits). The bottom
@@ -128,18 +133,33 @@ WIDE GEAR (stage B5): WEAPONS, ARMOUR AND ACCESSORIES NUMBERED FROM 10000
       accessories  [22000] to [27999]   in FF7_SpellExt_Accessories.ini
   each with exactly the keys of a [320] / [384] / [416] section (name, description, base, the
   figures, slots, growth, bonus, element, equip, price, sell, give_on_load ...). The sections
-  are read only with box = on; a number is one piece for ever (do not give a number to another
-  piece later: saves name it).
-  * A wide piece lives IN THE BOX or ON A CHARACTER. It is never in the item list: it cannot be
-    taken out ("Wide gear stays in the box: put it on in the Equip menu"), "Take all out"
-    leaves it, a battle never sees it. A WIDE WEAPON CANNOT BE THROWN in this version (throw =
-    yes is ignored, with a line). It cannot be sold or bought in a shop in this version; hand
-    it out with give_on_load = yes (one goes into the box at a load unless you own one).
-  * THE EQUIP MENU offers the box's wide pieces a character may wear after the others, and
-    wearing one works as with any piece: the old piece goes to the box (or the item list), the
-    new one leaves the box. Names, descriptions, slots, growth and the figures are the piece's
-    own on the Equip, Status, Materia and PHS screens; in battle the weapon's model and figures
-    are its base's with your changes.
+  are read only with box = on or auto; a number is one piece for ever (do not give a number to
+  another piece later: saves name it).
+  * A wide piece lives IN THE ITEM LIST, IN THE BOX or ON A CHARACTER. In the item list it is a
+    row of its own like a wide item (99 a row; the save's own 320 words hold ffff there and the
+    companion file holds the row). In the Item menu its row is GREY and OK buzzes, as a Buster
+    Sword's does; Arrange by Type puts wide gear after the wide items, by Name after everything
+    that has a name, both in number order. In a battle's Item and W-Item it is listed dimmed and
+    cannot be used. A WIDE WEAPON CANNOT BE THROWN in this version (throw = yes is ignored, with
+    a line). It cannot be sold or bought in a shop in this version. With box = auto a wide piece
+    you receive goes to the item list, and to the box only when the list has no row for it (the
+    box wakes then: overflow); with box = on it goes to the box, as all gear. Take out and Take
+    all out move wide gear to the item list. give_on_load = yes gives one at a load unless you
+    own one (in the item list, the box, worn or kept) or the box is LOCKED.
+  * A character of the character file may be CREATED wearing a wide piece (weapon = 10000,
+    armour = 16000, accessory = 22000 on its sheet): the piece is made then; a sleeping box does
+    NOT wake. A character with remake_on_load takes the piece back from the item list or the box
+    when one holds it, so remaking it never adds a piece. See "A piece of wide gear on a sheet"
+    in the characters readme.
+  * THE EQUIP MENU offers the wide pieces a character may wear after the others: those of the
+    item list first (in row order), then those of the box (while it is awake), each number once.
+    The piece chosen is taken from the item list first (box = on: from the box first); the piece
+    that comes off goes to the item list (box = on: the box), and to the box when the list has no
+    row for it. With a full item list and the box asleep, a wide piece that comes off is KEPT for
+    a moment: if the piece you chose leaves a row free, it goes into that row at once (no wake);
+    otherwise the box wakes the next time you are on the main menu and takes it. Names,
+    descriptions, slots, growth and the figures are the piece's own on the Equip, Status, Materia
+    and PHS screens; in battle the weapon's model and figures are its base's with your changes.
   * A wide piece borrows a number the game can hold in one byte (a "lent slot": 64 for weapons,
     96 for armour, 96 for accessories) while it is WORN, or while its row is ON SCREEN in the
     Equip menu's list. THE WINDOW (stage B6): when a character can wear more wide pieces of a
@@ -153,7 +173,7 @@ WIDE GEAR (stage B5): WEAPONS, ARMOUR AND ACCESSORIES NUMBERED FROM 10000
     game's own pieces and the mod's older ones (numbers below 512) that the character can wear
     and you own, which come first. With more, the last ones are not offered, with a line in
     the log ("*** box: the Equip menu's list: character N can wear M more weapons than the
-    game's list has room for (320) ..."); they stay in the box.
+    game's list has room for (320) ..."); they stay where they are.
     What can be WORN at one moment by everybody together stays 64 wide weapons, 96 wide
     armours, 96 wide accessories (different pieces; far more than there are characters).
     With no more wearable wide pieces than free slots the list is built as before the window.
@@ -167,24 +187,30 @@ WIDE GEAR (stage B5): WEAPONS, ARMOUR AND ACCESSORIES NUMBERED FROM 10000
     list of worn pieces (WORN). When you load with the mod and the companion file, the pieces
     are worn again. The materia in the piece's slots stay where they are in the save.
   * WITHOUT THE COMPANION FILE (it was lost, or the save was copied alone) the characters wear
-    the stand-ins and the box is MISSING (below): the worn wide pieces are in that file, with
-    the box. Put the file back and load again. This holds also when the box itself was empty
-    and every wide piece was worn: the save's line in sxc2_index.txt counts the worn pieces
-    with the box's kinds (box=N), so such a save is never taken for one that had no box.
+    the stand-ins: the worn wide pieces (and the wide pieces of the item list) are in that file.
+    Put the file back and load again. The save's line in sxc2_index.txt has a field worn=N (the
+    wide pieces worn or kept) whenever there are any, whatever the box: a load that finds no
+    companion says so with a "*** wide gear: this load has NO companion file ..." line naming
+    the file. A box that held something is MISSING as before (box=N counts the box's kinds only).
   * "Take the box of <file>.sxc" (below) takes that file's box AND the wide pieces its list of
-    worn pieces names: they go INTO THE BOX, not onto the characters (the file is another
-    state of the game), each with a "*** WORN: ... is NOT put on: the file is not this save's
-    own" line. Put them on again in the Equip menu.
-  * A wide piece that comes off while the box cannot take it (65,535 of it already, or the box
-    64 kinds past its cap) is not dropped: it is kept in the companion file's list of worn
-    pieces under the character's record (a "*** box: ... it is KEPT ..." line) and is boxed
-    at a later load, when the box has room for it. It is never put on over the piece the
-    character wears then; an accessory taken off is put on again if the place is still empty.
+    worn pieces names: they go to the item list (box = on: the box), or to the box when the list
+    has no row, not onto the characters (the file is another state of the game), each with a
+    "*** WORN: ... is NOT put on: the file is not this save's own" line. Put them on again in
+    the Equip menu.
+  * A wide piece that comes off while neither the item list nor the box can take it (the list
+    full and the box asleep or LOCKED, or the box at its limits) is not dropped: it is KEPT in
+    the companion file's list of worn pieces (a "box: ... it is KEPT ..." line; it stands under
+    some character's record there as a label only and is NEVER put on). It goes to the item list
+    or the box at the first moment one has room: when a row is freed in the Equip menu, at the
+    next frame of the main menu (a sleeping box wakes for it then), a save or a load. At most
+    125 pieces can be worn and kept together; past that the box takes it, or a *** line says it
+    is LOST.
   * If the save was played WITHOUT the mod, or with an older build, or with box = off, and the
-    equipment of a character was changed there, the wide piece that character wore is put IN
-    THE BOX at the next load with wide gear ("*** WORN: ... is NOT put on ... The piece goes to
-    the BOX"). A stand-in swapped away there leaves a piece you never owned in the item list
-    (a Buster Sword, a Bronze Bangle): the price of keeping the save readable without the mod.
+    equipment of a character was changed there, the wide piece that character wore goes to the
+    item list at the next load with wide gear (box = on: the box; with no row: the box, or KEPT)
+    ("*** WORN: ... is NOT put on ... The piece goes to ..."). A stand-in swapped away there
+    leaves a piece you never owned in the item list (a Buster Sword, a Bronze Bangle): the price
+    of keeping the save readable without the mod.
   * A wide piece whose section you take out of its file stays where it is (worn or boxed),
     shown as "Missing weapon 10000"; worn, it acts as the game's first piece of the kind until
     the section is back. Do not reuse its number.
@@ -201,8 +227,8 @@ WIDE GEAR (stage B5): WEAPONS, ARMOUR AND ACCESSORIES NUMBERED FROM 10000
   * The DLL checks all the time that what the characters wear is what it wrote down (at every
     frame of the main menu, at every save and load). A line beginning "*** box: worn pieces"
     says that a character's equipment changed behind the Equip menu's back (the game's name
-    screen copying a record, an event, another mod): the piece is then put in the box, never
-    dropped.
+    screen copying a record, an event, another mod): the piece then goes to the item list or
+    the box (or is KEPT), never dropped.
 
 FIELD SCRIPTS see the box (so that an event does not think you own nothing of what you put
 away):
@@ -283,9 +309,11 @@ scripts count and take from the item list only.
 "Start an empty box" (offered while MISSING or REFUSED, asked twice) gives the box up for this
 line of saves: it is empty from then on. The file that held the old box is not removed.
 
-While a box holds something, or a character wears a wide piece, a save whose companion file
+While a box holds something, or a character wears a wide piece (or one is KEPT), a save whose companion file
 cannot be written is REFUSED every time (the game shows its own "could not save"): free the folder and save again. (Without a box
-the second attempt is made without a companion, as before.)
+the second attempt is made without a companion, as before.) A wide piece that is only a row of the item list (on nobody, not
+in the box) is protected as a wide item is, not by this rule: the first attempt is refused with a warning, the second is
+made without the companion, and that piece is then in no file. Free the folder before you save again.
 
 A save whose companion could not be given its name (the log says so at that save: "NOT in place
 under its key's name") leaves the file as sxc2_*.tmp in FF7_SpellExt_Saves. The next load reads
@@ -293,7 +321,9 @@ such a save the old way and takes the BOX from that file (TAKEN, with the *** li
 and it is the save's own. If the file is gone the box is MISSING and the screen says so.
 
 A replaced companion that holds a box is not deleted: it is MOVED to
-FF7_SpellExt_Saves\box_backup. THIS GOES AGAINST THE EARLIER ORDER "remove the old one once
+FF7_SpellExt_Saves\box_backup. (One that holds worn or kept wide pieces and no box is deleted like
+any other once the new file holds every one of their numbers, worn, kept, in its item list or in
+its box; otherwise it is kept where it is.) THIS GOES AGAINST THE EARLIER ORDER "remove the old one once
 everything looks ok": it was chosen because after Store gear that file may be the only copy of
 most of the gear. box_backup = 0 follows the order (deleted). A save file put back from a backup
 finds its companion in box_backup by itself. Beyond the newest box_backup files of a save slot
@@ -339,7 +369,7 @@ Not yet in this stage / known limits
   * A shop offers at most 99 minus what you own: with 99 or more of a piece of gear in the box
     the shop sells you no more of it.
   * In a battle a thing you steal or morph needs a row of the battle's item list: with every row
-    in use it is lost, as in the game (the box is not reached from inside a battle).
+    in use it is lost, as in the game (only a wide item or a wide piece goes to the box then).
   * Gear gained in a battle you fled, or in the Battle Square, stays in the item list.
   * A thing nothing defines (a number no file gives a meaning) is never put in the box when it
     arrives: it goes to the item list as before.

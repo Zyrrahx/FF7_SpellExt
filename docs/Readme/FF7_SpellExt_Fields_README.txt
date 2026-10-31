@@ -1,5 +1,5 @@
-FF7 SpellExt - more fields than the game ships (field capacity, stage 1)
-=========================================================================
+FF7 SpellExt - more fields than the game ships (field capacity, stages 1 and 2)
+================================================================================
 
 The game knows a field (a map) by a number, its field id, and finds the field's file
 by the name its maplist gives that number. The game ships ids 0 to 787 and has room
@@ -26,13 +26,43 @@ it the game keeps its own tables, exactly as without SpellExt.
 ;                         ids it does not know: this key can only raise the size).
 ;                         It must hold the field DECODED; nothing checks it, so keep
 ;                         the default unless a field is bigger.
+; fields_fallback         none (default), or five numbers: a field of the game's own
+;                         (an id from 65 to 786), x, y, a walkmesh triangle and a
+;                         direction (0-255), as 576, -57, -132, 31, 124. It is used
+;                         twice (see "Saves" and "A jump the game cannot follow"
+;                         below): a save made in a registered field holds this place,
+;                         and a field id the game cannot read is sent here.
+;                         none: a save in a registered field is made as it is, and a
+;                         bad field id is not read (the game then very likely
+;                         crashes or ends).
 ;
-; All three are read at start-up only: a change needs a restart of the game
+; All four are read at start-up only: a change needs a restart of the game
 ; (Re-init .ini files says so in the log and changes nothing).
 
 fields_file           = FF7_SpellExt_Fields.ini
 fields_table_size     = auto
 field_buffer_bytes    = 4000000
+fields_fallback       = 576, -57, -132, 31, 124
+
+
+--- choosing fields_fallback ------------------------------------------------------
+
+Pick a place the player can always stand on, and from which play goes on: the best
+is the field just outside your new fields' entrance, at the spot a door into that
+field puts the player. Read it from a gateway of the field next to it (Makou
+Reactor, the field's exits: the destination field, x, y, triangle and direction).
+One fallback serves every registered field.
+  - 576, -57, -132, 31, 124 is the Wutai item shop (uta_im), where the town's door
+    puts the player: the place for the test mod "SpellExt Field Capacity Test",
+    whose door into field 1300 is in that shop.
+  - Not 116 (md1stin, where a new game starts): its scripts play the game's opening
+    by the story's progress, and x 0, y 0, triangle 0 is no spot to stand on outside
+    the opening.
+  - The place must lie on the field's walkmesh (the triangle must hold x, y): nothing
+    can check that from the config. A wrong triangle puts the player in the wrong
+    spot or off the floor.
+  - It must be a field of the plain game (65 to 786): a save made in a registered
+    field must load without SpellExt too.
 
 
 --- the registry: FF7_SpellExt_Fields.ini ----------------------------------------
@@ -75,13 +105,10 @@ What SpellExt does at start-up (with fields_file set)
   - The maplist is made again with a name for every id below fields_table_size: the
     game's names, the registered names, and the placeholder sx_none for every other
     id.
-  - A jump (a door, or a script's MAPJUMP) to an id nobody registered (an sx_none),
-    to an id past the tables, or to a registered field whose file is not served, is
-    not read: the log says "field N is not registered", "field N is past the field
-    tables" or "field N ...: no file", and the game goes on as it does for a missing
-    field file. That path of the game very likely CRASHES it (read from the code: the
-    field's section pointers are left pointing into the freed file buffer). Never
-    ship a door or a jump to an unregistered or missing field.
+  - The game's three calls that open a field's file (when a field is entered after a
+    load, the world map or a battle; after a door or a MAPJUMP; and the field loop's
+    other change of field) go through SpellExt, all three or none (see "A jump the
+    game cannot follow").
   - The table the game keeps for every field (its file buffer's size among other
     things) and a small table of default model sizes are copied into tables of that
     size; 13 places in the game's code are pointed at them, all or none: if any of
@@ -93,11 +120,40 @@ What SpellExt does at start-up (with fields_file set)
     fields_file off, the block is put back to the game's own size afterwards; if
     SpellExt is loaded but not active (log: "NOT active"), it is put back at once.
 
-Saves
-  A save made inside a registered field keeps its id. Loaded with SpellExt and the
-  same registry, it goes back there. Loaded WITHOUT them (the plain game, the mod
-  off, a registry without that id) the game cannot name the field: do not save in a
-  registered field yet. (A guard for this is the next stage of the work.)
+A jump the game cannot follow (stage 2)
+  A door, a script's MAPJUMP or a save that leads to
+    - an id nobody registered (its name is the placeholder sx_none),
+    - an id past the tables, or
+    - a registered field whose whole file is not served (its mod is not active),
+  is sent to fields_fallback: the game enters that field at that place instead, and
+  the log says "fields: field N ...: the game goes to the fallback instead, field F
+  NAME at (x,y) ...". Without fields_fallback such a field is not read, the log says
+  so with ***, and the game takes its own way for a field it cannot read: read from
+  the code, after a door it ends the game (it may crash on the way), after a load it
+  very likely crashes. So set fields_fallback; and still never ship a door to a field
+  that is not there.
+
+Saves (stage 2)
+  With fields_fallback set, a save made inside a registered field holds the FALLBACK
+  as its place, and its real place (the field's NAME, x, y, triangle, direction) goes
+  into the save's companion file (FF7_SpellExt_Saves\<key>.sxc, section FLDX). So:
+    - loaded with SpellExt and that name in the registry, the save goes back to the
+      real place, under the name's id of now (a renumbered registry still works: the
+      name decides);
+    - loaded with the name registered but its file not served (the field's mod is
+      off), the save goes to the real id, which cannot be read, and so to the
+      fallback;
+    - loaded with the name no longer registered, with fields_file off, or without
+      SpellExt (the plain game, the mod off), the save loads at the fallback;
+    - loaded in a run where the guard on the three calls was REFUSED (another mod
+      changed the code there), the save loads at the fallback too: without that
+      guard a field that cannot be read would not be caught.
+  The companion file is the one SpellExt already writes beside every save: keep the
+  FF7_SpellExt_Saves folder with your saves. A save made on the world map, or in a
+  field of the game's own, is not touched.
+  Without fields_fallback a save in a registered field is made as it is (the log
+  says so): loaded without SpellExt or with a registry that lacks it, it does not
+  load. Do not save in a registered field without fields_fallback.
 
 The log (FF7_SpellExt.log, beside the game's exe)
   fields: the block the game reads its maplist into at start-up ... is now 0x00200000 bytes ...
@@ -106,7 +162,15 @@ The log (FF7_SpellExt.log, beside the game's exe)
   fields: the field reader's call at 0060ba9f goes through this DLL (chained) ...
   field 1300 = xtest001 (registered): read; its file buffer is 4000000 bytes ...
   field 1300 xtest001: no file (...)                       the whole file is not served
-  field 1299 is not registered (its name is the placeholder sx_none): not read ...
-  field 1301 is past the field tables (1301 ids): not read ...  (both: never ship such a door)
+  fields: fields_fallback = field 576 uta_im at (-57,-132) triangle 31, direction 124: ...
+  fields: the three calls of field_open_file (0060e2da field_enter, 0060e8e8 field_main_loop, 0060eca2 FUN_0060e96c) go through this DLL (chained ...) ...
+  fields: field 1299 is not registered (...): the game goes to the fallback instead, field 576 uta_im at (-57,-132) ...
+  fields: field 1300 is registered, but no whole field file of that name was served (...): the game goes to the fallback instead, ...
+  fields: *** field N ...: NOT read, and no fields_fallback is set ... ***   (set fields_fallback)
+  fields: a save in field 1300 = xtest001 (registered) at (x,y) ...: the save itself holds the fallback ...
+  fields: this save was made in field xtest001 (id 1300 at the save, 1300 in this run's registry): its place is put back ...
+  field xtest001 no longer registered: the save continues at the fallback ...
+  fields: *** the callers of field_open_file are not guarded in this run (see REFUSED above): the save in xtest001 loads at the fallback ***
+  fields: REFUSED at <address> ...                         another mod changed the code there: nothing of this works
   fields file line N: ...: skipped                          a registry line that cannot be used
   fields: off (no fields_file in the game file) ...        the feature is off

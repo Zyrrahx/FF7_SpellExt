@@ -61,10 +61,10 @@ later stage.
     at 52 roll 0 over 14 ease        ; back level
 
 - One line: at FRAME roll ANGLE [over FRAMES] [ease]
-  FRAME   0 to 479: the frame the line starts at
+  FRAME   0 to 599: the frame the line starts at
   ANGLE   -8192 to 8192, in 4096ths of a full turn (1024 a quarter turn,
           2048 a half); the sign gives the direction
-  over    the glide's frames, 0 to 480; without it the roll jumps there
+  over    the glide's frames, 0 to 600; without it the roll jumps there
   ease    the glide starts and ends gently (without it: even speed)
 - Lines go in the order of their frames. A line glides from wherever the
   lines before it had left the roll at its frame. Before the first line the
@@ -150,7 +150,7 @@ home view, and do nothing else).
           With one, it stays there for FRAMES. With three or more (stage 2)
           the camera follows a smooth curve through all of them, FF8's own
           curve, without stopping at the keys in between; every key but the
-          last needs 1 frame at least. FRAMES: 0 to 480; a segment's keys
+          last needs 1 frame at least. FRAMES: 0 to 600; a segment's keys
           2047 frames at most together.
   snap    the keys' places are worked out once, when the segment starts
           (FF8 does this for all of Fire's camera). Without it, a key that
@@ -195,10 +195,17 @@ home view, and do nothing else).
   #hhhh              (stage 3) a reference as FF8 stores it, one to four hex
                      digits; only the low byte counts, as in FF8 (#5ef7 is
                      frame3: FF8 Water's data has 74 of these)
+  home               (stage 4) the caster's home spot: where it stood when its
+                     action was set up, on the floor; X Y Z added as they are
+                     (as caster). See "The action's clock" below.
+  frame0.home        (stage 4) FF8's frame0 measured from the caster's home
+                     spot instead of from where the caster is now (to the
+                     target, or the middle of the targets)
   FF8 also turns target and caster offsets with that actor's facing; this
   stage does not.
 - When it plays: like [roll], only while a NATIVE effect runs under this
-  camera, from the effect's first frame. A chain shorter than the effect
+  camera, from the effect's first frame (unless the camera says clock =
+  action: see "The action's clock" below). A chain shorter than the effect
   stays on its last shot until the effect ends; then the game cuts straight
   back to the battle's view (no glide unless blend = is given; the next
   turn is not delayed either way).
@@ -300,6 +307,77 @@ file and runs that program, FF8's own bytes, the way FF8 runs it.
   1 (camera_mode 0, 1)", then "sequence at frame 0: read var00=1 var17=0
   var19=3 ...; the program ended" and "sequence: anim 2 variant 4 from frame
   0 (1 segment(s), 22 frame(s))", then the segment lines as before.
+
+The action's clock: clock = action, home, frame0.home (camera stage 4)
+-----------------------------------------------------------------------
+An FF8 camera normally plays on a native effect's frames, and starts over
+with every native effect. A limit whose script has no native effect (or one
+for each cut) then shows the battle's home view, or a camera that keeps
+starting again. One more line before the first heading changes that:
+
+    camera = 1d9
+    engine = ff8
+    select = sequence
+    clock = action                   ; frame 0 = the action's effect step
+
+- clock = effect (the default, the same as no clock line): as above.
+  clock = action: the camera's frame 0 is the frame of the action's effect
+  step (the script's `ec`: for a limit, the step that loads its animation
+  pack), and from there it plays on the action's own frames, whatever the
+  action shows: the limit's own effects, its spell_effects steps, native
+  effects or the game's, none at all. It does not start over at a native
+  effect: a native effect started under the same camera plays as always
+  (its [roll], its stage lines, actors, sounds and hits) but leaves the
+  camera to the action's clock (one log line each).
+- It ends when the next action is set up, when another camera runs (a
+  record of the action with a camera of its own; a record that keeps the
+  camera keeps the clock), after 2400 frames at most, when the battle ends
+  or a new one starts. Once the action's display is over the game shows its
+  own home view again, as after any camera.
+- An action of several turns: the game gives each turn after the first no
+  camera (-1) unless the action's flag 0x1000 keeps it (-4), so the clock
+  ends at the second turn. Give such a limit its cuts in one turn
+  (spell_effects steps).
+- Such a camera is played on the action's clock only. If the clock could
+  not start (see "no free task" below) or has ended, a native effect under
+  it does not play it on its own frames: the battle's home view (one line,
+  "clock = action: not played on native effect N's frames").
+- The frames count as a native effect's do: not while the effects are
+  paused, and the frames FFNx draws in between at 30/60 fps show the same
+  frame again.
+- Not played while the Config menu's camera is fixed (one log line).
+  blend = is refused with clock = action (it counts an effect's last
+  frames, which the action's clock does not have): a [sequence]'s blend N
+  works. clock = on an engine = ff7 camera is refused.
+- home and frame0.home: FF8 measures its frame0 from where the caster
+  stands at home; in FF7 the caster runs about, so frame0 follows him. The
+  caster's home spot is taken when its action is set up (where it stands
+  then: actors are at rest between actions). home is that spot on the floor
+  (X Y Z added as they are, like caster); frame0.home is frame0 counted from
+  it: centred halfway from the home spot to the target (or to the middle of
+  the targets), Z pointing from the home spot to the target. Both work on an
+  effect's clock too. home.bone is refused (a spot has no bones). If no home
+  spot was taken this battle (an action that set up no attack record), they
+  use where the caster is now (one log line).
+- Log lines: when read, "... (played on the action's clock from its effect
+  step (clock = action); ...)"; in a battle "camera 1d9 (engine ff8): starts
+  at actor 0's effect step on the action's clock (clock = action), frame 0,
+  targets 0010, home (X, 0, Z): ...", "native effect 0201 starts at the
+  action's frame 40: the camera keeps the action's clock", "a second effect
+  step (actor 0) at the action's frame N: the clock goes on", "the action's
+  display is over at frame N (every actor finished): the game's own view
+  until the clock ends", and "ends (the next action was set up; the action's
+  frame N, M call(s))" (or "the running camera changed to X", "the clock's
+  limit of 2400 frames", "the battle is over"). M is about N at the game's
+  own frame rate (more while the effects are paused; 2 x N at FFNx's 30
+  fps, 4 x N at 60 fps). "no free task in the list of 60" means the camera
+  could not start: the action shows the battle's home view. The start,
+  "display is over", "ends" and refusal lines have their own budget (24 a
+  battle), so they are written even after the other camera lines of the
+  battle (30) are spent.
+- A camera text with clock =, home or frame0.home needs a SpellExt with
+  camera stage 4; an older one refuses the whole file (the log names the
+  line).
 
 Known limits
 ------------

@@ -341,7 +341,7 @@ static BYTE materia_given[NEW_MATERIA_COUNT];   /* testing aid: put one in stock
    0x100 upward. */
 #define LIMIT_LENT_FIRST        0x80
 #define LIMIT_SCRIPT_MAX        128
-#define LIMIT_SEQ_MAX           8            /* spell effects, or per-hit elements, one limit can list */
+#define LIMIT_SEQ_MAX           24           /* spell effects, or per-hit elements, one limit can list (8 before) */
 #define FOLLOW_CHAIN_MAX        6            /* follow-ups in a row (the game queues at most 8 attacks in an action) */
 #define LIMIT_BLOCKS            8
 #define LIMIT_NEW_COUNT         (LIMIT_BLOCKS * 12)     /* entries 0x80-0xdf */
@@ -648,6 +648,8 @@ static BYTE slot_mp_byte(const BYTE *record)
     return (BYTE)(cost > 0xff ? 0xff : cost);
 }
 
+static void atb_dex_follow(void);      /* atb_follows_dexterity (game file): see battle_start_party_hook */
+
 /* ---- Hooks ---------------------------------------------------------------- */
 
 /* Player command entering the action queue (FUN_0043258a). Entry layout:
@@ -676,6 +678,7 @@ static void __cdecl slot_match_hook(int actor)
     int *action;
     int id, slot, entry;
 
+    atb_dex_follow();           /* (the pre_action scripts of all ten actors have just run) */
     ((void (__cdecl *)(int))FN_SLOT_MATCH)(actor);
     action = current_action();
     id = action[ACT_QUEUED_ID];
@@ -817,8 +820,60 @@ static void __cdecl summon_intro_task(void)
 #define FN_QUEUE_EFFECT_EVENT   0x005bfaa0u  /* FUN_005bfaa0(type): returns the event's 20 bytes */
 #define SITE_SHOW_HIT_EVENT_1   0x005c0175u  /* the two calls in FUN_005c0158 */
 #define SITE_SHOW_HIT_EVENT_2   0x005c0184u
+#define FN_QUEUE_SHOW_HIT       0x005c0158u  /* FUN_005c0158(target) itself (= FN_NATIVE_SHOW_HIT): 55 8b ec 51 0f bf */
 
-#define LIMIT_SEQ_STEPS         8            /* = LIMIT_SEQ_MAX */
+#define LIMIT_SEQ_STEPS         LIMIT_SEQ_MAX
+/* (24 steps) A limit of up to eight steps, all an older DLL allowed, runs exactly as before. Beyond that:
+     LIMIT_SEQ_PER_FRAME   steps started in one call of limit_seq_task at most (the rest the next frame): the game's
+                           ring of display events holds 16 (FUN_005bfaa0 at 00c06428, write index 00c065a8 wrapped
+                           with no look at the read index 00c065ac; FUN_0042de61 drains it once a frame), so a step
+                           that shows a hit at once must not queue a 16th before it is read: eight is the most a
+                           limit could start in one frame before.
+     LIMIT_SEQ_OLD_STEPS   steps 0-7: never held back or passed over by the rules below.
+     LIMIT_SEQ_TASKS_FREE  a game effect's step (spell or `limit`) from the ninth on starts only while the list of 100
+                           has at least this many free slots at or after the running one (FUN_005bec50 takes the first
+                           free one from 00bf23b8 on and gives -1 when there is none, which the effects' routines do
+                           not check); otherwise it is passed over and its hit shown at once, as a native step's whose
+                           effect cannot play (not a `visual` step's: its hit is never shown).
+     A step from the ninth on is also HELD to the next frame (limit_seq_hold):
+       - while the hits that may reach the ring in this frame come to LIMIT_SEQ_PER_FRAME: the events queued since the
+         display last read it (write - read, 00c065a8 / 00c065ac: it is read to empty once a frame at 0042da31, before
+         the two lists run at 0042dabb / 0042dac0) and this limit's one-target game effects that have not yet shown
+         their hit (`pending`, less its `visual` steps), which may show them later in this same pass; those no more
+         than the other tasks in the list of 100 (only they can still queue an event in this pass: the list of 60 ran
+         before it; an effect whose tasks have all ended shows nothing more, its hit stays in `pending` for good). It
+         counts every other task, as an effect may show its hit from a task its first one started later (the
+         per-target dispatcher FUN_005bfd3e ends on its first run): so it may hold longer than needed, never less.
+         This rule has a budget of its own, LIMIT_SEQ_RING_HOLD_MAX frames, so a long effect's hit is waited for;
+         after it the rest start when due;
+       - for a step that shows a hit at once (bare, or native), while the list of 60 has fewer free slots than
+         LIMIT_SEQ_HIT_TASKS for each hit shown at once in this call and the one before (their tasks start a frame on)
+         and for this one, plus LIMIT_SEQ_LIST60_SPARE. Each shown hit makes a 100-list task (FUN_0042e0b9 ->
+         FUN_00425fc4) that starts up to three tasks in the list of 60 (FUN_005bed92: the number FUN_005bb410, about
+         13 frames; the HP / MP task FUN_00425e5f, 4; FUN_0042675f, 1, from FUN_0042613a), and FUN_005bed92 gives -1
+         when that list is full, which those callers do not check.
+       The list-of-60 rule holds a limit's steps LIMIT_SEQ_HOLD_MAX frames at most in all; after that the rest start
+       when due (the cap of 8 a frame still applies). A call is held by one rule at most, so the last step stays
+       inside an action's clock (frame 2000 + 300 + 60 + 3 at most, under CAMERA_CLOCK_FRAMES).
+     A step passed over for want of 100-list slots shows its hit at once only with two free slots for each of its
+       targets and for each hit shown at once in this call, and one for each hit of the call before: a shown hit
+       makes one 100-list task (FUN_0042e0b9, at the next frame's drain), and a killing one a second, the target's
+       death (FUN_0042613a -> FUN_00425890 -> FUN_005bec50, its slot unchecked at 004258d6). With fewer, its hit is
+       not shown (a target it kills is not started dying by it).
+   A bare step `hit:FRAME` (SEQ_HIT) starts no effect: at its frame it shows hit k (its place in the list) on the
+   target of result k, 00c05e68[k], as a native step's fallback does (native_hits: event 10 for that hit), and is
+   passed over with a line when there is none. It takes nothing after it (the reader refuses all, visual, skip). */
+#define LIMIT_SEQ_PER_FRAME     8
+#define LIMIT_SEQ_OLD_STEPS     8
+#define LIMIT_SEQ_TASKS_FREE    16
+#define LIMIT_SEQ_HOLD_MAX      60
+#define LIMIT_SEQ_RING_HOLD_MAX 300
+#define LIMIT_SEQ_HIT_TASKS     3
+#define LIMIT_SEQ_LIST60_SPARE  6
+#define ADDR_EVENT_RING_WRITE   0x00c065a8u  /* DWORD: the display events' write index (FUN_005bfaa0), 0-15 */
+#define ADDR_EVENT_RING_READ    0x00c065acu  /* DWORD: their read index (FUN_005bfadc) */
+#define ADDR_HIT_LIST60_FNS     0x00bfb1b0u  /* (= ADDR_WATCH_TASK_FNS, defined further on) the list of 60's routines */
+#define ADDR_HIT_LIST60_INDEX   0x00bf2df4u  /* (= ADDR_WATCH_TASK_INDEX) short: its running task, 0 outside its pass */
 /* A step of the list may also be (spell_effects = limit 178:43 all visual, 0x09:110 all)
      SEQ_LIMIT   a game LIMIT's effect, not a spell's: its set-up routine from the limit table
                  (FUN_00427c22 calls it the same way: fn(target mask, actor)). The ones looked at
@@ -832,10 +887,18 @@ static void __cdecl summon_intro_task(void)
      skip N      the effect starts N frames in: the frame count of each task its set-up started
                  (the word at +2 of the task's data, where the effects looked at keep it) is set
                  to N. Clear Tranquil's task shows nothing for its first 60 frames (the time
-                 Yuffie's own animation takes): skip 59 brings its water on at once. */
+                 Yuffie's own animation takes): skip 59 brings its water on at once.
+     SEQ_NATIVE  (effect N:frame) a NATIVE effect, an [effect N] section of the effects file with `play =` (the
+                 effect player's script), started as a magic cast's is at its effect step (native_limit_step):
+                 its camera, stage, actors, sounds and drawing, and its hit lines show the results: the step's own
+                 hit (event 10, the number carried by the effect: native_play.limit_hit, never `pending`), or with
+                 `all` event 4 per target. It takes `all` only: no `visual`, no `skip` (the reader refuses them). One
+                 native effect plays at a time: one that starts ends one still playing (its hits shown then). */
 #define SEQ_LIMIT               1
 #define SEQ_ALL                 2
 #define SEQ_VISUAL              4
+#define SEQ_NATIVE              8
+#define SEQ_HIT                 16           /* `hit:frame`: a bare hit, no effect */
 #define ADDR_EFFECT_TASK_FNS    0x00bf2858u  /* 100 routines, 0 = free */
 #define ADDR_EFFECT_TASK_INDEX  0x00bf23b8u  /* short: the task being run */
 static DWORD limit_effect_setup[256];
@@ -845,12 +908,24 @@ static struct {
     WORD at[LIMIT_SEQ_STEPS];
     BYTE flags[LIMIT_SEQ_STEPS];
     BYTE skip[LIMIT_SEQ_STEPS];
+    WORD native[LIMIT_SEQ_STEPS];           /* a SEQ_NATIVE step: the native effect's number (0x100 up) */
     DWORD task_fn[LIMIT_SEQ_STEPS][4];      /* a `visual` step: the task routines its effect started */
     int actor, frame, next, hit, running;
     /* hits whose effect has started and has not yet shown its damage, oldest first: effects may overlap */
     int pending[LIMIT_SEQ_STEPS], pending_count;
+    int held_said;                          /* (24 steps) the "held back" line written for this limit */
+    /* (24 steps) limit_seq_hold: frames this limit's steps were held in all, its two lines written, and the hits shown
+       at once by steps in this call and in the one before */
+    int held_frames, hold_said, hold_end_said, hits_now, hits_last;
+    int ring_held, ring_end_said, hold60_said;  /* (24 steps) the ring rule's frames held and its budget line; the list-of-60 line */
 } limit_seq;
 static struct { int count; WORD element[LIMIT_SEQ_STEPS]; int actor, hits; } limit_elements;
+/* A native effect's hits of a limit's `effect` step (native_hits): which hit of the limit they are, set only around
+   their FUN_005c0158 calls. A native effect may show its hits long after later steps started, so the step's own hit
+   is carried with the effect (native_play.limit_hit), not taken from `pending` (whose order is the start order). */
+#define NATIVE_HIT_NONE         (-2)         /* not a limit's step (a magic cast's native effect): the hook as before */
+#define NATIVE_HIT_ALL          (-1)         /* an `all` step: event 4 per target, as the game queues it */
+static int native_hit_forced = NATIVE_HIT_NONE;
 
 static short *__cdecl show_hit_event_hook(int type)
 {
@@ -870,6 +945,13 @@ static short *__cdecl show_hit_event_hook(int type)
                  fn == limit_seq.task_fn[k][2] || fn == limit_seq.task_fn[k][3]))
                 return thrown_away;
     }
+    if (native_hit_forced == NATIVE_HIT_ALL)
+        return ((short *(__cdecl *)(int))FN_QUEUE_EFFECT_EVENT)(type);
+    if (native_hit_forced >= 0 && type == 4) {
+        event = ((short *(__cdecl *)(int))FN_QUEUE_EFFECT_EVENT)(10);
+        event[8] = (short)native_hit_forced;    /* the caller writes the target into event[0] */
+        return event;
+    }
     if (!limit_seq.count || limit_seq.hit < 0 || type != 4)
         return ((short *(__cdecl *)(int))FN_QUEUE_EFFECT_EVENT)(type);
     if (limit_seq.pending_count > 0) {      /* the oldest effect still to show its damage */
@@ -886,10 +968,107 @@ static short *__cdecl show_hit_event_hook(int type)
 }
 
 static void effect_copies_before_routine(int n);    /* ("Effect copies", after the spell file code) */
+static BOOL native_limit_step(DWORD number, int actor, unsigned mask, int hit);     /* ("Native effects", after it) */
+static void native_hits(int mask, int limit_hit);   /* ("Native effects": event 10 for `limit_hit` on each target of the mask) */
+
+/* (24 steps) Free slots of the list of 100 at or after the running one: the ones FUN_005bec50 can give now. */
+static int limit_seq_tasks_room(void)
+{
+    int k = *(const short *)ADDR_EFFECT_TASK_INDEX, room = 0;
+
+    for (k = k < 0 ? 0 : k; k < 100; k++)
+        if (!((const DWORD *)ADDR_EFFECT_TASK_FNS)[k])
+            room++;
+    return room;
+}
+
+/* (bare hit) FUN_005c0158 starts as the exe has it (read from ff7_en.exe), or with another module's jump: checked once,
+   before a bare step first calls it; said once if not. */
+static int limit_hit_routine_state;     /* 0 not looked at, 1 as expected, -1 not */
+static BOOL limit_hit_routine_ok(void)
+{
+    static const BYTE first[6] = { 0x55, 0x8b, 0xec, 0x51, 0x0f, 0xbf };
+    const BYTE *at = (const BYTE *)FN_QUEUE_SHOW_HIT;
+    int i;
+
+    if (!limit_hit_routine_state) {
+        limit_hit_routine_state = 1;
+        for (i = 0; i < 6 && at[0] != 0xe9; i++)
+            if (at[i] != first[i]) {
+                log_line("limit spell effects: %08lx does not start as expected (byte %d is %02x): bare hit steps show nothing",
+                         FN_QUEUE_SHOW_HIT, i, at[i]);
+                limit_hit_routine_state = -1;
+                break;
+            }
+    }
+    return limit_hit_routine_state > 0;
+}
+
+/* (24 steps) Whether step limit_seq.next (from the ninth on) waits for the next frame: see LIMIT_SEQ_HOLD_MAX. Asked
+   once for each step about to start; held at most once a call (the call stops starting steps then), by one rule. */
+static void __cdecl limit_seq_task(void);
+static BOOL limit_seq_hold(void)
+{
+    int unread, unshown = 0, live = 0, free60 = 0, need, k;
+
+    if (limit_seq.next < LIMIT_SEQ_OLD_STEPS)
+        return FALSE;
+    unread = (int)((*(const DWORD *)ADDR_EVENT_RING_WRITE - *(const DWORD *)ADDR_EVENT_RING_READ) & 15);
+    for (k = 0; k < limit_seq.pending_count; k++)
+        if (!(limit_seq.flags[limit_seq.pending[k]] & SEQ_VISUAL))
+            unshown++;
+    /* only a running task can still show a hit in this pass, and only one of the list of 100 (the list of 60 ran
+       before it, 0042dabb / 0042dac0: its events are in `unread`): every task there but this one is counted, since an
+       effect may show its hit from a task its first one started later (the per-target dispatcher FUN_005bfd3e) */
+    for (k = 0; unshown && k < 100; k++) {
+        DWORD fn = ((const DWORD *)ADDR_EFFECT_TASK_FNS)[k];
+
+        if (fn && fn != (DWORD)limit_seq_task)
+            live++;
+    }
+    if (unshown > live)
+        unshown = live;
+    if (unread + unshown >= LIMIT_SEQ_PER_FRAME) {
+        if (limit_seq.ring_held < LIMIT_SEQ_RING_HOLD_MAX) {
+            limit_seq.ring_held++;
+            if (!limit_seq.hold_said) {
+                limit_seq.hold_said = 1;    /* (once a limit) */
+                log_line("limit spell effects: frame %d: step %d held back to the next frame(s): %d hit(s) may still be shown this frame",
+                         limit_seq.frame, limit_seq.next, unread + unshown);
+            }
+            return TRUE;
+        }
+        if (!limit_seq.ring_end_said) {
+            limit_seq.ring_end_said = 1;    /* (once a limit) */
+            log_line("limit spell effects: frame %d: steps held back %d frames in all for hits still to show; the steps from %d on start when due",
+                     limit_seq.frame, LIMIT_SEQ_RING_HOLD_MAX, limit_seq.next);
+        }
+    }
+    if (limit_seq.held_frames >= LIMIT_SEQ_HOLD_MAX || !(limit_seq.flags[limit_seq.next] & (SEQ_HIT | SEQ_NATIVE)))
+        return FALSE;
+    k = *(const short *)ADDR_HIT_LIST60_INDEX;
+    for (k = k < 0 ? 0 : k; k < 60; k++)
+        if (!((const DWORD *)ADDR_HIT_LIST60_FNS)[k])
+            free60++;
+    need = LIMIT_SEQ_HIT_TASKS * (limit_seq.hits_last + limit_seq.hits_now + 1) + LIMIT_SEQ_LIST60_SPARE;
+    if (free60 >= need)
+        return FALSE;
+    if (++limit_seq.held_frames >= LIMIT_SEQ_HOLD_MAX && !limit_seq.hold_end_said) {
+        limit_seq.hold_end_said = 1;    /* (once a limit) */
+        log_line("limit spell effects: frame %d: steps held back %d frames in all; the steps from %d on start when due",
+                 limit_seq.frame, LIMIT_SEQ_HOLD_MAX, limit_seq.next);
+    } else if (!limit_seq.hold60_said) {
+        limit_seq.hold60_said = 1;      /* (once a limit) */
+        log_line("limit spell effects: frame %d: step %d held back to the next frame(s): %d free slot(s) in the list of 60, %d wanted",
+                 limit_seq.frame, limit_seq.next, free60, need);
+    }
+    return TRUE;
+}
 
 static void __cdecl limit_seq_task(void)
 {
     short *task = (short *)(0x00bfb718u + *(const short *)0x00bf23b8u * 0x20);
+    int started;
 
     if (!limit_seq.count) {
         *task = -1;
@@ -897,18 +1076,75 @@ static void __cdecl limit_seq_task(void)
     }
     if (*(const BYTE *)0x00dc0e6cu)     /* effects paused */
         return;
-    while (limit_seq.next < limit_seq.count && limit_seq.frame >= limit_seq.at[limit_seq.next]) {
+    for (started = 0; started < LIMIT_SEQ_PER_FRAME && limit_seq.next < limit_seq.count && limit_seq.frame >= limit_seq.at[limit_seq.next] &&
+                      !limit_seq_hold();
+         started++) {
         int hit = limit_seq.next++, target = ((const BYTE *)ADDR_HIT_TARGETS)[hit];
         int flags = limit_seq.flags[hit], all = flags & SEQ_ALL;
-        DWORD fn = (flags & SEQ_LIMIT) ? limit_effect_setup[limit_seq.effect[hit]]
-                                       : *(const DWORD *)(ADDR_MAGIC_EFFECTS + limit_seq.effect[hit] * 4);
+        DWORD fn = (flags & (SEQ_NATIVE | SEQ_HIT)) ? 0 : (flags & SEQ_LIMIT) ? limit_effect_setup[limit_seq.effect[hit]]
+                                                                              : *(const DWORD *)(ADDR_MAGIC_EFFECTS + limit_seq.effect[hit] * 4);
         DWORD before[100];
         WORD *mask = (WORD *)ADDR_EFFECT_TARGETS, saved = *mask;
         int k, noted = 0;
 
+        if ((flags & SEQ_NATIVE) && !all && (target == 0xff || target > 9)) {
+            /* (as below: the step has no target, so no result of its own to show) */
+            log_line("limit spell effects: step %d has no target; native effect %04x passed over", hit, limit_seq.native[hit]);
+            continue;
+        }
+        if (flags & SEQ_NATIVE) {
+            int played;
+
+            if (!all)
+                limit_seq.hit = hit;    /* (not in `pending`: the effect carries its own hit, native_play.limit_hit) */
+            /* the targets handed over, not written to 00bfd0f8: the effect keeps its own mask (native_play.mask) */
+            played = native_limit_step(limit_seq.native[hit], limit_seq.actor, all ? (unsigned)saved : 1u << target,
+                                       all ? NATIVE_HIT_ALL : hit);
+            limit_seq.hits_now++;       /* (24 steps: it may show a hit at once) */
+            log_line("limit spell effects: frame %d, step %d, native effect %04x on %s %x%s", limit_seq.frame, hit, limit_seq.native[hit],
+                     all ? "targets" : "target", all ? (unsigned)saved : (unsigned)target, played ? "" : ": NOT played, its hits shown at once");
+            continue;
+        }
+        if (flags & SEQ_HIT) {
+            /* a bare hit: hit k on its target, no effect (the call a native step makes when its effect cannot play) */
+            if (target == 0xff || target > 9)
+                log_line("limit spell effects: step %d has no target; its bare hit passed over", hit);
+            else if (!limit_hit_routine_ok())
+                log_line("limit spell effects: step %d: its bare hit passed over (the line above)", hit);
+            else {
+                native_hits(1 << target, hit);
+                limit_seq.hits_now++;
+                log_line("limit spell effects: frame %d, step %d, bare hit on target %x", limit_seq.frame, hit, (unsigned)target);
+            }
+            continue;
+        }
         if ((!all && (target == 0xff || target > 9)) || !fn) {
             log_line("limit spell effects: step %d has no target or effect %02x is empty; passed over", hit,
                      limit_seq.effect[hit]);
+            continue;
+        }
+        if (hit >= LIMIT_SEQ_OLD_STEPS && limit_seq_tasks_room() < LIMIT_SEQ_TASKS_FREE) {
+            /* its damage is taken already: its hit shown at once, as a native step's whose effect cannot play, with two
+               free 100-list slots a target (FUN_0042e0b9's task, and a killing hit's death task, FUN_00425890: both
+               unchecked) for it and for every hit shown at once in this call, and one for each of the last call's
+               (its hit tasks are made, their death tasks may still be): the room does not change during the call, as
+               the hit tasks are made only at the next frame's drain; never a `visual` step's */
+            unsigned shown = all ? (unsigned)saved & 0x3ffu : 1u << target, t;
+            int n = 0;
+
+            for (t = 0; t < 10; t++)
+                n += (shown >> t) & 1;
+            if (flags & SEQ_VISUAL)
+                n = -1;
+            else if (!n || 2 * (n + limit_seq.hits_now) + limit_seq.hits_last > limit_seq_tasks_room() || !limit_hit_routine_ok())
+                n = 0;
+            else {
+                native_hits((int)shown, all ? NATIVE_HIT_ALL : hit);
+                limit_seq.hits_now += n;
+            }
+            log_line("limit spell effects: frame %d, step %d: fewer than %d free slots in the list of 100; %s effect %02x passed over%s",
+                     limit_seq.frame, hit, LIMIT_SEQ_TASKS_FREE, (flags & SEQ_LIMIT) ? "limit" : "spell", limit_seq.effect[hit],
+                     n > 0 ? ", its hit shown at once" : n < 0 ? " (for show only)" : ", its hit not shown");
             continue;
         }
         if (!all) {
@@ -936,6 +1172,14 @@ static void __cdecl limit_seq_task(void)
                  all ? (unsigned)saved : (unsigned)target, (flags & SEQ_VISUAL) ? ", for show only" : "", noted,
                  limit_seq.skip[hit]);
     }
+    if (started == LIMIT_SEQ_PER_FRAME && limit_seq.next < limit_seq.count && limit_seq.frame >= limit_seq.at[limit_seq.next] &&
+        !limit_seq.held_said) {
+        limit_seq.held_said = 1;        /* (once a limit) */
+        log_line("limit spell effects: frame %d: more than %d steps due; the steps from %d on start on the next frame(s), %d a frame",
+                 limit_seq.frame, LIMIT_SEQ_PER_FRAME, limit_seq.next, LIMIT_SEQ_PER_FRAME);
+    }
+    limit_seq.hits_last = limit_seq.hits_now;
+    limit_seq.hits_now = 0;
     limit_seq.frame++;
     if (limit_seq.next >= limit_seq.count) {
         limit_seq.running = 0;          /* the hooks stay answering until the next action is set up */
@@ -1097,12 +1341,18 @@ static void effect_copy_note(int *action, int spell);
 
 static void prop_effect_step(int actor);   /* a limit's `prop` (see "A prop", with the limits further down) */
 static void state_effect_step(int actor);   /* a limit's `state` (see "A state", after the prop) */
+/* an engine = ff8 camera with clock = action: the action's clock starts at its effect step and ends at the next set-up;
+   the home spot is latched at the set-up (see "The action's clock", with FF8's camera, played) */
+static void camera_clock_effect_step(int actor);
+static void camera_clock_stop(const char *why);
+static void camera_home_latch(int actor);
 
 /* The game's three calls of FUN_00427c22. */
 static void __cdecl summon_effect_hook(int actor_arg)
 {
     int actor = (BYTE)actor_arg;
 
+    camera_clock_effect_step(actor);    /* (only under an engine = ff8 camera with clock = action; nothing otherwise) */
     if (actor < 10 && cast_animation[actor].set &&
         *(const BYTE *)(ADDR_ACTOR_COMMAND_TYPE + actor * ACTOR_EFFECT_STRIDE) == 2) {
         /* `animation_all` was chosen at set-up from the targets asked for; the game trims them afterwards
@@ -1189,6 +1439,10 @@ static void __cdecl action_setup_hook(void)
     const BYTE *record = ext_record(id);
     int index = record ? index_reaching(record) : 0;
 
+    atb_dex_follow();           /* (an enemy's action reaches no slot_match_hook) */
+    /* the last action's display is over: an action's clock ends; this actor rests at its home spot */
+    camera_clock_stop("the next action was set up");
+    camera_home_latch(action[ACT_ACTOR]);
     /* A summon presentation still armed for this actor was never played: the cast failed before its
        effect step (FUN_005dbe6f: silenced, a frog, MP short; or no target left: FUN_005dbd40 queues a
        script with no effect step). The display has played every record of an action before the next
@@ -1751,7 +2005,7 @@ static int box_arrival_went;            /* (the box, stage B3) where the last ar
 static int box_battle_noted;
 static int box_spoils_pick(const WORD *list);
 static void box_spoils_entry(int id, int count);
-static int receive_box(int number, int count, const char *how, BOOL gear);     /* (receive) a wide thing from a battle into the box: see "RECEIVE" */
+static int receive_box(int number, int count, const char *how);     /* (receive) a wide thing from a battle into the box: see "RECEIVE" */
 static void box_battle_note(const BYTE *copy, int rows);
 static BOOL box_aid_give(int number, int quantity, BOOL room, const char *aid);
 static void stock_add(int number, int quantity);
@@ -2815,8 +3069,12 @@ static void log_spare_regions(const char *when)
 
 #define ADDR_STOCK              0x00dc0234u  /* 320 words: low 9 bits item ID, high 7 bits quantity */
 #define STOCK_SLOTS             320
-static int stock_rows(void);            /* (the wide list, stage 3) the rows the item list has in this run: STOCK_SLOTS, or 510 once wide_rows = 510 is on. Every loop of the DLL over the LIST asks this; STOCK_SLOTS stays the size of the game's own 320 words */
-static BYTE *wide_battle_at;            /* (stage 3) where the battle's copy of the item list is: the game's 009ac354, or the DLL's array once wide_rows = 510 is on */
+static int stock_rows(void);            /* (the wide list, stage 3) the rows the item list has in this run: STOCK_SLOTS, or 510 once wide_rows = 510 is on (stage 4: or N with wide_rows = N). Every loop of the DLL over the LIST asks this; STOCK_SLOTS stays the size of the game's own 320 words */
+static BYTE *wide_battle_at;            /* (stage 3) where the battle's copy of the item list is: the game's 009ac354, or the DLL's array once wide_rows = 510 (or more) is on */
+static int battle_rows(void);           /* (stage 4) the entries of the battle's copy that the DLL walks */
+static DWORD wide_battle_pairs;         /* (stage 4) the battle list's length (pairs of rows) once its 8 sites are written */
+static int wide4_live;
+static void wide_battle_pairs_mirror(void);
 static int wide_equip_hide(int kind);   /* (stage 3) the Equip list's room, guarded around the game's builder (nothing with 320 rows) */
 static void wide_equip_show(int hidden);
 static void wide_battle_guard(void);
@@ -2884,7 +3142,12 @@ static struct new_character *limit_item_owner_of(int item);    /* the character 
 static const BYTE *limit_item_text(int item, int description); /* its name or description; NULL if nobody's */
 static BOOL is_limit_item(int item);
 static BYTE weapon_descriptions[NEW_WEAPON_COUNT][96];
-static BYTE weapon_icon[NEW_WEAPON_COUNT];      /* kernel weapon whose item icon to show */
+static BYTE weapon_icon[NEW_WEAPON_COUNT];      /* kernel weapon whose item icon to show, or one of the WEAPON_ICON_ values below */
+/* (weapon icon) `icon = armour | accessory | item` in the weapon file: values of weapon_icon[] and wide_gear.icon past
+   the kernel weapons (0-127). Only the icon changes: the piece stays a weapon (its number, record and equip mask). */
+#define WEAPON_ICON_ARMOUR      0xf0
+#define WEAPON_ICON_ACCESSORY   0xf1
+#define WEAPON_ICON_ITEM        0xf2
 static BYTE weapon_given[NEW_WEAPON_COUNT];     /* testing aid: put one in stock when a save is loaded */
 static LONG weapon_sites_moved;
 static LONG weapon_table_live;      /* the game now reads the DLL's table */
@@ -2937,6 +3200,7 @@ static LONG driver_weapon_pointer_ok; /* and so does the original driver */
 #define PRICE_TABLE_ENTRIES     65536        /* (wide items) and a price for every 16-bit number (materia prices stay at entries 512-767: no number is ever given there) */
 #define ITEM_RANK_TABLE         65536        /* (wide items) and a sort-by-name place for every 16-bit number */
 #define ITEM_RANK_UNDEFINED     0xfffeu      /* the place of a number from 512 up that nothing defines: after everything */
+#define ITEM_RANK_GEAR_LAST     19999        /* (wide gear in the item list) the last place a defined wide piece takes: below an empty row's 0x4e20 (00714c3c) */
 #define ADDR_KERNEL_ITEM_POINTER 0x007ba080u
 #define ADDR_ITEM_BOUND_OPERAND 0x0041940bu  /* in FUN_004193c2: cmp [ebp+0xc], 0x80 before reading an item's record */
 #define GEAR_MIRROR             128          /* records kept before each table for a sign-extended index */
@@ -3177,10 +3441,12 @@ static void wide_items_report(void);
    refuse them with the words of the build before, and nothing of this stage is reached). They
    are kept in ONE catalogue (reserved once, committed as definitions come, as the wide items').
 
-   A wide piece lives IN THE BOX or ON A CHARACTER, never in the item list (so never in a battle's
-   Item or Throw list, never in a shop's sell list). The game knows a worn piece by ONE BYTE of the
-   character's record, which is an index into the kind's table. A wide piece is therefore LENT A
-   SLOT while it is worn or offered in the Equip menu's list:
+   (Wide gear in the item list, stages 1 and 2.) A wide piece lives IN THE ITEM LIST (a row of
+   number and quantity, exactly as a wide item's: greyed in the Item menu, dimmed in a battle's
+   Item list, never thrown, not sold in this version), IN THE BOX (box = on routes it there; box =
+   auto only when the item list has no row for it), or ON A CHARACTER. The game knows a worn piece
+   by ONE BYTE of the character's record, which is an index into the kind's table. A wide piece is
+   therefore LENT A SLOT while it is worn or offered in the Equip menu's list:
      weapons      128-191 (64 slots; the game's are 0-127, the mod's 192-255)
      armour        32-127 (96 slots; the game's 0-31, the mod's 128-159)
      accessories   32-127 (96 slots; the game's 0-31, the mod's 128-159; ff = none)
@@ -3220,6 +3486,14 @@ static BOOL gear_wide_sections(void);       /* is `box = on` asked (the readers 
 static int gear_wide_kind(int number)
 {
     return number < WIDE_GEAR_FIRST || number > WIDE_GEAR_LAST ? -1 : (number - WIDE_GEAR_FIRST) / GEAR_WIDE_BAND;
+}
+
+/* (Wide gear in the item list) What a wide number is, in a word of the log: "weapon", "armour", "accessory" or "item". */
+static const char *wide_kind_word(int number)
+{
+    int kind = gear_wide_kind(number);
+
+    return kind == 0 ? "weapon" : kind == 1 ? "armour" : kind == 2 ? "accessory" : "item";
 }
 
 /* The definition of a wide piece, or NULL: the number is not one, or nothing defines it now. */
@@ -3278,10 +3552,14 @@ static struct wide_gear *wide_gear_new(int number)
 }
 
 /* The restriction word of a wide piece (bit 0 set: cannot be sold; bit 3: cannot be thrown, which
-   is every wide weapon in this version: Throw takes its weapon's record by number - 0x80). */
+   is every wide weapon in this version: Throw takes its weapon's record by number - 0x80).
+   (Wide gear in the item list) bits 1 and 2 (not in a battle, not in the menu) are set for every
+   wide piece, as the kernel's own gear words have them: its row in the Item menu is greyed and OK
+   buzzes; and bit 0, so that a shop's sell list never offers it in this version (the sell panel of
+   a number from 10000 up is not traced). */
 static unsigned gear_wide_restrictions(const struct wide_gear *g)
 {
-    return *(const WORD *)(g->record + (g->kind == 0 ? WEAPON_RESTRICTIONS : g->kind == 1 ? ARMOUR_RESTRICTIONS : ACCESSORY_RESTRICTIONS)) | 8u;
+    return *(const WORD *)(g->record + (g->kind == 0 ? WEAPON_RESTRICTIONS : g->kind == 1 ? ARMOUR_RESTRICTIONS : ACCESSORY_RESTRICTIONS)) | 0x0fu;
 }
 
 /* The name or the description of a wide gear number; for one NOTHING defines now (a piece of a
@@ -3560,6 +3838,7 @@ static BOOL box_equip_wears(int kind, int slot, int character)
     return (*(const WORD *)(record + mask) & (1u << (character & 0x1f))) != 0;
 }
 
+static void gear_equip_plain(int kind);   /* (wide gear in the item list, stage 2) defined with the worn pieces, below */
 /* The game's list builder only knows item IDs 128-255 as weapons, and takes
    IDs 320-351 for accessories. Adds the new weapons to the weapon list and
    keeps them out of the accessory list. */
@@ -3620,6 +3899,8 @@ static void __cdecl equip_list_hook(int kind)
         }
         *count = n;
     }
+    if (gear_wide_live)
+        gear_equip_plain(kind);     /* (wide gear in the item list, stage 2) the box does not act (asleep, LOCKED): the item list's wide pieces after the game's; never unless wide gear is at work */
 }
 
 static unsigned __cdecl item_restrictions_hook(int id)
@@ -3867,7 +4148,8 @@ static void __cdecl battle_inventory_hook(void)
     wide_watch("the start of a battle", FALSE);     /* (the wide list, shadow) reads only */
     wide_battle_guard();            /* (stage 3) the DLL's copy: its guard entries empty; nothing while the copy is the game's */
     ((void (__cdecl *)(void))FN_BATTLE_INVENTORY)();
-    for (i = 0; i < stock_rows(); i++, entry += 6) {
+    wide_battle_pairs_mirror();     /* (stage 4) the game's byte follows the length the start build wrote into the DLL's dword; nothing unless its 8 sites are written */
+    for (i = 0; i < battle_rows(); i++, entry += 6) {
         int id = *(const WORD *)entry;
 
         if (is_new_weapon_item(id)) {
@@ -3897,23 +4179,34 @@ static void __cdecl battle_inventory_hook(void)
         }
     }
     if (box_live)
-        box_battle_note(wide_battle_at, stock_rows());      /* (the box, stage B3, R8) what the party carries into the battle; reads only; nothing with the box LOCKED or off */
+        box_battle_note(wide_battle_at, battle_rows());     /* (the box, stage B3, R8) what the party carries into the battle; reads only; nothing with the box LOCKED or off */
+}
+
+/* (weapon icon) The number whose icon a weapon's icon value shows: the kernel weapon's, or the first armour's,
+   accessory's or item's (the game's routines take the kind's icon from the number's range alone). */
+static int weapon_icon_item_id(int icon)
+{
+    if (icon < WEAPON_COUNT_ORIGINAL)
+        return ITEM_ID_WEAPON_BASE + icon;
+    return icon == WEAPON_ICON_ARMOUR ? ITEM_ID_ARMOUR_BASE : icon == WEAPON_ICON_ACCESSORY ? ITEM_ID_ACCESSORY_BASE : 0;
 }
 
 /* The item icon is chosen from the item ID by fixed ranges; a new weapon
    would get the accessory icon. Shows the icon of the kernel weapon the
-   weapon file names instead. */
+   weapon file names instead (or, with icon = armour | accessory | item, that kind's). */
 static int icon_item_id(int id)
 {
-    if (id >= WIDE_GEAR_FIRST && wide_gear(id))     /* (the box, stage B5) a wide piece: its kind's icon (a weapon: the kernel weapon's its section names) */
-        return wide_gear(id)->kind == 0 ? ITEM_ID_WEAPON_BASE + wide_gear(id)->icon : wide_gear(id)->kind == 1 ? ITEM_ID_ARMOUR_BASE : ITEM_ID_ACCESSORY_BASE;
+    if (id >= WIDE_GEAR_FIRST && wide_gear(id))     /* (the box, stage B5) a wide piece: its kind's icon (a weapon: the one its section names) */
+        return wide_gear(id)->kind == 0 ? weapon_icon_item_id(wide_gear(id)->icon) : wide_gear(id)->kind == 1 ? ITEM_ID_ARMOUR_BASE : ITEM_ID_ACCESSORY_BASE;
+    if (gear_wide_kind(id) >= 0)        /* (wide gear in the item list, fix round: game 7) a "Missing" piece (nothing defines it now): the icon of its kind by its band, not the item icon */
+        return gear_wide_kind(id) == 0 ? ITEM_ID_WEAPON_BASE : gear_wide_kind(id) == 1 ? ITEM_ID_ARMOUR_BASE : ITEM_ID_ACCESSORY_BASE;
     if (id >= NEW_ITEM_HIGH_FIRST)
         return 0;                       /* the item icon */
     if (id >= NEW_ACCESSORY_FIRST_ITEM)
         return ITEM_ID_ACCESSORY_BASE;
     if (id >= NEW_ARMOUR_FIRST_ITEM)
         return ITEM_ID_ARMOUR_BASE;
-    return is_new_weapon_item(id) ? ITEM_ID_WEAPON_BASE + weapon_icon[id - NEW_WEAPON_FIRST_ITEM] : id;
+    return is_new_weapon_item(id) ? weapon_icon_item_id(weapon_icon[id - NEW_WEAPON_FIRST_ITEM]) : id;
 }
 
 #define ICON_HOOK(name, fn) \
@@ -4663,6 +4956,13 @@ static void rebuild_item_ranks(void)
     for (id = ITEM_RANK_COUNT; id < ITEM_COUNT_EXTENDED; id++)
         if (!rank_as_new(id))
             item_ranks[id] = (WORD)rank++;
+    /* (wide gear in the item list) every DEFINED wide piece: a place of its own after everything above, in number order. The
+       game's comparer (00714be8) gives an EMPTY row the place 0x4e20 and compares the two places unsigned (masked with ffff), so
+       every place stays below that: past it the pieces share the last one (only with about 19,000 things defined). A number
+       nothing defines keeps ITEM_RANK_UNDEFINED, after the empty rows, as a Missing wide item does */
+    for (id = WIDE_GEAR_FIRST; id <= WIDE_GEAR_LAST; id++)
+        if (wide_gear(id))
+            item_ranks[id] = (WORD)(rank < ITEM_RANK_GEAR_LAST ? rank++ : ITEM_RANK_GEAR_LAST);
 }
 
 /* The three tables. The instruction before each operand is checked as well as the operand. */
@@ -4714,9 +5014,10 @@ static void move_limit_safety_tables(void)
    that the items file defines while wide items are admitted, or a piece of WIDE GEAR (weapons
    10000-15999, armour 16000-21999, accessories 22000-27999) that a gear file defines while wide gear
    is at work (the box: on or auto). Numbers 0-511: NULL (the game's and the mod's own; nothing here
-   is about them). Reads only. Where a wide thing goes: a wide item to the item list (the box when the
-   list, or the battle's copy of it, has no row for it); wide gear to the BOX, always (it lives in the
-   box or on a character, never in the item list): receive_box, with the box's own block. */
+   is about them). Reads only. Where a wide thing goes: (wide gear in the item list) a wide item and a
+   piece of wide gear alike to the item list (the box when the list, or the battle's copy of it, has
+   no row for it; box = on sends wide gear to the box, as all gear it stores): receive_box, with the
+   box's own block, takes what has no row. */
 static const char *receive_refusal(int number)
 {
     if (number < ITEM_COUNT_EXTENDED)
@@ -4732,8 +5033,9 @@ static const char *receive_refusal(int number)
 }
 
 /* (warn, D1 of the RECEIVE review) The testing aids test_stitm and test_steal: receive_refusal, and a
-   piece of wide gear is refused too while the box cannot take it (LOCKED: MISSING, REFUSED, no game),
-   so that the field's or the battle's own thing is given instead of a substitute that would be lost. */
+   piece of wide gear is refused too while NEITHER store can take it (wide gear in the item list: the
+   item list takes it whenever it is the DLL's; the box while it acts or sleeps), so that the field's
+   or the battle's own thing is given instead of a substitute that would be lost. */
 static BOOL box_acts(void);
 static BOOL box_dormant(void);
 static const char *box_locked_text(void);
@@ -4741,9 +5043,22 @@ static const char *receive_aid_refusal(int n)
 {
     const char *why = receive_refusal(n);
 
-    if (!why && gear_wide_kind(n) >= 0 && (!wide_live || !(box_acts() || box_dormant())))
+    if (!why && gear_wide_kind(n) >= 0 && !wide_live && !(box_acts() || box_dormant()))
         why = box_locked_text();
     return why;
+}
+
+/* (Wide gear in the item list) A wide thing that may be given and held in this run: a wide item that is defined and
+   admitted, or a piece of wide gear that a gear file defines while wide gear is at work (wide things admitted). */
+static BOOL wide_thing_usable(int number)
+{
+    return wide_item_usable(number) || (gear_wide_live && wide_items_ready() && wide_gear(number) != NULL);
+}
+
+/* The name of a wide number for a line of the log: a wide item's or a wide piece's. */
+static const char *wide_thing_log_name(int number)
+{
+    return gear_wide_kind(number) >= 0 ? gear_wide_log_name(number) : wide_item_log_name(number);
 }
 /* ==== RECEIVE: the refusal end (receive_box is in the box's stage B3 block; test_stitm_give is with the battle's aids) ==== */
 
@@ -4752,21 +5067,12 @@ static void spoils_entry(int id, int count)
 {
     int kind = defined_new_kind(id), i;
 
-    if (gear_wide_kind(id) >= 0 && !receive_refusal(id)) {
-        /* (receive) a piece of WIDE GEAR among the spoils (a scene's drop word, or test_drop): never the item list: the BOX
-           (a sleeping box wakes); the game's routine was kept from it, as from every entry of 0x180 and up */
-        int n = count > 99 ? 99 : count;
-
-        if (n < 1)
-            log_line("spoils: wide gear %d with a count of %d: nothing added", id, count);
-        else if (receive_box(id, n, "the spoils of a battle won", TRUE))
-            log_line("spoils: %d of wide gear %d went to the BOX (see the \"box: arriving\" line above)", n, id);
-        return;
-    }
     if (id >= WIDE_ITEM_FIRST) {
         /* (wide items) a wide item is given; any other number from 1024 up is given to NOBODY and said so
-           (never read as a materia, never turned into another item) */
-        if (!wide_item_usable(id)) {
+           (never read as a materia, never turned into another item). (Wide gear in the item list) a piece of WIDE GEAR is
+           given the same way: to the item list by the DLL's own add (box = on: the box; no row: the box, a sleeping box
+           waking for it) */
+        if (!wide_thing_usable(id)) {
             log_line("*** spoils: %d of number %d NOT given: %s. Nothing is added and nothing else is given in its place ***", count, id,
                      receive_refusal(id) ? receive_refusal(id) : "the items file does not define it");     /* (receive) wide gear's reasons too */
             return;
@@ -4790,8 +5096,8 @@ static void spoils_entry(int id, int count)
             log_line("spoils: %d of number %d went to the BOX (see the \"box: arriving\" line above)", n, id);
         else
         if (id >= WIDE_ITEM_FIRST)
-            log_line(room ? "spoils: %d of wide item %d (%s) added to the item list" : "spoils: %d of wide item %d (%s) NOT added: the item list is full", n, id,
-                     wide_item_log_name(id));
+            log_line(room ? "spoils: %d of wide %s %d (%s) added to the item list" : "spoils: %d of wide %s %d (%s) NOT added: the item list is full", n,
+                     wide_kind_word(id), id, wide_thing_log_name(id));
         else
         log_line(room ? "spoils: %d of item %d (one of this mod's) added to the stock; the game would have given materia %d"
                       : "spoils: %d of item %d (one of this mod's) NOT added: the stock is full", n, id, id - ID_READ_AS_MATERIA);
@@ -4877,30 +5183,30 @@ static void battle_gain_entry(int id)
     int kind = defined_new_kind(id), i, empty = -1, rows = 0;
     BYTE *inventory = wide_battle_at, *entry = NULL;
     const struct wide_item *wide = NULL;
+    BOOL gear = FALSE;
     BYTE target = 3, use;
 
-    if (gear_wide_kind(id) >= 0 && !receive_refusal(id)) {
-        /* (receive) a piece of WIDE GEAR stolen or morphed: never into the battle's copy of the item list (the battle's end
-           writes the copy back into the list, where wide gear never is; Item and Throw would offer it): into the BOX at
-           once (a sleeping box wakes). The game threw the number away (0x180 and up) */
-        receive_box(id, 1, "a battle gain: steal or morph", TRUE);
-        return;
-    }
     if (id >= WIDE_ITEM_FIRST) {
         /* (wide items) a wide item is added to the battle's items (the game threw the number away); any other
-           number from 1024 up is gained by NOBODY and said so */
-        if (!wide_item_usable(id)) {
+           number from 1024 up is gained by NOBODY and said so. (Wide gear in the item list) a piece of WIDE GEAR stolen
+           or morphed goes into the battle's items too, as a thing of no use (target 0, use 0x0b: dimmed in Item and
+           W-Item, never thrown, as battle_inventory_hook flags it); the battle's end writes it into the item list */
+        if (!wide_thing_usable(id)) {
             log_line("*** battle gain: number %d NOT gained: %s. Nothing is added and nothing else is given in its place ***", id,
                      receive_refusal(id) ? receive_refusal(id) : "the items file does not define it");      /* (receive) wide gear's reasons too */
             return;
         }
         wide = wide_item(id);
+        gear = wide == NULL;
         kind = 4;
     }
     if (!kind)
         return;                         /* as the game left it: thrown away (0x180 and more) or added with no flags */
     /* the flags, as the game's routine sets them for its own kinds and battle_inventory_hook for these */
-    if (kind == 1) {
+    if (gear) {
+        target = 0;                     /* (wide gear in the item list) no use: as battle_inventory_hook flags a number from 512 up the items file does not define */
+        use = 0x0b;
+    } else if (kind == 1) {
         const BYTE *record = weapon_table + (id - ITEM_ID_WEAPON_BASE) * WEAPON_RECORD_SIZE;
 
         target = record[0];
@@ -4917,7 +5223,7 @@ static void battle_gain_entry(int id)
         use = item_record(id)[ITEM_RESTRICTIONS];
     }
     use &= 0x0b;
-    for (i = 0; i < stock_rows(); i++) {
+    for (i = 0; i < battle_rows(); i++) {
         if (*(const WORD *)(inventory + i * 6) == id) {
             entry = inventory + i * 6;
             break;
@@ -4944,14 +5250,20 @@ static void battle_gain_entry(int id)
         entry[3] = target;
         entry[4] = use;
         rows = (empty + 1) / 2;
-    } else if (wide && box_live) {
+    } else if ((wide || gear) && box_live) {
         /* (receive) a wide item the battle's copy has NO ROW for (the list is full): into the BOX (a sleeping box wakes)
-           instead of being lost; with the box off it is lost, as before, with the line below */
-        receive_box(id, 1, "a battle gain: steal or morph", FALSE);
+           instead of being lost; with the box off it is lost, as before, with the line below. (Wide gear in the item list)
+           a piece of wide gear likewise: overflow */
+        receive_box(id, 1, "a battle gain: steal or morph");
         return;
     }
     *(BYTE *)ADDR_BATTLE_ITEM_REDO = 0xff;
-    if (*(const BYTE *)ADDR_BATTLE_ITEM_ROWS < rows)
+    if (wide4_live) {
+        /* (stage 4) the length is the DLL's dword (the game's own rule kept: (row + 1) / 2) */
+        if (wide_battle_pairs < (DWORD)rows)
+            wide_battle_pairs = (DWORD)rows;
+        wide_battle_pairs_mirror();
+    } else if (*(const BYTE *)ADDR_BATTLE_ITEM_ROWS < rows)
         *(BYTE *)ADDR_BATTLE_ITEM_ROWS = (BYTE)rows;
     log_line(entry ? "battle gain: item %d (one of this mod's) added to the battle's items; the game would have thrown it away"
                    : "battle gain: item %d (one of this mod's) NOT added: the battle's item list is full", id);
@@ -4983,6 +5295,7 @@ static void __cdecl battle_gain_hook(void)
     for (i = 0; i < count; i++)
         if ((short)gained[i] >= NEW_WEAPON_FIRST_ITEM)
             battle_gain_entry((short)gained[i]);
+    wide_battle_pairs_mirror();     /* (stage 4) after the game's gain (it writes the DLL's dword) and the DLL's own; nothing unless the 8 sites are written */
 }
 
 /* TESTING AID (test_stitm in the game file; receive): the next STITM a field script runs (a chest, a thing on the
@@ -5098,6 +5411,7 @@ static void store_new_character(void);
 static void give_materia_on_load(void);
 static void sxc2_load_decide(void);        /* stage 2 of the save move: see "SXC2" */
 static void sxc2_load_finish(void);
+static void fields_after_load(void);       /* (field capacity, stage 2) with the field capacity block */
 
 /* ==== THE WIDE ITEM LIST, STAGE 0 (SHADOW): begin ====
 
@@ -5120,7 +5434,8 @@ static void sxc2_load_finish(void);
 #define WIDE_OFF                0
 #define WIDE_SHADOW             1
 #define WIDE_ON                 2
-#define WIDE_ROWS               510
+#define WIDE_V2_ROWS            510                 /* (stage 4) the rows of an item list section of VERSION 1 OR 2 (always 510: its count, its length, its readers and writer) and the key's word "510"; NOT the list's length any more (that is wide_bound) */
+#define WIDE_ROWS_MAX           3350                /* the most rows `wide_rows` may ask for (an even number): every array of the list is this long (+ WIDE_GUARD_ROWS). (Stage 4a: 2040; stage 4b: 3350, the most at which the companion file keeps the box's whole 12,000 kinds beside the longest list this build writes: box_check_max below) */
 #define WIDE_GAME_ROWS          STOCK_SLOTS         /* the rows the game's list has */
 #define WIDE_EMPTY              0xffffffffu
 #define WIDE_NARROW_MAX         0x1ffu              /* the highest number a word of the game's list can hold */
@@ -5130,12 +5445,16 @@ static int wide_items_mode;                 /* WIDE_OFF until the game file is f
 static int wide_items_asked;                /* what the reading of the game file now under way has met (WIDE_OFF: the key is not there) */
 static int wide_items_taken;                /* 1: the key has been taken */
 /* (Stage 3) the key `wide_rows` of the game file: 320 (the default: the installed build's list) or 510. Read with wide_items, at
-   start-up only. 510 needs wide_items = on and the switch ON, and its own 52 sites in order (wide3_look): else the list has 320 rows. */
-#define WIDE_GUARD_ROWS         16          /* rows past the 510 that are always empty: the menus' draw loops read one row (the sell list: two cells) past the list's end while a scroll step is animated */
-static int wide_rows_asked = WIDE_ROWS;         /* what the reading of the game file now under way has met (owner, 2026-10-14: 510 by default) */
+   start-up only. 510 needs wide_items = on and the switch ON, and its own 52 sites in order (wide3_look): else the list has 320 rows.
+   (Stage 4) or an EVEN number from 512 to WIDE_ROWS_MAX: the 52 sites take that number, and 8 more (the battle list's length, a
+   byte of the game's, moved to a dword of the DLL's) must be in order too: else the list has 510 rows. 321-509, an odd number or
+   anything else: one line, and 510. */
+#define WIDE_GUARD_ROWS         16          /* rows past the list's end that are always empty: the menus' draw loops read one row (the sell list: two cells) past the list's end while a scroll step is animated */
+static int wide_rows_asked = WIDE_V2_ROWS;      /* what the reading of the game file now under way has met (owner, 2026-10-14: 510 by default) */
 static BOOL wide_rows_given;                    /* the game file has a wide_rows line (with none, 510 is only the default and is not talked about) */
 static int wide_rows_wanted = WIDE_GAME_ROWS;   /* what the first reading took: for the whole run */
-static BOOL wide_rows_long(void);       /* (stage 3) has the list 510 rows in this run? */
+static BOOL wide_rows_long(void);       /* (stage 3) has the list more than the game's 320 rows in this run? */
+static BOOL parse_number(char **p, const char *end, DWORD *out);
 
 /* Is anything of the wide list at work? (`on` acts as shadow in this build.) */
 static BOOL wide_shadow_on(void)
@@ -5157,15 +5476,19 @@ static BOOL wide_items_key(const char *value, const char *stop)
     return TRUE;
 }
 
-/* The value of the key `wide_rows` on a line of the game file. FALSE: neither 320 nor 510. */
+/* The value of the key `wide_rows` on a line of the game file: 320, or (stage 4) an EVEN number from 510 to WIDE_ROWS_MAX
+   (decimal, or 0x and hex, as every number of the file; at most 6 characters). FALSE: anything else, and 510 is used. */
 static BOOL wide_rows_key(const char *value, const char *stop)
 {
-    if (word_is(value, stop, "320"))
-        wide_rows_asked = WIDE_GAME_ROWS;
-    else if (word_is(value, stop, "510"))
-        wide_rows_asked = WIDE_ROWS;
-    else
+    char *p = (char *)value;
+    DWORD rows = 0;
+
+    if (stop - value > 6 || !parse_number(&p, stop, &rows) || p != stop
+        || !(rows == WIDE_GAME_ROWS || (rows >= WIDE_V2_ROWS && rows <= WIDE_ROWS_MAX && !(rows & 1)))) {
+        wide_rows_asked = WIDE_V2_ROWS;
         return FALSE;
+    }
+    wide_rows_asked = (int)rows;
     wide_rows_given = TRUE;
     return TRUE;
 }
@@ -5188,9 +5511,17 @@ static void wide_items_settle(void)
         }
         if (!wide_items_taken) {
             wide_rows_wanted = wide_rows_asked;
-            if (wide_rows_wanted == WIDE_ROWS && (wide_rows_given || wide_items_asked == WIDE_ON))     /* (rows default) said only when it matters */
+            if (wide_rows_wanted == WIDE_V2_ROWS && (wide_rows_given || wide_items_asked == WIDE_ON))  /* (rows default) said only when it matters */
                 log_line(wide_items_asked == WIDE_ON ? "wide item list: wide_rows = 510: THE 510-ROW LIST (stage 3) is asked for. It is decided with the switch, at the end of this first kernel load: its own 52 sites of the game's code are compared first; if one is not the game's the item list has 320 rows in this run and the switch still goes on (the lines \"THE LIST HAS 510 ROWS\" or \"510 ROWS REFUSED\" below)"
                                                      : "wide item list: wide_rows = 510 needs wide_items = on (the 510-row list is the DLL's own list): the item list has 320 rows in this run");
+            else if (wide_rows_wanted > WIDE_V2_ROWS) {
+                /* (stage 4) a list longer than 510 rows */
+                if (wide_items_asked == WIDE_ON)
+                    log_line("wide item list: wide_rows = %d: THE %d-ROW LIST (stage 4) is asked for. It is decided with the switch, at the end of this first kernel load: its own 60 sites of the game's code are compared first (the 52 of the 510-row list, valued for %d rows, and the 8 that name the battle list's length); if one of the 8 is not the game's the item list has 510 rows in this run, if one of the 52 is not, 320, and the switch still goes on (the lines \"THE LIST HAS %d ROWS\" or \"ROWS REFUSED\" below)",
+                             wide_rows_wanted, wide_rows_wanted, wide_rows_wanted, wide_rows_wanted);
+                else
+                    log_line("wide item list: wide_rows = %d needs wide_items = on (the long list is the DLL's own list): the item list has 320 rows in this run", wide_rows_wanted);
+            }
         }
     }
     if (!wide_items_taken) {
@@ -5212,14 +5543,14 @@ static void wide_items_settle(void)
     }
 }
 
-/* The WIDE PICTURE of the game's item list: WIDE_ROWS rows from the 320 words at `words` (as a
+/* The WIDE PICTURE of the game's item list: WIDE_V2_ROWS rows (an item list section of version 1) from the 320 words at `words` (as a
    save holds them: two bytes a word, low byte first; 9 bits number, 7 bits quantity, ffff empty).
    Row i is word i; the rows past the game's stay empty. Positions are kept. */
 static void wide_from_words(DWORD *wide, const BYTE *words)
 {
     int i;
 
-    for (i = 0; i < WIDE_ROWS; i++) {
+    for (i = 0; i < WIDE_V2_ROWS; i++) {
         unsigned w = i < WIDE_GAME_ROWS ? (unsigned)words[i * 2] | (unsigned)words[i * 2 + 1] << 8 : 0xffffu;
 
         wide[i] = w == 0xffffu ? WIDE_EMPTY : (DWORD)(w & 0x1ff) | (DWORD)(w >> 9) << 16;
@@ -5239,7 +5570,7 @@ static int wide_narrow_picture(const DWORD *wide, BYTE *words, int *wide_rows, i
     int i, painted = 0;
 
     *wide_rows = *beyond = *unpaintable = 0;
-    for (i = 0; i < WIDE_ROWS; i++) {
+    for (i = 0; i < WIDE_V2_ROWS; i++) {           /* (stage 4: a list of version 1, 510 rows) */
         DWORD row = wide[i], number = row & 0xffffu, quantity = row >> 16;
         unsigned w = 0xffffu;
 
@@ -5270,7 +5601,7 @@ static int wide_narrow_picture(const DWORD *wide, BYTE *words, int *wide_rows, i
    *row = the first that does not. */
 static BOOL wide_picture_holds(const BYTE *words, int *row)
 {
-    static DWORD wide[WIDE_ROWS];
+    static DWORD wide[WIDE_V2_ROWS];
     static BYTE back[WIDE_GAME_ROWS * 2];
     int a, b, c, i;
 
@@ -5500,18 +5831,34 @@ static void wide_new_game(void)
 enum { WIDE_SAY_PLAIN, WIDE_SAY_FOREIGN, WIDE_SAY_GUARD, WIDE_SAY_REFUSED, WIDE_SAY_SITES, WIDE_SAY_FED, WIDE_SAY_KINDS };
 #define WIDE_DUMPS              8
 #define WIDE_DUMP_ROWS          12
-static DWORD wide_list[WIDE_ROWS + WIDE_GUARD_ROWS];    /* THE item list once the switch is on (stage 3: and 16 guard rows after it, always empty) */
+static DWORD wide_list[WIDE_ROWS_MAX + WIDE_GUARD_ROWS];    /* THE item list once the switch is on: its first wide_bound rows (stage 4: every row from wide_bound up to the array's end is a GUARD row, always empty) */
 static WORD wide_painted[WIDE_GAME_ROWS];       /* what the DLL last painted into (or took from) the game's 320 words */
 static int wide_live;                           /* THE ONE VARIABLE: 0 the game's words are the list; 1 wide_list is. Set once (wide_switch_install) */
 static int wide_refused;                        /* 1: the switch was asked for and REFUSED: the run is in today's format */
-static int wide_bound = WIDE_GAME_ROWS;         /* the rows the list's routines walk, as every bound in the game's code: 320; 510 once wide_rows = 510 is on (stage 3: set once, with wide_live) */
+static int wide_bound = WIDE_GAME_ROWS;         /* the rows the list's routines walk, as every bound in the game's code: 320; 510 once wide_rows = 510 is on (stage 3: set once, with wide_live); (stage 4) wide_rows = N: N */
 static BOOL wide_rows_long(void)
 {
-    return wide_bound == WIDE_ROWS;
+    return wide_bound > WIDE_GAME_ROWS;
 }
-static int wide_rows_refused;                   /* (stage 3) 1: wide_rows = 510 was asked for and its sites were REFUSED: the list has 320 rows */
-static BYTE wide_battle[(WIDE_ROWS + WIDE_GUARD_ROWS) * 6];     /* (stage 3) the battle's copy of the list once it has 510 entries (6 bytes each: number word, quantity, target, use flags, one spare), and 16 guard entries */
+static int wide_rows_refused;                   /* (stage 3) 1: wide_rows = 510 (or more) was asked for and its sites were REFUSED: the list has 320 rows */
+static int wide4_refused;                       /* (stage 4) 1: wide_rows above 510 was asked for and one of the 8 sites of the battle list's length was REFUSED: the list has 510 rows */
+static BYTE wide_battle[(WIDE_ROWS_MAX + WIDE_GUARD_ROWS) * 6]; /* (stage 3) the battle's copy of the list once it has more than 320 entries (6 bytes each: number word, quantity, target, use flags, one spare); every entry from wide_bound up is a guard entry */
 static BYTE *wide_battle_at = (BYTE *)ADDR_BATTLE_INVENTORY;    /* where the battle's copy is: the game's own 320 entries until the stage's sites are written */
+/* (Stage 4) THE BATTLE LIST'S LENGTH, in PAIRS of rows: the game keeps it in the byte 009ac110 (255 at most: the reason for 510);
+   with wide_rows above 510 its 8 operands in the game's code name this dword instead (wide4_sites). The DLL's own writer
+   (battle_gain_entry) writes it, and the game's byte gets min(255, it) after the start build and after a gain (no reader of
+   the byte is left in the exe; for anybody else's). */
+static DWORD wide_battle_pairs;
+static int wide4_live;                          /* (stage 4) 1: the 8 sites of the battle list's length are written: wide_battle_pairs is the length */
+static int battle_rows(void)                    /* (stage 4) the entries of the battle's copy the DLL walks: the list's rows (the copy and the list have one length) */
+{
+    return wide_bound;
+}
+static void wide_battle_pairs_mirror(void)      /* (stage 4) the game's byte 009ac110 follows the dword; nothing unless the 8 sites are written */
+{
+    if (wide4_live)
+        *(BYTE *)ADDR_BATTLE_ITEM_ROWS = (BYTE)(wide_battle_pairs > 255 ? 255 : wide_battle_pairs);
+}
 static short wide_pic_row[WIDE_GAME_ROWS];      /* (stage 3) the picture as last painted: which row of the list word k holds; -1 none */
 static int wide_pic_compact;                    /* (stage 3) 1: that picture is the COMPACT one (a row past the game's 320 is in use) */
 static int stock_rows(void)
@@ -5538,8 +5885,8 @@ static long wide_fed_calls, wide_fed_known_511; /* removals fed; of them, those 
    took out of the list. They are written again in the item list of every companion this game
    writes (wide_section_rows: at the row each had, if that row is free there) and are FORGOTTEN
    only with the game itself (another load, a new game: sxc2_forget_loaded). */
-static DWORD wide_carried[WIDE_ROWS];           /* the rows, as the file held them */
-static WORD wide_carried_home[WIDE_ROWS];       /* the row each had */
+static DWORD wide_carried[WIDE_ROWS_MAX];       /* the rows, as the file held them */
+static WORD wide_carried_home[WIDE_ROWS_MAX];   /* the row each had */
 static int wide_carried_count;
 static long wide_carried_no_room;               /* rows that found no place even here (more than a file has rows): said with *** */
 
@@ -5553,14 +5900,14 @@ static void wide_carry(DWORD row, int home)
 {
     if ((row >> 16) > 0x7fffu)
         row = (row & 0xffffu) | (row >> 16 & 0x7f) << 16;
-    if (wide_carried_count >= WIDE_ROWS) {
+    if (wide_carried_count >= WIDE_ROWS_MAX) {
         if (!wide_carried_no_room++)
             log_line("*** wide list: NO ROOM to carry one more row (%d are carried; the row: number %lu x %lu): it is NOT kept. STOP and keep this log ***",
                      wide_carried_count, row & 0xffffu, row >> 16);
         return;
     }
     wide_carried[wide_carried_count] = row;
-    wide_carried_home[wide_carried_count++] = (WORD)(home >= 0 && home < WIDE_ROWS ? home : WIDE_ROWS - 1);
+    wide_carried_home[wide_carried_count++] = (WORD)(home >= 0 && home < WIDE_ROWS_MAX ? home : WIDE_ROWS_MAX - 1);       /* (stage 4: a home is only where the section prefers to put it: wide_section_list) */
 }
 
 /* May one more line of this block be written? Plain lines are bounded for the run (the bound is
@@ -5653,27 +6000,28 @@ static BOOL wide_game_kind(DWORD number)
     return number <= 104 || (number >= 128 && number < 320);
 }
 
-/* Is a row past the game's 320 in use in a list of WIDE_ROWS rows? */
-static BOOL wide_rows_past_game(const DWORD *list)
+/* Is a row past the game's 320 in use in a list of `rows` rows? */
+static BOOL wide_rows_past_game(const DWORD *list, int rows)
 {
     int i;
 
-    for (i = WIDE_GAME_ROWS; i < WIDE_ROWS; i++)
+    for (i = WIDE_GAME_ROWS; i < rows; i++)
         if (list[i] != WIDE_EMPTY)
             return TRUE;
     return FALSE;
 }
 
-/* THE COMPACT PICTURE of a list of WIDE_ROWS rows: `words` (320) and `map` (320: the list row each
-   word holds, -1 for none). Returns the rows in use that the picture does NOT hold. */
-static int wide_compact_picture(const DWORD *list, WORD *words, short *map)
+/* THE COMPACT PICTURE of a list of `rows` rows (stage 4: the run's wide_bound, or the rows a section's writer showed):
+   `words` (320) and `map` (320: the list row each word holds, -1 for none). Returns the rows in use that the picture does
+   NOT hold. */
+static int wide_compact_picture(const DWORD *list, int rows, WORD *words, short *map)
 {
     int i, k = 0, game = 0, game_room = WIDE_GAME_ROWS, other_room, left = 0;
 
-    for (i = 0; i < WIDE_ROWS; i++)
+    for (i = 0; i < rows; i++)
         game += list[i] != WIDE_EMPTY && wide_row_is_narrow(list[i]) && wide_game_kind(list[i] & 0xffffu);
     other_room = game >= WIDE_GAME_ROWS ? 0 : WIDE_GAME_ROWS - game;
-    for (i = 0; i < WIDE_ROWS; i++) {
+    for (i = 0; i < rows; i++) {
         DWORD row = list[i];
         BOOL take = FALSE;
 
@@ -5699,10 +6047,25 @@ static int wide_compact_picture(const DWORD *list, WORD *words, short *map)
     return left;
 }
 
+/* (Stage 4) THE ROW-FOR-ROW PICTURE of a list (as wide_paint paints it while no row past the game's 320 is in use): word i
+   holds row i when a word can hold it, else ffff. Returns the rows in use of the first `rows` that it does NOT hold. */
+static int wide_row_picture(const DWORD *list, int rows, WORD *words, short *map)
+{
+    int i, left = 0;
+
+    for (i = 0; i < WIDE_GAME_ROWS; i++) {
+        words[i] = (WORD)wide_word_of_row(i < rows ? list[i] : WIDE_EMPTY);
+        map[i] = (short)(words[i] != 0xffff ? i : -1);
+    }
+    for (i = 0; i < rows; i++)
+        left += list[i] != WIDE_EMPTY && (i >= WIDE_GAME_ROWS || words[i] == 0xffff);
+    return left;
+}
+
 /* Is the picture of the DLL's list the compact one now? (Never with 320 rows.) */
 static BOOL wide_compact_now(void)
 {
-    return wide_bound == WIDE_ROWS && wide_rows_past_game(wide_list);
+    return wide_bound > WIDE_GAME_ROWS && wide_rows_past_game(wide_list, wide_bound);
 }
 
 /* The game's word that the picture, as last painted, is expected to hold at place i, from the list as it is now. */
@@ -5739,51 +6102,105 @@ static WORD wide_word_at_row(int row)
        a new row at the first free row (carried unseen if there is none).
    The same number in several rows is paired in order. Rows the picture did not hold (wide items,
    rows it had no room for) are otherwise untouched, and no row changes its place. */
+/* (Stage 4, fix pass) wide_merge_carried: 1 while a load's merge (sxc3_take_list2) may follow the words into the NARROW rows
+   the split of a longer list carried: a number the save's words no longer hold goes from them too (else it would come back at
+   the next long run's load); 0 for a foreign write in the run (wide_sync). */
+static int wide_merge_carried;
+static int wide_merge_emptied, wide_merge_emptied_game;   /* (stage 4, fix pass) the last merge: carried rows it took out (of them, game kinds) */
 static void wide_merge_words(const WORD *base, const WORD *theirs, int *changed, int *gone, int *added, int *merged, int *carried)
 {
+    /* (Stage 4b) LINEAR in the rows: each number's words, rows and carried rows are CHAINED in their order once (the first of a
+       number, then the next of the same number), where the stage-3 form walked them again for every number and every word: the
+       same pairing in the same order (each chain is made before anything of its number changes, and a number's own turn changes
+       only its own rows), the same rows written, the same counts */
     static WORD count_base[512], count_theirs[512], seen[512];
-    int n, i;
+    static short first_base[512], first_theirs[512], first_list[512], first_carried[512];
+    static short next_base[WIDE_GAME_ROWS], next_theirs[WIDE_GAME_ROWS], next_list[WIDE_ROWS_MAX], next_carried[WIDE_ROWS_MAX];
+    int n, i, emptied = 0, free_row;
 
     *changed = *gone = *added = *merged = *carried = 0;
+    wide_merge_emptied = wide_merge_emptied_game = 0;
     for (n = 0; n < 512; n++)
-        count_base[n] = count_theirs[n] = seen[n] = 0;
-    for (i = 0; i < WIDE_GAME_ROWS; i++) {
-        if (base[i] != 0xffff)
-            count_base[base[i] & 0x1ff]++;
-        if (theirs[i] != 0xffff)
-            count_theirs[theirs[i] & 0x1ff]++;
+        count_base[n] = count_theirs[n] = seen[n] = 0, first_base[n] = first_theirs[n] = first_list[n] = first_carried[n] = -1;
+    for (i = WIDE_GAME_ROWS - 1; i >= 0; i--) {
+        if (base[i] != 0xffff) {
+            n = base[i] & 0x1ff;
+            count_base[n]++;
+            next_base[i] = first_base[n], first_base[n] = (short)i;
+        }
+        if (theirs[i] != 0xffff) {
+            n = theirs[i] & 0x1ff;
+            count_theirs[n]++;
+            next_theirs[i] = first_theirs[n], first_theirs[n] = (short)i;
+        }
     }
+    for (i = wide_bound - 1; i >= 0; i--)
+        if (wide_list[i] != WIDE_EMPTY && wide_row_is_narrow(wide_list[i])) {
+            n = (int)(wide_list[i] & 0xffffu);
+            next_list[i] = first_list[n], first_list[n] = (short)i;
+        }
+    for (i = wide_carried_count - 1; wide_merge_carried && i >= 0; i--)
+        if (wide_carried[i] != WIDE_EMPTY && wide_row_is_narrow(wide_carried[i])) {
+            n = (int)(wide_carried[i] & 0xffffu);
+            next_carried[i] = first_carried[n], first_carried[n] = (short)i;
+        }
     /* what the picture held: its quantity follows the words, or the row goes */
     for (n = 0; n < 512; n++) {
-        int at_base = 0, at_theirs = 0, at_list = 0, occurrence;
+        int at_base = first_base[n], at_theirs = first_theirs[n], at_list = first_list[n], at_carried = first_carried[n], occurrence;
 
         for (occurrence = 0; occurrence < (int)count_base[n]; occurrence++) {
             unsigned was, now = 0;
-            int row = -1;
+            int row;
 
-            while (base[at_base] == 0xffff || (base[at_base] & 0x1ff) != n)
-                at_base++;
-            was = base[at_base++] >> 9;
+            was = base[at_base] >> 9;
+            at_base = next_base[at_base];
             if (occurrence < (int)count_theirs[n]) {
-                while (theirs[at_theirs] == 0xffff || (theirs[at_theirs] & 0x1ff) != n)
-                    at_theirs++;
-                now = theirs[at_theirs++] >> 9;
+                now = theirs[at_theirs] >> 9;
+                at_theirs = next_theirs[at_theirs];
             }
-            for (; at_list < WIDE_ROWS && row < 0; at_list++)
-                if (wide_list[at_list] != WIDE_EMPTY && wide_row_is_narrow(wide_list[at_list]) && (wide_list[at_list] & 0xffffu) == (DWORD)n)
-                    row = at_list;
+            row = at_list;
+            if (at_list >= 0)
+                at_list = next_list[at_list];
+            if (row < 0 && wide_merge_carried) {
+                /* (stage 4, fix pass) a narrow row this run CARRIES (the split of a longer list, no free row): it follows the words too */
+                if (at_carried < 0)
+                    break;      /* (the list no longer holds it: changed in place since the picture was made; nothing to follow) */
+                if (occurrence >= (int)count_theirs[n])
+                    wide_carried[at_carried] = WIDE_EMPTY, ++*gone, emptied++, wide_merge_emptied_game += wide_game_kind((DWORD)n) != 0;
+                else if (now != was)
+                    wide_carried[at_carried] = (DWORD)n | (DWORD)now << 16, ++*changed;
+                at_carried = next_carried[at_carried];
+                continue;
+            }
             if (row < 0)
-                break;          /* (the list no longer holds it: changed in place since the picture was made; nothing to follow) */
+                break;
             if (occurrence >= (int)count_theirs[n])
                 wide_list[row] = WIDE_EMPTY, ++*gone;
             else if (now != was)
                 wide_list[row] = (DWORD)n | (DWORD)now << 16, ++*changed;
         }
     }
-    /* what the words hold beyond the picture, in the words' order */
+    if (emptied) {
+        /* (stage 4, fix pass) the carried rows the words no longer hold: out, the others kept in their order */
+        int to = 0;
+        for (i = 0; i < wide_carried_count; i++)
+            if (wide_carried[i] != WIDE_EMPTY)
+                wide_carried[to] = wide_carried[i], wide_carried_home[to++] = wide_carried_home[i];
+        wide_carried_count = to;
+        wide_merge_emptied = emptied;
+    }
+    /* what the words hold beyond the picture, in the words' order: into the FIRST row of its number, else the FIRST free row
+       (stage 4b: each number's first row is looked up once; the first free row only moves on, as rows are only filled here) */
+    for (n = 0; n < 512; n++)
+        first_list[n] = -1;
+    for (i = wide_bound - 1; i >= 0; i--)
+        if (wide_list[i] != WIDE_EMPTY && wide_row_is_narrow(wide_list[i]))
+            first_list[wide_list[i] & 0xffffu] = (short)i;
+    for (free_row = 0; free_row < wide_bound && wide_list[free_row] != WIDE_EMPTY; free_row++)
+        ;
     for (i = 0; i < WIDE_GAME_ROWS; i++) {
         DWORD quantity;
-        int row, free_row = -1;
+        int row;
 
         if (theirs[i] == 0xffff)
             continue;
@@ -5791,26 +6208,22 @@ static void wide_merge_words(const WORD *base, const WORD *theirs, int *changed,
         if (seen[n]++ < count_base[n])
             continue;
         quantity = theirs[i] >> 9;
-        for (row = 0; row < WIDE_ROWS; row++) {
-            if (wide_list[row] == WIDE_EMPTY) {
-                if (free_row < 0 && row < wide_bound)
-                    free_row = row;
-            } else if (wide_row_is_narrow(wide_list[row]) && (wide_list[row] & 0xffffu) == (DWORD)n) {
-                break;
-            }
-        }
-        if (row < WIDE_ROWS) {
+        row = first_list[n];
+        if (row >= 0) {
             DWORD held = wide_list[row] >> 16, total = held + quantity;
 
             if (total > WIDE_QUANTITY_CAP)
                 total = held > WIDE_QUANTITY_CAP ? held : WIDE_QUANTITY_CAP;
             wide_list[row] = (DWORD)n | total << 16;
             ++*merged;
-        } else if (free_row >= 0) {
+        } else if (free_row < wide_bound) {
             wide_list[free_row] = (DWORD)n | quantity << 16;
+            first_list[n] = (short)free_row;
             ++*added;
+            for (free_row++; free_row < wide_bound && wide_list[free_row] != WIDE_EMPTY; free_row++)
+                ;
         } else {
-            wide_carry((DWORD)n | quantity << 16, WIDE_ROWS - 1);
+            wide_carry((DWORD)n | quantity << 16, wide_bound > WIDE_V2_ROWS ? wide_bound : WIDE_V2_ROWS - 1);     /* (stage 4: past the run's rows; with 510 rows the last, as before) */
             ++*carried;
         }
     }
@@ -5826,7 +6239,7 @@ static void wide_paint(void)
 
     if (wide_compact_now()) {
         static WORD words[WIDE_GAME_ROWS];
-        int left = wide_compact_picture(wide_list, words, wide_pic_row), painted = 0;
+        int left = wide_compact_picture(wide_list, wide_bound, words, wide_pic_row), painted = 0;
 
         for (i = 0; i < WIDE_GAME_ROWS; i++) {
             if (block[i] != words[i])
@@ -5869,7 +6282,7 @@ static void wide_paint(void)
 static void wide_guard(const char *moment)
 {
     static int odd_said = -1, twice_said = -1, missing_said = -1;
-    static BYTE seen_wide[(WIDE_ITEM_BAND + 7) / 8];
+    static BYTE seen_wide[(WIDE_GEAR_LAST - WIDE_ITEM_FIRST + 1 + 7) / 8];     /* (wide gear in the item list) numbers 1024-27999: the wide items' and the wide pieces' */
     BYTE seen[(WIDE_NARROW_MAX + 1) / 8];
     int i, bad = 0, odd = 0, twice = 0, first_bad = 0, first_odd = 0, out = 0, first_out = 0, missing = 0, first_missing = 0;
     DWORD bad_row = 0, bad_now = 0, odd_row = 0, out_row = 0;
@@ -5878,20 +6291,21 @@ static void wide_guard(const char *moment)
         seen[i] = 0;
     for (i = 0; i < (int)sizeof seen_wide; i++)
         seen_wide[i] = 0;
-    for (i = 0; i < WIDE_ROWS; i++) {
+    for (i = 0; i < wide_bound; i++) {         /* (stage 4: the list's own rows; every row past them is a guard row, below) */
         DWORD row = wide_list[i], number = row & 0xffffu, quantity = row >> 16, fixed;
 
         if (row == WIDE_EMPTY)
             continue;
-        if (i >= wide_bound)
-            fixed = WIDE_EMPTY;                                 /* a row the game's code cannot reach in this stage */
-        else if (quantity == 0xffffu)
+        if (quantity == 0xffffu)
             fixed = wide_row_of_word((unsigned)number);         /* (number is not ffff here) a 16-bit store of an old word over an empty row */
         else if (number == 0xffffu)
             fixed = WIDE_EMPTY;                                 /* a 16-bit "empty" written over a row */
         else if (number > WIDE_NARROW_MAX && number <= WIDE_NUMBER_MAX) {
-            /* (stage 2) a number above 511 */
-            if (!wide_items_ready() || !wide_item_number((int)number)) {
+            /* (stage 2) a number above 511. (Wide gear in the item list) a wide piece's number is a row like a wide item's
+               while wide gear is at work */
+            BOOL gear = gear_wide_live && gear_wide_kind((int)number) >= 0;
+
+            if (!wide_items_ready() || (!wide_item_number((int)number) && !gear)) {
                 /* a number this run cannot show: OUT of the list, carried; never another item */
                 if (!out++)
                     first_out = i, out_row = row;
@@ -5900,7 +6314,7 @@ static void wide_guard(const char *moment)
                 continue;
             }
             if (quantity <= WIDE_WORD_QUANTITY_MAX) {
-                /* a wide item's row: it stays, defined or not */
+                /* a wide item's row (or a wide piece's): it stays, defined or not */
                 int bit = (int)number - WIDE_ITEM_FIRST;
 
                 if (!quantity || quantity > WIDE_QUANTITY_CAP) {
@@ -5910,7 +6324,7 @@ static void wide_guard(const char *moment)
                 if (seen_wide[bit >> 3] & (1 << (bit & 7)))
                     twice++;
                 seen_wide[bit >> 3] |= (BYTE)(1 << (bit & 7));
-                if (!wide_item((int)number) && !missing++)
+                if (!gear && !wide_item((int)number) && !missing++)
                     first_missing = i;
                 continue;
             }
@@ -5932,11 +6346,12 @@ static void wide_guard(const char *moment)
         wide_list[i] = fixed;
     }
     {
-        /* (stage 3) the rows past the list's end: always empty (the game's draw loops read them; nothing writes them) */
+        /* (stage 3) the rows past the list's end: always empty (the game's draw loops read them; nothing writes them).
+           (Stage 4) every row from wide_bound to the array's end */
         int written = 0, first_written = 0;
         DWORD written_row = 0;
 
-        for (i = WIDE_ROWS; i < WIDE_ROWS + WIDE_GUARD_ROWS; i++)
+        for (i = wide_bound; i < WIDE_ROWS_MAX + WIDE_GUARD_ROWS; i++)
             if (wide_list[i] != WIDE_EMPTY) {
                 if (!written++)
                     first_written = i, written_row = wide_list[i];
@@ -5944,13 +6359,14 @@ static void wide_guard(const char *moment)
             }
         if (written && wide_may_say(WIDE_SAY_GUARD))
             log_line("*** wide list: at \"%s\" %d row(s) PAST THE END of the item list (rows %d and up, kept empty) held something; the first: row %d = %08lx. Emptied again: the list has %d rows. STOP and keep this log ***",
-                     moment, written, WIDE_ROWS, first_written, written_row, wide_bound);
+                     moment, written, wide_bound, first_written, written_row, wide_bound);
     }
     if (out) {
         if (wide_may_say(WIDE_SAY_GUARD))
             log_line("*** wide list: at \"%s\" %d row(s) held a number above 511 that this run CANNOT SHOW; the first: row %d = %08lx (number %lu, quantity %lu): %s. Taken OUT of the item list and CARRIED UNSEEN (%d row(s) are carried now): written again in the companion file at every save, never turned into another item. The list was in order at \"%s\"; the DLL's last own write: %s, asked by %08lx. STOP and keep this log ***",
                      moment, out, first_out, out_row, out_row & 0xffffu, out_row >> 16,
-                     !wide_items_ready() ? "wide items are not admitted in this run" : "only wide ITEMS, numbers 1024 to 9999, exist in this build",
+                     !wide_items_ready() ? "wide items are not admitted in this run" : gear_wide_kind((int)(out_row & 0xffffu)) >= 0 ? "wide gear is not at work in this run"
+                     : "only wide ITEMS, numbers 1024 to 9999, exist in this build",
                      wide_carried_count, wide_guard_good, wide_last_routine, wide_last_caller);
         wide_wrote("the guard (rows carried unseen)", 0);
     }
@@ -6048,7 +6464,7 @@ static void wide_refill(const char *moment)
 
     if (!wide_live)
         return;
-    for (i = 0; i < WIDE_ROWS + WIDE_GUARD_ROWS; i++) {      /* (stage 3: the rows past the game's 320, and the guard rows, are EMPTIED at every kernel load, new game and load) */
+    for (i = 0; i < WIDE_ROWS_MAX + WIDE_GUARD_ROWS; i++) {  /* (stage 3: the rows past the game's 320, and the guard rows, are EMPTIED at every kernel load, new game and load; stage 4: the whole array) */
         wide_list[i] = i < WIDE_GAME_ROWS ? wide_row_of_word(block[i]) : WIDE_EMPTY;
         if (i < WIDE_GAME_ROWS)
             wide_painted[i] = block[i], used += block[i] != 0xffff;
@@ -6084,7 +6500,7 @@ static void wide_dump(const char *moment)
         if (wide_rows || wide_carried_count)
             log_line("wide list dump: WIDE ITEMS: %d row(s) of the list hold a number above 511 (the first: row %d = %lu x %lu, \"%s\"); %d row(s) are CARRIED UNSEEN (the first: number %lu x %lu)",
                      wide_rows, first_wide, first_wide < 0 ? 0 : wide_list[first_wide] & 0xffffu, first_wide < 0 ? 0 : wide_list[first_wide] >> 16,
-                     first_wide < 0 ? "-" : wide_item_log_name((int)(wide_list[first_wide] & 0xffffu)), wide_carried_count,
+                     first_wide < 0 ? "-" : wide_thing_log_name((int)(wide_list[first_wide] & 0xffffu)), wide_carried_count,
                      wide_carried_count ? wide_carried[0] & 0xffffu : 0, wide_carried_count ? wide_carried[0] >> 16 : 0);
     }
     if (wide_live && wide_pic_compact)
@@ -6099,6 +6515,7 @@ static void wide_dump(const char *moment)
         log_line("wide list dump:   row %3d: %08lx = %lu x %lu | %04x%s", i, row, row & 0xffffu, row >> 16, word,
                  wide_word_of_row(row) == word && wide_row_is_narrow(row) ? ""
                  : word == 0xffff && wide_live && wide_items_ready() && wide_item_number((int)(row & 0xffffu)) ? "   (a WIDE ITEM: left out of the picture)"
+                 : word == 0xffff && wide_live && wide_items_ready() && gear_wide_live && gear_wide_kind((int)(row & 0xffffu)) >= 0 ? "   (a piece of WIDE GEAR: left out of the picture)"
                  : word == 0xffff && wide_live && wide_pic_compact && wide_row_is_narrow(row) ? "   (the picture has no room for it: in the companion file alone)" : "   <-- NOT the same thing");
     }
 }
@@ -6132,6 +6549,15 @@ static const char *wide_number_refusal(DWORD number, BOOL adding)
 {
     if (number <= WIDE_NARROW_MAX)
         return NULL;
+    if (gear_wide_live && gear_wide_kind((int)number) >= 0) {
+        /* (wide gear in the item list) a piece of wide gear is a row like a wide item's while wide gear is at work (and wide
+           things are admitted): add takes a piece a gear file defines; find and remove act on any piece's row */
+        if (!wide_items_ready())
+            return "wide items are not admitted in this run (see the \"wide items:\" lines at the start)";
+        if (adding && !wide_gear((int)number))
+            return "the gear files do not define it";
+        return NULL;
+    }
     if (!wide_item_number((int)number))
         return number < WIDE_ITEM_FIRST ? "numbers 512 to 1023 are never given to anything"
              : number <= WIDE_NUMBER_MAX ? "only wide ITEMS, numbers 1024 to 9999, exist in this build" : "no number above 32767 can exist";
@@ -6188,7 +6614,7 @@ static void wide_add(DWORD number, DWORD quantity, DWORD caller, const char *rou
         for (i = 0; i < wide_bound && wide_list[i] != WIDE_EMPTY; i++)
             ;
         if (i == wide_bound) {
-            if (wide_bound == WIDE_ROWS || sxc3_item_carried) {
+            if (wide_bound > WIDE_GAME_ROWS || sxc3_item_carried) {
                 /* (fix pass, finding 6) 510 rows full, or 320 rows beside a carried list (a save of the list of 510: its picture fills all 320 words) */
                 if (wide_may_say(WIDE_SAY_REFUSED))
                     log_line("*** wide list: add of %lu of item %lu, asked by %08lx (%s): THE LIST IS FULL (%d rows): NOTHING is added ***", quantity, number,
@@ -6391,6 +6817,8 @@ static BOOL gear_wide_taken(DWORD word, DWORD caller, DWORD *answer);
 static void gear_wide_gate(void);       /* (with the Equip menu's start-up line, among the sites) */
 static void gear_wide_loaded(void);
 static void gear_worn_after_load(void); /* (the three are with the companion's code) */
+static int character_wide_defer;        /* (a sheet's wide piece) set by load_accepted_hook while it makes the characters: their wide pieces are put on after the save's WORN entries */
+static void character_wide_wear_pending(const char *moment);
 static void gear_worn_save_begin(void);
 static void gear_worn_save_end(int result);
 static BOOL gear_worn_writes(void);     /* (fix pass of B5, findings 2 and 3) */
@@ -6492,7 +6920,7 @@ static void stock_row_put(int row, int number, int quantity, const char *routine
         ((WORD *)ADDR_STOCK)[row] = (WORD)(number | quantity << 9);
         return;
     }
-    if (number < 0 || quantity < 0 || (number > (int)WIDE_NARROW_MAX ? !wide_item_usable(number) || quantity > (int)WIDE_WORD_QUANTITY_MAX
+    if (number < 0 || quantity < 0 || (number > (int)WIDE_NARROW_MAX ? !wide_thing_usable(number) || quantity > (int)WIDE_WORD_QUANTITY_MAX
                                                                          : !wide_row_is_narrow((DWORD)number | (DWORD)quantity << 16))) {
         if (wide_may_say(WIDE_SAY_REFUSED))
             log_line("*** wide list: %s: row %d is NOT written with number %d, quantity %d: no row can hold that in this run ***", routine, row, number, quantity);
@@ -6565,10 +6993,10 @@ static BOOL wide_row_beyond_words(DWORD row, int at)
    UNSEEN: returns 1 moved, 2 carried. */
 static int wide_take_row(DWORD row, int home, int pass)
 {
-    BOOL shown = wide_items_ready() && wide_item_number((int)(row & 0xffffu)) && (row >> 16) <= WIDE_WORD_QUANTITY_MAX;
+    BOOL shown = wide_items_ready() && (wide_item_number((int)(row & 0xffffu)) || (gear_wide_live && gear_wide_kind((int)(row & 0xffffu)) >= 0)) && (row >> 16) <= WIDE_WORD_QUANTITY_MAX;     /* (wide gear in the item list) a wide piece's row too while wide gear is at work */
     int i;
 
-    if (!shown && wide_bound == WIDE_ROWS && row != WIDE_EMPTY && wide_row_is_narrow(row)) {
+    if (!shown && wide_bound > WIDE_GAME_ROWS && row != WIDE_EMPTY && wide_row_is_narrow(row)) {
         /* (stage 3) a row of a number 0-511 past the game's 320 in a version-1 list (a row some build carried): with 510 rows it
            can be shown. By NUMBER: if the list holds the number, the quantity is added to that row (capped at 99) */
         for (i = 0; i < wide_bound && (wide_list[i] == WIDE_EMPTY || (wide_list[i] & 0xffffu) != (row & 0xffffu)); i++)
@@ -6611,7 +7039,7 @@ static int wide_rows_at_stake(void)
         static WORD words[WIDE_GAME_ROWS];
         static short map[WIDE_GAME_ROWS];
 
-        return n + wide_compact_picture(wide_list, words, map);
+        return n + wide_compact_picture(wide_list, wide_bound, words, map);
     }
     for (i = 0; wide_live && i < WIDE_GAME_ROWS; i++)
         n += wide_list[i] != WIDE_EMPTY && !wide_row_is_narrow(wide_list[i]);
@@ -6626,37 +7054,45 @@ static int wide_rows_at_stake(void)
         row from the game's 320th up (out of the game's way), else at any free row.
    *held = rows put in by 2 and 3 (0: the list is the words, widened, as before stage 2);
    *no_room = carried rows that found no row (said with *** by the save). */
+static int wide_section_misfit;     /* (stage 4) the last wide_section_rows / wide_section_list: carried rows that list's version cannot hold as its reader needs them (then the save writes version 3) */
 static void wide_section_rows(DWORD *out, const BYTE *words, int *held, int *no_room)
 {
     int i, j;
 
     *held = *no_room = 0;
+    wide_section_misfit = 0;
     wide_from_words(out, words);
     for (i = 0; wide_live && i < WIDE_GAME_ROWS; i++)
         if (wide_list[i] != WIDE_EMPTY && !wide_row_is_narrow(wide_list[i])) {
-            for (j = i; j < WIDE_ROWS && out[j] != WIDE_EMPTY; j = j < WIDE_GAME_ROWS ? WIDE_GAME_ROWS : j + 1)
+            for (j = i; j < WIDE_V2_ROWS && out[j] != WIDE_EMPTY; j = j < WIDE_GAME_ROWS ? WIDE_GAME_ROWS : j + 1)
                 ;       /* (its own row is free: the picture has ffff there; anything else is looked for past the game's rows) */
-            if (j < WIDE_ROWS)
+            if (j < WIDE_V2_ROWS)
                 out[j] = wide_list[i], ++*held;
             else
                 ++*no_room;
         }
-    for (i = 0; i < wide_carried_count; i++)
+    for (i = 0; i < wide_carried_count; i++) {
+        if (wide_carried_home[i] >= WIDE_V2_ROWS) {
+            wide_section_misfit++;      /* (stage 4) a home past this version's 510 rows (a row of a longer list): looked for below */
+            continue;
+        }
         if (out[wide_carried_home[i]] == WIDE_EMPTY)
             out[wide_carried_home[i]] = wide_carried[i], wide_carried_home[i] |= 0x8000, ++*held;        /* (marked: placed at its own row) */
+    }
     for (i = 0; i < wide_carried_count; i++) {
         if (wide_carried_home[i] & 0x8000) {
             wide_carried_home[i] &= 0x7fff;
             continue;
         }
-        for (j = WIDE_GAME_ROWS; j < WIDE_ROWS && out[j] != WIDE_EMPTY; j++)
+        for (j = WIDE_GAME_ROWS; j < WIDE_V2_ROWS && out[j] != WIDE_EMPTY; j++)
             ;
-        if (j == WIDE_ROWS)
+        if (j == WIDE_V2_ROWS)
             for (j = WIDE_GAME_ROWS - 1; j >= 0 && out[j] != WIDE_EMPTY; j--)
                 ;
-        if (j >= 0)
+        if (j >= 0) {
             out[j] = wide_carried[i], ++*held;
-        else
+            wide_section_misfit += j < WIDE_GAME_ROWS && wide_row_is_narrow(wide_carried[i]);     /* (stage 4) a narrow row below the 320: its reader takes the save's word there */
+        } else
             ++*no_room;
     }
 }
@@ -6676,19 +7112,71 @@ static void wide_section_list(DWORD *out, const BYTE *words, int *held, int *no_
     int i, j;
 
     *no_room = *differs = 0;
-    for (i = 0; i < WIDE_ROWS; i++)
+    wide_section_misfit = 0;
+    for (i = 0; i < WIDE_V2_ROWS; i++)
         out[i] = wide_list[i];
     for (i = 0; i < wide_carried_count; i++) {
         j = wide_carried_home[i];
+        if (j >= WIDE_V2_ROWS || wide_row_is_narrow(wide_carried[i])) {
+            /* (stage 4) a row this version cannot hold as its reader needs it: a home past its 510 rows; or a NARROW row this run
+               did not show: the next load computes the picture over all 510 rows and would find it there and not in the save's
+               words (and take it out as gone). The save writes version 3 instead */
+            wide_section_misfit++;
+            continue;
+        }
         if (out[j] != WIDE_EMPTY)
-            for (j = WIDE_ROWS - 1; j >= 0 && out[j] != WIDE_EMPTY; j--)
+            for (j = WIDE_V2_ROWS - 1; j >= 0 && out[j] != WIDE_EMPTY; j--)
                 ;
         if (j >= 0)
             out[j] = wide_carried[i];
         else
             ++*no_room;
     }
-    *held = wide_compact_picture(out, picture, map);
+    *held = wide_compact_picture(out, WIDE_V2_ROWS, picture, map);
+    for (i = 0; i < WIDE_GAME_ROWS; i++)
+        *differs += picture[i] != (WORD)((unsigned)words[i * 2] | (unsigned)words[i * 2 + 1] << 8);
+}
+
+/* (Stage 4) AT A SAVE, in a run with more than 320 rows, when the list does not fit version 1 or 2 (a list longer than 510
+   rows; or carried rows those versions cannot hold): THE ITEM LIST OF VERSION 3. Rows 0 to wide_bound - 1 are the run's own
+   list ("shown": its picture is what the save's 320 words hold, *compact says which picture); then each carried row at its
+   home if that is at or past wide_bound and free, else at the lowest free row at or past wide_bound; a carried WIDE row that
+   finds none there takes any free row (it is in no picture); a carried NARROW row never goes below wide_bound (the next load
+   computes the picture over rows 0 to wide_bound - 1: it must not find there a row the save's words lack): if it finds no
+   row it is *no_room. *count: the highest row used + 1, rounded up to even, at least 512 (never a version-2 length), at most
+   WIDE_ROWS_MAX. *held, *differs as wide_section_list. */
+static void wide_section_list3(DWORD *out, const BYTE *words, int *held, int *no_room, int *differs, int *count, BYTE *compact)
+{
+    static WORD picture[WIDE_GAME_ROWS];
+    static short map[WIDE_GAME_ROWS];
+    int i, j, last = -1, shown = wide_bound;
+
+    *no_room = *differs = 0;
+    *compact = (BYTE)(wide_compact_now() != 0);
+    for (i = 0; i < WIDE_ROWS_MAX; i++)
+        out[i] = i < shown ? wide_list[i] : WIDE_EMPTY;
+    for (i = 0; i < wide_carried_count; i++) {
+        j = wide_carried_home[i];
+        if (j < shown || j >= WIDE_ROWS_MAX || out[j] != WIDE_EMPTY)
+            for (j = shown; j < WIDE_ROWS_MAX && out[j] != WIDE_EMPTY; j++)
+                ;
+        if (j >= WIDE_ROWS_MAX && !wide_row_is_narrow(wide_carried[i]))
+            for (j = 0; j < shown && out[j] != WIDE_EMPTY; j++)
+                ;       /* (a WIDE row only: a narrow one is never below the shown rows) */
+        if (j < WIDE_ROWS_MAX && out[j] == WIDE_EMPTY)
+            out[j] = wide_carried[i];
+        else
+            ++*no_room;
+    }
+    for (i = 0; i < WIDE_ROWS_MAX; i++)
+        if (out[i] != WIDE_EMPTY)
+            last = i;
+    *count = (last + 2) & ~1;
+    if (*count < WIDE_V2_ROWS + 2)
+        *count = WIDE_V2_ROWS + 2;
+    *held = *compact ? wide_compact_picture(out, shown, picture, map) : wide_row_picture(out, shown, picture, map);
+    for (i = shown; i < *count; i++)
+        *held += out[i] != WIDE_EMPTY;
     for (i = 0; i < WIDE_GAME_ROWS; i++)
         *differs += picture[i] != (WORD)((unsigned)words[i * 2] | (unsigned)words[i * 2 + 1] << 8);
 }
@@ -6705,8 +7193,8 @@ static void wide_section_list(DWORD *out, const BYTE *words, int *held, int *no_
    (kind 0: 0x80-0xff, 1: 0x100-0x11f, 2: 0x120-0x15f; any other kind: no row at all), so the
    rows counted and hidden are those of the kind asked for. */
 #define WIDE_EQUIP_ROOM         0x140
-static DWORD wide_equip_hidden[WIDE_ROWS - WIDE_EQUIP_ROOM];
-static WORD wide_equip_hidden_at[WIDE_ROWS - WIDE_EQUIP_ROOM];
+static DWORD wide_equip_hidden[WIDE_ROWS_MAX - WIDE_EQUIP_ROOM];
+static WORD wide_equip_hidden_at[WIDE_ROWS_MAX - WIDE_EQUIP_ROOM];
 static int wide_equip_hide(int kind)
 {
     DWORD first = kind == 0 ? 0x80 : kind == 1 ? 0x100 : 0x120, end = kind == 0 ? 0x100 : kind == 1 ? 0x120 : 0x160;
@@ -6714,7 +7202,7 @@ static int wide_equip_hide(int kind)
 
     if (!wide_live || wide_bound <= WIDE_GAME_ROWS || kind < 0 || kind > 2)
         return 0;
-    for (i = 0; i < WIDE_ROWS; i++) {
+    for (i = 0; i < wide_bound; i++) {
         DWORD row = wide_list[i], number = row & 0xffffu;
 
         if (row == WIDE_EMPTY || number < first || number >= end || ++gear <= WIDE_EQUIP_ROOM)
@@ -6749,7 +7237,7 @@ static void wide_battle_guard(void)
 
     if (wide_battle_at != wide_battle)
         return;
-    for (i = WIDE_ROWS, entry = wide_battle + WIDE_ROWS * 6; i < WIDE_ROWS + WIDE_GUARD_ROWS; i++, entry += 6)
+    for (i = battle_rows(), entry = wide_battle + battle_rows() * 6; i < WIDE_ROWS_MAX + WIDE_GUARD_ROWS; i++, entry += 6)        /* (stage 4) every entry from the battle's rows to the array's end */
         entry[0] = entry[1] = 0xff, entry[2] = entry[3] = 0, entry[4] = 0x0b, entry[5] = 0;
 }
 /* ==== THE WIDE ITEM LIST, STAGE 1 (THE SWITCH), the list and its routines: end ==== */
@@ -6798,7 +7286,7 @@ static void wide_battle_guard(void)
 #define BOX_KINDS_MAX           12000
 #define BOX_COUNT_MAX           65535
 #define BOX_FILE_ROOM           0x10000     /* (= SXC3_SECTIONS_ROOM: checked where that is defined) */
-#define BOX_ITEM_SECTION        (12 + 4 + WIDE_ROWS * 4)    /* (= a section head and SXC3_ITEM_BYTES: checked there) */
+#define BOX_ITEM_SECTION        (12 + 8 + WIDE_ROWS_MAX * 4)    /* (= a section head and SXC3_ITEM_BYTES_MAX: checked there) (stage 4: the longest item list this build can write, of version 3: the box's room never shrinks when the list grows) */
 #define BOX_SECTION_FIXED       (12 + 8)    /* a `BOX ` section's head and what comes before its entries */
 #define BOX_RESERVE             4096
 #define BOX_KEYS_WRITTEN        32
@@ -6942,13 +7430,14 @@ static BOOL box_acts(void)
                add: STITM, FLITM, the shop's buy, anybody else; the DLL's own add: the spoils of
                0x180 and up; the spoils below 0x180; the testing aids of a load; a piece that comes
                off in the Equip menu, the strip) and the item list has NO ROW for it (the game would
-               lose it), or the thing is a piece of WIDE gear (10000 and up: it lives nowhere
-               else). The thing goes into the box; the state is KNOWN; the save is marked (HAS_BOX
+               lose it). (Wide gear in the item list: a piece of WIDE gear is such a thing too, and
+               wakes it ONLY for overflow: never because it arrived, was given at a load, was made by
+               a character's sheet or is worn.) The thing goes into the box; the state is KNOWN; the save is marked (HAS_BOX
                at its next save); the Box row appears, "Box new" in yellow until the Box screen is
                opened (the header bit BOX_NEW keeps that across a save); the log says so.
      AWAKE     box = on's box with one difference, OVERFLOW ONLY: nothing goes to the box because
                it is gear (no R1 on arrival, no R4 for a piece that comes off, no R8 after a
-               battle); it takes what the item list has no row for, wide gear, and what the player
+               battle); it takes what the item list has no row for and what the player
                moves by hand in the Box screen (Store gear included). The Equip menu sees both
                stores (R5, the item list first); scripts and the shop count both (R6, R7).
    A save that has a box (the mark) loads AWAKE; a save that woke and has room again stays awake.
@@ -6983,10 +7472,12 @@ static BOOL box_routes(int number)
     return !box_is_auto() && box_stores(number);
 }
 
-/* A load decided KNOWN for a save that never had a box: with auto it sleeps. TRUE: it does now. */
+/* A load decided KNOWN for a save that never had a box: with auto it sleeps. TRUE: it does now.
+   (Wide gear in the item list) a worn or kept wide piece no longer keeps it awake: the list of worn
+   pieces is written and read while the box sleeps. */
 static BOOL box_settle_auto(void)
 {
-    if (!box_live || !box_is_auto() || box_state != BOX_KNOWN || box_mark || box_kinds || box_unseen || gear_worn_writes())
+    if (!box_live || !box_is_auto() || box_state != BOX_KNOWN || box_mark || box_kinds || box_unseen)
         return FALSE;
     box_state = BOX_DORMANT;
     return TRUE;
@@ -7120,10 +7611,8 @@ static int list_room(int number)
     int i;
 
     if (!wide_live || !box_number_defined(number))
-        return 0;
-    if (gear_wide_kind(number) >= 0)
-        return 0;       /* (stage B5) a wide piece of gear lives in the box or on a character, never in the item list (reached only while wide gear is at work: no such number is defined otherwise) */
-    if (sxc3_item_carried && (number > (int)WIDE_NARROW_MAX || wide_bound == WIDE_ROWS || !wide_game_kind((DWORD)number)))
+        return 0;       /* (wide gear in the item list) a wide piece that a gear file defines while wide gear is at work has room as any wide item */
+    if (sxc3_item_carried && (number > (int)WIDE_NARROW_MAX || wide_bound > WIDE_GAME_ROWS || !wide_game_kind((DWORD)number)))
         return 0;       /* (fix pass of B2, finding 1) a loaded companion's item list is carried in the list's place: a save of this run writes no list of its own, so a row the game's 320 words cannot hold would be written nowhere: it stays in the box */
     row = wide_find((DWORD)number, 0, "find (the box)");
     if (row != WIDE_EMPTY)
@@ -7240,11 +7729,11 @@ static const char *box_take_all(void)
 }
 
 /* (box = auto) THE BOX WAKES for this save: `quantity` of `number` arrived (`how`) and the item
-   list has no row for it, or it is a piece of wide gear (`wide`). DORMANT -> KNOWN, marked; the Box
-   row appears ("Box new" until its screen is opened); the log says it. The caller then goes the
-   way of a box that acts, which puts the thing in the box. TRUE if the box acts now. Nothing in
-   any other state. */
-static BOOL box_wake(int number, int quantity, const char *how, BOOL wide)
+   list has no row for it. DORMANT -> KNOWN, marked; the Box row appears ("Box new" until its
+   screen is opened); the log says it. The caller then goes the way of a box that acts, which puts
+   the thing in the box. TRUE if the box acts now. Nothing in any other state. (Wide gear in the
+   item list: a piece of wide gear wakes it only as any thing does, for overflow.) */
+static BOOL box_wake(int number, int quantity, const char *how)
 {
     if (!box_dormant())
         return box_acts();
@@ -7252,11 +7741,11 @@ static BOOL box_wake(int number, int quantity, const char *how, BOOL wide)
     box_mark = 1;
     box_unseen = 1;
     box_woke++;
-    wsprintfA(box_woke_text, wide ? "The box woke: %s came (wide gear lives in the box or on a character)" : "The box woke: %s came and the item list had no row for it",
+    wsprintfA(box_woke_text, "The box woke: %s came and the item list had no row for it",
               box_number_text(number));
-    log_line("box: WAKES (box = auto)%s: %d of %s arrived (%s) and %s: it goes into the BOX. From now on this save has a box: the Box row is in the main menu (\"Box new\" until the Box screen is opened) and the companion file is marked at the next save. Overflow only: the box takes what the item list has no row for, and wide gear",
+    log_line("box: WAKES (box = auto)%s: %d of %s arrived (%s) and %s: %s. From now on this save has a box: the Box row is in the main menu (\"Box new\" until the Box screen is opened) and the companion file is marked at the next save. Overflow only: the box takes what the item list has no row for",
              box_selftest_running ? " (the SELF-TEST's own, on a snapshot)" : "", quantity, box_number_text(number), how ? how : "?",
-             wide ? "it is a piece of WIDE GEAR, which lives only in the box or on a character" : "THE ITEM LIST HAS NO ROW FOR IT");
+             "THE ITEM LIST HAS NO ROW FOR IT", "it goes into the BOX");
     return TRUE;
 }
 
@@ -7370,7 +7859,10 @@ static int box_view_build(int side, int filter)
 
             if (row == WIDE_EMPTY || (filter && box_kind_of((int)(row & 0xffffu)) != filter - 1))
                 continue;
-            box_view[n++] = (WORD)i;        /* (wide_bound is far below the view's room) */
+            if (n < BOX_VIEW_ROOM)          /* (stage 4b) bounded as the box's side is: wide_bound is far below the view's room (box_check_max) */
+                box_view[n++] = (WORD)i;
+            else
+                box_view_cut++;
         }
     }
     box_view_count = n;
@@ -7422,8 +7914,7 @@ static int box_move_most(int side, int entry, const char **why)
     if (side == BOX_SIDE_BOX) {
         room = list_room(number);
         if (!room)
-            *why = gear_wide_kind(number) >= 0 ? "Wide gear stays in the box: put it on in the Equip menu" :      /* (stage B5) */
-                   sxc3_item_carried && (number > (int)WIDE_NARROW_MAX || wide_bound == WIDE_ROWS || !wide_game_kind((DWORD)number)) ? "It stays in the box: this run cannot save it in the list" :     /* (fix pass of B2, finding 1) */
+            *why = sxc3_item_carried && (number > (int)WIDE_NARROW_MAX || wide_bound > WIDE_GAME_ROWS || !wide_game_kind((DWORD)number)) ? "It stays in the box: this run cannot save it in the list" :     /* (fix pass of B2, finding 1) */
                    wide_find((DWORD)number, 0, "find (the box)") != WIDE_EMPTY ? "The item list holds 99 of it" : "The item list is full";
     } else {
         room = BOX_COUNT_MAX - box_held(number);
@@ -7614,15 +8105,15 @@ static int box_arrive_said, box_owned_said, box_unknown_said;
 static DWORD box_owned_last[3] = { 0xffffffffu, 0, 0 };    /* (fix pass of B3, findings 1 and 2) the number, the list's count and the box's count of the last "a shop counts" line: the shop asks every frame */
 static int box_arrival_went;                /* where the last arrival went: 0 the item list's own add, 1 the box */
 static int box_arrival_went;                /* where the last arrival went: 0 the item list's own add, 1 the box */
-static WORD box_battle_number[WIDE_ROWS];   /* the battle's copy of the item list as it was at the battle's start: numbers and quantities */
-static BYTE box_battle_quantity[WIDE_ROWS];
+static WORD box_battle_number[WIDE_ROWS_MAX];   /* the battle's copy of the item list as it was at the battle's start: numbers and quantities */
+static BYTE box_battle_quantity[WIDE_ROWS_MAX];
 static int box_battle_noted = -1;           /* how many entries; -1: no battle's start is noted */
 
 /* A row of this number would be written nowhere at a save of this run (the fix pass of B2: a run
    that CARRIES the loaded companion's item list writes no list of its own). */
 static BOOL box_list_cannot_save(int number)
 {
-    return sxc3_item_carried && (number > (int)WIDE_NARROW_MAX || wide_bound == WIDE_ROWS || !wide_game_kind((DWORD)number));
+    return sxc3_item_carried && (number > (int)WIDE_NARROW_MAX || wide_bound > WIDE_GAME_ROWS || !wide_game_kind((DWORD)number));
 }
 
 /* Who called the game's add: by the address it returns to. NULL: none of the game's three. */
@@ -7651,26 +8142,18 @@ static int box_arrive(DWORD number, DWORD quantity, DWORD caller, const char *ro
 
     box_arrival_went = 0;
     if (box_dormant() && wide_live && number < BOX_NUMBERS && q && box_number_defined((int)number)) {
-        /* (box = auto) the box sleeps: it WAKES for this save when the item list has no row for the thing (it would be lost),
-           or the thing is a piece of wide gear (it can live nowhere else); else the sleeping box is the LOCKED one: box = off */
-        BOOL wide = gear_wide_kind((int)number) >= 0;
-
+        /* (box = auto) the box sleeps: it WAKES for this save when the item list has no row for the thing (it would be lost);
+           else the sleeping box is the LOCKED one: box = off. (Wide gear in the item list) a piece of wide gear likewise:
+           overflow only */
         wide_sync(routine);
-        if (wide || (wide_find(number, caller, routine) == WIDE_EMPTY && list_room((int)number) <= 0))
-            box_wake((int)number, (int)q, from == BOX_FROM_DLL ? "the DLL's own add" : box_arrival_caller(caller) ? box_arrival_caller(caller) : "a caller of the game's add that is none of the game's three", wide);
+        if (wide_find(number, caller, routine) == WIDE_EMPTY && list_room((int)number) <= 0)
+            box_wake((int)number, (int)q, from == BOX_FROM_DLL ? "the DLL's own add" : box_arrival_caller(caller) ? box_arrival_caller(caller) : "a caller of the game's add that is none of the game's three");
     }
     if (!box_acts() || !wide_live || number >= BOX_NUMBERS || !q || !box_number_defined((int)number)) {
-        if (box_live && gear_wide_kind((int)number) >= 0 && box_number_defined((int)number)) {
-            /* (warn, D2 of the RECEIVE review) a piece of wide gear while the box is LOCKED: it can live nowhere else; said as it is (wide_add would say only wide ITEMS exist) */
-            if (wide_may_say(WIDE_SAY_REFUSED))     /* (review of warn, 2) limited as the wide_add line it replaces */
-                log_line("*** box: arriving: %lu of %s (%s): it CANNOT go into the box: %s. Wide gear lives only in the box or on a character: NOTHING is added ***", q, box_number_text((int)number), routine,
-                         !q ? "a quantity of 0 (the 7 bits the game's word holds)" : box_locked_text());     /* (review of warn, 1) */
-            return 0;
-        }
-        wide_add(number, quantity, caller, routine);
+        wide_add(number, quantity, caller, routine);    /* (wide gear in the item list) a piece of wide gear too, as any wide item: the list (nothing with no row) */
         return 0;
     }
-    gear = box_routes((int)number) || gear_wide_kind((int)number) >= 0;       /* (box = auto: OVERFLOW ONLY) no gear is routed by R1; a wide piece goes to the box */
+    gear = box_routes((int)number);       /* (box = auto: OVERFLOW ONLY) no gear is routed by R1. (Wide gear in the item list) box = on routes wide gear by R1 as all gear it stores; auto: overflow only */
     who = from == BOX_FROM_DLL ? "the DLL's own add" : box_arrival_caller(caller);
     if (!who) {
         who = "a caller of the game's add that is none of the game's three";
@@ -7746,11 +8229,11 @@ static BOOL box_aid_give(int number, int quantity, BOOL room, const char *aid)
 {
     BOOL gear;
 
-    if (box_dormant() && wide_live && quantity > 0 && number >= 0 && number < BOX_NUMBERS && box_number_defined(number) && (!room || gear_wide_kind(number) >= 0))
-        box_wake(number, quantity, aid, gear_wide_kind(number) >= 0);       /* (box = auto) a testing aid with no row for the thing, or a wide piece: the box wakes */
+    if (box_dormant() && wide_live && quantity > 0 && number >= 0 && number < BOX_NUMBERS && box_number_defined(number) && !room)
+        box_wake(number, quantity, aid);       /* (box = auto) a testing aid with no row for the thing: the box wakes (wide gear in the item list: a wide piece too, for overflow only) */
     if (!box_acts() || !wide_live || quantity <= 0 || number < 0 || number >= BOX_NUMBERS || !box_number_defined(number))
         return FALSE;
-    gear = box_routes(number) || gear_wide_kind(number) >= 0;       /* (box = auto: overflow only) */
+    gear = box_routes(number);       /* (box = auto: overflow only) */
     if (!gear && room && !box_list_cannot_save(number))
         return FALSE;
     if (!box_put(number, quantity)) {
@@ -7813,7 +8296,7 @@ static int box_spoils_pick(const WORD *list)
         /* (box = auto) the sleeping box wakes when the game's routine would lose an entry: the list has no row for it */
         wide_sync("the spoils of a battle (the box on demand)");
         if ((i = box_spoils_lost(list)) >= 0)
-            box_wake((short)list[i * 3], (short)list[i * 3 + 1], "the spoils of a battle won", FALSE);
+            box_wake((short)list[i * 3], (short)list[i * 3 + 1], "the spoils of a battle won");
     }
     if (!box_acts() || !wide_live)
         return 0;
@@ -7850,13 +8333,12 @@ static void box_spoils_entry(int id, int count)
                   : "spoils: %d of %s given through the item list's own add (the box did not take it; the game's routine was kept from the entry)", count, box_number_text(id));
 }
 
-/* (RECEIVE) `count` of a wide thing from a battle goes into the BOX at once: a piece of WIDE GEAR (`gear`: the
-   spoils, a steal, a morph; it can live nowhere else) or a wide ITEM the battle's copy of the item list has no
-   row for (a steal, a morph). A sleeping box (box = auto) WAKES for it, as for any arrival with no row or of
-   wide gear. Returns what the box took (all of it), or 0 with a *** line: the box is not at work, is LOCKED, or
-   cannot take it (65,535 of it; its cap of kinds). Like every arrival it calls no remove routine and moves no
-   row of the item list. */
-static int receive_box(int number, int count, const char *how, BOOL gear)
+/* (RECEIVE) `count` of a wide thing from a battle goes into the BOX at once: a wide ITEM, or (wide gear in the
+   item list) a piece of WIDE GEAR, that the battle's copy of the item list has no row for (a steal, a morph). A
+   sleeping box (box = auto) WAKES for it, as for any arrival with no row. Returns what the box took (all of it),
+   or 0 with a *** line: the box is not at work, is LOCKED, or cannot take it (65,535 of it; its cap of kinds).
+   Like every arrival it calls no remove routine and moves no row of the item list. */
+static int receive_box(int number, int count, const char *how)
 {
     const char *why = receive_refusal(number);
 
@@ -7865,24 +8347,21 @@ static int receive_box(int number, int count, const char *how, BOOL gear)
     if (!why && (!box_live || !wide_live))
         why = !box_live ? "the box is not at work in this run" : "the item list is not the DLL's in this run";
     if (!why && box_dormant())
-        box_wake(number, count, how, gear);
+        box_wake(number, count, how);
     if (!why && !box_acts())
         why = box_locked_text();
     if (!why && !box_put(number, count))
         why = box_held(number) ? "it would pass 65535 of it" : "it holds all the kinds it can";
     if (why) {
         log_line("*** box: arriving: %d of %s (%s): it CANNOT go into the box: %s. %s ***", count, box_number_text(number), how, why,
-                 gear ? "Wide gear lives only in the box or on a character: NOTHING is added" : "The battle's item list has no row for it either: it is LOST, as the game loses a gain into a full list");
+                 "The battle's item list has no row for it either: it is LOST, as the game loses a gain into a full list");
         return 0;
     }
-    if (gear)
-        box_arrived_box += count;
-    else
-        box_arrived_full += count;
+    box_arrived_full += count;
     box_arrival_went = 1;
     if (box_arrive_may_say())
         log_line("box: arriving: %d of %s (%s): %s: it goes to the BOX; the box holds %d of it now, %d kinds, %lu pieces%s", count, box_number_text(number), how,
-                 gear ? "WIDE GEAR lives in the box or on a character, never in the item list" : "THE BATTLE'S ITEM LIST HAS NO ROW FOR IT",
+                 "THE BATTLE'S ITEM LIST HAS NO ROW FOR IT",
                  box_held(number), box_kinds, box_pieces, box_arrive_said == BOX_ARRIVE_LINES ? " (no more such lines in this run)" : "");
     return count;
 }
@@ -7895,7 +8374,7 @@ static void box_battle_note(const BYTE *copy, int rows)
     int i, n = 0;
 
     box_battle_noted = -1;
-    if (!box_acts() || !wide_live || rows < 0 || rows > WIDE_ROWS)
+    if (!box_acts() || !wide_live || rows < 0 || rows > WIDE_ROWS_MAX)
         return;
     for (i = 0; i < rows; i++) {
         unsigned id = *(const WORD *)(copy + i * 6);
@@ -7917,27 +8396,40 @@ static void box_battle_note(const BYTE *copy, int rows)
    once. Returns the pieces moved. */
 static int box_battle_surplus(BOOL won)
 {
-    int i, k, n = box_battle_noted, kinds = 0, pieces = 0, stayed = 0, refused = 0;
+    /* (Stage 4b) LINEAR in the rows: one pass gives every number its first row, its total and its rows (chained from the last
+       back), where the stage-3 form walked the rows before and after each row again; the numbers are taken in the order of
+       their first rows, as before, and the rows written are the same (a number's turn changes only its own rows) */
+    static WORD slot_of[BOX_NUMBERS];                   /* 0: no row of the number; else 1 + its slot (cleared again at the end) */
+    static WORD number_of[WIDE_ROWS_MAX];
+    static int now_of[WIDE_ROWS_MAX], before_of[WIDE_ROWS_MAX];
+    static short last_row[WIDE_ROWS_MAX], prev_row[WIDE_ROWS_MAX];
+    int i, k, s, slots = 0, n = box_battle_noted, kinds = 0, pieces = 0, stayed = 0, refused = 0;
 
     box_battle_noted = -1;
     if (n < 0 || !box_acts() || !wide_live || box_is_auto())
         return 0;           /* (box = auto: overflow only) gear gained in a battle stays where the battle put it */
     for (i = 0; i < wide_bound; i++) {
         DWORD row = wide_list[i];
-        int number = (int)(row & 0xffffu), now = 0, before = 0, surplus, left;
+        int number = (int)(row & 0xffffu);
 
         if (row == WIDE_EMPTY || number >= BOX_NUMBERS)
             continue;
-        for (k = 0; k < i && (wide_list[k] == WIDE_EMPTY || (int)(wide_list[k] & 0xffffu) != number); k++)
-            ;
-        if (k < i || !box_number_defined(number) || !box_stores(number))
+        if (!slot_of[number]) {
+            number_of[slots] = (WORD)number, now_of[slots] = before_of[slots] = 0, last_row[slots] = -1;
+            slot_of[number] = (WORD)++slots;
+        }
+        s = slot_of[number] - 1;
+        now_of[s] += (int)(row >> 16);
+        prev_row[i] = last_row[s], last_row[s] = (short)i;
+    }
+    for (k = 0; k < n; k++)
+        if (box_battle_number[k] < BOX_NUMBERS && slot_of[box_battle_number[k]])
+            before_of[slot_of[box_battle_number[k]] - 1] += box_battle_quantity[k];
+    for (s = 0; s < slots; s++) {
+        int number = number_of[s], now = now_of[s], before = before_of[s], surplus, left;
+
+        if (!box_number_defined(number) || !box_stores(number))
             continue;                   /* (a number once, at its first row; gear only) */
-        for (k = i; k < wide_bound; k++)
-            if (wide_list[k] != WIDE_EMPTY && (int)(wide_list[k] & 0xffffu) == number)
-                now += (int)(wide_list[k] >> 16);
-        for (k = 0; k < n; k++)
-            if (box_battle_number[k] == number)
-                before += box_battle_quantity[k];
         surplus = now - before;
         if (surplus <= 0)
             continue;
@@ -7949,13 +8441,9 @@ static int box_battle_surplus(BOOL won)
             refused += surplus;
             continue;
         }
-        for (k = wide_bound - 1, left = surplus; k >= i && left > 0; k--) {     /* ... the rows second */
-            int have, take;
+        for (k = last_row[s], left = surplus; k >= 0 && left > 0; k = prev_row[k]) {     /* ... the rows second, from the last back */
+            int have = (int)(wide_list[k] >> 16), take = have < left ? have : left;
 
-            if (wide_list[k] == WIDE_EMPTY || (int)(wide_list[k] & 0xffffu) != number)
-                continue;
-            have = (int)(wide_list[k] >> 16);
-            take = have < left ? have : left;
             wide_list[k] = have > take ? (DWORD)number | (DWORD)(have - take) << 16 : WIDE_EMPTY;      /* an EMPTY row, never a number with quantity 0 */
             left -= take;
         }
@@ -7965,6 +8453,8 @@ static int box_battle_surplus(BOOL won)
             log_line("box: after the battle: %d of %s gained in it (the item list held %d at its start, %d after it) moved to the BOX (R8); the box holds %d of it now, %d kinds, %lu pieces", surplus,
                      box_number_text(number), before, now, box_held(number), box_kinds, box_pieces);
     }
+    for (s = 0; s < slots; s++)
+        slot_of[number_of[s]] = 0;
     if (pieces) {
         box_arrived_surplus += pieces;
         log_line("box: after the battle: %d piece(s) of %d kind(s) of gear gained in it went to the box (the rows are written by the DLL itself: NOT through the remove routine 006cbe5f); the box holds %d kinds, %lu pieces",
@@ -8036,7 +8526,7 @@ static long box_equip_returned[2], box_equip_taken[2];      /* pieces since the 
 static int box_equip_said, box_equip_odd_said, box_equip_cut_said;
 static int box_equip_went;                  /* where the last piece that came off went, or the last chosen piece came from: 0 the item list, 1 the box */
 static int box_equip_high;                  /* the longest list the DLL's builder wrote into the game's memory (what it fills with ff after a shorter one) */
-static int gear_equip_wide(int kind, int character, BYTE *list, int n, int room, int *boxed, int *cut);     /* (stage B5) defined with the worn pieces, below */
+static int gear_equip_wide(int kind, int character, BYTE *list, int n, int room, int *listed, int *boxed, int *cut);     /* (stage B5) defined with the worn pieces, below */
 static BOOL box_equip_take_ours(void);      /* is the call at 007075c7 the DLL's thunk? (defined with the start-up line, among the sites) */
 
 /* The byte of a number in the Equip menu's list and in a record (kind 0 weapon, 1 armour,
@@ -8124,7 +8614,7 @@ static int box_equip_return(DWORD number, DWORD quantity, DWORD caller, const ch
         /* (box = auto) the sleeping box wakes when the item list has no room for a piece that comes off: the game would drop it */
         wide_sync(routine);
         if (list_room((int)number) < (int)q)
-            box_wake((int)number, (int)q, box_equip_caller(caller, from), FALSE);
+            box_wake((int)number, (int)q, box_equip_caller(caller, from));
     }
     if (!box_acts() || !wide_live || number >= BOX_NUMBERS || !q || !box_number_defined((int)number)) {
         wide_add(number, quantity, caller, routine);
@@ -8282,7 +8772,7 @@ static BOOL box_equip_list(int kind)
     character = ((const BYTE *)ADDR_PARTY)[*(int *)ADDR_EQUIP_MENU_SLOT];
     n = box_equip_build(kind, character, list, BOX_EQUIP_ROOM, &listed, &boxed, &cut);
     if (gear_wide_live)
-        n = gear_equip_wide(kind, character, list, n, BOX_EQUIP_ROOM, &boxed, &cut);       /* (stage B5) the box's wide pieces the character may wear, each lent a slot; never unless wide gear is at work */
+        n = gear_equip_wide(kind, character, list, n, BOX_EQUIP_ROOM, &listed, &boxed, &cut);       /* (stage B5) the wide pieces the character may wear (wide gear in the item list: the item list's, then the box's), each lent a slot; never unless wide gear is at work */
     fill = box_equip_high > BOX_EQUIP_PAD ? box_equip_high : BOX_EQUIP_PAD;
     for (i = n; i < fill && i < BOX_EQUIP_ROOM; i++)
         list[i] = 0xff;
@@ -8483,11 +8973,15 @@ static void __cdecl load_accepted_hook(int argument)
     if (!box_live)                  /* (the box, A8 / C9) with the box at work the aids run AFTER the box of the load is decided: box_after_decide */
         load_aids();
     sxc2_load_decide();             /* what this load is read from: the SXC2 file of the slot's key, the old format, the fallback */
+    fields_after_load();            /* (field capacity, stage 2) a save made in a registered field: its real place back into the block, by name, before the Load menu closes and mode 0x15 copies it */
     box_after_decide();             /* (the box) its self-test if armed, then the aids; nothing unless the box is at work */
+    character_wide_defer = 1;       /* (a sheet's wide piece) a character made now gets its sheet's wide pieces after the save's WORN entries: character_wide_wear_pending */
     set_up_new_characters();
     sxc2_load_finish();
     if (gear_wide_live)
         gear_worn_after_load();     /* (the box, stage B5, A14) the wide pieces the save's characters wore: lent a slot and worn again, or boxed, or carried; before the game rebuilds the party's figures (007224ab, after the Load menu closes); never unless wide gear is at work */
+    else
+        character_wide_wear_pending("a load");     /* (a sheet's wide piece) wide gear is not at work: each wish's one line, the stand-in stays */
     wide_give_on_load();            /* (wide items) the testing aids for wide numbers, after the companion's item list was taken */
     wide_test_fill();               /* (stage 3) the testing aid test_fill_rows; nothing without the key */
     wide_sync("a load accepted (after the characters)");    /* (the switch) a limit item given at this load was put after the last look: the picture after it; nothing unless the switch is on */
@@ -10244,7 +10738,7 @@ static int effect_file_parse(char *text, DWORD size, struct effect_copy *copies,
                 if (colon < stop)
                     trim(&to, &to_end);
                 if (colon == stop || !effect_take_name(r->from, value, from_end) || !effect_take_name(r->to, to, to_end)) {
-                    problem(line_number, "file is FROM:TO, two file names of 1 to 31 characters: letters, digits, _ and - (and the dot of the extension), like FIRE00.TIM:YFIRE00.TIM");
+                    problem(line_number, "file is FROM:TO, two file names of 1 to 31 characters: letters, digits, _ and - (and the dot of the extension), like FIRE00.TIM:NEWFIRE00.TIM");
                     c->usable = 0;
                     continue;
                 }
@@ -10425,16 +10919,19 @@ static int native_clock_step(struct native_clock *k, int paused, int group_ok, i
    `play = NAME` reads SpellExtConfig\effects\NAME.txt (format: Readme\FF7_SpellExt_EffectsPlayer_README.txt
    and the comment at "Native effects" below). Read into a struct nfx_script and items in a shared pool; a
    script with any refused line is not used at all (its spells play their base effect). */
-#define NFX_FILES_MAX           16           /* file entries of one effect's group (8, then 12 before the limits stage; the
-                                                refusal texts say 16) */
+#define NFX_FILES_MAX           32           /* file entries of one effect's group (8, then 12 before the limits stage, 16
+                                                before 2026-10-24; the refusal texts say 32). The game's group has no
+                                                bound of its own: FUN_00689978 allocates count x 0xc and every routine
+                                                of the group walks *group entries */
 #define NFX_ITEMS_MAX           2048         /* timeline lines of one script (512 before the limits stage) */
-#define NFX_POOL_ITEMS          65536        /* timeline lines of all scripts together (a static pool, int indices; 4096 before stage 3a) */
+#define NFX_POOL_ITEMS          256000       /* timeline lines of all scripts together (a static pool, int indices; 4096 before stage 3a, 65536 before 2026-10-23) */
 #define NFX_LINES_MAX           12000        /* lines of one script file (4000 before the limits stage) */
 #define NFX_TEXT_MAX            0x80000      /* bytes of one script file: 512 KB (128 KB before the limits stage) */
-#define NFX_LENGTH_MAX          480          /* frames: 32 s at the battle's 15 updates a second (240 before the limits stage) */
+#define NFX_LENGTH_MAX          600          /* frames: 40 s at the battle's 15 updates a second (240 before the limits stage, 480
+                                                before 2026-10-24) */
 #define NFX_EACH_MAX            60           /* frames between one target and the next */
 #define NFX_TEX_MAX             4            /* texture pages a sprite sheet may name (the .S format's) */
-#define NFX_BONE_MAX            54           /* bone places 0..54: 00be1d24 + entry*12, below the bone matrices at 00be1fbc */
+#define NFX_BONE_MAX            49           /* bone places 0..49: 00be1d24 + entry*12 (50 entries; 50-54 would be the actor's camera matrix at 00be1f7c) */
 #define NFX_SCALE_MAX           700          /* percent: 7.0 x 4096 still fits the matrix's shorts */
 #define NFX_ROT_MAX             3600         /* degrees, either way */
 #define NFX_OFFSET_MAX          8192         /* x, y, depth */
@@ -10443,8 +10940,15 @@ static int native_clock_step(struct native_clock *k, int paused, int group_ok, i
 #define NFX_SOUND_MAX           751          /* FUN_00745606 indexes its table (0x2ef entries) by id - 1 */
 #define NFX_DRAWS_MAX           128          /* sprite draws one update may make (runtime; each a sheet page of quads,
                                                 FUN_005d1ffb; 64 before the limits stage) */
-#define NFX_MODEL_DRAWS_MAX     64           /* model instances one update may add (runtime; apart from the sprites; 32 before
-                                                the limits stage) */
+#define NFX_MODEL_DRAWS_MAX     256          /* model instances one update may add (runtime; apart from the sprites; 32 before
+                                                the limits stage, 64 before 2026-10-24). Only native_draw_models' int
+                                                count is bounded by it: no array is sized by it (the matrix and the
+                                                context are one each, handed over per instance). The game has no bound
+                                                of its own: FUN_005d1ba4 takes each instance's draw-chain entry from a
+                                                pool that chains a new block when one is full (FUN_0068f860,
+                                                FUN_006a56f5, FUN_006a5498) and the driver walks the whole chain
+                                                (FFNx with enable_lighting queues 1024 draws a frame for the whole
+                                                scene and draws any past that at once, unqueued) */
 #define NFX_TURN_MAX            36000        /* a model's turn about each axis, degrees, either way (100 turns) */
 #define NFX_FADE_MAX            255          /* stage 3b: a model's fade, 255 its own colours .. 0 fully the colour (alpha = fade) */
 #define NFX_UV_MAX              255          /* stage 3b: a model's texture offset, 256ths of the texture, each way */
@@ -10549,7 +11053,7 @@ struct nfx_range { short a, b; };    /* from a at the item's first frame to b at
 struct nfx_wide { int a, b; };       /* the same, for a model's turns (past a short) */
 struct nfx_item {
     BYTE kind, entry, at, page_mode;
-    signed char bone;                   /* NFX_BONE_RANDOM, NFX_BONE_GROUND, or a bone place 0..54 */
+    signed char bone;                   /* NFX_BONE_RANDOM, NFX_BONE_GROUND, or a bone place 0..49 */
     BYTE flags, sound_kind, given;      /* given: NFX_G_* keys the line names (the screen anchor's refusals) */
     short from, to, each, line;
     WORD sound;
@@ -10569,8 +11073,9 @@ struct nfx_file {
 struct nfx_script {
     char folder[EFFECT_NAME_MAX];
     int usable, problems, notes;
-    int file_count, length, first, count, sprite_files;    /* sprite_files: a bit per file a sprite draws */
-    int model_files;                    /* a bit per file a model line draws */
+    int file_count, length, first, count;
+    DWORD sprite_files;                 /* a bit per file a sprite draws (bit k = file k, 0-31) */
+    DWORD model_files;                  /* a bit per file a model line draws */
     int centre;                         /* (centre anchor) its at=centre lines: native_load checks FUN_005bfec9 for them */
     int stage;                          /* (stage fx 1) its stage lines */
     int screen;                         /* (screen anchor) its at=screen lines */
@@ -10579,13 +11084,14 @@ struct nfx_script {
     int actors;                         /* (stage fx 3) its actors lines (a backdrop, layer=back, is a fill line) */
     struct nfx_file file[NFX_FILES_MAX];
 };
-/* the refusal texts name the limit (16 files, numbers 0 to 15); a file is a bit of sprite_files, model_files and the
-   runtime's WORD native_list_models (and of `models` in native_load), so 16 is also the most there is room for */
-typedef char nfx_files_max_check[NFX_FILES_MAX == 16 && NFX_FILES_MAX <= 16 ? 1 : -1];
-/* (the limits stage) the other refusal texts spell out their numbers too (2048 timeline lines, frames 0 to 479 and
-   length 1 to 480, 12000 lines, 512 KB), and what holds them: an item's from, to and line are shorts; a model's turn
+/* the refusal texts name the limit (32 files, numbers 0 to 31); a file is a bit of the DWORDs sprite_files, model_files,
+   the runtime's native_list_models, `models` in native_load and `pinned` in native_draw_models, so 32 is also the most
+   there is room for (16 before 2026-10-24, with a WORD native_list_models) */
+typedef char nfx_files_max_check[NFX_FILES_MAX == 32 && NFX_FILES_MAX <= 32 && sizeof(DWORD) * 8 >= NFX_FILES_MAX ? 1 : -1];
+/* (the limits stage) the other refusal texts spell out their numbers too (2048 timeline lines, frames 0 to 599 and
+   length 1 to 600, 12000 lines, 512 KB), and what holds them: an item's from, to and line are shorts; a model's turn
    is interpolated as (b - a) x (f - from) with |b - a| <= 72000 within an int (nfx_lerp_wide) */
-typedef char nfx_limits_check[NFX_ITEMS_MAX == 2048 && NFX_LENGTH_MAX == 480 && NFX_LINES_MAX == 12000 &&
+typedef char nfx_limits_check[NFX_ITEMS_MAX == 2048 && NFX_LENGTH_MAX == 600 && NFX_LINES_MAX == 12000 &&
                               NFX_TEXT_MAX == 0x80000 && NFX_LINES_MAX <= 32767 && NFX_LENGTH_MAX <= 32767 &&
                               72000LL * NFX_LENGTH_MAX <= 0x7fffffffLL ? 1 : -1];
 
@@ -10755,7 +11261,7 @@ static const char *nfx_file_line(struct nfx_file *f, char *p, char *end)
                 return "tex is a list of 1 to 4 file numbers, the files whose textures the sheet's texture pages use, in order (tex=0,1)";
             for (i = 0; i < n; i++) {
                 if (list[i] < 0 || list[i] >= NFX_FILES_MAX)
-                    return "tex names a file number, 0 to 15";
+                    return "tex names a file number, 0 to 31";
                 f->tex[i] = (BYTE)list[i];
             }
             f->tex_count = n;
@@ -10802,10 +11308,10 @@ static const char *nfx_file_line(struct nfx_file *f, char *p, char *end)
    writable now) and the value at Re-init and again at each play. A handle plays through FUN_00745160 on its
    channel (1-4) only, never through FUN_00745606 (kind 0x20), which reads the table and a pointer in it.
        [sound 56780]
-       name = ff8_fire_0        optional: letters, digits and _, not starting with a digit, 1 to 23
+       name = my_sound_0        optional: letters, digits and _, not starting with a digit, 1 to 23
        channel = 4            optional, 1-4 (default 4): the channel it plays on (and cuts)
        volume = 100           reserved for stage 3: a note, ignored
-   Scripts say `sound 56780` or `sound ff8_fire_0`; the game's own sounds 1-751 are played as before. */
+   Scripts say `sound 56780` or `sound my_sound_0`; the game's own sounds 1-751 are played as before. */
 #define SOUND_HANDLE_MAX        256          /* [sound N] sections (64 before stage 3a) */
 #define SOUND_NAME_MAX          24           /* a name and its 0 */
 #define SOUND_GAME_LAST         751          /* the game's own sounds (= NFX_SOUND_MAX): never a handle */
@@ -11070,7 +11576,7 @@ static int sound_file_parse(char *text, DWORD size, struct sound_handle *h, int 
         } else if (word_is(start, key_end, "name")) {
             if (c->name[0] || !sound_take_name(c->name, value, stop)) {
                 say(line_number, 1, c->name[0] ? "name is given twice"
-                                               : "a sound's name is 1 to 23 letters, digits and _, not starting with a digit (name = ff8_fire_0)");
+                                               : "a sound's name is 1 to 23 letters, digits and _, not starting with a digit (name = my_sound_0)");
                 c->usable = 0;
             }
         } else if (word_is(start, key_end, "channel")) {
@@ -11196,7 +11702,7 @@ static const char *nfx_item_key(struct nfx_item *it, char *key, char *key_end, c
             it->given |= NFX_G_BLEND;
         } else if (flash && (word_is(key, key_end, "in") || word_is(key, key_end, "out"))) {
             if (nfx_values(value, end, 1, a, b) != 1 || a[0] != b[0] || a[0] < 0 || a[0] >= NFX_LENGTH_MAX)
-                return "in and out are the frames the flash takes to rise from nothing and to fall back, 0 to 479 (FF8's attack and decay)";
+                return "in and out are the frames the flash takes to rise from nothing and to fall back, 0 to 599 (FF8's attack and decay)";
             if (word_is(key, key_end, "in"))
                 it->page.a = (short)a[0];
             else
@@ -11347,7 +11853,7 @@ static const char *nfx_item_key(struct nfx_item *it, char *key, char *key_end, c
             else if (nfx_values(value, end, 1, a, b) == 1 && a[0] == b[0] && a[0] >= 0 && a[0] <= NFX_BONE_MAX)
                 it->bone = (signed char)a[0];
             else
-                return "bone is a bone place, 0 to 54 (0: the model's root, inside its body; past the model's last bone: its last), ground (the floor under the actor), or random (chosen once per target)";
+                return "bone is a bone place, 0 to 49 (0: the model's root, inside its body; past the model's last bone: its last), ground (the floor under the actor), or random (chosen once per target)";
         } else if (word_is(key, key_end, "x") || word_is(key, key_end, "y") || word_is(key, key_end, "z")) {
             /* (screen anchor) read within at=screen's range whatever the key order; nfx_timeline_line holds any other
                anchor to -8192..8192 with this same text once the line is read */
@@ -11438,7 +11944,7 @@ static const char *nfx_item_key(struct nfx_item *it, char *key, char *key_end, c
         else if (nfx_values(value, end, 1, a, b) == 1 && a[0] == b[0] && a[0] >= 0 && a[0] <= NFX_BONE_MAX)
             it->bone = (signed char)a[0];
         else
-            return "bone is a bone place, 0 to 54 (0: the model's root, inside its body; past the model's last bone: its last), ground (the floor under the actor), or random (chosen once per target)";
+            return "bone is a bone place, 0 to 49 (0: the model's root, inside its body; past the model's last bone: its last), ground (the floor under the actor), or random (chosen once per target)";
     } else if (word_is(key, key_end, "page")) {
         if (word_is(value, end, "loop"))
             it->page_mode = NFX_PAGE_LOOP;
@@ -11532,7 +12038,7 @@ static const char *nfx_timeline_line(struct nfx_item *it, char *p, char *end, nf
             dash++;
         if (!nfx_int(p, dash, &a) || (dash < word_end ? !nfx_int(dash + 1, word_end, &b) : (b = a, 0)) || a < 0 || b < a ||
             b >= NFX_LENGTH_MAX)
-            return "a timeline line starts with its frame, or FIRST-LAST (0 to 479, LAST not before FIRST), then the command";
+            return "a timeline line starts with its frame, or FIRST-LAST (0 to 599, LAST not before FIRST), then the command";
         it->from = (short)a;
         it->to = (short)b;
         for (p = word_end; p < end && is_space(*p); p++)
@@ -11628,7 +12134,7 @@ static const char *nfx_timeline_line(struct nfx_item *it, char *p, char *end, nf
                                           : "sound is followed by the sound's number (sound 9), or a [sound N] handle's number or name";
         else if (it->kind == NFX_SPRITE || it->kind == NFX_MODEL) {
             if (a < 0 || a >= NFX_FILES_MAX)
-                return it->kind == NFX_SPRITE ? "sprite is followed by a file number, 0 to 15" : "model is followed by a file number, 0 to 15";
+                return it->kind == NFX_SPRITE ? "sprite is followed by a file number, 0 to 31" : "model is followed by a file number, 0 to 31";
             it->entry = (BYTE)a;
         } else if (a >= 1 && a <= NFX_SOUND_MAX)
             it->sound = (WORD)a;        /* the game's own sound: as before */
@@ -11837,7 +12343,7 @@ static int nfx_parse(char *text, DWORD size, struct nfx_script *s, struct nfx_it
                 int n;
 
                 if (s->length || !nfx_int(value, stop, &n) || n < 1 || n > NFX_LENGTH_MAX)
-                    NFX_REFUSE(line_number, s->length ? "length is given twice" : "length is the effect's frames, 1 to 480 (15 a second); it always ends then");
+                    NFX_REFUSE(line_number, s->length ? "length is given twice" : "length is the effect's frames, 1 to 600 (15 a second); it always ends then");
                 else
                     s->length = n, length_line = line_number;
             } else {
@@ -11852,7 +12358,7 @@ static int nfx_parse(char *text, DWORD size, struct nfx_script *s, struct nfx_it
                     continue;
                 }
                 if (s->file_count == NFX_FILES_MAX) {
-                    NFX_REFUSE(line_number, "an effect has at most 16 files");
+                    NFX_REFUSE(line_number, "an effect has at most 32 files");
                     continue;
                 }
                 if ((why = nfx_file_line(&s->file[n], value, stop)) != NULL) {
@@ -11876,7 +12382,7 @@ static int nfx_parse(char *text, DWORD size, struct nfx_script *s, struct nfx_it
                 continue;
             if (s->count == NFX_ITEMS_MAX || used + s->count >= capacity) {
                 NFX_REFUSE(line_number, s->count == NFX_ITEMS_MAX ? "more than 2048 timeline lines in one script"
-                                                                  : "the scripts together have more than 65536 timeline lines");
+                                                                  : "the scripts together have more timeline lines than the pool holds (256000)");
                 continue;
             }
             pool[used + s->count++] = it;
@@ -11928,13 +12434,13 @@ static int nfx_parse(char *text, DWORD size, struct nfx_script *s, struct nfx_it
                 if (it->entry >= s->file_count || !s->file[it->entry].second[0])
                     NFX_REFUSE(it->line, "sprite names a file that is not given, or has no sprite sheet (.SPT)");
                 else
-                    s->sprite_files |= 1 << it->entry;
+                    s->sprite_files |= 1u << it->entry;
             }
             if (it->kind == NFX_MODEL) {
                 if (it->entry >= s->file_count || !s->file[it->entry].model)
                     NFX_REFUSE(it->line, "model names a file that is not given, or is not a model (file N = NAME.RSD)");
                 else
-                    s->model_files |= 1 << it->entry;
+                    s->model_files |= 1u << it->entry;
             }
             hits += it->kind == NFX_HIT;
             s->centre += it->at == NFX_AT_CENTRE && (it->kind == NFX_SPRITE || it->kind == NFX_MODEL);
@@ -12276,8 +12782,8 @@ struct nfx_actor_state { int hide, hide_target, look_on, amount, tint_on, r, g, 
 /* (actor move) A turn= range (degrees, FROM>TO over the line's frames from..to) at frame f in the game's angle unit
    (4096 a turn, 512 / 45 a degree), the whole turns left out (the angle is a short the draw converts, so only the angle
    modulo a turn shows), rounded toward zero. Exact at the line's first and last frames; in between the straight line
-   of degrees x span, not the whole degrees nfx_lerp_wide gives: |a x span| + |(b - a) x (f - from)| <= 36000 x 479 +
-   72000 x 479 fits an int, and what is left of a turn (|d| < 360 x 479) times 512 too. */
+   of degrees x span, not the whole degrees nfx_lerp_wide gives: |a x span| + |(b - a) x (f - from)| <= 36000 x 599 +
+   72000 x 599 fits an int, and what is left of a turn (|d| < 360 x 599) times 512 too. */
 static int nfx_turn_units(struct nfx_wide v, int from, int to, int f)
 {
     int span = to - from, d;
@@ -12450,7 +12956,7 @@ static int nfx_lerp_wide(struct nfx_wide v, int from, int to, int f)
 {
     if (to <= from || v.a == v.b)
         return v.a;
-    return v.a + (v.b - v.a) * (f - from) / (to - from);    /* (|b - a| <= 72000, frames < 480: within an int; no
+    return v.a + (v.b - v.a) * (f - from) / (to - from);    /* (|b - a| <= 72000, frames < 600: within an int; no
                                                                64-bit division, the DLL has no libgcc) */
 }
 
@@ -13360,7 +13866,7 @@ static void load_spells(void)
    given", before apply_key):
        [effect 0x100]
        copy = 0x1b                           the magic effect copied (0x05-0x35)
-       file = FIRE00.TIM:YFIRE00.TIM         one of its files, and the name asked for in its place
+       file = FIRE00.TIM:NEWFIRE00.TIM       one of its files, and the name asked for in its place
    Nothing of the game's code is changed for it but one call (the script's preload, chained). What it rests
    on, read from the code (tools/work/fire_trace):
    - A magic effect is run by 008fe4b0[number](targets, actor), from FUN_00427c22 (the script's `ec`, the
@@ -14191,7 +14697,8 @@ static void effect_copies_install(void)
      (FUN_004b56da), set as the current matrix (FUN_00663673, FUN_00663707), the current colour none
      (FUN_0066335f(0, 0, 0): the value the frame gives the task lists), then FUN_005d1ba4({record, 0x80, 0,
      0x20}, 0, 0xc, 0), the prop's call to the bit: one instance at the current matrix, drawn later in the frame
-     by the group manager. 64 models an update (32 before the limits stage). Nothing is restored after it but
+     by the group manager. 256 models an update (32 before the limits stage, 64 before 2026-10-24). Nothing is
+     restored after it but
      the colour (left as the frame set it): the current matrix is scratch every effect sets before it draws, as
      the sprites' is.
    - stage 3b (FF7FF8Fusion/Notes/EffectPlayer_Stage3b_Models.md): the context carries fade= as the
@@ -14310,13 +14817,14 @@ static DWORD native_model_ctx[4];       /* FUN_005d1ba4's: model record, flags, 
 static BYTE native_model_local[0x20];   /* a model line's matrix to the world, then camera x it: the game's form */
 static BYTE native_model_out[0x20];
 static BYTE native_orphaned[EFFECT_COPY_MAX];   /* a group of an older reading may still read this effect's list */
-static WORD native_list_models[EFFECT_COPY_MAX];        /* the list's entries written as models, a bit each */
+static DWORD native_list_models[EFFECT_COPY_MAX];       /* the list's entries written as models, a bit each (files 0-31) */
 static int native_list_count[EFFECT_COPY_MAX];  /* its entries written since the battle started (the most) */
 static struct {
     BYTE running, draw_said, limit_said, model_said, model_limit_said, centre_said, screen_said, zoom_said;
     BYTE arena_said;                    /* (arena anchor) the first at=arena draw logged */
     WORD serial;                        /* which task this is: an older one ends itself */
     int actor, mask, drawn, undrawn, effect, generation, length, watchdog;
+    int limit_hit;                      /* a limit's step: its hit (NATIVE_HIT_ALL for `all`); NATIVE_HIT_NONE a magic cast */
     DWORD number;
     struct native_clock clock;
     signed char bones[NFX_ITEMS_MAX][10];   /* bone=random: the place chosen for each target, -1 not yet */
@@ -14515,12 +15023,12 @@ static BOOL native_load(int e, int actor)
     if (!native_handles[e]) {
         char path[512];
         DWORD args[3];
-        WORD models = 0;
+        DWORD models = 0;
+        int both = s->file_count < native_list_count[e] ? s->file_count : native_list_count[e];     /* the entries both lists have */
 
         for (k = 0; k < s->file_count; k++)
-            models |= (WORD)(s->file[k].model ? 1u << k : 0u);
-        if (native_orphaned[e] && ((models ^ native_list_models[e]) & ((1u << (s->file_count < native_list_count[e] ? s->file_count
-                                                                                                                     : native_list_count[e])) - 1u))) {
+            models |= s->file[k].model ? 1u << k : 0u;
+        if (native_orphaned[e] && ((models ^ native_list_models[e]) & (both >= 32 ? 0xffffffffu : (1u << both) - 1u))) {
             /* the scripts were read again while a group of this list was loaded: that group may still be in the
                manager until the game frees it (its next preload with a loader, or the battle's end), and
                FUN_0068983d frees each entry by the kind its flags in THIS list give (0x800 sprite, else model) */
@@ -14682,14 +15190,17 @@ static BOOL native_load(int e, int actor)
     return TRUE;
 }
 
-/* The hit for each target of the mask. */
-static void native_hits(int mask)
+/* The hit for each target of the mask; `limit_hit` the limit's hit they are (show_hit_event_hook), NATIVE_HIT_NONE for
+   a magic cast's. */
+static void native_hits(int mask, int limit_hit)
 {
     int t;
 
+    native_hit_forced = limit_hit;
     for (t = 0; t < 10; t++)
         if (mask & (1 << t))
             ((void (__cdecl *)(int))FN_NATIVE_SHOW_HIT)(t);
+    native_hit_forced = NATIVE_HIT_NONE;
 }
 
 /* The sounds and hits of frame f (an advancing call). */
@@ -14711,7 +15222,7 @@ static void native_events(int f)
     due = nfx_hits_due(items, s->count, f, native_play.mask, native_play.clock.hit_done);
     if (due) {
         native_play.clock.hit_done |= due;
-        native_hits(due);
+        native_hits(due, native_play.limit_hit);
         if (native_say())
             log_line("native effect %04lx: hit queued at frame %d for targets %04x", native_play.number, f, due);
     }
@@ -14834,18 +15345,20 @@ static void native_screen_zoom(int f, const struct nfx_item *it, BYTE *m)
 }
 
 /* Stage 3a: every model line on at frame f, after the frame's sprites: one instance at each target (or the caster)
-   with a battle model, 64 an update. How many were added; *last the line of the last, and its place and draw. */
+   with a battle model, NFX_MODEL_DRAWS_MAX (256) an update. How many were added; *last the line of the last, and its place
+   and draw. */
 static int native_draw_models(DWORD group, int f, int *last, int *at, struct nfx_model_draw *shown)
 {
     const struct nfx_script *s = &nfx_scripts[native_play.effect];
     const struct nfx_item *items = nfx_pool + s->first;
     DWORD records[NFX_FILES_MAX];
-    int i, k, t, models = 0, coloured = 0, pinned = 0, full = 0;
+    int i, k, t, models = 0, coloured = 0, full = 0;
+    DWORD pinned = 0;
     short place[4] = { 0, 0, 0, 0 };
 
     for (i = 0; i < s->count; i++)
         if (items[i].kind == NFX_MODEL && (items[i].flags & NFX_F_PALETTE))
-            pinned |= 1 << items[i].entry;      /* a file some line gives palette= to: every line of it names its row */
+            pinned |= 1u << items[i].entry;     /* a file some line gives palette= to: every line of it names its row */
     for (k = 0; k < s->file_count; k++) {
         records[k] = 0;
         if (s->model_files >> k & 1) {
@@ -14923,7 +15436,7 @@ static int native_draw_models(DWORD group, int f, int *last, int *at, struct nfx
             } else
                 ((void (__cdecl *)(int, int, int))FN_NATIVE_COLOUR)(0, 0, 0);
             /* {record, 0x80, 0, 0x20} with none of stage 3b's keys (stage 3a's call to the bit) */
-            nfx_model_context(&d, (it->flags & NFX_F_COLOUR) != 0, pinned >> it->entry & 1, records[it->entry], native_model_ctx);
+            nfx_model_context(&d, (it->flags & NFX_F_COLOUR) != 0, (int)(pinned >> it->entry & 1), records[it->entry], native_model_ctx);
             ((DWORD (__cdecl *)(DWORD *, DWORD, DWORD, DWORD))FN_NATIVE_ADD_INSTANCE)(native_model_ctx, 0, 0xc, 0);
             models++;
             *last = i;
@@ -15092,8 +15605,9 @@ static void camera_roll_step(WORD serial, int frame, int length, DWORD effect);
 static void camera_roll_stop(WORD serial, const char *why);
 static void camera_roll_battle_start(void);
 /* camera stage 1: FF8's camera played under a native effect ("FF8's camera, played", with the cameras of our own) */
-static void camera_ff8_begin(WORD serial);
+static void camera_ff8_begin(WORD serial, int actor, int mask, int clock);
 static void camera_ff8_step(WORD serial, int frame, int length, DWORD effect);
+static BOOL camera_clock_keeps(DWORD effect);    /* (the action's clock keeps the camera through a native step) */
 static void camera_ff8_stop(WORD serial, const char *why);
 static void camera_ff8_battle_start(void);
 static void native_task_cameras(WORD serial, int frame, int length, DWORD effect, int todo);
@@ -15144,7 +15658,7 @@ static void __cdecl native_task(void)
         rest = native_play.mask & ~native_play.clock.hit_done;
         if (rest) {                     /* every target's result is shown, exactly once */
             native_play.clock.hit_done |= rest;
-            native_hits(rest);
+            native_hits(rest, native_play.limit_hit);
             if (native_say())
                 log_line("native effect %04lx: hit queued at frame %d for targets %04x (as it ends)", native_play.number, frame, rest);
         }
@@ -15159,23 +15673,16 @@ static void __cdecl native_task(void)
     }
 }
 
-/* The effect step of a magic cast (start_effect_copy): TRUE if the actor's action plays a native effect and its
-   task was started; FALSE and the game's routine runs (nothing native noted, or a refusal: logged). */
-static BOOL native_effect_step(int actor_arg)
+/* Starts native effect c (its index in effect_copies) for `actor` on the targets of `shown`: TRUE if its task was
+   started. `number` is the record's effect number at a magic cast's effect step (native_effect_step), whose game
+   routine runs when this gives FALSE; NATIVE_FROM_LIMIT for a limit's spell_effects step (native_limit_step), which
+   has no game routine to fall back on (the effect step of the limit itself has already run, FUN_00427c22 included). */
+#define NATIVE_FROM_LIMIT       (-1)
+static BOOL native_start(int actor, int c, unsigned shown, int number, int limit_hit)
 {
-    int actor = (BYTE)actor_arg, c, number, i, t;
-    unsigned shown;
+    int i, t;
     short slot;
 
-    if (!effect_natives_usable || actor >= 10 || *(const BYTE *)(ADDR_ACTOR_COMMAND_TYPE + actor * ACTOR_EFFECT_STRIDE) != 2)
-        return FALSE;
-    shown = *(const WORD *)ADDR_EFFECT_TARGETS;
-    number = *(const BYTE *)(ADDR_ACTOR_NUMBER + actor * ACTOR_EFFECT_STRIDE);
-    /* one target or several from the record's results, as for a copy (effect_for_actor) */
-    c = effect_native_choice(effect_copy_cast[actor].single, effect_copy_cast[actor].several, (shown & (shown - 1)) != 0, number,
-                             effect_copies, effect_copy_count);
-    if (c < 0 || !nfx_scripts[c].usable)
-        return FALSE;
     if (!native_routines_ok())
         return FALSE;                   /* (said once) */
     if (native_play.running) {
@@ -15184,7 +15691,7 @@ static BOOL native_effect_step(int actor_arg)
 
         if (rest) {
             native_play.clock.hit_done |= rest;
-            native_hits(rest);
+            native_hits(rest, native_play.limit_hit);   /* (the old effect's own hit, before native_play is the new one's) */
         }
         if (native_say())
             log_line("native effect %04lx: still running at frame %d as actor %d's next one starts: ended (its hits are queued)",
@@ -15195,7 +15702,7 @@ static BOOL native_effect_step(int actor_arg)
         native_play.running = 0;        /* its task ends itself at its next call */
     }
     if (!native_load(c, actor)) {
-        if (native_say())
+        if (native_say() && number != NATIVE_FROM_LIMIT)
             log_line("native effect %04lx: not played for actor %d: the game's effect %02x plays instead", effect_copies[c].number, actor,
                      number);
         return FALSE;
@@ -15203,26 +15710,36 @@ static BOOL native_effect_step(int actor_arg)
     slot = ((short (__cdecl *)(DWORD))FN_NATIVE_NEW_TASK)((DWORD)native_task);
     /* (and the task is really in the list: a replacement of FUN_005bec50 that keeps its own list would not run it) */
     if (slot < 0 || slot >= 100 || ((const DWORD *)ADDR_NATIVE_TASK_FNS)[slot] != (DWORD)native_task) {
-        if (native_say())
-            log_line("native effect %04lx: no task slot (FUN_005bec50 gave %d%s): the game's effect %02x plays instead for actor %d",
-                     effect_copies[c].number, slot, slot < 0 || slot >= 100 ? ": the list of 100 is full" : ", and the list holds another routine there",
-                     number, actor);
+        if (native_say()) {
+            if (number != NATIVE_FROM_LIMIT)
+                log_line("native effect %04lx: no task slot (FUN_005bec50 gave %d%s): the game's effect %02x plays instead for actor %d",
+                         effect_copies[c].number, slot, slot < 0 || slot >= 100 ? ": the list of 100 is full" : ", and the list holds another routine there",
+                         number, actor);
+            else
+                log_line("native effect %04lx: no task slot (FUN_005bec50 gave %d%s) for actor %d's limit",
+                         effect_copies[c].number, slot, slot < 0 || slot >= 100 ? ": the list of 100 is full" : ", and the list holds another routine there",
+                         actor);
+        }
         return FALSE;
     }
-    /* what FUN_00427c22 does for a magic effect before it calls the routine (00427c3b-00427cc5), so that only
-       the routine differs: a byte to 0, and for effect 0x19 on one result the three party actors' bytes at
-       00be119e (stride 0x1aec) set */
-    *(BYTE *)ADDR_NATIVE_STEP_FLAG = 0;
-    if (number == 0x19 && !*(const BYTE *)ADDR_EFFECT_SEVERAL) {
-        *(BYTE *)0x00be119eu = 1;
-        *(BYTE *)0x00be2c8au = 1;
-        *(BYTE *)0x00be4776u = 1;
+    if (number != NATIVE_FROM_LIMIT) {
+        /* what FUN_00427c22 does for a magic effect before it calls the routine (00427c3b-00427cc5), so that only
+           the routine differs: a byte to 0, and for effect 0x19 on one result the three party actors' bytes at
+           00be119e (stride 0x1aec) set. (A limit's step: the limit's own effect step ran FUN_00427c22 itself.) */
+        *(BYTE *)ADDR_NATIVE_STEP_FLAG = 0;
+        if (number == 0x19 && !*(const BYTE *)ADDR_EFFECT_SEVERAL) {
+            *(BYTE *)0x00be119eu = 1;
+            *(BYTE *)0x00be2c8au = 1;
+            *(BYTE *)0x00be4776u = 1;
+        }
     }
     native_play.serial = ++native_serial;
     camera_roll_begin(native_play.serial);
-    camera_ff8_begin(native_play.serial);
+    if (!camera_clock_keeps(effect_copies[c].number))  /* (an action's clock under the same camera keeps the player) */
+        camera_ff8_begin(native_play.serial, actor, (int)(shown & 0x3ff), 0);    /* (CAMERA_CLOCK_EFFECT) */
     stage_fx_begin(native_play.serial);
     native_play.actor = actor;
+    native_play.limit_hit = limit_hit;
     native_play.mask = (int)(shown & 0x3ff);
     native_play.number = effect_copies[c].number;
     native_play.effect = c;
@@ -15245,11 +15762,62 @@ static BOOL native_effect_step(int actor_arg)
         data[1] = 0;
         data[2] = (short)native_play.serial;
     }
-    if (native_say())
-        log_line("native effect %04lx: started for actor %d (effects\\%s.txt, record effect %02x, targets %04x, task %d, group %08lx): %d frames, %d timeline line(s)",
-                 native_play.number, actor, effect_copies[c].play_name, number, native_play.mask, slot, native_handles[c],
-                 native_play.length, nfx_scripts[c].count);
+    if (native_say()) {
+        if (number != NATIVE_FROM_LIMIT)
+            log_line("native effect %04lx: started for actor %d (effects\\%s.txt, record effect %02x, targets %04x, task %d, group %08lx): %d frames, %d timeline line(s)",
+                     native_play.number, actor, effect_copies[c].play_name, number, native_play.mask, slot, native_handles[c],
+                     native_play.length, nfx_scripts[c].count);
+        else
+            log_line("native effect %04lx: started for actor %d's limit (effects\\%s.txt, a spell_effects step, targets %04x, task %d, group %08lx): %d frames, %d timeline line(s)",
+                     native_play.number, actor, effect_copies[c].play_name, native_play.mask, slot, native_handles[c],
+                     native_play.length, nfx_scripts[c].count);
+    }
     return TRUE;
+}
+
+/* The effect step of a magic cast (start_effect_copy): TRUE if the actor's action plays a native effect and its
+   task was started; FALSE and the game's routine runs (nothing native noted, or a refusal: logged). */
+static BOOL native_effect_step(int actor_arg)
+{
+    int actor = (BYTE)actor_arg, c, number;
+    unsigned shown;
+
+    if (!effect_natives_usable || actor >= 10 || *(const BYTE *)(ADDR_ACTOR_COMMAND_TYPE + actor * ACTOR_EFFECT_STRIDE) != 2)
+        return FALSE;
+    shown = *(const WORD *)ADDR_EFFECT_TARGETS;
+    number = *(const BYTE *)(ADDR_ACTOR_NUMBER + actor * ACTOR_EFFECT_STRIDE);
+    /* one target or several from the record's results, as for a copy (effect_for_actor) */
+    c = effect_native_choice(effect_copy_cast[actor].single, effect_copy_cast[actor].several, (shown & (shown - 1)) != 0, number,
+                             effect_copies, effect_copy_count);
+    if (c < 0 || !nfx_scripts[c].usable)
+        return FALSE;
+    return native_start(actor, c, shown, number, NATIVE_HIT_NONE);
+}
+
+/* A limit's spell_effects step `effect N:FRAME [all]` (limit_seq_task): native effect `number` for the limit's
+   actor on `mask` (the step's one target, or with `all` the record's results), started the way a magic cast's is,
+   at the step's frame. Its hit lines show the limit's results (FUN_005c0158, which the limit's hooks turn into the
+   step's own hit), each target exactly once, as a spell's do. When it cannot be played (no such native effect, its
+   script refused, its files or a task slot not had) nothing else would show them: the step's targets are hit at
+   once, so every result is still shown and the record closes. `hit`: the step's hit of the limit, NATIVE_HIT_ALL for
+   an `all` step (show_hit_event_hook). TRUE if the effect plays. */
+static BOOL native_limit_step(DWORD number, int actor, unsigned mask, int hit)
+{
+    int c = effect_copy_index(number);
+    const char *why = !effect_natives_usable ? "native effects are off (see the start of the log)"
+                    : c < 0 ? "there is no usable [effect] section of that number in the effects file"
+                    : !effect_copies[c].play ? "its [effect] section is a copy (file =), not a native effect (play =)"
+                    : !nfx_scripts[c].usable ? "its script was refused when it was read (the log says why)"
+                    : actor < 0 || actor >= 3 ? "the limit's actor is not a party member" : NULL;
+
+    mask &= 0x3ff;
+    if (!why && mask && native_start(actor, c, mask, NATIVE_FROM_LIMIT, hit))
+        return TRUE;
+    if (native_say())
+        log_line("limit spell effects: native effect %04lx not played for actor %d (%s): the step's targets %04x are hit at once",
+                 number, actor, why ? why : !mask ? "the step has no target" : "refused as it started: the lines above say why", mask);
+    native_hits((int)mask, hit);
+    return FALSE;
 }
 
 /* A battle starts (battle_start_party_hook): the task lists were emptied (FUN_005beec6) and the last battle's
@@ -15700,6 +16268,7 @@ static void move_materia_table(void)
 #define NEW_CHARACTER_FIRST_ID  12           /* the first seat's character ID, and the first section the character file may have */
 #define SEAT_MAX                4            /* character IDs 12 to 15: all that the game's 16-bit masks of characters have room for */
 #define ROSTER_MAX              32           /* characters the file may define: sections [12] to [43] */
+#define AI_NAME_MAX             31           /* `ai = NAME`: the file's name, without .ai */
 #define ADDR_ID_TO_RECORD       0x00919928u  /* dword per character ID: its record index */
 #define UNUSED_RECORD_ID        0xfe         /* never matches a party slot (ff = empty slot) */
 #define RECORD_NAME             0x10
@@ -15802,7 +16371,10 @@ static BOOL sign_extend_site(DWORD address, BOOL check_only)
    once the limit has been carried out, its user is in that state (per actor, to the end of the
    battle). What a state changes: each TURN of an attack the actor makes with one of the listed
    commands hits `hits` times (the turns are the command's own: Attack 1, 2x-Cut 2, 4x-Cut 4), with
-   scripts of the state's own, and a turn whose target has died goes to another. The battle side is
+   scripts of the state's own, and a turn whose target has died goes to another; the attack may go at
+   every enemy, with an element and a range of the state's (`attack_targets`, `attack_element`,
+   `long_range`); physical hits on the actor may all miss (`physical_evade`); and model scripts of the
+   actor's may be replaced while the state lasts (`script_NN`: reactions, casting). The battle side is
    further down, with the limits ("A state", before battle_start_party_hook).
 
    The commands a state may list are those whose handler list has handler 0x0e, the weapon set-up
@@ -15821,6 +16393,12 @@ enum { STATE_HIDE_DEAD = 1, STATE_HIDE_VICTORY = 2, STATE_HIDE_ESCAPE = 4, STATE
 #define STATE_GAP_DEFAULT        6           /* `hit_gap` not given */
 #define STATE_GAP_MAX           60
 enum { STATE_SCRIPT_FIRST, STATE_SCRIPT_NEXT, STATE_SCRIPT_LAST, STATE_SCRIPT_ONLY, STATE_SCRIPT_NEXT2, STATE_SCRIPTS };
+#define STATE_LENDS_MAX         16          /* `script_NN` lines of a state: model scripts replaced while it lasts */
+#define STATE_LEND_MAX          32          /* bytes of one of them */
+#define STATE_VIEW_RAISE_MAX    6000        /* `view_raise`, units (a battle model stands about 1,300 to 1,800 tall) */
+#define STATE_VIEW_BACK_MAX     100         /* `view_back`, per cent */
+#define STATE_POINTER_RAISE_MAX 6000        /* `pointer_raise`, units */
+enum { STATE_TARGETS_AS_CHOSEN, STATE_TARGETS_ALL_ENEMIES };     /* `attack_targets` */
 
 struct limit_state {                    /* one [12 state NAME] section */
     char name[STATE_NAME_MAX + 1];      /* lower case; "" = not used */
@@ -15847,6 +16425,22 @@ struct limit_state {                    /* one [12 state NAME] section */
     WORD prop_scale;                    /* `prop_scale` in tenths of a per cent */
     BYTE idle_length, idle_weak_length; /* `idle_script`, `idle_weak_script`: 0 = not given */
     BYTE idle[STATE_IDLE_MAX], idle_weak[STATE_IDLE_MAX];
+    /* what the state does to the actor's attacks and to the hits on it ("A state: every enemy, element, range, evasion") */
+    BYTE attack_targets;                /* `attack_targets`: STATE_TARGETS_* */
+    BYTE attack_element_set;            /* `attack_element`: 1 = the element below replaces the weapon's; 0 = `weapon` */
+    WORD attack_element;                /* ... its bits (the spell file's element words) */
+    BYTE long_range;                    /* `long_range = yes`: the attacks have no short-range bit (0x20 of action[0x14]) */
+    BYTE physical_evade;                /* `physical_evade = 100`: every physical hit check on the actor is a miss */
+    /* `script_NN`: model script NN is replaced by these bytes while the state lasts (lent, as the idle is) */
+    BYTE lend_count;
+    BYTE lend_slot[STATE_LENDS_MAX];
+    BYTE lend_length[STATE_LENDS_MAX];
+    BYTE lend[STATE_LENDS_MAX][STATE_LEND_MAX];
+    /* the battle's home view while the state lasts (`view_raise`, `view_back`: see "A state's home view") */
+    WORD view_raise;                    /* `view_raise`: units the eye and the point looked at go up; 0 = not raised */
+    BYTE view_back;                     /* `view_back`: per cent the eye goes back from the point looked at; 0 = not */
+    /* the yellow pointer over the acting party member while the state lasts (see "A state's pointer raised") */
+    WORD pointer_raise;                 /* `pointer_raise`: units the pointer goes up; 0 = where the game puts it */
 };
 
 static const struct { BYTE number; const char *name; } state_command_names[] = {
@@ -15865,6 +16459,18 @@ static const char *state_command_name(int number)
     return "?";
 }
 
+/* Does the state change a listed attack beyond its hits: scripts of its own, its targets, element or range?
+   (Then the attack passes state_hits with hits = 1 as well.) */
+static BOOL state_changes_attacks(const struct limit_state *s)
+{
+    int i;
+
+    for (i = 0; i < STATE_SCRIPTS; i++)
+        if (s->script_length[i])
+            return TRUE;
+    return s->attack_targets != STATE_TARGETS_AS_CHOSEN || s->attack_element_set || s->long_range;
+}
+
 /* "attack 2x_cut 4x_cut" (at most 8 names: under 64 characters), or "none" */
 static void state_commands_text(char *out, DWORD mask)
 {
@@ -15881,12 +16487,18 @@ static void state_commands_text(char *out, DWORD mask)
         lstrcpyA(out, "none");
 }
 
+/* equip_like's values other than one of the nine (0 to 8) */
+#define EQUIP_LIKE_UNSET        (-1)        /* no equip_like line: the base's (or battle_like's) equipment, set once the whole file is read */
+#define EQUIP_LIKE_NONE         (-2)        /* `equip_like = none`: no original character's own gear (equip_like_allows) */
+#define EQUIP_ALL_NINE          0x01ffu     /* the mask bits of the nine (0 to 8): a piece every one of them can equip */
+
 struct new_character {
     int defined, base, party_slot;      /* base: one of the nine; party_slot: 1-3 or 0 */
     int join_on_load;                   /* testing: exists in every loaded save; otherwise joins by field script */
     char portrait[20];                  /* own portrait: <name>.tex and <name>_l.tex in the game folder; "" = the base's */
     DWORD portrait_texture;             /* loaded for the screens that draw from the game's set of nine */
     int portrait_fit;                   /* scale a PNG portrait to fill the drawn part of the texture */
+    int portrait_number;                /* `portrait = <a game name>`: the game's own portrait 0-11 it shows, from the menu archive; -1 = a file (portrait[]) or the base's; -2 = the same, written file:NAME */
     int battle_model;                   /* battle_like: whose place in the game's list of 17 battle models it takes (0-16), or -1 for the base's */
     char battle_prefix[4];              /* two letters: its own model files in battle.lgp naming (snaa ...); "" = none */
     char model_name[16];                /* the made-up data file name the battle asks for: NEWCH12.DAT */
@@ -15895,10 +16507,11 @@ struct new_character {
     BYTE growth[GROWTH_RECORD_SIZE];    /* the growth record handed to the level-up code */
     BYTE start[0x40], start_set[0x40];  /* record bytes 0x00-0x3f to set when the character is created */
     DWORD start_materia[16];            /* materia it is created with: 8 weapon slots, 8 armour slots; ID | AP << 8, ffffffff = empty */
-    int remake_on_load;                 /* testing aid: rebuilt from the sheet at every load instead of read from the save */
+    WORD start_wide[3];                 /* a piece of WIDE gear it is created wearing (weapon, armour, accessory: 10000-27999); 0 = none: see character_wide_wear */
+    int remake_on_load;                /* testing aid: rebuilt from the sheet at every load instead of read from the save */
     int level_like, level_offset;       /* starting level follows one of the nine (0-8) or the party's average (9), plus this; -1 = a fixed level */
     int from_sheet;                     /* no base given: the starting record is worked out from the sheet */
-    int equip_like;                     /* one of the nine whose equipment it may use */
+    int equip_like;                     /* one of the nine whose equipment it may use, or EQUIP_LIKE_NONE (EQUIP_LIKE_UNSET only while the file is read) */
     int limits_like;                    /* one of the nine whose limit breaks it uses, or -1 for none */
     int own_limits;                     /* has a limit set of its own, from the limits file */
     BYTE limit_command[12];             /* its limits: 4 levels x 3, as table entry + 0x80; ff = none */
@@ -15929,8 +16542,9 @@ struct new_character {
     /* `spell_effects`: a spell's effect run for each of the limit's hits, on that hit's target */
     BYTE limit_seq_count[12], limit_seq_effect[12][LIMIT_SEQ_MAX];
     WORD limit_seq_frame[12][LIMIT_SEQ_MAX];
-    BYTE limit_seq_flags[12][LIMIT_SEQ_MAX];        /* SEQ_LIMIT, SEQ_ALL, SEQ_VISUAL */
+    BYTE limit_seq_flags[12][LIMIT_SEQ_MAX];        /* SEQ_LIMIT, SEQ_ALL, SEQ_VISUAL, SEQ_NATIVE */
     BYTE limit_seq_skip[12][LIMIT_SEQ_MAX];         /* frames of the effect passed over at its start */
+    WORD limit_seq_native[12][LIMIT_SEQ_MAX];       /* SEQ_NATIVE: the native effect's number (`effect N:frame`) */
     /* `hit_elements`: the element of each hit, in place of the record's */
     BYTE limit_hit_element_count[12];
     WORD limit_hit_element[12][LIMIT_SEQ_MAX];
@@ -15949,11 +16563,15 @@ struct new_character {
     int seated;                         /* the seat it occupies, + 1; 0 = not seated */
     BYTE has_record;                    /* `record` holds its save record (only looked at while it is not seated) */
     BYTE hidden;                        /* the PHS did not show it when it gave its seat up (a field script had hidden it) */
+    BYTE gear_wish_pending;             /* bit 1 << kind: its record was just made with the stand-in for start_wide[kind], to be worn by character_wide_wear; bit 0x10 << kind: a load sent the save's own piece of that number to the box: take it back rather than make one */
     BYTE record[SAVE_RECORD_SIZE];
     int copy_of;                        /* `copy_of = N`: the character (file ID) it was copied from, or 0 */
     int keep_seat;                      /* `keep_seat = yes`: always seated, and its seat is never given to another */
     char field_model[8];                /* `field_model = YUAA`: its field skeleton YUAA.HRC (four characters, upper case); "" = none */
     signed char field_model_found;      /* 0 not looked for yet, 1 the skeleton file can be found, -1 it can not */
+    int ai_like;                        /* `ai_like`: the kernel's character-AI entry it has a private copy of, + 1; 0 = none */
+    char ai_file[AI_NAME_MAX + 1];      /* `ai = NAME`: its block is SpellExtConfig\ai\NAME.ai; "" = none */
+    BYTE ai_keys_here;                  /* of the section being read: 1 ai_like given, 2 ai given (the second of the two is refused) */
     DWORD battle_avatar_texture;        /* Enhanced Stock UI's battle window: its small picture, once loaded */
     BYTE battle_avatar_tried, battle_avatar_queued;
     /* The character's limit item (limits file, its own section). Outside the part copy_limits copies:
@@ -16272,6 +16890,29 @@ static void __cdecl pick_models_hook(void)
 #define ADDR_NINE_PORTRAITS     0x00dc1020u  /* textures of the nine characters' portraits */
 #define FN_FREE_TEXTURE_SLOT    0x00671082u  /* FUN_00671082(&slot) */
 #define FN_LOAD_NINE_PORTRAITS  0x006c1b93u  /* FUN_006c1b93(mode): free and reload the set of nine */
+/* The game's own portraits: both loaders take the file name from one of two tables of twelve in the
+   exe, by portrait number (the character ID for 0-10, 9 being young Cloud and 10 Sephiroth; 11 the
+   chocobo): <name>.tim for the plain picture, <name>_l.tim for the small one (the loader reads the
+   .tex). A character with `portrait = <a game name>` is shown with one of them, read from the menu
+   archive exactly as the game's party loader reads it, so a replacement texture a mod supplies for
+   that portrait (FFNx names it menu/<name>) applies to the character too. Read, never written. */
+#define ADDR_PORTRAIT_NAMES     0x00919c18u  /* 12 pointers: "cloud.tim" ... "choco.tim" */
+#define ADDR_PORTRAIT_NAMES_SMALL 0x00919c48u  /* 12 pointers: "cloud_l.tim" ... "choco_l.tim" */
+#define ADDR_MENU_ARCHIVE_DIR   0x00dc1078u  /* the directory string the party loader hands over for an archive read */
+#define MENU_ARCHIVE_NUMBER     4            /* the menu archive (menu_us.lgp) in the game's list of archives */
+#define GAME_PORTRAITS          12
+
+/* The game's file name of its portrait `number` (0-11), in the display mode's table (plain or _l),
+   as the game hands it to the loader ("pcefi.tim"); NULL if the table does not hold a name there. */
+static const char *game_portrait_file(int number, BOOL plain)
+{
+    const char *name;
+
+    if (number < 0 || number >= GAME_PORTRAITS)
+        return NULL;
+    name = ((const char *const *)(plain ? ADDR_PORTRAIT_NAMES : ADDR_PORTRAIT_NAMES_SMALL))[number];
+    return name && !IsBadReadPtr(name, 1) ? name : NULL;
+}
 static const DWORD load_nine_sites[] = {
     0x00718ab5, 0x00718ac1, 0x00700b3d, 0x00700b49, 0x0071a795, 0x00720ed2, 0x006fed6d, 0x006fed79,
 };
@@ -16326,12 +16967,15 @@ static BOOL portrait_texture_file(struct new_character *c, const char *name, cha
     return TRUE;
 }
 
-/* `suffix` NULL: the picture the game's display mode wants (<portrait> or <portrait>_l); else that one (<portrait><suffix>). */
+/* `suffix` NULL: the picture the game's display mode wants (<portrait> or <portrait>_l); else that one (<portrait><suffix>).
+   A character shown with one of the game's own portraits (portrait_number) has it read from the menu archive. */
 static void load_portrait_named(struct new_character *c, DWORD *slot, const char *suffix)
 {
     BYTE source[0x80];
     char name[32], path[MAX_PATH + 200];
     static char folder[MAX_PATH + 200];     /* the game may keep the pointer */
+    static LONG told, failed;               /* the first six loads, and the first six failures from the archive, are logged */
+    const char *file = NULL;                /* the game's own file name, for one of its portraits */
     DWORD saved_mode;
     int game = ((int (__cdecl *)(void))0x00676578u)();
 
@@ -16350,6 +16994,27 @@ static void load_portrait_named(struct new_character *c, DWORD *slot, const char
         lstrcatA(name, ".tex");
     } else {
         lstrcatA(name, ((int (__cdecl *)(void))0x00404d80u)() == 2 ? ".tex" : "_l.tex");
+    }
+    /* One of the game's own portraits: the source as the game's party loader (FUN_006c1aba) sets it
+       (the archive switch on, the menu archive, the game's directory string) and the name from the
+       game's table for the display mode. The battle avatar (<portrait>_b, which the archive does not
+       have) is a loose file of that name if there is one, else the same picture the menu shows. */
+    if (c->portrait_number >= 0 && (!suffix || !find_loose_file(name, path)))
+        file = game_portrait_file(c->portrait_number, ((int (__cdecl *)(void))0x00404d80u)() == 2);
+    if (file) {
+        *(DWORD *)(source + 0x44) = 1;
+        *(DWORD *)(source + 0x48) = MENU_ARCHIVE_NUMBER;
+        *(DWORD *)(source + 0x24) = ADDR_MENU_ARCHIVE_DIR;
+        ((void (__cdecl *)(int, BYTE *))0x00674659u)(4, source);
+        *slot = ((DWORD (__cdecl *)(int, int, BYTE *, const char *, DWORD))0x006710acu)(
+            1, 0xc, source, file, *(DWORD *)(game + 0x910));
+        ((void (__cdecl *)(DWORD))0x0067453au)(saved_mode);
+        if (!*slot) {
+            if (InterlockedIncrement(&failed) <= 6)
+                log_line("portrait %s could not be loaded from the menu archive (the game's portrait %d)", file, c->portrait_number);
+        } else if (InterlockedIncrement(&told) <= 6)
+            log_line("portrait %s loaded from the menu archive (the game's portrait %d)", file, c->portrait_number);
+        return;
     }
     /* directory to read from: wherever under SpellExtConfig\\files the file is */
     lstrcpyA(folder, override_dir);
@@ -16401,12 +17066,8 @@ static void load_portrait_named(struct new_character *c, DWORD *slot, const char
     ((void (__cdecl *)(DWORD))0x0067453au)(saved_mode);
     if (!*slot)
         log_line("portrait %s could not be loaded from %s", name, folder);
-    else {
-        static LONG told;
-
-        if (InterlockedIncrement(&told) <= 6)
-            log_line("portrait %s loaded from %s", name, folder);
-    }
+    else if (InterlockedIncrement(&told) <= 6)
+        log_line("portrait %s loaded from %s", name, folder);
 }
 
 static void load_portrait_file(struct new_character *c, DWORD *slot)
@@ -16415,12 +17076,22 @@ static void load_portrait_file(struct new_character *c, DWORD *slot)
 }
 
 /* The menu loads a party member's portrait from a table of twelve file
-   names. A new character gets its own file, or its base character's. */
+   names. A new character gets its own file, one of the game's own portraits
+   (the game's loader called with that portrait's number, as the game calls it
+   for Sephiroth in the flashback), or its base character's. */
 static void __cdecl load_portrait_hook(int portrait, int slot)
 {
+    static LONG failed;                 /* the first six failures are logged */
     struct new_character *c = new_character(portrait);
 
-    if (c && c->portrait[0] && slot >= 0 && slot < 3) {
+    if (c && c->portrait_number >= 0 && c->portrait_number < GAME_PORTRAITS) {
+        ((void (__cdecl *)(int, int))FN_LOAD_PORTRAIT)(c->portrait_number, slot);
+        if (slot < 0 || slot >= 3 || ((DWORD *)ADDR_PARTY_PORTRAITS)[slot])
+            return;
+        if (InterlockedIncrement(&failed) <= 6)
+            log_line("portrait of character %d: the game's portrait %d could not be loaded for party slot %d: its base's is shown",
+                     character_file_id(c), c->portrait_number, slot);
+    } else if (c && c->portrait[0] && slot >= 0 && slot < 3) {
         load_portrait_file(c, (DWORD *)ADDR_PARTY_PORTRAITS + slot);
         if (((DWORD *)ADDR_PARTY_PORTRAITS)[slot])
             return;
@@ -17088,6 +17759,7 @@ static void move_growth_curves(void)
 /* ---- Character definition keys ---- */
 
 static const char unknown_character_key[] = "unknown key";
+static const char *character_ai_key(BOOL like, char *value, char *end, int *ai_like, char *ai_file, BYTE *keys_here);  /* (with the character AI) */
 
 static void set_start(struct new_character *c, int offset, int size, DWORD value)
 {
@@ -17099,17 +17771,43 @@ static void set_start(struct new_character *c, int offset, int size, DWORD value
     }
 }
 
+/* (a sheet's wide piece) A number of WIDE gear on a sheet (`weapon = 10000`, `armour = 16000`,
+   `accessory = 22000`) is a WISH, never a byte of the record: the record is made with the
+   stand-in a save would hold, and character_wide_wear puts the piece on (or says why not). The
+   first reading of this file comes before box_gate and gear_wide_gate, so nobody can know here
+   whether wide gear will be at work; what is known is whether a gear file defines the number now
+   (a plain line if none does, not a problem: the sheet's line is kept). `kind`: 0 weapon, 1
+   armour, 2 accessory. The last line of a key wins: a wish clears the key's byte, a byte its wish. */
+static int character_file_line;             /* the line of the character file being read (for that line) */
+static void character_wide_key(struct new_character *c, int kind, int number)
+{
+    static const char *const keys[3] = { "weapon", "armour", "accessory" };
+    static const char *const instead[3] = { "the stand-in, the first of the game's weapons its equip_like character can wear",
+                                            "the stand-in, armour 256", "the stand-in, no accessory" };
+
+    c->start_wide[kind] = (WORD)number;
+    c->start_set[SAVE_RECORD_WEAPON + kind] = 0;
+    if (!wide_gear(number))
+        log_line("character file line %d: %s %d is a wide %s that no gear file defines now (with box = off their sections are not read): until it is defined the character is created wearing %s",
+                 character_file_line, keys[kind], number, keys[kind],
+                 kind == 0 && c->equip_like == EQUIP_LIKE_NONE ? "the stand-in, the first weapon it may equip (equip_like = none)" : instead[kind]);
+}
+
+/* The game's characters by the names battle_like takes, as character IDs (which are also their
+   portrait numbers): used by battle_like and by `portrait = <a game name>`. */
+static const struct flag_name character_model_names[] = {
+    { "cloud", 0 }, { "barret", 1 }, { "tifa", 2 }, { "aeris", 3 }, { "aerith", 3 }, { "red", 4 },
+    { "yuffie", 5 }, { "caitsith", 6 }, { "vincent", 7 }, { "cid", 8 }, { "youngcloud", 9 },
+    { "sephiroth", 10 }, { NULL, 0 },
+};
+
 /* The keys that define what the character IS: its battle model, how it
    grows, and what its record holds when it is created. Returns NULL, a
    problem, or unknown_character_key if the key is not one of these. */
 
 static const char *apply_character_key(struct new_character *c, char *key, char *key_end, char *value, char *end)
 {
-    static const struct flag_name models[] = {
-        { "cloud", 0 }, { "barret", 1 }, { "tifa", 2 }, { "aeris", 3 }, { "aerith", 3 }, { "red", 4 },
-        { "yuffie", 5 }, { "caitsith", 6 }, { "vincent", 7 }, { "cid", 8 }, { "youngcloud", 9 },
-        { "sephiroth", 10 }, { NULL, 0 },
-    };
+    const struct flag_name *const models = character_model_names;
     static const struct { const char *name; BYTE offset; } stats[] = {
         { "level", 0x01 }, { "strength", 0x02 }, { "vitality", 0x03 }, { "magic", 0x04 }, { "spirit", 0x05 },
         { "dexterity", 0x06 }, { "luck", 0x07 }, { NULL, 0 },
@@ -17174,10 +17872,15 @@ static const char *apply_character_key(struct new_character *c, char *key, char 
         return NULL;
     }
     if (word_is(key, key_end, "equip_like")) {
+        if (word_is(value, end, "none")) {
+            /* none of the nine's own gear: what all nine can equip, and what an `equip` list names it for */
+            c->equip_like = EQUIP_LIKE_NONE;
+            return NULL;
+        }
         for (i = 0; i < 9 && !word_is(value, end, models[i == 4 ? 5 : i > 4 ? i + 1 : i].name); i++)
             ;
         if (i == 9 && (!parse_number(&p, end, &n) || p != end || n > 8))
-            return "equip_like must be one of the nine: cloud barret tifa aeris red yuffie caitsith vincent cid, or 0 to 8";
+            return "equip_like must be none, or one of the nine: cloud barret tifa aeris red yuffie caitsith vincent cid, or 0 to 8";
         c->equip_like = i < 9 ? i : (int)n;
         return NULL;
     }
@@ -17269,14 +17972,24 @@ static const char *apply_character_key(struct new_character *c, char *key, char 
             return "exp must be a number";
         set_start(c, 0x3c, 4, n);
     } else if (word_is(key, key_end, "weapon")) {
-        /* item ID: 128-255 for a kernel weapon, 320-383 for one from the weapon file */
-        if (!parse_number(&p, end, &n) || p != end || n < 128 || (n > 255 && !is_new_weapon_item((int)n)))
-            return "weapon must be a weapon's item ID: 128 to 255, or 320 to 383 for a new weapon";
-        set_start(c, 0x1c, 1, n - ITEM_ID_WEAPON_BASE);
+        /* item ID: 128-255 for a kernel weapon, 320-383 for one from the weapon file, 10000-15999 for a wide weapon */
+        if (!parse_number(&p, end, &n) || p != end || n < 128 || (n > 255 && !is_new_weapon_item((int)n) && gear_wide_kind((int)n) != 0))
+            return "weapon must be a weapon's item ID: 128 to 255, 320 to 383 for a new weapon, or 10000 to 15999 for a wide weapon";
+        if (n >= WIDE_GEAR_FIRST) {
+            character_wide_key(c, 0, (int)n);
+        } else {
+            set_start(c, 0x1c, 1, n - ITEM_ID_WEAPON_BASE);
+            c->start_wide[0] = 0;
+        }
     } else if (word_is(key, key_end, "armour") || word_is(key, key_end, "armor")) {
-        if (!parse_number(&p, end, &n) || p != end || n < 256 || (n > 287 && (n < 384 || n > 415)))
-            return "armour must be an armour item ID: 256 to 287, or 384 to 415 for a new armour";
-        set_start(c, 0x1d, 1, n - 256);
+        if (!parse_number(&p, end, &n) || p != end || n < 256 || (n > 287 && (n < 384 || n > 415) && gear_wide_kind((int)n) != 1))
+            return "armour must be an armour item ID: 256 to 287, 384 to 415 for a new armour, or 16000 to 21999 for a wide armour";
+        if (n >= WIDE_GEAR_FIRST) {
+            character_wide_key(c, 1, (int)n);
+        } else {
+            set_start(c, 0x1d, 1, n - 256);
+            c->start_wide[1] = 0;
+        }
     } else if (word_is(key, key_end, "weapon_materia") || word_is(key, key_end, "armour_materia")
                || word_is(key, key_end, "armor_materia")) {
         /* one entry per slot, in slot order: ID, ID:AP, ID:master, or none for an empty slot */
@@ -17315,13 +18028,137 @@ static const char *apply_character_key(struct new_character *c, char *key, char 
     } else if (word_is(key, key_end, "accessory")) {
         if (word_is(value, end, "none"))
             n = 288 + 0xff;
-        else if (!parse_number(&p, end, &n) || p != end || n < 288 || (n > 319 && (n < 416 || n > 447)))
-            return "accessory must be an accessory item ID: 288 to 319, or 416 to 447 for a new accessory, or none";
-        set_start(c, 0x1e, 1, n - 288);
+        else if (!parse_number(&p, end, &n) || p != end || n < 288 || (n > 319 && (n < 416 || n > 447) && gear_wide_kind((int)n) != 2))
+            return "accessory must be an accessory item ID: 288 to 319, 416 to 447 for a new accessory, 22000 to 27999 for a wide accessory, or none";
+        if (n >= WIDE_GEAR_FIRST) {
+            character_wide_key(c, 2, (int)n);
+        } else {
+            set_start(c, 0x1e, 1, n - 288);
+            c->start_wide[2] = 0;
+        }
     } else {
         return unknown_character_key;
     }
     return NULL;
+}
+
+/* ---- `portrait`: a picture file, or one of the game's own portraits ----
+
+   portrait = NAME        a loose file NAME.tex or NAME.png under SpellExtConfig\\files if there is one; else,
+                          if NAME is a game name (below), the game's own portrait of that number; else a file
+                          of that name looked for when the portrait is shown (the base's while there is none)
+   portrait = game:NAME   the game's own portrait, even if a file of that name exists
+   portrait = file:NAME   the file, never the game's portrait
+   A game name: a character as battle_like names it (the game's character IDs are its portrait numbers), one
+   of the menu archive's portrait files as the exe's own table names them (matched against that table, never
+   typed here), or a number 0 to 11. The loose files are indexed at start-up, before this file is first read,
+   so the choice is made here, once (a file added later needs a restart, as any loose file does). */
+
+/* Whether SpellExtConfig\\files holds the portrait `portrait` (<portrait>.tex, or a <portrait>.png to be
+   converted): copies its path and returns TRUE, or returns FALSE. */
+static BOOL portrait_file_found(const char *portrait, char *path)
+{
+    char file[24];
+    struct loose_file *png;
+
+    lstrcpyA(file, portrait);
+    lstrcatA(file, ".tex");
+    if (find_loose_file(file, path))
+        return TRUE;
+    lstrcpyA(file, portrait);
+    lstrcatA(file, ".png");
+    png = find_loose_entry(file);
+    if (png)
+        lstrcpyA(path, png->path);
+    return png != NULL;
+}
+
+/* The number of the game's portrait that [start, end) names (a game name, above), or -1. */
+static int game_portrait_number(const char *start, const char *end)
+{
+    char *p = (char *)start;
+    DWORD n;
+    int i, k;
+
+    for (i = 0; character_model_names[i].name; i++)
+        if (word_is(start, end, character_model_names[i].name))
+            return (int)character_model_names[i].value;
+    for (i = 0; i < GAME_PORTRAITS; i++) {
+        const char *file = game_portrait_file(i, TRUE);     /* "pcefi.tim": the name is what comes before the dot */
+
+        for (k = 0; file && start + k < end && file[k] && file[k] != '.' && (start[k] | 0x20) == (file[k] | 0x20); k++)
+            ;
+        if (file && k > 0 && start + k == end && file[k] == '.')
+            return i;
+    }
+    /* at most four characters (11, 010, 0x0b): parse_number wraps at 32 bits, and 4294967296 is not 0 */
+    if (end - start <= 4 && parse_number(&p, end, &n) && p == end && n < GAME_PORTRAITS)
+        return (int)n;
+    return -1;
+}
+
+/* `portrait = ...` in a section (the three forms above): sets portrait[] (the name as written, without
+   its form) and portrait_number. Returns NULL or a problem; a refused line leaves the base's portrait. */
+static const char *character_portrait_key(struct new_character *c, const char *value, const char *stop)
+{
+    const char *problem = NULL;
+    char path[MAX_PATH + 200];
+    int form = 0, length, k;            /* 0 as written, 1 game:, 2 file: */
+
+    c->portrait_number = -1;
+    if (stop - value >= 5 && (word_is(value, value + 5, "game:") || word_is(value, value + 5, "file:"))) {
+        form = (value[0] | 0x20) == 'g' ? 1 : 2;
+        value += 5;
+    }
+    length = (int)(stop - value);
+    if (length < 1 || length > 12)
+        problem = "portrait must be a file name of 1 to 12 characters, without extension";
+    for (k = 0; !problem && k < length; k++) {
+        char ch = value[k];
+
+        if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_'))
+            problem = "portrait may only use letters, digits and _";
+        c->portrait[k] = ch;
+    }
+    c->portrait[problem ? 0 : length] = 0;
+    if (problem)
+        return problem;
+    c->portrait_number = form == 2 ? -2 : game_portrait_number(c->portrait, c->portrait + length);
+    if (form == 1 && c->portrait_number < 0) {
+        c->portrait[0] = 0;
+        return "portrait = game:NAME must name a character as battle_like does (cloud ... cid, youngcloud, sephiroth), one of the menu archive's own portrait files, or a number 0 to 11";
+    }
+    if (form == 0 && c->portrait_number >= 0 && portrait_file_found(c->portrait, path))
+        c->portrait_number = -1;        /* a file of that name comes first */
+    return NULL;
+}
+
+/* The one line, each time the file is read, that says where a character's portrait comes from. */
+static void portrait_source_line(const struct new_character *c)
+{
+    char path[MAX_PATH + 200], stem[16];
+    BOOL found = portrait_file_found(c->portrait, path);
+    int number = game_portrait_number(c->portrait, c->portrait + lstrlenA(c->portrait)), id = character_file_id(c);
+
+    if (c->portrait_number >= 0) {
+        const char *file = game_portrait_file(c->portrait_number, TRUE);
+        int k;
+
+        for (k = 0; file && file[k] && file[k] != '.' && k < (int)sizeof stem - 1; k++)
+            stem[k] = file[k];
+        stem[k] = 0;
+        log_line("character %d: portrait %s = the game's own portrait %d (%s.tex or %s_l.tex by display mode, from the menu archive; a mod's replacement of it, as menu\\%s_00.dds or menu\\%s_l_00.dds, applies if the mod has one)%s",
+                 id, c->portrait, c->portrait_number, stem, stem, stem, stem,
+                 found ? "; game: the file of that name is not used" : "");
+    } else if (found && number >= 0 && c->portrait_number != -2) {
+        log_line("character %d: portrait %s = the file %s (a file of that name takes precedence over the game's portrait %d; write portrait = game:%s for the game's)",
+                 id, c->portrait, path, number, c->portrait);
+    } else if (found) {
+        log_line("character %d: portrait %s = the file %s", id, c->portrait, path);
+    } else {
+        log_line("character %d: portrait %s = no %s.tex or %s.png under SpellExtConfig\\files%s: the base's is shown",
+                 id, c->portrait, c->portrait, c->portrait, number >= 0 ? " (file: never the game's portrait)" : " and not a game portrait");
+    }
 }
 
 /* Reads the character file. Returns how many characters it defines. */
@@ -17362,6 +18199,7 @@ static int load_characters(void)
         for (end = line; end < file_end && *end != '\n'; end++)
             ;
         line_number++;
+        character_file_line = line_number;
         for (stop = start; stop < end; stop++)
             if ((*stop == ';' || *stop == '#') && (stop == start || is_space(stop[-1])))
                 break;
@@ -17381,7 +18219,7 @@ static int load_characters(void)
                 current->defined = 1;
                 current->base = -1;
                 current->from_sheet = 0;
-                current->equip_like = -1;
+                current->equip_like = EQUIP_LIKE_UNSET;
                 current->limits_like = -1;
                 current->own_limits = 0;
                 for (i = 0; i < 9; i++)
@@ -17391,6 +18229,7 @@ static int load_characters(void)
                 current->party_slot = 0;
                 current->join_on_load = 0;
                 current->portrait[0] = 0;
+                current->portrait_number = -1;
                 current->portrait_texture = 0;
                 current->portrait_fit = 1;
                 current->battle_model = -1;
@@ -17398,6 +18237,9 @@ static int load_characters(void)
                 current->model_base_stem[0] = 0;
                 current->field_model[0] = 0;
                 current->field_model_found = 0;
+                current->ai_like = 0;
+                current->ai_file[0] = 0;
+                current->ai_keys_here = 0;
                 wsprintfA(current->model_name, "NEWCH%d.DAT", (int)n);
                 for (i = 0; i < 9; i++)
                     current->curve_set[i] = 0;
@@ -17405,6 +18247,7 @@ static int load_characters(void)
                     current->start_set[i] = 0;
                 for (i = 0; i < 16; i++)
                     current->start_materia[i] = 0xffffffff;
+                current->start_wide[0] = current->start_wide[1] = current->start_wide[2] = 0;
                 current->level_like = -1;
                 current->level_offset = 0;
                 encode_text(current->name, "New");
@@ -17453,25 +18296,15 @@ static int load_characters(void)
                         current->battle_avatar_tried = current->battle_avatar_queued = 0;
                         current->limit_block = current->seated = 0;
                         current->has_record = current->hidden = 0;
+                        current->gear_wish_pending = 0;     /* (a sheet's wide piece) its start_wide is copied; nothing is pending for it */
                         current->model_base_stem[0] = 0;
+                        current->ai_keys_here = 0;      /* (the AI keys it copied may be changed by one line of its own) */
                         wsprintfA(current->model_name, "NEWCH%d.DAT", own_id);
                     }
                 } else if ((problem = apply_character_key(current, start, key_end, value, stop)) != unknown_character_key) {
                     ;   /* one of the definition keys; `problem` is NULL or what was wrong */
                 } else if (word_is(start, key_end, "portrait")) {
-                    problem = NULL;
-                    int length = (int)(stop - value), k;
-
-                    if (length < 1 || length > 12)
-                        problem = "portrait must be a file name of 1 to 12 characters, without extension";
-                    for (k = 0; !problem && k < length; k++) {
-                        char ch = value[k];
-
-                        if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_'))
-                            problem = "portrait may only use letters, digits and _";
-                        current->portrait[k] = ch;
-                    }
-                    current->portrait[problem ? 0 : length] = 0;
+                    problem = character_portrait_key(current, value, stop);    /* a file or one of the game's own portraits */
                 } else if (word_is(start, key_end, "field_model")) {
                     /* the four characters of a field skeleton's name (YUAA for YUAA.HRC), or none */
                     int length = (int)(stop - value), k;
@@ -17495,6 +18328,9 @@ static int load_characters(void)
                         }
                         current->field_model[problem ? 0 : 4] = 0;
                     }
+                } else if (word_is(start, key_end, "ai_like") || word_is(start, key_end, "ai")) {
+                    problem = character_ai_key(word_is(start, key_end, "ai_like"), value, stop, &current->ai_like,
+                                               current->ai_file, &current->ai_keys_here);
                 } else if (word_is(start, key_end, "portrait_fit")) {
                     problem = NULL;
                     if (word_is(value, stop, "yes"))
@@ -17536,8 +18372,10 @@ static int load_characters(void)
             log_line("character %d has no base: built from its own sheet; %d of its 9 growth curves, and anything "
                      "else left out, come from character %d", NEW_CHARACTER_FIRST_ID + i, borrowed, c->base);
         }
-        if (c->equip_like < 0)
+        if (c->equip_like == EQUIP_LIKE_UNSET)       /* (not EQUIP_LIKE_NONE: that one stays) */
             c->equip_like = c->base;
+        if (c->portrait[0])
+            portrait_source_line(c);
     }
     return count;
 }
@@ -17731,6 +18569,512 @@ static void quiet_seat_ai(void)
     for (id = NEW_CHARACTER_FIRST_ID; id < NEW_CHARACTER_FIRST_ID + SEAT_MAX; id++)
         remap[id] = 11;
     log_line("character AI: a seat's member runs no kernel script in battle (it ran Cloud's)");
+}
+
+/* ---- Character AI of a new character (`ai_like`, `ai`) --------------------------------------------
+
+   How the game does it (read from the code, ff7_en.exe): FUN_005c86e0(actor, section, arg) runs one
+   section of a party member's AI. It takes the slot's character ID (009a87f4 + slot*0x10), puts it
+   through the byte table above (008fee38: ff = itself), asks FUN_005c88c7(0099d42c, index, section)
+   for the script (the call at 005c8786), and hands the script to the interpreter FUN_005d7fe4 with
+   that index as its third argument. The interpreter reads the script where it lies. Its only use of
+   the index is opcode 0x75 ("link"), which calls FUN_005c8b65(index, value) (at 005d8685) to write
+   008fee38[index] = value: the character then runs the entry `value` from its next lookup on (one
+   step: the byte of the entry looked up is not followed again). Sections: 0 init, 1 main (only for
+   an actor with flag 0x10, "AI-controlled": a transformation, or a script that sets bit 4024),
+   2 counter, 3 death, 4 physical counter, 5 magical counter, 6 battle end, 7 pre-action, 8-15
+   custom events.
+
+   A new character's AI: a block of its own in this DLL's memory, in the kernel's layout (a table of
+   16-bit entry offsets, the entry count being the first offset / 2; each entry 16 section offsets
+   from the entry, ffff = none, then the scripts, whose jumps count from the script's start):
+     ai_like = <one of the eleven, or 0-11>: a private copy of the kernel's whole character-AI block
+               as the game loaded it (whichever kernel that is), its own entry being that one;
+     ai = NAME: SpellExtConfig\ai\NAME.ai, a block in the same layout; its own entry is entry 0.
+   A block is checked whole before it is used (every script that a section starts walked through
+   every path with the interpreter's operand rules) or dropped with one line.
+
+   Once a block is in use, two calls are answered for the four seat IDs (12-15) and passed to the
+   game's routines for everything else, unchanged:
+     005c8786 -> party_ai_section_hook: a seat's script comes from its occupant's block;
+     005d8685 -> ai_link_hook: a seat's link is kept here, per seat and inside its block.
+   The seats' bytes of 008fee38 become ff, so that a seat's own ID reaches the first. A seat whose
+   occupant has no block is looked up exactly as before (the byte quiet_seat_ai left: 11, or 0
+   under a kernel whose entry 11 is not empty). Links are as in the game (only a script that runs as
+   the seat's own entry re-points it), except that they are forgotten at each battle's start
+   (battle_start_party_hook). Neither site is touched by FFNx 1.24.3 or Enhanced Stock UI. */
+#define SITE_PARTY_AI_SECTION   0x005c8786u  /* in FUN_005c86e0: 68 2c d4 99 00 (push 0099d42c) | e8 3c 01 00 00 | 83 c4 0c */
+#define FN_AI_FIND_SECTION      0x005c88c7u  /* FUN_005c88c7(base, index, section): the script, or 0 */
+#define SITE_AI_LINK            0x005d8685u  /* in FUN_005d7fe4, opcode 0x75: 8b 55 10 52 | e8 db 04 ff ff | 83 c4 08 */
+#define FN_AI_LINK              0x005c8b65u  /* FUN_005c8b65(index, value): 008fee38[index] = value */
+#define KERNEL_AI_SIZE          0x978u       /* 0099d42c to the end of kernel section 3 (0099dda4) */
+#define AI_FILE_MAX             0xffffu      /* a block's offsets are 16-bit (in this DLL's memory, never in the kernel's area) */
+#define AI_SECTIONS             16
+#define AI_LOGS                 24           /* lines from the two hooks in a run */
+
+static BOOL battle_start_hooked;             /* install_limit_hooks: battle_start_party_hook is in */
+
+/* CHAR AI PURE BEGIN */
+struct char_ai_block {
+    BYTE *bytes;            /* the block, in the kernel's layout; NULL = no AI of its own */
+    DWORD size;
+    int entries;            /* entries in its table */
+    int home;               /* the character's own entry */
+};
+
+static const char *const ai_section_names[AI_SECTIONS] = {
+    "init", "main", "counter", "death", "physical", "magical", "battle_end", "pre_action",
+    "custom1", "custom2", "custom3", "custom4", "custom5", "custom6", "custom7", "custom8",
+};
+
+static WORD ai_word(const BYTE *b, DWORD at)
+{
+    return (WORD)(b[at] | b[at + 1] << 8);
+}
+
+/* One script, by the rules of the project's tools/ai_tool.py `check` (the same files pass both), with the
+   interpreter's own operand rules (FUN_005d7fe4): 00-03 and 10-13 take a 16-bit address, 70-72 a 16-bit
+   offset from the script's start (jz, jne, jmp), 60/61/62 one, two or three bytes; 93 a text ended by ff
+   in which ea-f1 carry two more bytes; a0 a count byte and a zero-ended text; the rest take nothing.
+   The script is read in order from its start to an end (73) that no jump seen so far points past; every
+   opcode on the way must be one of the interpreter's, every operand inside the block, and every jump must
+   land on an instruction of that walk. So no path can run off the script or into the middle of an
+   instruction. NULL if so; otherwise what is wrong, *where its offset in the block. */
+static BYTE ai_seen[AI_FILE_MAX / 8 + 1];
+static WORD ai_jump[AI_FILE_MAX / 3 + 2];
+
+static const char *ai_script_check(const BYTE *b, DWORD size, DWORD start, DWORD *where)
+{
+    DWORD limit = size - start, pc = 0, furthest = 0, i;
+    int jumps = 0, any_jump = 0;
+
+    for (i = 0; i < limit / 8 + 1; i++)
+        ai_seen[i] = 0;
+    for (;;) {
+        BYTE op;
+
+        *where = start + pc;
+        if (pc >= limit)
+            return "runs past the end of the block (no end, 73)";
+        ai_seen[pc >> 3] |= (BYTE)(1 << (pc & 7));
+        op = b[start + pc++];
+        if ((op <= 0x03) || (op >= 0x10 && op <= 0x13) || (op >= 0x70 && op <= 0x72)) {
+            DWORD operand;
+
+            if (pc + 2 > limit)
+                return "an operand runs past the end of the block";
+            operand = ai_word(b, start + pc);
+            pc += 2;
+            if (op >= 0x70) {
+                ai_jump[jumps++] = (WORD)operand;       /* (one a 3-byte instruction: never more than the array) */
+                if (!any_jump || operand > furthest)
+                    furthest = operand;
+                any_jump = 1;
+            }
+        } else if (op >= 0x60 && op <= 0x62) {
+            if (pc + (op - 0x5f) > limit)
+                return "an operand runs past the end of the block";
+            pc += op - 0x5f;
+        } else if (op == 0x73) {
+            if (!any_jump || furthest < pc)
+                break;
+        } else if (op == 0x93) {
+            for (;;) {
+                BYTE c;
+
+                if (pc >= limit)
+                    return "a text (93) has no ff before the end of the block";
+                c = b[start + pc++];
+                if (c == 0xff)
+                    break;
+                if (c >= 0xea && c <= 0xf1)
+                    pc += 2;
+            }
+        } else if (op == 0xa0) {
+            if (pc + 1 > limit)
+                return "a debug text (a0) runs past the end of the block";
+            for (pc++;; pc++) {
+                if (pc >= limit)
+                    return "a debug text (a0) has no 00 before the end of the block";
+                if (!b[start + pc])
+                    break;
+            }
+            pc++;
+        } else if (!((op >= 0x30 && op <= 0x37) || (op >= 0x40 && op <= 0x45) || (op >= 0x50 && op <= 0x52) ||
+                     op == 0x74 || op == 0x75 || (op >= 0x80 && op <= 0x87) || (op >= 0x90 && op <= 0x96) || op == 0xa1)) {
+            *where = start + pc - 1;
+            return "an opcode the interpreter does not have";
+        }
+    }
+    for (i = 0; i < (DWORD)jumps; i++)
+        if (ai_jump[i] >= pc || !(ai_seen[ai_jump[i] >> 3] & (1 << (ai_jump[i] & 7)))) {
+            *where = start + ai_jump[i];
+            return "a jump does not land on an instruction of its script";
+        }
+    return NULL;
+}
+
+/* The block whole: its table, each entry's sections, each script (ai_script_check). NULL and *entries
+   if it may be used; otherwise what is wrong, and where (entry, section: -1 if not about one). */
+static const char *ai_block_check(const BYTE *b, DWORD size, int *entries, int *bad_entry, int *bad_section, DWORD *where)
+{
+    DWORD first = 0xffff, i;
+    int e, s;
+
+    *bad_entry = *bad_section = -1;
+    *where = 0;
+    *entries = 0;
+    if (size < 2 || size > AI_FILE_MAX)
+        return size < 2 ? "too small to hold a table" : "larger than 65535 bytes";
+    for (i = 0; 2 * i + 2 <= size && 2 * i < first; i++)
+        if (ai_word(b, 2 * i) != 0xffff && ai_word(b, 2 * i) < first)
+            first = ai_word(b, 2 * i);
+    if (first == 0xffff || first >= size)
+        return "its table has no entry";
+    if ((first & 1) || 2 * i != first)
+        return "the lowest entry offset is not the end of the table";
+    for (e = 0; e < (int)(first / 2); e++) {
+        DWORD entry = ai_word(b, 2 * e);
+
+        if (entry == 0xffff)
+            continue;
+        *bad_entry = e;
+        *where = entry;
+        if (entry & 1)
+            return "the entry starts at an odd offset";
+        if (entry + 2 * AI_SECTIONS > size)
+            return "the entry's 16 section offsets run past the end of the block";
+        for (s = 0; s < AI_SECTIONS; s++) {
+            DWORD section = ai_word(b, entry + 2 * s);
+            const char *problem;
+
+            if (section == 0xffff)
+                continue;
+            *bad_section = s;
+            *where = entry + section;
+            if (entry + section >= size)
+                return "the script starts past the end of the block";
+            if ((problem = ai_script_check(b, size, entry + section, where)) != NULL)
+                return problem;
+        }
+        *bad_section = -1;
+    }
+    *bad_entry = -1;
+    *entries = (int)(first / 2);
+    return NULL;
+}
+
+/* FUN_005c88c7 for a block of ours, bounded: the script of `section` in `entry`, or NULL. */
+static const BYTE *ai_find_section(const struct char_ai_block *b, int entry, int section)
+{
+    DWORD at, script;
+
+    if (!b->bytes || entry < 0 || entry >= b->entries || section < 0 || section >= AI_SECTIONS)
+        return NULL;
+    at = ai_word(b->bytes, 2 * (DWORD)entry);
+    if (at == 0xffff || at + 2 * AI_SECTIONS > b->size)
+        return NULL;
+    script = ai_word(b->bytes, at + 2 * (DWORD)section);
+    if (script == 0xffff || at + script >= b->size)
+        return NULL;
+    return b->bytes + at + script;
+}
+
+/* Takes `bytes` (size) as the block of `b` with its own entry `home`, once checked: NULL; otherwise the
+   problem (the bytes are not taken) and where it is, as ai_block_check gives it. */
+static const char *char_ai_make(struct char_ai_block *b, BYTE *bytes, DWORD size, int home, int *bad_entry,
+                                int *bad_section, DWORD *where)
+{
+    int entries;
+    const char *problem = ai_block_check(bytes, size, &entries, bad_entry, bad_section, where);
+
+    if (problem)
+        return problem;
+    if (home < 0 || home >= entries)
+        return "the block has no entry for the character";
+    b->bytes = bytes;
+    b->size = size;
+    b->entries = entries;
+    b->home = home;
+    return NULL;
+}
+
+/* `ai_like = NAME | 0-11 | none` (like != 0) or `ai = NAME | none` of one section: *ai_like is the kernel
+   entry + 1 (0 = none), ai_file the file's name without ".ai" ("" = none); *keys_here which of the two
+   this section has given (1 ai_like, 2 ai): the second of the two in one section is refused. */
+static const char *character_ai_key(BOOL like, char *value, char *end, int *ai_like, char *ai_file, BYTE *keys_here)
+{
+    static const char *const names[11] = {
+        "cloud", "barret", "tifa", "aeris", "red", "yuffie", "caitsith", "vincent", "cid", "youngcloud", "sephiroth",
+    };
+    char *p = value;
+    DWORD n;
+    int i;
+
+    if (*keys_here & (like ? 2 : 1))
+        return like ? "ai_like and ai in one section: this ai_like is ignored (the ai line before it stays)"
+                    : "ai_like and ai in one section: this ai is ignored (the ai_like line before it stays)";
+    if (like) {
+        if (word_is(value, end, "none")) {
+            n = 0;
+        } else {
+            for (i = 0; i < 11 && !word_is(value, end, names[i]); i++)
+                ;
+            if (i < 11 || word_is(value, end, "aerith"))
+                n = i < 11 ? (DWORD)i + 1 : 4;
+            else if (parse_number(&p, end, &n) && p == end && n <= 11)
+                n++;
+            else
+                return "ai_like must be cloud barret tifa aeris red yuffie caitsith vincent cid youngcloud sephiroth, an entry 0 to 11, or none";
+        }
+        *ai_like = (int)n;
+        ai_file[0] = 0;
+    } else {
+        int length = (int)(end - value);
+
+        if (word_is(value, end, "none")) {
+            length = 0;
+        } else {
+            if (length < 1 || length > AI_NAME_MAX)
+                return "ai must be a file name of 1 to 31 characters, without .ai (the file is SpellExtConfig\\ai\\NAME.ai), or none";
+            for (i = 0; i < length; i++)
+                if (!((value[i] >= 'a' && value[i] <= 'z') || (value[i] >= 'A' && value[i] <= 'Z') ||
+                      (value[i] >= '0' && value[i] <= '9') || value[i] == '_' || value[i] == '-'))
+                    return "ai may only use letters, digits, _ and -";
+            for (i = 0; i < length; i++)
+                ai_file[i] = value[i];
+        }
+        ai_file[length] = 0;
+        *ai_like = 0;
+    }
+    *keys_here |= like ? 1 : 2;
+    return NULL;
+}
+
+/* ---- the two hooks and what they keep ---- */
+static DWORD party_ai_next = FN_AI_FIND_SECTION, ai_link_next = FN_AI_LINK;
+static BOOL char_ai_live;                   /* both calls are ours and the seats' bytes are ff */
+static BOOL char_ai_tried;                  /* install_character_ai has run (once a run) */
+static BYTE seat_ai_fallback[SEAT_MAX];     /* the index a seat without a block of its own is looked up by, as before */
+static BYTE seat_ai_link[SEAT_MAX] = { 0xff, 0xff, 0xff, 0xff };    /* this battle: the entry a link sent the seat to, ff = its own */
+static int seat_ai_running[SEAT_MAX] = { -1, -1, -1, -1 };          /* the entry of the seat's script being run (its last lookup) */
+static LONG char_ai_passed, char_ai_answered, char_ai_found, char_ai_links, char_ai_logs, char_ai_battles, char_ai_said;
+
+static const struct char_ai_block *char_ai_occupant(int id);   /* the block of a seat's occupant, NULL if it has none */
+
+static void char_ai_say(const char *what, int id, DWORD value)
+{
+    if (char_ai_logs >= AI_LOGS)
+        return;
+    char_ai_logs++;
+    log_line("character AI: seat %d: link to %lu %s%s", id, value, what, char_ai_logs == AI_LOGS ? " (no more of these lines)" : "");
+}
+
+/* Once a battle, at the first party member's battle-end lookup (or never, if it has none): what went through the call. */
+static void char_ai_battle_said(void)
+{
+    if (char_ai_said)
+        return;
+    char_ai_said = 1;
+    if (char_ai_battles <= 5 || char_ai_answered)
+        log_line("character AI, battle %ld, at its end: %ld party lookups passed to the game, %ld answered for seats (%ld with a script), %ld links by seats",
+                 char_ai_battles, char_ai_passed, char_ai_answered, char_ai_found, char_ai_links);
+}
+
+static const BYTE *__cdecl party_ai_section_hook(const BYTE *base, int chr, int section)
+{
+    int seat = chr - NEW_CHARACTER_FIRST_ID;
+
+    if (char_ai_live && seat >= 0 && seat < SEAT_MAX) {
+        const struct char_ai_block *b = char_ai_occupant(chr);
+
+        if (b) {
+            int entry = seat_ai_link[seat] != 0xff && seat_ai_link[seat] < b->entries ? seat_ai_link[seat] : b->home;
+            const BYTE *script = ai_find_section(b, entry, section);
+
+            seat_ai_running[seat] = entry;
+            char_ai_answered++;
+            if (script)
+                char_ai_found++;
+            if (section == 6)
+                char_ai_battle_said();
+            return script;
+        }
+        if (seat_ai_fallback[seat] != 0xff)
+            chr = seat_ai_fallback[seat];
+    }
+    char_ai_passed++;
+    if (section == 6)
+        char_ai_battle_said();
+    return ((const BYTE *(__cdecl *)(const BYTE *, int, int))party_ai_next)(base, chr, section);
+}
+
+static void __cdecl ai_link_hook(int chr, DWORD value)
+{
+    int seat = chr - NEW_CHARACTER_FIRST_ID;
+
+    if (char_ai_live && seat >= 0 && seat < SEAT_MAX) {
+        const struct char_ai_block *b = char_ai_occupant(chr);
+
+        if (b) {
+            BYTE to = (BYTE)value;          /* the game keeps a byte */
+
+            char_ai_links++;
+            if (seat_ai_running[seat] != b->home)
+                /* the game's: the script runs as another entry, whose own byte the link writes; no lookup of
+                   this seat reads that one */
+                char_ai_say("made by a script of a linked entry: changes nothing, as in the game", chr, to);
+            else if (to != 0xff && to >= b->entries)
+                char_ai_say("is not an entry of the seat's block: ignored", chr, to);
+            else
+                seat_ai_link[seat] = to;
+            return;
+        }
+        if (seat_ai_fallback[seat] != 0xff)
+            chr = seat_ai_fallback[seat];
+    }
+    ((void (__cdecl *)(int, DWORD))ai_link_next)(chr, value);
+}
+
+/* battle_start_party_hook, before the party's init scripts run: no seat is linked anywhere. */
+static void char_ai_battle_start(void)
+{
+    int seat;
+
+    for (seat = 0; seat < SEAT_MAX; seat++) {
+        seat_ai_link[seat] = 0xff;
+        seat_ai_running[seat] = -1;
+    }
+    char_ai_passed = char_ai_answered = char_ai_found = char_ai_links = char_ai_said = 0;
+    char_ai_battles++;
+}
+
+/* Once, when the first block is made: both sites as the game has them, or neither is touched. */
+static void install_character_ai(void)
+{
+    static const BYTE site_a[13] = { 0x68, 0x2c, 0xd4, 0x99, 0x00, 0xe8, 0x3c, 0x01, 0x00, 0x00, 0x83, 0xc4, 0x0c };
+    static const BYTE site_b[12] = { 0x8b, 0x55, 0x10, 0x52, 0xe8, 0xdb, 0x04, 0xff, 0xff, 0x83, 0xc4, 0x08 };
+    static const BYTE find_a[13] = { 0x55, 0x8b, 0xec, 0x83, 0xec, 0x08, 0xc7, 0x45, 0xfc, 0x00, 0x00, 0x00, 0x00 };
+    static const BYTE link_b[17] = { 0x55, 0x8b, 0xec, 0x8b, 0x45, 0x08, 0x8a, 0x4d, 0x0c, 0x88, 0x88, 0x38, 0xee, 0x8f, 0x00, 0x5d, 0xc3 };
+    BYTE *remap = (BYTE *)ADDR_AI_REMAP;
+    int id, done;
+
+    if (char_ai_tried)
+        return;
+    char_ai_tried = TRUE;
+    for (id = NEW_CHARACTER_FIRST_ID; id < NEW_CHARACTER_FIRST_ID + SEAT_MAX; id++)
+        if (remap[id] != 0 && remap[id] != 11) {
+            log_line("character AI hooks: NOT in (the byte of 008fee38 for ID %d holds %02x, not what SpellExt left there): no seat runs an AI of its own",
+                     id, remap[id]);
+            return;
+        }
+    if (!bytes_are(SITE_PARTY_AI_SECTION - 5, site_a, 13) || !bytes_are(FN_AI_FIND_SECTION, find_a, 13) ||
+        !bytes_are(SITE_AI_LINK - 4, site_b, 12) || !bytes_are(FN_AI_LINK, link_b, 17)) {
+        const BYTE *a = (const BYTE *)SITE_PARTY_AI_SECTION, *l = (const BYTE *)SITE_AI_LINK;
+
+        log_line("character AI hooks: NOT in (the code at %08lx or %08lx is not the game's: %02x %02x %02x %02x %02x / %02x %02x %02x %02x %02x): no seat runs an AI of its own",
+                 SITE_PARTY_AI_SECTION, SITE_AI_LINK, a[0], a[1], a[2], a[3], a[4], l[0], l[1], l[2], l[3], l[4]);
+        return;
+    }
+    done = patch_call_chained(SITE_PARTY_AI_SECTION, FN_AI_FIND_SECTION, party_ai_section_hook, &party_ai_next);
+    if (done && !patch_call_chained(SITE_AI_LINK, FN_AI_LINK, ai_link_hook, &ai_link_next)) {
+        log_line("character AI hooks: 1 of 2 (the link call could not be written): no seat runs an AI of its own");
+        return;         /* (the first passes everything to the game while char_ai_live is FALSE) */
+    }
+    if (!done) {
+        log_line("character AI hooks: 0 of 2 (the lookup call could not be written): no seat runs an AI of its own");
+        return;
+    }
+    for (id = NEW_CHARACTER_FIRST_ID; id < NEW_CHARACTER_FIRST_ID + SEAT_MAX; id++) {
+        seat_ai_fallback[id - NEW_CHARACTER_FIRST_ID] = remap[id];
+        remap[id] = 0xff;
+    }
+    char_ai_live = TRUE;
+    log_line("character AI hooks: 2 of 2 (%08lx the party's lookup, %08lx opcode 0x75 link): a seat whose occupant has ai_like or ai runs its own block; any other seat as before (index %d); the original characters through the game's routines",
+             SITE_PARTY_AI_SECTION, SITE_AI_LINK, seat_ai_fallback[0]);
+}
+/* CHAR AI PURE END */
+
+/* The blocks, one per character of the roster (by its place in new_characters: a character made with
+   copy_of has a block of its own, built from the keys it copied or gave). */
+static struct char_ai_block char_ai[ROSTER_MAX];
+
+static const struct char_ai_block *char_ai_occupant(int id)
+{
+    struct new_character *c = new_character(id);
+    const struct char_ai_block *b = c ? &char_ai[c - new_characters] : NULL;
+
+    return b && b->bytes ? b : NULL;
+}
+
+/* After the character file is read (start-up; a reload from the main menu, when no battle runs): every
+   block made afresh from the keys. The first block made puts the two hooks in. */
+static void build_character_ai(void)
+{
+    int i, built = 0;
+
+    for (i = 0; i < ROSTER_MAX; i++) {
+        struct char_ai_block *b = &char_ai[i];
+        const struct new_character *c = &new_characters[i];
+        char name[AI_NAME_MAX + 8], sections[160];
+        const char *problem;
+        BYTE *bytes;
+        DWORD size = 0, where;
+        int home, bad_entry, bad_section, s;
+
+        if (b->bytes)
+            VirtualFree(b->bytes, 0, MEM_RELEASE);
+        b->bytes = NULL;
+        b->size = 0;
+        b->entries = b->home = 0;
+        if (!c->defined || (!c->ai_like && !c->ai_file[0]))
+            continue;
+        if (c->ai_like) {
+            size = KERNEL_AI_SIZE;
+            home = c->ai_like - 1;
+            bytes = VirtualAlloc(NULL, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            if (bytes)
+                copy_bytes(bytes, (const BYTE *)ADDR_KERNEL_AI_OFFSETS, (int)size);
+            wsprintfA(name, "%d", home);
+        } else {
+            home = 0;
+            wsprintfA(name, "ai\\%s.ai", c->ai_file);
+            bytes = (BYTE *)read_whole_file(name, &size);
+            if (!bytes) {
+                log_line("character %d: ai = %s: SpellExtConfig\\%s cannot be read: no AI of its own", NEW_CHARACTER_FIRST_ID + i,
+                         c->ai_file, name);
+                continue;
+            }
+        }
+        if (!bytes) {
+            log_line("character %d: no memory for its AI block: no AI of its own", NEW_CHARACTER_FIRST_ID + i);
+            continue;
+        }
+        problem = char_ai_make(b, bytes, size, home, &bad_entry, &bad_section, &where);
+        if (problem) {
+            log_line("character %d: %s %s REFUSED: %s (entry %d, section %d, offset %04lx): no AI of its own",
+                     NEW_CHARACTER_FIRST_ID + i, c->ai_like ? "ai_like =" : "ai =", c->ai_like ? name : c->ai_file, problem,
+                     bad_entry, bad_section, where);
+            VirtualFree(bytes, 0, MEM_RELEASE);
+            continue;
+        }
+        sections[0] = 0;
+        for (s = 0; s < AI_SECTIONS; s++)
+            if (ai_find_section(b, home, s)) {
+                if (sections[0])
+                    lstrcatA(sections, " ");
+                lstrcatA(sections, ai_section_names[s]);
+            }
+        log_line("character %d: AI %s%s (%d entries, %lu bytes), its own entry %d: %s", NEW_CHARACTER_FIRST_ID + i,
+                 c->ai_like ? "a private copy of the loaded kernel's block, like entry " : "SpellExtConfig\\",
+                 name, b->entries, b->size, home, sections[0] ? sections : "NO script (it will do nothing by itself)");
+        built++;
+    }
+    if (built) {
+        install_character_ai();
+        if (char_ai_live && !battle_start_hooked)
+            log_line("character AI: the battle-start hook is not in: a seat's link is NOT forgotten between battles");
+    }
 }
 
 /* The field keeps, for each character ID, which of the field's entities is that character (a byte
@@ -18283,6 +19627,31 @@ static void fields_game_free(void *block)
 #define FIELD_BUFFER_LEAST      4000000u     /* the key can only raise the size: never below FFNx's own for a new id */
 #define FIELD_BUFFER_MOST       0x04000000u
 #define FIELDS_FILE_NAME_MAX    64
+/* (stage 2) */
+#define FIELDS_FALLBACK_LOW     65           /* ids 1-64 are the world map's (the field loop hands 0 < id < 0x41 to it), 0 the dummy */
+#define FIELDS_FALLBACK_HIGH    786          /* the game's own last field (787 is its empty name, never loaded) */
+#define ADDR_FIELD_ID_NOW       0x00cc15d0u  /* WORD: the current field (sub_00408074 from the save; the jump in field_loop_sub_0063c17f) */
+#define ADDR_FIELD_ID_NEXT      0x00cc0d8au  /* WORD: where a jump goes (gateway, MAPJUMP); field_main_loop and FUN_0060e96c read it */
+#define ADDR_FIELD_ID_PREVIOUS  0x00cc0decu  /* WORD: the field before (a jump sets it to the field left, 0063c592; sub_00408074 copies the save's id here too, 004080c0) */
+#define ADDR_FIELD_ENTRY_X      0x00cc0d8cu  /* WORD: where the player is put in the field entered: x */
+#define ADDR_FIELD_ENTRY_Y      0x00cc0d8eu  /* WORD: y */
+#define ADDR_FIELD_ENTRY_TRI    0x00cc0daau  /* WORD: walkmesh triangle */
+#define ADDR_FIELD_ENTRY_DIR    0x00cc0dacu  /* WORD: direction (sub_00408074 widens the save's byte) */
+#define ADDR_SAVE_PLACE         0x00dc08c8u  /* the save block's place, savemap +0xb90 .. +0xba2: what sub_00408116 writes */
+#define SAVE_PLACE_BYTES        19
+#define SAVE_PLACE_MODE         0x04         /* WORD: 1 a field, 3 the world map */
+#define SAVE_PLACE_ID           0x06         /* WORD: savemap +0xb96, 00dc08ce */
+#define SAVE_PLACE_X            0x0a         /* WORD: 00dc08d2 */
+#define SAVE_PLACE_Y            0x0c         /* WORD: 00dc08d4 */
+#define SAVE_PLACE_TRI          0x0e         /* WORD: 00dc08d6 */
+#define SAVE_PLACE_DIR          0x10         /* BYTE: 00dc08d8 */
+#define FLDX_VERSION            1
+#define FLDX_NAME_BYTES         16
+#define FLDX_BYTES              (2 + FLDX_NAME_BYTES + 2 * SAVE_PLACE_BYTES)    /* 56: the id at the save, the name, the place, the place as saved */
+#define FLDX_SECTION            (12 + FLDX_BYTES)                                /* with the SXC3 section head */
+#define FN_FIELD_OPEN           0x0060b9d0u  /* field_open_file_0060b9d0(name): FFNx reads its address (field_main_loop + 0x331), replaces nothing in it */
+#define ADDR_FIELDS_RESUMING    0x00cff268u  /* (= ADDR_FIELD_RESUMING, named again so the block stands alone) set: back from a battle or a menu, nothing is read */
+#define FN_FIELD_NAME_OF        0x00620f54u  /* FUN_00620f54(id, out): a field's name from the maplist block (0 if id >= the count) */
 
 /* The 12 instructions of FUN_0060dad4 that name the info table (00cc2280 + a record offset), as the exe has them. */
 static const struct { DWORD at; BYTE length, operand; BYTE bytes[8]; } fields_info_sites[12] = {
@@ -18319,6 +19688,11 @@ static DWORD fields_game_count;     /* the names the game read from its maplist 
 static BYTE *fields_infos;
 static DWORD *fields_scales;
 static BOOL fields_guard_said;
+
+/* (stage 2) fields_fallback: where a save made in a registered field says it was made, and where a field id the game
+   cannot read is sent. `asked` as the last reading of the game file left it; `taken` at start-up (fields_install). */
+struct fields_place { int on; WORD id; short x, y; WORD triangle; BYTE direction; };
+static struct fields_place fields_fallback_asked, fields_fallback_taken;
 
 struct fields_entry { WORD id; WORD line; char name[32]; };
 static struct fields_entry *fields_entries;     /* the registered fields, in the file's order */
@@ -18424,6 +19798,35 @@ static void fields_keys_begin(void)
     fields_file_asked[0] = 0;
     fields_table_asked = 0;
     fields_buffer_asked = FIELD_BUFFER_DEFAULT;
+    fields_fallback_asked.on = 0;
+}
+
+/* (stage 2) One signed number of fields_fallback's list, spaces around it allowed. parse_number wraps past 32 bits
+   (4294967872 would read as 576): a number of more than 10 digits, or of more than 5 once its leading zeros are left
+   out (every value this key takes has at most 5, decimal or hex), is refused. */
+static BOOL fields_parse_signed(char **p, char *stop, long *out)
+{
+    char *c = *p, *digits;
+    DWORD n;
+    BOOL minus = FALSE;
+    int count, significant;
+
+    while (c < stop && is_space(*c))
+        c++;
+    if (c < stop && (*c == '-' || *c == '+'))
+        minus = *c++ == '-';
+    digits = c + (stop - c > 2 && c[0] == '0' && (c[1] | 0x20) == 'x' ? 2 : 0);
+    if (!parse_number(&c, stop, &n))
+        return FALSE;
+    for (count = significant = 0; digits + count < c; count++)
+        significant += significant || digits[count] != '0';
+    if (count > 10 || significant > 5 || n > 0x10000u)
+        return FALSE;
+    while (c < stop && is_space(*c))
+        c++;
+    *out = minus ? -(long)n : (long)n;
+    *p = c;
+    return TRUE;
 }
 
 /* 0: not a key of this block; 1: read; -1: a mistake (*fault says what; the key keeps its default). */
@@ -18474,7 +19877,42 @@ static int fields_key_line(char *start, char *key_end, char *value, char *stop, 
         fields_buffer_asked = n;
         return 1;
     }
+    if (word_is(start, key_end, "fields_fallback")) {
+        long v[5];
+        int k;
+
+        fields_fallback_asked.on = 0;
+        if (value == stop || word_is(value, stop, "none") || word_is(value, stop, "off"))
+            return 1;
+        for (k = 0; k < 5; k++) {
+            if (k) {
+                if (p >= stop || *p != ',')
+                    break;
+                p++;
+            }
+            if (!fields_parse_signed(&p, stop, &v[k]))
+                break;
+        }
+        if (k < 5 || p != stop || v[0] < FIELDS_FALLBACK_LOW || v[0] > FIELDS_FALLBACK_HIGH || v[1] < -32768 || v[1] > 32767 ||
+            v[2] < -32768 || v[2] > 32767 || v[3] < 0 || v[3] > 65535 || v[4] < 0 || v[4] > 255) {
+            *fault = "fields_fallback takes none, or five numbers: a field of the game's own (an id from 65 to 786), x, y (-32768 to 32767), a walkmesh triangle (0 to 65535) and a direction (0 to 255), as 576, -57, -132, 31, 124: none is used (a save in a registered field is saved as it is, and a field id the game cannot read is not sent anywhere)";
+            return -1;
+        }
+        fields_fallback_asked.id = (WORD)v[0];
+        fields_fallback_asked.x = (short)v[1];
+        fields_fallback_asked.y = (short)v[2];
+        fields_fallback_asked.triangle = (WORD)v[3];
+        fields_fallback_asked.direction = (BYTE)v[4];
+        fields_fallback_asked.on = 1;
+        return 1;
+    }
     return 0;
+}
+
+static BOOL fields_place_same(const struct fields_place *a, const struct fields_place *b)
+{
+    return a->on == b->on && (!a->on || (a->id == b->id && a->x == b->x && a->y == b->y && a->triangle == b->triangle &&
+                                         a->direction == b->direction));
 }
 
 /* After each reading of the game file: the tables are built once; a later change waits for the next start. */
@@ -18487,6 +19925,12 @@ static void fields_keys_settle(void)
         log_line("fields: the game file now says fields_file = %s, fields_table_size = %lu (0 = auto), field_buffer_bytes = %lu; the field tables were built at start-up with %s, %lu, %lu and are not built again: restart the game for the change",
                  fields_file_asked[0] ? fields_file_asked : "none", fields_table_asked, fields_buffer_asked,
                  fields_file_taken[0] ? fields_file_taken : "none", fields_table_taken, fields_buffer_taken);
+    if (!fields_place_same(&fields_fallback_asked, &fields_fallback_taken))
+        log_line("fields: the game file now says fields_fallback = %s (%u, %d, %d, %u, %u); this run keeps the one it started with, %s (%u, %d, %d, %u, %u): restart the game for the change",
+                 fields_fallback_asked.on ? "a place" : "none", fields_fallback_asked.id, fields_fallback_asked.x, fields_fallback_asked.y,
+                 fields_fallback_asked.triangle, fields_fallback_asked.direction, fields_fallback_taken.on ? "a place" : "none",
+                 fields_fallback_taken.id, fields_fallback_taken.x, fields_fallback_taken.y, fields_fallback_taken.triangle,
+                 fields_fallback_taken.direction);
 }
 
 /* ---- the registry file: `id = name` lines in [fields] ---- */
@@ -18804,6 +20248,7 @@ static void fields_install(void)
     lstrcpyA(fields_file_taken, fields_file_asked);
     fields_table_taken = fields_table_asked;
     fields_buffer_taken = fields_buffer_asked;
+    fields_fallback_taken = fields_fallback_asked;      /* (stage 2) */
     fields_game_count = game_count;
     log_line("fields: the game read %lu field names from its maplist at start-up (block %08lx); the block's size was %s",
              game_count, (DWORD)game_block, fields_step0_done && !fields_step0_late ? "this DLL's 2 MB" : "the game's 0x9600 (1,200 names)");
@@ -18974,6 +20419,438 @@ static void fields_after_read(const char *name, int result)
     else
         log_line("field %lu %.31s: no file (the reader found no whole field file of that name: a registered field must ship one, chunk files alone are not read)",
                  id, part);
+}
+
+/* ---- stage 2: the save guard and the bad-id guard (FF7FF8Fusion/Notes/Field_Capacity_Stage2.md) ----
+
+   THE SAVE GUARD. A save keeps the place it was made in as a u16 field id and a position (savemap +0xb96 .. +0xba0;
+   sub_00408116 writes them from the field globals when a menu opens, sub_00408074 copies them back at mode 0x15,
+   the load: both read from the decompile). A save made in a registered field cannot be loaded by a game that lacks
+   the field (the plain game, this DLL with the feature off, a registry without the name): the name is missing and
+   the game crashes or ends. So, at a save in a registered field with fields_fallback set, the save block holds the
+   FALLBACK while the save is made (written into the block before the companion file is built, put back after the
+   game's writer), and the real place goes BY NAME into the companion file (SXC3 section 'FLDX'). At a load with the
+   feature on, the name is looked up in the registry of this run and the place is put back into the save block with
+   the name's id of NOW, in load_accepted_hook: after the game has checked the slot, before the Load menu closes and
+   mode 0x15 copies the place into the field globals (menu_sub_007212fb calls FUN_006cdc09 at 0072220b on the
+   success path; the menu's close sets mode 0x15 only later; read from the decompile). A save loaded without this
+   DLL, or with a registry without the name, loads at the fallback. The section is read only from the save's OWN
+   companion (found by its key), only if the build that wrote it made it (not CARRIED), and only if the save's place
+   is exactly the fallback the section says was written: a stale or foreign section is never applied. It is never
+   carried forward: a later save made elsewhere has none.
+
+   THE BAD-ID GUARD. field_open_file_0060b9d0 is called from three places, each right after the field id was put in
+   00cff468 and the name "<name>\<name>.ate" was built in the caller's buffer from the maplist (FUN_00620f54):
+   0060e2da (field_enter_0060e0bd, from 00cc15d0: a load, the world map, a battle's end), 0060e8e8 (field_main_loop,
+   from 00cc0d8a: a gateway or MAPJUMP) and 0060eca2 (FUN_0060e96c, from 00cc0d8a). Each call is chained here
+   (bytes checked, all three or none). An id at or past the DLL's tables (FUN_0060dad4, inside field_open_file, would
+   read past its table), an id whose name is the placeholder sx_none, or a registered id whose file could not be read
+   goes to fields_fallback: the id (00cff468, 00cc15d0, and 00cc0d8a at the two jump sites), the place the player is
+   put (00cc0d8c, 00cc0d8e, 00cc0daa, 00cc0dac) and the name in the caller's buffer, made by the game's FUN_00620f54
+   and the caller's own two strings. Without fields_fallback nothing is redirected: the id is not read, one line
+   says so, and the game takes its own way for a field it cannot read. FFNx replaces none of these calls; it reads
+   the one at 0060e8e8 once, at its start (field_main_loop + 0x331, ff7_data.h:159), before this DLL installs, as it
+   reads the reader's call at 0060ba9f that stage 1 chains. */
+static const char fields_fldx_tag[4] = { 'F', 'L', 'D', 'X' };
+
+static struct {
+    int pending;                    /* 1: the save block holds the fallback (fields_save_begin until fields_save_end) */
+    WORD id;
+    char name[FLDX_NAME_BYTES];
+    BYTE real[SAVE_PLACE_BYTES], written[SAVE_PLACE_BYTES];
+} fields_save;
+
+static struct {
+    int have;                       /* 1: the loaded companion's FLDX section, to be put back by fields_after_load */
+    WORD id;
+    char name[FLDX_NAME_BYTES];
+    BYTE real[SAVE_PLACE_BYTES], written[SAVE_PLACE_BYTES];
+} fields_loaded;
+
+static BOOL fields_open_live;       /* the three callers of field_open_file are guarded (fields_open_install) */
+
+/* The name of a field id in the maplist block, for the log ("?" past it). */
+static const char *fields_name_at(DWORD id)
+{
+    static char name[33];
+    const BYTE *block = *(BYTE *const *)ADDR_MAPLIST_BLOCK;
+    int i;
+
+    if (!block || id >= *(const DWORD *)ADDR_MAPLIST_COUNT)
+        return "?";
+    for (i = 0; i < 32; i++)
+        name[i] = (char)block[id * 32 + i];
+    name[32] = 0;
+    return name;
+}
+
+/* Is the save block's place a registered field's, with the feature on? */
+static BOOL fields_save_place_registered(void)
+{
+    const BYTE *place = (const BYTE *)ADDR_SAVE_PLACE;
+
+    return fields_live && *(const WORD *)(place + SAVE_PLACE_MODE) == 1 && fields_is_registered(*(const WORD *)(place + SAVE_PLACE_ID));
+}
+
+/* Does this run want companion files for the save guard (save_work_on)? Fixed at start-up. */
+static BOOL fields_save_wanted(void)
+{
+    return fields_live && fields_fallback_taken.on;
+}
+
+/* AT A SAVE, from save_write_hook before the companion file is built. `cannot`: why no companion file can hold the
+   real place (the caller's checks), or NULL. Returns 1 if the save block now holds the fallback. */
+static int fields_save_begin(const char *cannot)
+{
+    BYTE *place = (BYTE *)ADDR_SAVE_PLACE;
+    DWORD id = *(const WORD *)(place + SAVE_PLACE_ID);
+    int i, e;
+
+    fields_save.pending = 0;
+    if (!fields_save_place_registered())
+        return 0;
+    if (!fields_fallback_taken.on) {
+        log_line("fields: a save in field %lu (%s, registered) is made AS IT IS: no fields_fallback is set. Without this DLL, or with a registry that lacks the field, that save does not load (the game cannot name the field)",
+                 id, fields_name_at(id));
+        return 0;
+    }
+    if (cannot) {
+        log_line("fields: *** a save in field %lu (%s, registered) is made AS IT IS: %s. Without this DLL, or with a registry that lacks the field, that save does not load ***",
+                 id, fields_name_at(id), cannot);
+        return 0;
+    }
+    for (e = 0; e < fields_entry_count && fields_entries[e].id != id; e++)
+        ;
+    if (e == fields_entry_count)
+        return 0;                                   /* (cannot be: the id is registered) */
+    for (i = 0; i < FLDX_NAME_BYTES; i++)
+        fields_save.name[i] = i < FLDX_NAME_BYTES - 1 ? fields_entries[e].name[i] : 0;
+    for (i = 0; i < SAVE_PLACE_BYTES; i++)
+        fields_save.real[i] = place[i];
+    *(WORD *)(place + SAVE_PLACE_ID) = fields_fallback_taken.id;
+    *(short *)(place + SAVE_PLACE_X) = fields_fallback_taken.x;
+    *(short *)(place + SAVE_PLACE_Y) = fields_fallback_taken.y;
+    *(WORD *)(place + SAVE_PLACE_TRI) = fields_fallback_taken.triangle;
+    place[SAVE_PLACE_DIR] = fields_fallback_taken.direction;
+    for (i = 0; i < SAVE_PLACE_BYTES; i++)
+        fields_save.written[i] = place[i];
+    fields_save.id = (WORD)id;
+    fields_save.pending = 1;
+    log_line("fields: a save in field %lu = %s (registered) at (%d,%d) triangle %u, direction %u: the save itself holds the fallback, field %u %s at (%d,%d) triangle %u, direction %u (fields_fallback); the real place goes into the companion file, by name (section FLDX)",
+             id, fields_save.name, *(const short *)(fields_save.real + SAVE_PLACE_X), *(const short *)(fields_save.real + SAVE_PLACE_Y),
+             *(const WORD *)(fields_save.real + SAVE_PLACE_TRI), fields_save.real[SAVE_PLACE_DIR], fields_fallback_taken.id,
+             fields_name_at(fields_fallback_taken.id), fields_fallback_taken.x, fields_fallback_taken.y, fields_fallback_taken.triangle,
+             fields_fallback_taken.direction);
+    return 1;
+}
+
+/* ON EVERY WAY OUT of save_write_hook, and when no companion file will be written after all (`why`, else NULL): the
+   save block's place back to the real one, if it still holds what fields_save_begin wrote. */
+static void fields_save_end(const char *why)
+{
+    BYTE *place = (BYTE *)ADDR_SAVE_PLACE;
+    int i, same = 1;
+
+    if (!fields_save.pending)
+        return;
+    fields_save.pending = 0;
+    for (i = 0; i < SAVE_PLACE_BYTES; i++)
+        same &= place[i] == fields_save.written[i];
+    if (!same) {
+        log_line("fields: *** the save block's place changed while the save was made (not by this DLL): left as it is, field %u ***",
+                 *(const WORD *)(place + SAVE_PLACE_ID));
+        return;
+    }
+    for (i = 0; i < SAVE_PLACE_BYTES; i++)
+        place[i] = fields_save.real[i];
+    if (why)
+        log_line("fields: *** the save in field %u (%s) is made AS IT IS after all: %s. Without this DLL, or with a registry that lacks the field, that save does not load ***",
+                 fields_save.id, fields_save.name, why);
+}
+
+/* For the companion file being built: the FLDX section's length (0: none), and the section written at `p`. */
+static DWORD fields_fldx_bytes(void)
+{
+    return fields_save.pending ? FLDX_SECTION : 0;
+}
+
+static BYTE *fields_fldx_write(BYTE *p)
+{
+    int i;
+
+    for (i = 0; i < 4; i++)
+        p[i] = (BYTE)fields_fldx_tag[i];
+    p[4] = p[5] = 0;                                /* flags: this build's own */
+    p[6] = FLDX_VERSION, p[7] = 0;
+    p[8] = FLDX_BYTES, p[9] = p[10] = p[11] = 0;
+    p += 12;
+    p[0] = (BYTE)fields_save.id, p[1] = (BYTE)(fields_save.id >> 8);
+    for (i = 0; i < FLDX_NAME_BYTES; i++)
+        p[2 + i] = (BYTE)fields_save.name[i];
+    for (i = 0; i < SAVE_PLACE_BYTES; i++) {
+        p[2 + FLDX_NAME_BYTES + i] = fields_save.real[i];
+        p[2 + FLDX_NAME_BYTES + SAVE_PLACE_BYTES + i] = fields_save.written[i];
+    }
+    return p + FLDX_BYTES;
+}
+
+/* Forgets a loaded FLDX section (another load, a new game). */
+static void fields_fldx_forget(void)
+{
+    fields_loaded.have = 0;
+}
+
+/* From sxc3_take_sections, for each section of the companion file that decides a load: TRUE if it is an FLDX
+   section (taken here, NEVER carried forward: the place is that save's alone). `own`: the file is the save's own
+   (found by its key), not one found by the fallback search. */
+static BOOL fields_fldx_met(const BYTE *head, BOOL own)
+{
+    DWORD length = head[8] | (DWORD)head[9] << 8 | (DWORD)head[10] << 16 | (DWORD)head[11] << 24;
+    unsigned flags = head[4] | head[5] << 8, version = head[6] | head[7] << 8;
+    const BYTE *p = head + 12;
+    int i;
+
+    if (head[0] != (BYTE)fields_fldx_tag[0] || head[1] != (BYTE)fields_fldx_tag[1] || head[2] != (BYTE)fields_fldx_tag[2] ||
+        head[3] != (BYTE)fields_fldx_tag[3])
+        return FALSE;
+    fields_loaded.have = 0;
+    if (!own) {
+        log_line("fields: the companion file taken for this load was found by the fallback search, not by the save's key: its FLDX section is not read; the save continues where the save itself says");
+        return TRUE;
+    }
+    if (flags & 1) {
+        log_line("fields: the companion's FLDX section was carried forward by a build that does not know it (it is an older save's): not read, not carried; the save continues where the save itself says");
+        return TRUE;
+    }
+    if (version != FLDX_VERSION || length != FLDX_BYTES) {
+        log_line("fields: the companion's FLDX section is of version %u (%lu bytes); this build reads version %d (%d bytes): not read, not carried; the save continues where the save itself says",
+                 version, length, FLDX_VERSION, FLDX_BYTES);
+        return TRUE;
+    }
+    fields_loaded.id = (WORD)(p[0] | p[1] << 8);
+    for (i = 0; i < FLDX_NAME_BYTES; i++)
+        fields_loaded.name[i] = i < FLDX_NAME_BYTES - 1 ? (char)p[2 + i] : 0;
+    for (i = 0; i < SAVE_PLACE_BYTES; i++) {
+        fields_loaded.real[i] = p[2 + FLDX_NAME_BYTES + i];
+        fields_loaded.written[i] = p[2 + FLDX_NAME_BYTES + SAVE_PLACE_BYTES + i];
+    }
+    fields_loaded.have = 1;
+    return TRUE;
+}
+
+/* From load_accepted_hook, after the companion file was read (sxc2_load_decide) and before the Load menu closes:
+   the real place back into the save block, the name's id of this run. */
+static void fields_after_load(void)
+{
+    BYTE *place = (BYTE *)ADDR_SAVE_PLACE;
+    int i, e, same = 1;
+
+    if (!fields_loaded.have)
+        return;
+    fields_loaded.have = 0;
+    for (i = 0; i < SAVE_PLACE_BYTES; i++)
+        same &= place[i] == fields_loaded.written[i];
+    if (!same) {
+        log_line("fields: the companion's FLDX section (made in field %.15s) does not match this save's place (field %u at (%d,%d) triangle %u, direction %u; the section says the save held field %u at (%d,%d) triangle %u, direction %u, and the bytes around them): not read; the save continues where it says",
+                 fields_loaded.name, *(const WORD *)(place + SAVE_PLACE_ID), *(const short *)(place + SAVE_PLACE_X),
+                 *(const short *)(place + SAVE_PLACE_Y), *(const WORD *)(place + SAVE_PLACE_TRI), place[SAVE_PLACE_DIR],
+                 *(const WORD *)(fields_loaded.written + SAVE_PLACE_ID), *(const short *)(fields_loaded.written + SAVE_PLACE_X),
+                 *(const short *)(fields_loaded.written + SAVE_PLACE_Y), *(const WORD *)(fields_loaded.written + SAVE_PLACE_TRI),
+                 fields_loaded.written[SAVE_PLACE_DIR]);
+        return;
+    }
+    if (!fields_live) {
+        log_line("fields: this save was made in field %.15s (id %u then); the field capacity is off in this run (see the fields lines above): the save continues at the fallback, field %u %s",
+                 fields_loaded.name, fields_loaded.id, *(const WORD *)(place + SAVE_PLACE_ID), fields_name_at(*(const WORD *)(place + SAVE_PLACE_ID)));
+        return;
+    }
+    if (!fields_open_live) {
+        /* safety over place: without the guard at the three callers, a registered field whose file is not served would
+           reach field_enter as it is (very likely a crash); the fallback is a field of the game's own */
+        log_line("fields: *** the callers of field_open_file are not guarded in this run (see REFUSED above): the save in %.15s loads at the fallback ***",
+                 fields_loaded.name);
+        return;
+    }
+    for (e = 0; e < fields_entry_count && !fields_same_name(fields_entries[e].name, fields_loaded.name); e++)
+        ;
+    if (e == fields_entry_count) {
+        log_line("field %.15s no longer registered: the save continues at the fallback, field %u %s at (%d,%d) triangle %u",
+                 fields_loaded.name, *(const WORD *)(place + SAVE_PLACE_ID), fields_name_at(*(const WORD *)(place + SAVE_PLACE_ID)),
+                 *(const short *)(place + SAVE_PLACE_X), *(const short *)(place + SAVE_PLACE_Y), *(const WORD *)(place + SAVE_PLACE_TRI));
+        return;
+    }
+    for (i = 0; i < SAVE_PLACE_BYTES; i++)
+        place[i] = fields_loaded.real[i];
+    *(WORD *)(place + SAVE_PLACE_ID) = fields_entries[e].id;
+    log_line("fields: this save was made in field %s (id %u at the save, %u in this run's registry%s): its place is put back from the companion file, (%d,%d) triangle %u, direction %u; the save itself holds the fallback, field %u",
+             fields_entries[e].name, fields_loaded.id, fields_entries[e].id, fields_loaded.id != fields_entries[e].id ? ": THE ID CHANGED, the name decides" : "",
+             *(const short *)(place + SAVE_PLACE_X), *(const short *)(place + SAVE_PLACE_Y), *(const WORD *)(place + SAVE_PLACE_TRI),
+             place[SAVE_PLACE_DIR], *(const WORD *)(fields_loaded.written + SAVE_PLACE_ID));
+}
+
+/* ---- the three callers of field_open_file ---- */
+static const struct {
+    DWORD call;                     /* the call instruction (e8 rel32) */
+    DWORD separator, extension;     /* the caller's own "\" and ".ate" (the name is name + separator + name + extension) */
+    BYTE window[31];                /* from the id's load (call - 21) to test eax, eax; bytes 22-25 (the call's rel32) are not compared */
+    const char *who;
+} fields_open_sites[3] = {
+    { 0x0060e2dau, 0x00905cf0u, 0x00905cf4u,
+      { 0x66, 0x8b, 0x15, 0xd0, 0x15, 0xcc, 0x00,  0x66, 0x89, 0x15, 0x68, 0xf4, 0xcf, 0x00,  0x8d, 0x85, 0x80, 0xfc, 0xff, 0xff,  0x50,
+        0xe8, 0, 0, 0, 0,  0x83, 0xc4, 0x04, 0x85, 0xc0 },
+      "field_enter_0060e0bd (a load, the world map, the end of a battle)" },
+    { 0x0060e8e8u, 0x00905d08u, 0x00905d0cu,
+      { 0x66, 0x8b, 0x15, 0x8a, 0x0d, 0xcc, 0x00,  0x66, 0x89, 0x15, 0x68, 0xf4, 0xcf, 0x00,  0x8d, 0x85, 0x6c, 0xfe, 0xff, 0xff,  0x50,
+        0xe8, 0, 0, 0, 0,  0x83, 0xc4, 0x04, 0x85, 0xc0 },
+      "field_main_loop_0060e5b7 (a gateway or MAPJUMP)" },
+    { 0x0060eca2u, 0x00905d14u, 0x00905d18u,
+      { 0x66, 0x8b, 0x15, 0x8a, 0x0d, 0xcc, 0x00,  0x66, 0x89, 0x15, 0x68, 0xf4, 0xcf, 0x00,  0x8d, 0x85, 0x6c, 0xfe, 0xff, 0xff,  0x50,
+        0xe8, 0, 0, 0, 0,  0x83, 0xc4, 0x04, 0x85, 0xc0 },
+      "FUN_0060e96c (a field change of the field loop)" },
+};
+#define FIELDS_OPEN_SITES       3
+#define FIELDS_OPEN_NAME_ROOM   128         /* the callers' buffers: field_enter's [ebp-0x380] and the other two's [ebp-0x194] are 128 bytes each */
+static DWORD fields_open_next[FIELDS_OPEN_SITES] = { FN_FIELD_OPEN, FN_FIELD_OPEN, FN_FIELD_OPEN };
+static int (__cdecl *fields_name_of)(DWORD id, char *out) = (int (__cdecl *)(DWORD, char *))FN_FIELD_NAME_OF;
+
+/* Why the field about to be opened (00cff468) cannot be read, or NULL. */
+static const char *fields_bad_id(DWORD id)
+{
+    const BYTE *block = *(BYTE *const *)ADDR_MAPLIST_BLOCK;
+
+    if (id >= fields_count || id >= *(const DWORD *)ADDR_MAPLIST_COUNT || !block)
+        return "is past the field tables";
+    if (fields_same_name((const char *)block + id * 32, FIELDS_PLACEHOLDER))
+        return "is not registered (its name is the placeholder sx_none)";
+    return NULL;
+}
+
+/* Sends the field about to be opened at site `site` to fields_fallback, or refuses it; returns what the caller's
+   call returns. */
+static int fields_redirect(int site, char *name, DWORD id, const char *why)
+{
+    int (__cdecl *next)(char *) = (int (__cdecl *)(char *))fields_open_next[site];
+    const char *separator = (const char *)fields_open_sites[site].separator, *extension = (const char *)fields_open_sites[site].extension;
+    const struct fields_place *f = &fields_fallback_taken;
+    char base[40];
+    int i, n = 0, result;
+
+    if (!f->on) {
+        log_line("fields: *** field %lu %s: NOT read, and no fields_fallback is set to send it to. The game now takes its own way for a field it cannot read (%s). Set fields_fallback in the game file ***",
+                 id, why, site == 0 ? "field_enter_0060e0bd goes on without a field: read from the code, very likely a crash"
+                                    : "FUN_0060e58c sets mode 0x13 and the game ends, after a second teardown of the field: read from the code, it may crash on the way");
+        return 0;
+    }
+    for (i = 0; i < 40; i++)
+        base[i] = 0;
+    if (!fields_name_of(f->id, base) || !base[0]) {
+        log_line("fields: *** field %lu %s; the fallback, field %u, has no name in the maplist: NOT read ***", id, why, f->id);
+        return 0;
+    }
+    base[32] = 0;
+    for (i = 0; base[i] && n < FIELDS_OPEN_NAME_ROOM - 1; i++)
+        name[n++] = base[i];
+    for (i = 0; i < 2 && separator[i] && n < FIELDS_OPEN_NAME_ROOM - 1; i++)
+        name[n++] = separator[i];
+    for (i = 0; base[i] && n < FIELDS_OPEN_NAME_ROOM - 1; i++)
+        name[n++] = base[i];
+    for (i = 0; i < 5 && extension[i] && n < FIELDS_OPEN_NAME_ROOM - 1; i++)
+        name[n++] = extension[i];
+    name[n] = 0;
+    *(WORD *)ADDR_FIELD_MODULE_ID = f->id;
+    *(WORD *)ADDR_FIELD_ID_NOW = f->id;
+    if (site)
+        *(WORD *)ADDR_FIELD_ID_NEXT = f->id;
+    if (site == 0 && *(const WORD *)ADDR_FIELD_ID_PREVIOUS == (WORD)id)
+        *(WORD *)ADDR_FIELD_ID_PREVIOUS = f->id;    /* after a load sub_00408074 left the save's id here too: the fallback's now */
+    *(short *)ADDR_FIELD_ENTRY_X = f->x;
+    *(short *)ADDR_FIELD_ENTRY_Y = f->y;
+    *(WORD *)ADDR_FIELD_ENTRY_TRI = f->triangle;
+    *(WORD *)ADDR_FIELD_ENTRY_DIR = f->direction;
+    log_line("fields: field %lu %s: the game goes to the fallback instead, field %u %s at (%d,%d) triangle %u, direction %u (fields_fallback; at %08lx, %s)",
+             id, why, f->id, base, f->x, f->y, f->triangle, f->direction, fields_open_sites[site].call, fields_open_sites[site].who);
+    result = next(name);
+    if (!result)
+        log_line("fields: *** the fallback, field %u %s, could not be read either: the game takes its own way for a field it cannot read ***",
+                 f->id, base);
+    return result;
+}
+
+/* The guard on a caller's call of field_open_file. */
+static int fields_open_guard(int site, char *name)
+{
+    int (__cdecl *next)(char *) = (int (__cdecl *)(char *))fields_open_next[site];
+    DWORD id = *(const WORD *)ADDR_FIELD_MODULE_ID;
+    const char *why;
+    int result;
+
+    if (!fields_live || *(const DWORD *)ADDR_FIELDS_RESUMING)
+        return next(name);              /* back from a battle or a menu nothing is read: the field is the one that was */
+    fields_guard();
+    why = fields_bad_id(id);
+    if (!why) {
+        result = next(name);
+        if (result || !fields_is_registered(id))
+            return result;              /* a field of the game's that cannot be read: the game's way, as without this DLL */
+        why = "is registered, but no whole field file of that name was served (is the mod that ships it active?)";
+    }
+    return fields_redirect(site, name, id, why);
+}
+
+static int __cdecl fields_open_hook_0(char *name) { return fields_open_guard(0, name); }
+static int __cdecl fields_open_hook_1(char *name) { return fields_open_guard(1, name); }
+static int __cdecl fields_open_hook_2(char *name) { return fields_open_guard(2, name); }
+
+/* From fields_start, with the tables the DLL's: the three calls chained, all or none, every byte checked first. */
+static void fields_open_install(void)
+{
+    static void *const hooks[FIELDS_OPEN_SITES] = { (void *)fields_open_hook_0, (void *)fields_open_hook_1, (void *)fields_open_hook_2 };
+    const struct fields_place *f = &fields_fallback_taken;
+    DWORD was[FIELDS_OPEN_SITES], old_protect;
+    int k, i;
+
+    if (!fields_live || fields_open_live)
+        return;
+    if (f->on)
+        log_line("fields: fields_fallback = field %u %s at (%d,%d) triangle %u, direction %u: a save made in a registered field holds this place, and a field id the game cannot read is sent here",
+                 f->id, fields_name_at(f->id), f->x, f->y, f->triangle, f->direction);
+    else
+        log_line("fields: fields_fallback = none: a save made in a registered field is saved as it is, and a field id the game cannot read is not sent anywhere (it is not read; the game takes its own way)");
+    for (k = 0; k < FIELDS_OPEN_SITES; k++) {
+        DWORD start = fields_open_sites[k].call - 21;
+
+        if (IsBadReadPtr((const void *)start, 31))
+            break;
+        for (i = 0; i < 31 && ((i >= 22 && i <= 25) || ((const BYTE *)start)[i] == fields_open_sites[k].window[i]); i++)
+            ;
+        if (i < 31)
+            break;
+        was[k] = *(const DWORD *)(fields_open_sites[k].call + 1);
+    }
+    if (k < FIELDS_OPEN_SITES) {
+        log_line("fields: REFUSED at %08lx (the code around the call of field_open_file is not as the exe has it: another mod's patch?): none of the three callers is guarded; a field id the game cannot read is not redirected",
+                 fields_open_sites[k].call);
+        return;
+    }
+    for (k = 0; k < FIELDS_OPEN_SITES; k++)
+        if (!patch_call_chained(fields_open_sites[k].call, FN_FIELD_OPEN, hooks[k], &fields_open_next[k]))
+            break;
+    if (k < FIELDS_OPEN_SITES) {
+        for (i = k - 1; i >= 0; i--)
+            if (VirtualProtect((void *)(fields_open_sites[i].call + 1), 4, PAGE_EXECUTE_READWRITE, &old_protect)) {
+                fields_code_dword(fields_open_sites[i].call + 1, was[i]);
+                VirtualProtect((void *)(fields_open_sites[i].call + 1), 4, old_protect, &old_protect);
+                FlushInstructionCache(GetCurrentProcess(), (void *)(fields_open_sites[i].call + 1), 4);
+                fields_open_next[i] = FN_FIELD_OPEN;
+            }
+        log_line("fields: REFUSED: the call at %08lx could not be hooked: the %d hooked before it are put back; none of the three callers is guarded",
+                 fields_open_sites[k].call, k);
+        return;
+    }
+    fields_open_live = TRUE;
+    log_line("fields: the three calls of field_open_file (%08lx field_enter, %08lx field_main_loop, %08lx FUN_0060e96c) go through this DLL (chained; they called %08lx, %08lx, %08lx): a field id past the tables, with the placeholder's name, or registered without a file %s",
+             fields_open_sites[0].call, fields_open_sites[1].call, fields_open_sites[2].call, fields_open_next[0], fields_open_next[1],
+             fields_open_next[2], f->on ? "goes to fields_fallback" : "is not read (no fields_fallback)");
 }
 /* ==== FIELD CAPACITY END ==== */
 
@@ -19832,6 +21709,7 @@ static void fields_start(void)
     log_line("fields: the field reader's call at %08lx %s", SITE_FIELD_READ,
              hooked ? "goes through this DLL (chained): a registered field is logged as it is read, an id nobody registered is not read"
                     : "is NOT the game's (push 00cc1ef0 / call / add esp,4 / test eax,eax): not hooked; the tables are the DLL's all the same, an id nobody registered then reaches the reader with the name sx_none");
+    fields_open_install();          /* (stage 2) the three callers of field_open_file: a field id the game cannot read goes to fields_fallback */
 }
 
 /* ---- New characters in a shop ----
@@ -20303,6 +22181,7 @@ static void enable_new_characters(void)
     install_text_more();
     install_shop_seats();
     quiet_seat_ai();
+    build_character_ai();       /* (after quiet_seat_ai: with a block, the two hooks take the seats' bytes it left) */
     for (i = 0; i < seat_count; i++)        /* every seat, occupied or not: an empty one must not read as Cloud's record */
         ((DWORD *)ADDR_ID_TO_RECORD)[NEW_CHARACTER_FIRST_ID + i] = (DWORD)new_character_index(NEW_CHARACTER_FIRST_ID + i);
     new_characters_live = 1;
@@ -21311,6 +23190,15 @@ static void state_gauge(int actor, BOOL freeze)
 }
 static int state_lines;                 /* lines logged about affected actions in this battle */
 static BOOL weapon_hook_live;
+static BOOL evade_hook_live;            /* `physical_evade`: the physical hit check is followed (physical_hit_check_hook) */
+static BYTE evade_said[3];              /* a miss of `physical_evade` said for the actor in this battle */
+static BYTE menu_all_said[3];           /* the battle menu's widened cursor said for the actor in this battle */
+static void view_lift_battle_start(void);   /* a state's home view (`view_raise`): in the camera's part */
+static void view_lift_install(int actor);
+static void pointer_raise_battle_start(void);   /* a state's pointer raised (`pointer_raise`): after the home view's */
+static void pointer_raise_install(int actor);
+static void pointer_raise_step(int actor);
+static void pointer_raise_end(int actor);
 /* stage C (after the showing of the hits, further down): what stays with the actor, and the state's ends */
 static void state_stay_begin(int actor);
 static void state_stay_start(int actor);
@@ -21318,6 +23206,7 @@ static void state_stay_battle_start(void);
 static void state_end(int actor, const char *why);
 static const char *state_end_reason(unsigned ends, DWORD status);
 static void state_ends_text(char *out, unsigned ends);
+static void state_keys_text(char *out, const struct limit_state *s);   /* the keys of "A state's physical_evade" and the like, for the log */
 
 /* ---- the game's memory as the per-turn code reads it: one small routine each ---- */
 #define SITE_TURN_TARGETS       0x005d9b06u  /* in the hit loop FUN_005d9940: call FUN_005dc390, once per turn */
@@ -21376,6 +23265,10 @@ static BOOL state_actor_far(int k)
     return *(const BYTE *)(ADDR_ACTOR_REACH + (DWORD)k * 0x68) > 0x0f;
 }
 
+/* The Long Range materia's bit: what exempts an attack from the reach rule of FUN_005da278. (A state's
+   `long_range` clears the action's short-range bit, 0x20 of action[0x14], which that rule does not read; the
+   rule is skipped only by this bit, by bit 0x10 of action[0x24], which the game also copies into each hit's
+   flags (action[0x86], FUN_005da5da), or by an element without cut, hit and punch.) */
 static BOOL state_long_range(int actor)
 {
     return (*(const BYTE *)(ADDR_PARTY_LONG_RANGE + (DWORD)actor * 0x440) & 4) != 0;
@@ -21668,6 +23561,7 @@ enum { STATE_PATH_KEPT, STATE_PATH_STATE, STATE_PATH_ONLY };
 #define STATE_SAID_SEVERAL      2
 #define STATE_SAID_GAP          4
 #define STATE_SAID_PARTY        8
+#define STATE_SAID_ALL          16
 
 /* `attack_script_next2` (the SECOND of the turns between, and every other one after it: the third turn of
    a 4x-Cut) shares slot 0x18 with the one-turn script: an action has one turn or several, never both.
@@ -21682,6 +23576,7 @@ static struct state_action {            /* the action weapon_setup_hook noted fo
     BYTE turn;                          /* turns begun */
     BYTE retarget, stop_step, only;     /* only: slot 0x18 holds the state's one-turn script */
     BYTE next2;                         /* slot 0x18 holds `attack_script_next2` instead: every other turn between plays it */
+    BYTE all;                           /* `attack_targets = all_enemies`: each turn goes at every living enemy */
     BYTE said;
     short first_record;                 /* the display records written before the first turn: its record is that one */
     short record;                       /* the display records written before the turn last begun */
@@ -21745,13 +23640,17 @@ static void state_battle_start(void)
     state_show.task = 0;                /* the battle's set-up empties the task lists (FUN_005beec6) */
     state_stop.pending = 0;
     state_lines = 0;
+    evade_said[0] = evade_said[1] = evade_said[2] = 0;
+    menu_all_said[0] = menu_all_said[1] = menu_all_said[2] = 0;
+    view_lift_battle_start();
+    pointer_raise_battle_start();
 }
 
 /* The armed limit has been carried out. */
 static void state_enter(int actor, const char *when)
 {
     const struct limit_state *s = &state_run[actor].armed_state;
-    char commands[64], ends[20], text[72];
+    char commands[64], ends[20], text[72], keys[256];
 
     state_run[actor].armed = state_run[actor].reached = 0;
     if (state_run[actor].on && !lstrcmpA(state_run[actor].state.name, s->name)) {
@@ -21774,9 +23673,15 @@ static void state_enter(int actor, const char *when)
              s->script_length[STATE_SCRIPT_FIRST] ? "its own" : "the model's", s->script_length[STATE_SCRIPT_ONLY] ? "its own for one turn" : "the model's for one turn",
              weapon_hook_live ? "" : "; BUT the weapon set-up entry is not hooked, so nothing changes",
              turn_hook_live && state_show_live ? "" : "; BUT the per-turn call, the record's call or the f7 task's call is not followed, so nothing changes");
+    state_keys_text(keys, s);
+    if (keys[0])
+        log_line("state %s actor %d: %s%s", s->name, actor, keys,
+                 s->physical_evade && !evade_hook_live ? "; BUT the physical hit check is not followed, so physical hits are rolled as always" : "");
     if (s->gauge_frozen)
         state_gauge(actor, TRUE);
     state_stay_begin(actor);            /* its idle, its prop, its task: stage C */
+    view_lift_install(actor);           /* `view_raise`, `view_back`: the home view lifted while it lasts */
+    pointer_raise_install(actor);       /* `pointer_raise`: the pointer over the acting actor raised while it lasts */
 }
 
 /* From note_limit_action: a limit with `state` is being set up for the actor. */
@@ -21918,6 +23823,37 @@ static BOOL state_scripts_place(int actor, const struct limit_state *s, unsigned
     return TRUE;
 }
 
+/* `attack_targets = all_enemies` puts each turn's record at several targets: the record's target is then 0x0f
+   (FUN_0042cbf9), and script command 9e, which waits for THE target to have finished, reads no actor's flag there
+   (SHOWING THE HITS) and could wait for ever. The game's own several-target scripts have no 9e (Slash-All's 0x15);
+   the model's 2x-Cut and 4x-Cut scripts end in one. So the widening is given only to Attack, 2x-Cut or 4x-Cut
+   whose every script is known to have no 9e: the state's own (no byte 9e in it at all: an operand 9e refuses too),
+   or for one turn the model's Attack (0x14, played by the game as its several-target 0x15). */
+static BOOL state_bytes_wait(const BYTE *bytes, int length)
+{
+    int i;
+
+    for (i = 0; i < length; i++)
+        if (bytes[i] == 0x9e)
+            return TRUE;
+    return FALSE;
+}
+
+static BOOL state_all_safe(const struct limit_state *s, int turns, int script)
+{
+    int i;
+
+    if (turns == 1)
+        return s->script_length[STATE_SCRIPT_ONLY] ? !state_bytes_wait(s->script[STATE_SCRIPT_ONLY], s->script_length[STATE_SCRIPT_ONLY])
+                                                   : script == 0x14;
+    if (!s->script_length[STATE_SCRIPT_FIRST])
+        return FALSE;
+    for (i = 0; i < STATE_SCRIPTS; i++)
+        if (state_bytes_wait(s->script[i], s->script_length[i]))
+            return FALSE;
+    return TRUE;
+}
+
 /* An attack of an actor in a state, after the game's weapon set-up: the action is noted for the
    turn hook, which gives each turn its hits, and given the state's scripts if it has them for it. */
 static void state_hits(int actor, int *action)
@@ -21934,7 +23870,8 @@ static void state_hits(int actor, int *action)
        for each hit: both would show the one result. FUN_005dc390 sends a confused or manipulated
        actor's attack to its own side (status 0x400040) */
     BOOL side = (targets & 0x0f) != 0 || (state_actor_status(actor) & 0x400040) != 0;
-    char scripts[160];
+    BOOL all;
+    char scripts[160], keys[256];
 
     if (command < 0 || command > 31 || !(s->commands & (1u << command)) || turns < 1 || turns > 8)
         return;
@@ -21953,6 +23890,33 @@ static void state_hits(int actor, int *action)
                      turn_hook_live ? "the record's call or the f7 task's call is not followed, so a turn's further hits could not be shown"
                                     : "the per-turn call is not followed, so a turn cannot be given its hits");
         return;
+    }
+    /* the state's own targets, element and range: for an attack at the enemies' side only (one at the party's,
+       by choice, confusion or manipulation, is left to the game) */
+    keys[0] = 0;
+    all = s->attack_targets == STATE_TARGETS_ALL_ENEMIES && !side;
+    if (all && !(own && state_all_safe(s, turns, script))) {
+        all = 0;
+        lstrcpyA(keys, own ? "; every enemy NOT applied: a script of this action has a 9e (it waits for ONE target to finish)"
+                           : "; every enemy NOT applied: only to Attack, 2x-Cut and 4x-Cut");
+    }
+    if (all) {
+        /* every enemy each turn, as one record (state_turn_aim writes action[6] at each turn): no pick of one per
+           hit (0x80, 4x-Cut's), and "several, no toggle" (4 without 8) so FUN_005dc390 picks no single one */
+        unsigned was = (unsigned)action[ACT_TARGET_FLAGS] & 0xff;
+
+        action[ACT_TARGET_FLAGS] = (int)(((unsigned)action[ACT_TARGET_FLAGS] & ~0x88u) | 0x04u);
+        one = TRUE;                     /* a turn is one record at the group: the one-turn script may play it */
+        wsprintfA(keys, "; every enemy each turn (target flags %02x -> %02x)", was, (unsigned)action[ACT_TARGET_FLAGS] & 0xff);
+    }
+    if (s->attack_element_set && !side) {
+        wsprintfA(keys + lstrlenA(keys), "; element %04x -> %04x", (unsigned)action[0x11] & 0xffff, (unsigned)s->attack_element);
+        action[0x11] = (int)s->attack_element;      /* the weapon's | the Elemental materia's (005c9c64): replaced */
+    }
+    if (s->long_range && !side && ((unsigned)action[ACT_TARGET_FLAGS] & 0x20)) {
+        /* the short-range bit: back-row halving (FUN_005de5df) and the uncovered rule (FUN_005dc390) test it */
+        action[ACT_TARGET_FLAGS] = (int)((unsigned)action[ACT_TARGET_FLAGS] & ~0x20u);
+        lstrcatA(keys, "; long range (short-range bit 0x20 cleared)");
     }
     note->only = note->next2 = 0;
     if (own && one && !side && turns == 1 && s->script_length[STATE_SCRIPT_ONLY] && state_scripts_place(actor, s, 1u << STATE_SCRIPT_ONLY)) {
@@ -21993,12 +23957,136 @@ static void state_hits(int actor, int *action)
     note->stop_step = s->stop_step;
     note->said = 0;
     note->first_record = note->record = -1;
+    note->all = (BYTE)all;
     state_show.hits[actor] = note->hits;
     state_show.gap[actor] = s->hit_gap ? s->hit_gap : STATE_GAP_DEFAULT;
     if (state_line())
-        log_line("state %s actor %d: command %02x (%s): %d turn%s of %d hits, scripts %s, targets %04x, flags %04x, retarget %s",
+        log_line("state %s actor %d: command %02x (%s): %d turn%s of %d hits, scripts %s, targets %04x, flags %04x, retarget %s%s",
                  s->name, actor, command, state_command_name(command), turns, turns == 1 ? "" : "s", (int)note->hits, scripts, targets,
-                 flags & 0xffff, s->retarget ? "yes" : "no");
+                 flags & 0xffff, s->retarget ? "yes" : "no", keys);
+}
+
+/* ---- A state's `attack_targets = all_enemies` in the battle menu: the target cursor on every enemy --------------
+
+   The command list (FUN_006d91fa, battle menu state 1) takes a command's slot (00dba4e4 + actor x 0x440 + n x 6: the
+   command, its cursor action, its target flags, ...) and, for cursor action 0 (4x-Cut, Slash-All; Attack and 2x-Cut
+   of a long-range actor) or 7 (Attack and 2x-Cut otherwise: the pool of the uncovered, 009a8898),
+   writes the slot's target flags to the word 00dc3c84 and calls FUN_006e5c52, which sets the cursor from them: with
+   flag 4 (several) and not 0x40, every target of one side, the enemies' with flag 2 (00dc3c90 = 6). The target
+   selection (FUN_006e6291, each frame) lets left / right change sides only with flag 1, and L1 / R1 change one / all
+   only with flags 8 and 1; FUN_006d86d2 then issues the command at every target of the pool on that side (00dc3c60
+   & 0xfff0; one group of a side attack, 009a8762 = 4). An Attack's slot flags are the weapon's targeting (009a8e54 +
+   actor x 0x18, copied into the slot by FUN_005cfe67 when kernel's command data says 0xff: 0x03, 0x23 short range),
+   0x0c added with Mega-All; FUN_005cfe67 also turns cursor action 7 into 0 for a long-range actor (009a8b39 bit 2).
+   For an actor in a state whose Attack (2x-Cut, 4x-Cut) state_hits would widen to every enemy, the hook on the two
+   calls (cursor actions 0 and 7) writes the flags (flags & ~0xc9) | 0x06 (several, enemies, no choice of side, no
+   toggle, not everyone) before the game's routine: the cursor sits on every enemy, as a spell on all with no
+   choice. The pool is the game's, but when the attack will not be short range (the weapon's 0x20 not set, or
+   `long_range = yes`, which state_hits clears it for) the uncovered pool of cursor action 7 becomes every target
+   (00dc3c8c = 1, the pool of cursor action 0; FUN_006e5980 reads it each frame): the cursor shows the enemies the
+   turn will go at (state_turn_candidates). With every enemy hidden the pool has no enemy: the game's own no-target
+   case (the confirm button sounds the buzzer; cancel goes back), as for a spell on all. Nothing else of the menu is
+   touched. FFNx 1.24.3 replaces none of these calls or routines (its auto attack issues the command itself, with
+   one target: the action's set-up widens it as for any). */
+#define SITE_MENU_TARGET_A      0x006d95bau  /* in FUN_006d91fa, cursor action 0: e8 93 c6 00 00 (call FUN_006e5c52) */
+#define SITE_MENU_TARGET_B      0x006d95feu  /* in FUN_006d91fa, cursor action 7: e8 4f c6 00 00 (call FUN_006e5c52) */
+#define FN_MENU_TARGET_SETUP    0x006e5c52u  /* FUN_006e5c52(): the target cursor from the flags 00dc3c84 */
+#define ADDR_MENU_COMMAND       0x00dc3c70u  /* byte: the command chosen (FUN_006d91fa: the slot's byte 0) */
+#define ADDR_MENU_TARGET_FLAGS  0x00dc3c84u  /* word: its target flags (the slot's byte 2) */
+#define ADDR_MENU_TARGET_POOL   0x00dc3c8cu  /* byte: 0 = the uncovered 009a8898, 1 = every target 009a889a (FUN_006e5980) */
+
+static DWORD menu_target_next[2] = { FN_MENU_TARGET_SETUP, FN_MENU_TARGET_SETUP };
+static BOOL menu_all_live;
+
+/* Would state_hits widen this command, chosen now by `actor` (0-2), to every enemy? Its tests, before the action
+   exists: the state, the key, a listed Attack (turns 1, the model's 0x14), 2x-Cut (2, 0x16) or 4x-Cut (4, 0x18)
+   whose scripts have no 9e (state_all_safe), not a frog, not confused, the hooks it needs live. */
+static BOOL state_menu_all(int actor, int command)
+{
+    const struct limit_state *s;
+    int turns, script;
+
+    if (actor < 0 || actor > 2 || !state_run[actor].on || !weapon_hook_live || !turn_hook_live || !state_show_live)
+        return FALSE;
+    s = &state_run[actor].state;
+    if (s->attack_targets != STATE_TARGETS_ALL_ENEMIES || command < 0 || command > 31 || !(s->commands & (1u << command))
+        || s->hits > 1 || (state_actor_status(actor) & 0x400840))
+        return FALSE;
+    if (command == 0x01)
+        turns = 1, script = 0x14;
+    else if (command == 0x19)
+        turns = 2, script = 0x16;
+    else if (command == 0x1b)
+        turns = 4, script = 0x18;
+    else
+        return FALSE;
+    return state_all_safe(s, turns, script);
+}
+
+/* The flags and pool the menu is about to set the cursor from, for the actor and command it holds. */
+static void menu_target_widen(void)
+{
+    int actor = *(const BYTE *)ADDR_BATTLE_MENU_ACTOR, command = *(const BYTE *)ADDR_MENU_COMMAND;
+    unsigned was = *(const WORD *)ADDR_MENU_TARGET_FLAGS, flags;
+    int pool = *(const BYTE *)ADDR_MENU_TARGET_POOL;
+    const struct limit_state *s;
+
+    if (!state_menu_all(actor, command))
+        return;
+    s = &state_run[actor].state;
+    flags = (was & ~0xc9u) | 0x06u;
+    *(WORD *)ADDR_MENU_TARGET_FLAGS = (WORD)flags;
+    if (pool == 0 && ((was & 0x30u) != 0x20u || s->long_range))
+        *(BYTE *)ADDR_MENU_TARGET_POOL = 1;
+    if (!menu_all_said[actor]) {
+        menu_all_said[actor] = 1;
+        log_line("state %s actor %d: the battle menu's target cursor for %s is every enemy (target flags %02x -> %02x%s): the attack goes at every enemy",
+                 s->name, actor, state_command_name(command), was & 0xff, flags & 0xff,
+                 pool == 0 ? (*(const BYTE *)ADDR_MENU_TARGET_POOL ? ", the pool every enemy, not only the uncovered" : ", the pool the uncovered (short range)") : "");
+    }
+}
+
+static void __cdecl menu_target_hook_a(void)
+{
+    menu_target_widen();
+    ((void (__cdecl *)(void))menu_target_next[0])();
+}
+
+static void __cdecl menu_target_hook_b(void)
+{
+    menu_target_widen();
+    ((void (__cdecl *)(void))menu_target_next[1])();
+}
+
+/* The two calls, each between the store of the flags and the jump out of its case; refused (one line) if the bytes
+   are not the game's. A call another DLL has taken is chained (its routine is called after the flags are set). */
+static BOOL install_menu_target_hook(void)
+{
+    static const BYTE before_a[6] = { 0x66, 0xa3, 0x84, 0x3c, 0xdc, 0x00 }, after_a[5] = { 0xe9, 0x23, 0x02, 0x00, 0x00 };
+    static const BYTE before_b[7] = { 0x66, 0x89, 0x0d, 0x84, 0x3c, 0xdc, 0x00 }, after_b[5] = { 0xe9, 0xdf, 0x01, 0x00, 0x00 };
+    static const BYTE routine[8] = { 0x55, 0x8b, 0xec, 0x83, 0xec, 0x08, 0x6a, 0x01 };
+
+    if (!bytes_are(SITE_MENU_TARGET_A - 6, before_a, 6) || !bytes_are(SITE_MENU_TARGET_A + 5, after_a, 5)
+        || !bytes_are(SITE_MENU_TARGET_B - 7, before_b, 7) || !bytes_are(SITE_MENU_TARGET_B + 5, after_b, 5)
+        || !bytes_are(FN_MENU_TARGET_SETUP, routine, 8)) {
+        log_line("patch %08lx / %08lx skipped: the battle menu's code around its target set-up (FUN_006e5c52) is not the game's",
+                 SITE_MENU_TARGET_A, SITE_MENU_TARGET_B);
+        return FALSE;
+    }
+    if (!patch_call_chained(SITE_MENU_TARGET_A, FN_MENU_TARGET_SETUP, menu_target_hook_a, &menu_target_next[0]))
+        return FALSE;
+    if (!patch_call_chained(SITE_MENU_TARGET_B, FN_MENU_TARGET_SETUP, menu_target_hook_b, &menu_target_next[1])) {
+        DWORD old_protect;      /* the first call back as it was */
+        BYTE *p = (BYTE *)SITE_MENU_TARGET_A;
+
+        if (VirtualProtect(p, 5, PAGE_EXECUTE_READWRITE, &old_protect)) {
+            *(DWORD *)(p + 1) = menu_target_next[0] - (SITE_MENU_TARGET_A + 5);
+            VirtualProtect(p, 5, old_protect, &old_protect);
+            FlushInstructionCache(GetCurrentProcess(), p, 5);
+        }
+        return FALSE;
+    }
+    return TRUE;
 }
 
 /* A turn of the hit loop begins, before the game's FUN_005dc390: is it a turn of the action noted
@@ -22125,7 +24213,25 @@ static void state_turn_aim(int actor, int *action, int turn)
 
     if (turn == 0)
         note->first_record = (short)count;
-    if (turn > 0 && note->retarget && targets && !(targets & 0x0f)) {
+    if (note->all && !(targets & 0x0f)) {
+        /* `attack_targets = all_enemies`: every enemy the attack can be aimed at, alive now and in reach (the game's
+           reach test FUN_005da278 runs next; its uncovered rule is applied when the attack is short range), in
+           one record. Nobody left: after a first turn the action stops there; at the first, the game's targets
+           are left to it (it says why it cannot go on) */
+        to = state_turn_candidates(actor, action);
+        if (!to && turn > 0) {
+            state_turn_stop(actor, action, note, turn);
+            return;
+        }
+        if (to) {
+            action[ACT_TARGETS] = (int)to;
+            action[ACT_TARGETS_ASKED] = (int)to;
+            if (!(note->said & STATE_SAID_ALL) && state_line())
+                log_line("state %s actor %d: turn %d of %d goes at every living enemy: %04x -> %04x",
+                         state_run[actor].state.name, actor, turn + 1, (int)note->turns, targets, to);
+            note->said |= STATE_SAID_ALL;
+        }
+    } else if (turn > 0 && note->retarget && targets && !(targets & 0x0f)) {
         /* every target is an enemy (one aimed at the party's side, by choice or confusion, is never moved) */
         for (k = 4; k < 10; k++)
             if ((targets & (1u << k)) && (state_actor_status(k) & 1))
@@ -22217,6 +24323,7 @@ static void __cdecl weapon_setup_hook(void)
     ((void (__cdecl *)(void))FN_WEAPON_SETUP)();
     action = current_action();
     actor = action[ACT_ACTOR];
+    camera_clock_stop("the next action was set up");   /* (an action's clock, clock = action, ends with the last display) */
     /* a new action is being set up: the display of the last one is over, and with it the need for
        state scripts in anybody's model and for the notes of its records */
     state_scripts_restore_all();
@@ -22242,8 +24349,67 @@ static void __cdecl weapon_setup_hook(void)
             state_stay_start(actor);    /* (its task, if the list of 60 had no room for it before) */
         }
     }
-    if (state_run[actor].on && state_run[actor].state.hits > 1)
+    /* hits = 1 changes no hits, but scripts of the state's own, its targets, element or range still apply */
+    if (state_run[actor].on && (state_run[actor].state.hits > 1 || state_changes_attacks(&state_run[actor].state)))
         state_hits(actor, action);
+}
+
+/* ---- A state's `physical_evade = 100` -------------------------------------------------------------
+
+   FUN_005d173f runs a hit's steps, each a routine of the table 007b77a8 called with no argument
+   (005d1791: call [ecx*4 + 007b77a8]); entry 0 is the physical hit check FUN_005ddbb0, which the step lists of
+   formula classes 1, 6, 0xA and 0xB name (007b7700 by 00c069c0): every weapon-type hit, party or enemy. Magic's
+   check is entry 1 and is not touched. The entry is pointed at physical_hit_check_hook (as 008fee78 / 008fee80:
+   only if it holds the game's routine). For a hit on a party actor (action[0x82] 0-2) in a state with the key,
+   not a frog, the hook makes the game's own MISS: FUN_005ddbb0 calls FUN_005de356 first (facing: action[0x8d]
+   bits 1 and 2, the attacker's flag 0x80 at 009ab0e0; it reads no argument, its caller's push is left unread)
+   and on a miss sets bit 0 of action[0x86] and nothing else; its hit path (FUN_005de53b, the target's facing)
+   is not taken. No luck roll, status or affinity of the routine can make the hit land. Every other hit: the
+   game's routine, unchanged. The random numbers its roll would have used are not drawn. */
+#define ADDR_HIT_STEP_PHYSICAL  0x007b77a8u  /* the hit-step table, entry 0: b0 db 5d 00 */
+#define FN_HIT_CHECK_PHYSICAL   0x005ddbb0u  /* 55 8b ec 83 ec 2c a1 0c ce 99 00 */
+#define FN_HIT_FACING           0x005de356u  /* 55 8b ec 83 ec 2c c7 45 f4 00 00 00 00 */
+
+static void __cdecl physical_hit_check_hook(void)
+{
+    int *action = current_action();
+    int target = action[0x82];
+
+    if (target >= 0 && target <= 2 && state_run[target].on && state_run[target].state.physical_evade
+        && !(state_actor_status(target) & 0x800)) {
+        ((void (__cdecl *)(void))FN_HIT_FACING)();
+        action[0x86] |= 1;              /* the miss, as the game's routine writes it */
+        if (!evade_said[target]) {
+            evade_said[target] = 1;
+            log_line("state %s actor %d: physical_evade: a physical hit on it by actor %d is a miss (said once a battle)",
+                     state_run[target].state.name, target, action[ACT_ACTOR]);
+        }
+        return;
+    }
+    ((void (__cdecl *)(void))FN_HIT_CHECK_PHYSICAL)();
+}
+
+/* The table entry, after a look at the two routines the hook calls (FUN_005ddbb0 and FUN_005de356 begin as the
+   game's). FALSE: not followed (said in the log); `physical_evade` then changes nothing. */
+static BOOL install_evade_hook(void)
+{
+    static const BYTE check[11] = { 0x55, 0x8b, 0xec, 0x83, 0xec, 0x2c, 0xa1, 0x0c, 0xce, 0x99, 0x00 };
+    static const BYTE facing[13] = { 0x55, 0x8b, 0xec, 0x83, 0xec, 0x2c, 0xc7, 0x45, 0xf4, 0x00, 0x00, 0x00, 0x00 };
+    int i;
+
+    for (i = 0; i < (int)sizeof check; i++)
+        if (((const BYTE *)FN_HIT_CHECK_PHYSICAL)[i] != check[i]) {
+            log_line("limit states: physical_evade: %08lx does not begin as the game's physical hit check (byte %d is %02x): not followed",
+                     FN_HIT_CHECK_PHYSICAL, i, ((const BYTE *)FN_HIT_CHECK_PHYSICAL)[i]);
+            return FALSE;
+        }
+    for (i = 0; i < (int)sizeof facing; i++)
+        if (((const BYTE *)FN_HIT_FACING)[i] != facing[i]) {
+            log_line("limit states: physical_evade: %08lx does not begin as the game's facing step (byte %d is %02x): not followed",
+                     FN_HIT_FACING, i, ((const BYTE *)FN_HIT_FACING)[i]);
+            return FALSE;
+        }
+    return patch_pointer(ADDR_HIT_STEP_PHYSICAL, FN_HIT_CHECK_PHYSICAL, physical_hit_check_hook);
 }
 
 /* The call of FUN_005dc390 in the hit loop (005d9b06), once at the start of every turn of every
@@ -22325,6 +24491,7 @@ static void __cdecl state_record_loaded_hook(void)
     int i, target;
 
     ((void (__cdecl *)(void))state_record_loaded_next)();
+    atb_dex_follow();           /* (an action with neither of the two above; a counter's script) */
     if (!state_show_begin())
         return;
     target = state_show_entry_target(0);
@@ -22770,6 +24937,213 @@ static BOOL state_weapon_part_name(char *out, const char *file, int n)
 }
 /* [state stage C logic: end] */
 
+/* ---- A state's script_NN: model scripts replaced while it lasts ----------------------------------
+
+   A party actor's reactions are model SCRIPT numbers: the hit code gives each result one (action[0x89]:
+   the target's damage_anim_id 009ab0ed, or its miss_anim_script 009ab132 for a miss, constants), the record's
+   loading copies it to the actor (00be117c, FUN_0042d3cb) and FUN_0042613a starts it when the result is
+   shown. Magic, Summon, Enemy Skill, Item and the rest are model scripts too (007b7510: 0x1d, 0x1f, 0x1e,
+   0x21 ...). So "while the state lasts, play these instead" is the idle's lending for any slot: the pointer of
+   slot NN of the actor's own model's table points at the DLL's copy of the line's bytes, followed by four ee.
+   FUN_0041fba4 takes the pointer from the table on EVERY frame and reads it at the position the script has
+   reached (00be11b4), so a slot is never changed under a script that plays it: a slot the actor is playing,
+   or is about to start as its reaction to a result already being shown (a task FUN_00425fc4 for it in the
+   list of 100, its reaction script 00be117c that slot), is lent or put back only when it no longer is; the
+   state's task (list of 60) looks every frame, and stays after the state for that alone. The KO fall that
+   ends a state with `ends = ko` is the case: it is shown with the dead status that ends the state, and its
+   lent fall plays whole before the slot goes back.
+   Lent at the state's entry (the limit's effect step: the actor plays its limit's script, 0x3c up, so no
+   lendable slot), again when the model's table changes (script ac), put back when the state ends; a new
+   battle loads the models afresh (nothing to put back). A long script is safe while an effect plays: the
+   record ends when the effect's tasks are gone AND the actor is finished (FUN_0042d808), whichever is later;
+   only a script that never finishes would hold it, which the reader refuses (fe c0 at the end of an action's
+   or a reaction's script, state_lend_key). */
+#define FN_SHOW_RESULT_TASK     0x00425fc4u  /* FUN_00425fc4: 100-list task: shows a result on a target, then starts its reaction */
+
+static struct state_lend {
+    DWORD *table;                       /* the table the slots are lent in; NULL = none */
+    WORD lent;                          /* bit per entry: its slot holds the copy */
+    WORD waiting;                       /* bit per entry: to be put back (lent) or lent (not yet) when the actor no longer
+                                           plays the slot */
+    BYTE count;
+    BYTE slot[STATE_LENDS_MAX];
+    DWORD original[STATE_LENDS_MAX];
+    BYTE bytes[STATE_LENDS_MAX][STATE_LEND_MAX + 4];    /* copies, each followed by ee */
+} state_lend[3];
+
+/* [state lend logic: begin] (ult_limit_dll/test compiles this stretch as it is) */
+/* Is model script `slot` of the actor's own model being played, or about to be started as its reaction? */
+static BOOL state_lend_busy(int actor, int slot)
+{
+    DWORD base = (DWORD)actor * ACTOR_EFFECT_STRIDE;
+    int i;
+
+    if (*(const signed char *)(ADDR_SHOWN_MODEL + (DWORD)actor * 0x74) != actor)
+        return FALSE;                   /* shown by another model (a frog: slot 6): its own table is not read */
+    if (*(const short *)(ADDR_ACTOR_SCRIPT + base) == slot)
+        return TRUE;
+    if (*(const short *)(ADDR_ACTOR_REACTION + base) != slot)
+        return FALSE;
+    for (i = 0; i < 100; i++)
+        if (((const DWORD *)ADDR_EFFECT_TASK_FNS)[i] == FN_SHOW_RESULT_TASK && *(const short *)(ADDR_EFFECT_TASK_DATA + i * 0x20) != -1
+            && *(const short *)(ADDR_EFFECT_TASK_DATA + i * 0x20 + 8) == actor)
+            return TRUE;
+    return FALSE;
+}
+
+/* "05 07 08 0a" for the entries in `bits` (out: 64 characters) */
+static void state_lend_slots_text(char *out, int actor, unsigned bits)
+{
+    int k;
+
+    out[0] = 0;
+    for (k = 0; k < state_lend[actor].count; k++)
+        if (bits & (1u << k))
+            wsprintfA(out + lstrlenA(out), "%s%02x", out[0] ? " " : "", (unsigned)state_lend[actor].slot[k]);
+}
+
+/* The slots lent put back in `table_now` (the actor's own table as it is now); with `wait`, one the actor plays
+   is left lent and marked waiting (state_lend_settle puts it back). Returns the entries put back. Nothing is
+   put back in a table that is gone (the model loaded again) or in a slot another hand has written since. */
+static unsigned state_lend_back(int actor, DWORD *table_now, BOOL wait)
+{
+    struct state_lend *d = &state_lend[actor];
+    unsigned back = 0;
+    int k;
+
+    d->waiting &= d->lent;              /* entries waiting to be lent never were: forgotten */
+    if (!d->table || d->table != table_now) {
+        d->table = NULL;
+        d->lent = d->waiting = 0;
+        return 0;
+    }
+    for (k = 0; k < d->count; k++) {
+        if (!(d->lent & (1u << k)))
+            continue;
+        if (wait && state_lend_busy(actor, d->slot[k])) {
+            d->waiting |= (WORD)(1u << k);
+            continue;
+        }
+        if (d->table[d->slot[k]] == (DWORD)d->bytes[k]) {
+            d->table[d->slot[k]] = d->original[k];
+            back |= 1u << k;
+        }
+        d->lent &= (WORD)~(1u << k);
+        d->waiting &= (WORD)~(1u << k);
+    }
+    if (!d->lent)
+        d->table = NULL;
+    return back;
+}
+
+/* The state's script_NN copies into `table`; a slot the actor plays now is lent when it no longer does.
+   Whatever was lent before is put back first. Returns the entries lent now. */
+static unsigned state_lend_lend(int actor, const struct limit_state *s, DWORD *table)
+{
+    struct state_lend *d = &state_lend[actor];
+    int k, i;
+
+    state_lend_back(actor, table, FALSE);
+    d->table = NULL;
+    d->lent = d->waiting = 0;
+    d->count = 0;
+    if (!table)
+        return 0;
+    for (k = 0; k < s->lend_count && k < STATE_LENDS_MAX; k++) {
+        int length = s->lend_length[k];
+
+        if (length < 1 || length > STATE_LEND_MAX)
+            continue;
+        d->slot[d->count] = s->lend_slot[k];
+        copy_bytes(d->bytes[d->count], s->lend[k], length);
+        for (i = length; i < STATE_LEND_MAX + 4; i++)
+            d->bytes[d->count][i] = 0xee;
+        if (state_lend_busy(actor, d->slot[d->count])) {
+            d->waiting |= (WORD)(1u << d->count);
+        } else {
+            d->original[d->count] = table[d->slot[d->count]];
+            table[d->slot[d->count]] = (DWORD)d->bytes[d->count];
+            d->lent |= (WORD)(1u << d->count);
+        }
+        d->count++;
+    }
+    if (d->lent | d->waiting)
+        d->table = table;
+    return d->lent;
+}
+
+/* Every frame of the state's task (and after the state, while an entry waits): the waiting entries whose
+   slot the actor no longer plays are lent (the state lasts) or put back (it is over). Returns the entries
+   still waiting. */
+static unsigned state_lend_settle(int actor, BOOL on, DWORD *table_now)
+{
+    struct state_lend *d = &state_lend[actor];
+    int k;
+
+    if (!d->waiting)
+        return 0;
+    if (!d->table || d->table != table_now) {
+        d->table = NULL;                /* the model was loaded again: its slots went with it */
+        d->lent = d->waiting = 0;
+        return 0;
+    }
+    for (k = 0; k < d->count; k++) {
+        if (!(d->waiting & (1u << k)) || state_lend_busy(actor, d->slot[k]))
+            continue;
+        d->waiting &= (WORD)~(1u << k);
+        if (d->lent & (1u << k)) {
+            if (d->table[d->slot[k]] == (DWORD)d->bytes[k])
+                d->table[d->slot[k]] = d->original[k];
+            d->lent &= (WORD)~(1u << k);
+        } else if (on) {
+            d->original[k] = d->table[d->slot[k]];
+            d->table[d->slot[k]] = (DWORD)d->bytes[k];
+            d->lent |= (WORD)(1u << k);
+        }
+    }
+    if (!d->lent && !d->waiting)
+        d->table = NULL;
+    return d->waiting;
+}
+/* [state lend logic: end] */
+
+static void state_lend_place(int actor, const char *when)
+{
+    const struct limit_state *s = &state_run[actor].state;
+    char lent[64], waiting[64];
+
+    if (!s->lend_count)
+        return;
+    state_lend_lend(actor, s, state_own_table(actor));
+    if (!state_lend[actor].table) {
+        log_line("state %s actor %d: scripts NOT lent (%s): the actor's model has no script table", s->name, actor, when);
+        return;
+    }
+    state_lend_slots_text(lent, actor, state_lend[actor].lent);
+    state_lend_slots_text(waiting, actor, state_lend[actor].waiting);
+    log_line("state %s actor %d: scripts lent (%s): slots %s%s%s", s->name, actor, when, lent[0] ? lent : "none yet",
+             waiting[0] ? "; when the actor no longer plays it: " : "", waiting);
+}
+
+/* At the state's end: what was lent goes back, a slot the actor plays when its task has stopped looking at it
+   (the task is the one that waits). `said`: 128 characters. */
+static void state_lend_end(int actor, BOOL task, char *said)
+{
+    unsigned lent = state_lend[actor].lent, back;
+    char text[64], later[64];
+
+    if (!state_lend[actor].table && !state_lend[actor].waiting) {
+        lstrcpyA(said, state_run[actor].state.lend_count ? "no scripts lent" : "");
+        return;
+    }
+    back = state_lend_back(actor, state_own_table(actor), task);
+    state_lend_slots_text(text, actor, back);
+    state_lend_slots_text(later, actor, state_lend[actor].waiting);
+    if (!back && !state_lend[actor].waiting)
+        lstrcpyA(said, lent ? "lent scripts not put back (the model was loaded again, or the slots were written since)" : "no scripts lent");
+    else
+        wsprintfA(said, "scripts put back: %s%s%s", text[0] ? text : "none yet", later[0] ? "; when the actor no longer plays it: " : "", later);
+}
 /* `prop = weapon`: the name of the file the game loaded the actor's weapon model from, which is the
    name of the prop's files in the magic folder (NAME.RSD, NAME.P: copies made by a tool).
    The game (FUN_005e1ad2): n = the low nibble of the byte at battle record + 0x411 of the party
@@ -22825,6 +25199,7 @@ static struct state_stay {
     BYTE bone;                          /* as prop_bone */
     BYTE reason;                        /* STATE_HID_* of the last update that was drawn */
     BYTE seen, late_said, full_said, relent;
+    BYTE lend_said;                     /* the state has ended with a script_NN slot still being played */
     WORD serial;
     int slot, frames, drawn, since, lines, still;
     int hidden[STATE_HID_REASONS];
@@ -22958,7 +25333,7 @@ static void state_stay_start(int actor)
     short *task;
     int i, slot, from = *(const short *)ADDR_WATCH_TASK_INDEX;
 
-    if (t->task || !(t->prop || s->ends || s->idle_length || s->idle_weak_length))
+    if (t->task || !(t->prop || s->ends || s->idle_length || s->idle_weak_length || s->lend_count || s->pointer_raise))
         return;
     if (!watch_task_state) {
         watch_task_state = 1;
@@ -22991,9 +25366,11 @@ static void state_stay_start(int actor)
     task[3] = (short)++state_stay_serial;
     t->serial = state_stay_serial;
     t->task = 1;
-    log_line("state %s actor %d: task started in slot %d of the list of 60 (%d in it now): %s%s%s", s->name, actor, slot,
+    log_line("state %s actor %d: task started in slot %d of the list of 60 (%d in it now): %s%s%s%s", s->name, actor, slot,
              (int)*(const short *)ADDR_WATCH_TASK_COUNT, t->prop ? "draws the prop; " : "",
              s->idle_length || s->idle_weak_length ? "keeps the idle lent; " : "",
+             s->lend_count ? "keeps its scripts lent; " : "",
+             s->pointer_raise ? "keeps the pointer raised; " : "",
              s->ends ? "watches the shown statuses for the state's ends" : "the state ends with the battle");
 }
 
@@ -23008,6 +25385,7 @@ static void state_stay_begin(int actor)
         ((BYTE *)t)[i] = 0;
     t->serial = serial;                 /* (a task of an earlier state of the actor's ends itself: state_stay_task) */
     state_idle_place(actor, "the state is entered");
+    state_lend_place(actor, "the state is entered");
     state_prop_start(actor);
     state_stay_start(actor);
 }
@@ -23021,7 +25399,7 @@ static void state_end(int actor, const char *why)
     BOOL playing = state_placed[actor].table && *(const signed char *)(ADDR_SHOWN_MODEL + (DWORD)actor * 0x74) == actor
                 && script >= STATE_SLOT_ONLY && script <= STATE_SLOT_LAST;
     BOOL lent = state_placed[actor].table != NULL;
-    char idle[112], prop[96];
+    char idle[112], prop[96], scripts[128];
 
     if (!state_run[actor].on)
         return;
@@ -23030,6 +25408,8 @@ static void state_end(int actor, const char *why)
     state_action[actor].live = 0;       /* no turn of hers is given the state's hits from here on; the records of an
                                            action already worked out keep their notes: its hits are still shown */
     state_idle_back(actor, idle);
+    pointer_raise_end(actor);           /* `pointer_raise`: the game's height back (its own line) */
+    state_lend_end(actor, t->task, scripts);       /* (a slot being played: when it no longer is, by the task) */
     /* the attack slots are NOT put back here: records of an action already worked out may still have to play
        the lent scripts (she is knocked out by her own shot mid-burst and is given a hurt script meanwhile);
        state_scripts_restore_all at the next action's set-up puts them back, and the lent bytes are static */
@@ -23039,8 +25419,8 @@ static void state_end(int actor, const char *why)
     else
         lstrcpyA(prop, "no prop");
     t->prop = 0;                        /* the task ends itself at its next call (state_run[].on) */
-    log_line("state %s actor %d: ENDED: %s; %s; %s; attack script slots %s; the actor's attacks are the game's again",
-             state_run[actor].state.name, actor, why, prop, idle,
+    log_line("state %s actor %d: ENDED: %s; %s; %s; %s%sattack script slots %s; the actor's attacks are the game's again",
+             state_run[actor].state.name, actor, why, prop, idle, scripts, scripts[0] ? "; " : "",
              !lent ? "not lent" : playing ? "left until the next action's set-up (one of them is being played)" : "put back");
 }
 
@@ -23053,6 +25433,8 @@ static void state_stay_battle_start(void)
         state_stay[i].task = state_stay[i].prop = 0;
         state_idle[i].table = NULL;
         state_idle[i].lent = 0;
+        state_lend[i].table = NULL;
+        state_lend[i].lent = state_lend[i].waiting = 0;
     }
 }
 
@@ -23099,7 +25481,15 @@ static void __cdecl state_stay_task(void)
     t = &state_stay[actor];
     s = &state_run[actor].state;
     if (!state_run[actor].on) {
-        t->task = 0;                    /* the state ended (said where it did) */
+        /* the state ended (said where it did); a script_NN slot the actor was playing goes back when it no longer
+           is: the task stays for that alone */
+        if (state_lend[actor].waiting && *(const DWORD *)ADDR_BATTLE_3D && state_lend_settle(actor, FALSE, state_own_table(actor)))
+            return;
+        if (state_lend[actor].waiting)
+            state_lend_settle(actor, FALSE, NULL);      /* (the battle is over: nothing to put back) */
+        else if (t->lend_said)
+            log_line("state %s actor %d: the script slots it was playing at the state's end are put back", s->name, actor);
+        t->task = 0;
         *task = -1;
         return;
     }
@@ -23114,15 +25504,27 @@ static void __cdecl state_stay_task(void)
 
         wsprintfA(text, "%s, as it was shown (frame %d of the state)", why, t->frames);
         state_end(actor, text);
+        if (state_lend[actor].waiting) {
+            t->lend_said = 1;           /* the task stays until those slots are put back (above) */
+            return;
+        }
         t->task = 0;
         *task = -1;
         return;
     }
     t->frames++;
+    pointer_raise_step(actor);          /* `pointer_raise`: the pointer's height while the actor stands in the state */
     if ((s->idle_length || s->idle_weak_length) && state_idle[actor].table != state_own_table(actor) && t->relent < 8) {
         t->relent++;                    /* the model was loaded again (script command ac): a new table */
         state_idle_place(actor, "the actor's model has another script table than the one lent in");
+        if (s->lend_count && state_lend[actor].table != state_own_table(actor))
+            state_lend_place(actor, "the actor's model has another script table than the one lent in");
+    } else if (s->lend_count && state_lend[actor].table != state_own_table(actor) && t->relent < 8) {
+        t->relent++;
+        state_lend_place(actor, "the actor's model has another script table than the one lent in");
     }
+    if (state_lend[actor].waiting)
+        state_lend_settle(actor, TRUE, state_own_table(actor));     /* a slot that was being played at the lending */
     if (!t->prop)
         return;
     reason = state_prop_hidden(&v, actor, s->prop_hide);
@@ -23274,6 +25676,107 @@ static void install_pause_log(void)
              done == 2 ? "on" : "NOT whole", done, SITE_PAUSE_ON_SOUND, SITE_PAUSE_OFF_SOUND);
 }
 
+/* ---- atb_follows_dexterity (game file) ------------------------------------------------------
+   An actor's time-gauge step (word +2 of its timer block, 009a8b10 + actor * 0x44, added to the gauge
+   +4 at every battle tick, FUN_004320ac) is worked out from its battle dexterity (byte 009ab0f0 +
+   actor * 0x68, AI variable 40a0) by the game's FUN_004339c2(actor) (cdecl, returns nothing). It writes
+   the words +0, +2 and +0x0a of that block and nothing else (never the gauge itself; it reads the
+   statuses, the stat modifier +0x25, the battle speed 009aacfe and the divisor 009aad00, and calls
+   FUN_005c7eb3, which only reads). The game runs it at battle start for all ten actors (also the empty
+   ones), at a second scene, at a KO, a revive and the gauge statuses (through FUN_00433bc1), in copystats
+   (FUN_005d97d5), when a party member leaves (FUN_00434e47) and in an additional effect of the hit
+   routine (FUN_005df95a): so a dexterity changed by a battle script (`store` to 40a0, as a character's
+   pre_action script may) reaches the gauge only at the next of those.
+   With the key: the three party slots' dexterity is kept at battle start, compared at the set-up of
+   every action (slot_match_hook: an action of a party member, after the pre_action scripts of all ten
+   actors; action_setup_hook: handler 0x0c, an enemy's attack) and when an action's record starts to
+   play (state_record_loaded_hook, when it is in), and on a change the game's own routine is called for
+   that slot. The step it then gives is what the game would give at its next own call. None of these
+   runs inside the battle tick (FUN_0041c0bb builds and plays the actions; FUN_006ce8b3 runs the tick).
+   The slot's step word is kept too (after each call, and at battle start): a step word that is no longer
+   the one kept means the game has worked the step out itself since (a status, copystats FUN_005df5d7, a
+   second scene's party change FUN_005cfbf5), possibly from a dexterity a script has since put back to
+   the kept value: the routine is then called too. That call is the game's own computation from the
+   record as it is, so where the game's step was already right it writes the same three words again
+   (and nothing is logged: a line only when the step changes or the dexterity did).
+   Without the key nothing is called and nothing of the game's is written. The key needs the battle-start
+   hook (battle_start_party_hook, put in by install_limit_hooks): without it the key is refused with one
+   line, at its first check (the game file is first read before that hook is put in). */
+#define FN_ATB_STEP             0x004339c2u  /* FUN_004339c2(actor): its time-gauge step from its dexterity */
+#define ADDR_ACTOR_INDEX        0x009ab0e4u  /* byte, 0x68 per actor: ff = nobody in that place */
+#define ADDR_ACTOR_DEXTERITY    0x009ab0f0u  /* byte, 0x68 per actor: the battle dexterity (AI 40a0) */
+#define ADDR_ACTOR_TIMERS       0x009a8b10u  /* 0x44 per actor: word +2 the step, word +4 the gauge */
+#define ATB_DEX_LINES_MAX       8            /* log lines a battle */
+static int atb_follows_dex;                  /* the key: 0 no (default), 1 yes */
+static int atb_dex_checked;                  /* this battle: 0 not yet, 1 the routine is the game's, -1 it is not */
+static BYTE atb_dex_kept[3];                 /* each party slot's dexterity when its step was last worked out */
+static WORD atb_dex_step[3];                 /* and its step word as last seen (+2 of its timer block) */
+static int atb_dex_lines;
+static int atb_dex_refused_said;             /* the line "needs the battle-start hook", once a session */
+
+/* battle_start_party_hook, after the game's FUN_005cf650 has made the party's battle records and
+   before its own FUN_004339c2 for all ten (in FUN_00437db0): the dexterity the game's steps will be made from.
+   (Taken with the key off too: only this DLL's own bytes, so the key may be switched on in a battle.) */
+static void atb_dex_battle_start(void)
+{
+    int slot;
+
+    for (slot = 0; slot < 3; slot++) {
+        atb_dex_kept[slot] = *(const BYTE *)(ADDR_ACTOR_DEXTERITY + slot * 0x68);
+        atb_dex_step[slot] = *(const WORD *)(ADDR_ACTOR_TIMERS + slot * 0x44 + 2);   /* (the last battle's: see atb_dex_follow) */
+    }
+    atb_dex_checked = 0;
+    atb_dex_lines = 0;
+}
+
+static void atb_dex_follow(void)
+{
+    /* FUN_004339c2's first 20 bytes: push ebp / mov ebp, esp / sub esp, 18 / push esi /
+       mov eax, [ebp+8] / imul eax, eax, 68 / mov ecx, [eax+009ab0dc] / mov [ebp-..] */
+    static const BYTE head[20] = { 0x55, 0x8b, 0xec, 0x83, 0xec, 0x18, 0x56, 0x8b, 0x45, 0x08,
+                                   0x6b, 0xc0, 0x68, 0x8b, 0x88, 0xdc, 0xb0, 0x9a, 0x00, 0x89 };
+    int slot;
+
+    if (!atb_follows_dex)
+        return;
+    if (!battle_start_hooked) {
+        if (!atb_dex_refused_said) {
+            atb_dex_refused_said = 1;
+            log_line("atb_follows_dexterity: NOT at work: it needs the battle-start hook (%08lx), which is not in; the steps are the game's own",
+                     SITE_BATTLE_START_PARTY);
+        }
+        return;
+    }
+    if (!atb_dex_checked) {
+        atb_dex_checked = bytes_are(FN_ATB_STEP, head, sizeof head) ? 1 : -1;
+        if (atb_dex_checked < 0)
+            log_line("atb_follows_dexterity: NOT at work in this battle: the code at %08lx is not the game's (%02x %02x %02x %02x %02x); the steps are the game's own",
+                     FN_ATB_STEP, ((const BYTE *)FN_ATB_STEP)[0], ((const BYTE *)FN_ATB_STEP)[1], ((const BYTE *)FN_ATB_STEP)[2],
+                     ((const BYTE *)FN_ATB_STEP)[3], ((const BYTE *)FN_ATB_STEP)[4]);
+    }
+    if (atb_dex_checked < 0)
+        return;
+    for (slot = 0; slot < 3; slot++) {
+        BYTE dex = *(const BYTE *)(ADDR_ACTOR_DEXTERITY + slot * 0x68), was = atb_dex_kept[slot];
+        WORD step = *(const WORD *)(ADDR_ACTOR_TIMERS + slot * 0x44 + 2), now;
+
+        if (dex == was && step == atb_dex_step[slot])
+            continue;
+        atb_dex_kept[slot] = dex;
+        atb_dex_step[slot] = step;
+        if (*(const BYTE *)(ADDR_ACTOR_INDEX + slot * 0x68) == 0xff)
+            continue;           /* nobody in the slot */
+        ((void (__cdecl *)(int))FN_ATB_STEP)(slot);
+        atb_dex_step[slot] = now = *(const WORD *)(ADDR_ACTOR_TIMERS + slot * 0x44 + 2);
+        if ((dex != was || now != step) && atb_dex_lines < ATB_DEX_LINES_MAX) {
+            log_line("atb_follows_dexterity: party slot %d: dexterity %d -> %d, its time-gauge step worked out again by the game's routine: %u -> %u",
+                     slot, was, dex, (unsigned)step, (unsigned)now);
+            if (++atb_dex_lines == ATB_DEX_LINES_MAX)
+                log_line("atb_follows_dexterity: %d lines in this battle; further changes are followed but not logged", ATB_DEX_LINES_MAX);
+        }
+    }
+}
+
 static void __cdecl battle_start_party_hook(void)
 {
     const BYTE *party = (const BYTE *)ADDR_PARTY;
@@ -23288,12 +25791,14 @@ static void __cdecl battle_start_party_hook(void)
     }
     ((void (__cdecl *)(void))FN_BATTLE_START_PARTY)();
     forget_followup_scripts();
+    atb_dex_battle_start();     /* atb_follows_dexterity: the dexterity the steps are about to be made from */
     effect_swap_off();          /* a swap left from the last battle's last limit */
     effect_copies_battle_start();   /* effect copies: nothing of the last battle's loads is known */
     native_battle_start();          /* native effects: no group handle or task is carried over */
     prop_battle_start();        /* props: no group handle, armed prop or task is carried over */
     state_battle_start();       /* states: nobody is in one when a battle starts */
     pause_battle_start();
+    char_ai_battle_start();     /* character AI: no seat is linked (before the party's init scripts run) */
     for (slot = 0; slot < 3; slot++) {
         struct new_character *c = new_character(party[slot]);
         BYTE *limit = (BYTE *)ADDR_BATTLE_LIMIT + slot * 0x34, *battle = (BYTE *)ADDR_BATTLE_RECORDS + slot * 0x440;
@@ -23731,10 +26236,14 @@ static void note_limit_action(int actor, int command, int id)
                     limit_seq.at[k] = c->limit_seq_frame[position][k];
                     limit_seq.flags[k] = c->limit_seq_flags[position][k];
                     limit_seq.skip[k] = c->limit_seq_skip[position][k];
+                    limit_seq.native[k] = c->limit_seq_native[position][k];
                     limit_seq.task_fn[k][0] = limit_seq.task_fn[k][1] = limit_seq.task_fn[k][2] = limit_seq.task_fn[k][3] = 0;
                 }
                 limit_seq.actor = actor;
                 limit_seq.frame = limit_seq.next = limit_seq.running = limit_seq.pending_count = 0;
+                limit_seq.held_said = limit_seq.held_frames = limit_seq.hold_said = limit_seq.hold_end_said = 0;
+                limit_seq.hits_now = limit_seq.hits_last = 0;
+                limit_seq.ring_held = limit_seq.ring_end_said = limit_seq.hold60_said = 0;
                 limit_seq.hit = -1;
             }
             if (c->limit_hit_element_count[position]) {
@@ -23915,6 +26424,7 @@ static int limits_defined;
 static BYTE limit_seq_draft_count, limit_seq_draft_effect[LIMIT_SEQ_MAX];
 static WORD limit_seq_draft_frame[LIMIT_SEQ_MAX];
 static BYTE limit_seq_draft_flags[LIMIT_SEQ_MAX], limit_seq_draft_skip[LIMIT_SEQ_MAX];
+static WORD limit_seq_draft_native[LIMIT_SEQ_MAX];
 static BYTE limit_element_draft_count;
 static WORD limit_element_draft[LIMIT_SEQ_MAX];
 static BYTE limit_script_draft[3][LIMIT_SCRIPT_MAX];    /* script, followup_script, followup_chain_script */
@@ -23996,6 +26506,12 @@ static const char *state_section_start(struct new_character *c, char *name, char
     c->state[spare].prop_turn[0] = c->state[spare].prop_turn[1] = c->state[spare].prop_turn[2] = 0;
     c->state[spare].prop_scale = 1000;
     c->state[spare].idle_length = c->state[spare].idle_weak_length = 0;
+    c->state[spare].attack_targets = STATE_TARGETS_AS_CHOSEN;
+    c->state[spare].attack_element_set = 0;
+    c->state[spare].attack_element = 0;
+    c->state[spare].long_range = 0;
+    c->state[spare].physical_evade = 0;
+    c->state[spare].lend_count = 0;
     *out = &c->state[spare];
     return NULL;
 }
@@ -24052,7 +26568,8 @@ static const char *state_bytes(BYTE *out, BYTE *out_length, int most, char *valu
             v = v * 16 + d;
         }
         if (length == most)
-            return most == STATE_SCRIPT_MAX ? "a state's attack script may be up to 48 bytes" : "a state's idle script may be up to 16 bytes";
+            return most == STATE_SCRIPT_MAX ? "a state's attack script may be up to 48 bytes"
+                 : most == STATE_LEND_MAX ? "a state's script_NN may be up to 32 bytes" : "a state's idle script may be up to 16 bytes";
         out[length++] = (BYTE)v;
     }
     if (!length)
@@ -24146,6 +26663,55 @@ static const char *prop_scale_value(int *out, char *value, char *stop)
     if (p != value_end || p == value || n > PROP_SCALE_MAX || n * 10 + tenths < 10 || n * 10 + tenths > PROP_SCALE_MAX * 10)
         return "prop_scale is the prop's size in per cent of its own, 1 to 700, with one decimal if wanted (100 = as it is, 87.5)";
     *out = (int)(n * 10 + tenths);
+    return NULL;
+}
+
+/* Model scripts the game's tick chooses as an actor's standing script (FUN_004326bf: 0 the idle, 1 the weak
+   idle, 2 knocked out, 0x0d running away; the base byte 009ab0f2: 0x0c, 0x0e at the battle's end, 0x13 Defend).
+   Nothing waits for them to end. Every other script is an action or a reaction, and the display of the record
+   it belongs to waits until the actor is finished (00be119e: ee, f1, 9e; FUN_0042d808): one that ends in
+   fe c0 goes back to the idle WITHOUT being finished (FUN_0041fba4, case fe) and would hold the battle. */
+static BOOL state_lend_standing(int slot)
+{
+    return slot == 0x02 || slot == 0x0c || slot == 0x0d || slot == 0x0e || slot == 0x13;
+}
+
+/* `script_NN = bytes`: the model script the line replaces while the state lasts. NN in hexadecimal. Refused:
+   00 and 01 (idle_script, idle_weak_script), 18-1b (the slots the attack scripts are lent in), 2e-32 and 34-3b
+   (FUN_0041fba4 takes them from the exe for every model: a slot of the model's table is never read), 33 and
+   3c up (the reaction "none"; the character's limits and transformations). The line's bytes are copied whole:
+   no opcode of them is read but the last two (fe c0, above). A later line for the same NN replaces it. */
+static const char *state_lend_key(struct limit_state *s, char *key, char *key_end, char *value, char *stop)
+{
+    BYTE bytes[STATE_LEND_MAX], length;
+    const char *problem;
+    int slot, hi, lo, k;
+
+    if (key_end - key != 9 || (hi = hex_digit(key[7])) < 0 || (lo = hex_digit(key[8])) < 0)
+        return "script_NN takes the number of the model script it replaces in two hexadecimal digits: script_05 = 22 f2 e5 ee";
+    slot = hi * 16 + lo;
+    if (slot < 2)
+        return "script_00 and script_01 are the idle and the weak idle: use idle_script and idle_weak_script";
+    if (slot >= 0x18 && slot <= 0x1b)
+        return "script_18 to script_1b are the slots the state's attack scripts are lent in: use attack_script_only, attack_script, _next, _next2, _last";
+    if ((slot >= 0x2e && slot <= 0x32) || (slot >= 0x34 && slot <= 0x3b))
+        return "scripts 2e-32 and 34-3b are taken from the game's exe for every model, not from the model's table: a replacement would never be played";
+    if (slot == 0x33 || slot >= 0x3c)
+        return "script_NN replaces a model script from 02 to 17 or 1c to 2d (3c and above are the character's limits and transformations)";
+    problem = state_bytes(bytes, &length, STATE_LEND_MAX, value, stop);
+    if (problem)
+        return problem;
+    if (!state_lend_standing(slot) && length >= 2 && bytes[length - 2] == 0xfe && bytes[length - 1] == 0xc0)
+        return "this script is an action or a reaction, which the battle waits to see finished: one that ends in fe c0 never says so and would hold the battle; end it with e5 ee (or ee)";
+    for (k = 0; k < s->lend_count && s->lend_slot[k] != slot; k++)
+        ;
+    if (k == STATE_LENDS_MAX)
+        return "a state may replace up to 16 model scripts (script_NN lines)";
+    if (k == s->lend_count)
+        s->lend_count++;
+    s->lend_slot[k] = (BYTE)slot;
+    s->lend_length[k] = length;
+    copy_bytes(s->lend[k], bytes, length);
     return NULL;
 }
 
@@ -24285,10 +26851,112 @@ static const char *state_key(struct limit_state *s, char *key, char *key_end, ch
         return state_script_bytes(s, STATE_SCRIPT_ONLY, value, stop);
     } else if (word_is(key, key_end, "attack_script_next2")) {
         return state_script_bytes(s, STATE_SCRIPT_NEXT2, value, stop);
+    } else if (word_is(key, key_end, "attack_targets")) {
+        if (word_is(value, stop, "all_enemies"))
+            s->attack_targets = STATE_TARGETS_ALL_ENEMIES;
+        else if (word_is(value, stop, "as_chosen"))
+            s->attack_targets = STATE_TARGETS_AS_CHOSEN;
+        else
+            return "attack_targets is as_chosen (the default: the targets the attack was given) or all_enemies (each turn of a listed attack goes at every living enemy, with one animation)";
+    } else if (word_is(key, key_end, "attack_element")) {
+        DWORD mask;
+
+        if (word_is(value, stop, "weapon"))
+            s->attack_element_set = 0, s->attack_element = 0;
+        else if (value < stop && parse_flags(value, stop, element_flags, 0xffff, &mask))
+            s->attack_element_set = 1, s->attack_element = (WORD)mask;
+        else
+            return "attack_element is weapon (the default: the weapon's and the Elemental materia's) or element words, as a spell's element: hidden, fire ice, none";
+    } else if (word_is(key, key_end, "long_range")) {
+        if (word_is(value, stop, "yes"))
+            s->long_range = 1;
+        else if (word_is(value, stop, "no"))
+            s->long_range = 0;
+        else
+            return "long_range is yes or no (the default): whether the listed attacks are long range (no back-row halving; enemies behind others can be aimed at)";
+    } else if (word_is(key, key_end, "physical_evade")) {
+        if (word_is(value, stop, "100") || word_is(value, stop, "100%"))
+            s->physical_evade = 1;
+        else if (word_is(value, stop, "normal"))
+            s->physical_evade = 0;
+        else
+            return "physical_evade is normal (the default) or 100: every physical hit on the actor misses while the state lasts";
+    } else if (word_is(key, key_end, "view_raise")) {
+        if (!parse_number(&p, stop, &n) || p != stop || n > STATE_VIEW_RAISE_MAX)
+            return "view_raise is 0 (the default) to 6000: units the battle's home view (between turns, the command menu, choosing a target) goes up while an actor is in the state";
+        s->view_raise = (WORD)n;
+    } else if (word_is(key, key_end, "view_back")) {
+        if (stop > value && stop[-1] == '%')
+            stop--;
+        if (!parse_number(&p, stop, &n) || p != stop || n > STATE_VIEW_BACK_MAX)
+            return "view_back is 0 (the default) to 100: per cent the battle's home view goes back from the point it looks at while an actor is in the state";
+        s->view_back = (BYTE)n;
+    } else if (word_is(key, key_end, "pointer_raise")) {
+        if (!parse_number(&p, stop, &n) || p != stop || n > STATE_POINTER_RAISE_MAX)
+            return "pointer_raise is 0 (the default) to 6000: units the yellow pointer over the party member whose command menu is open goes up while the actor is in the state";
+        s->pointer_raise = (WORD)n;
+    } else if (key_end - key >= 7 && word_is(key, key + 7, "script_")) {
+        return state_lend_key(s, key, key_end, value, stop);
     } else {
-        return "a state's section takes: hits, commands, ends (battle ko frog), retarget, hit_gap, stop_step, camera, attack_script / _next / _next2 / _last / _only, idle_script, idle_weak_script, prop (a name, or weapon), prop_bone, prop_offset, prop_turn, prop_scale, prop_hide, prop_colour";
+        return "a state's section takes: hits, commands, ends (battle ko frog), retarget, hit_gap, stop_step, camera, attack_script / _next / _next2 / _last / _only, idle_script, idle_weak_script, prop (a name, or weapon), prop_bone, prop_offset, prop_turn, prop_scale, prop_hide, prop_colour, attack_targets, attack_element, long_range, physical_evade, script_NN, view_raise, view_back, pointer_raise";
     }
     return NULL;
+}
+
+/* "attack_targets all_enemies, attack_element 8000, long_range, physical_evade 100, scripts lent: 05 07 08 0a",
+   or "" when the state has none of these keys (out: 256 characters). */
+static void state_keys_text(char *out, const struct limit_state *s)
+{
+    int k;
+
+    out[0] = 0;
+    if (s->attack_targets == STATE_TARGETS_ALL_ENEMIES)
+        lstrcatA(out, "attack_targets all_enemies");
+    if (s->attack_element_set)
+        wsprintfA(out + lstrlenA(out), "%sattack_element %04x", out[0] ? ", " : "", (unsigned)s->attack_element);
+    if (s->long_range)
+        wsprintfA(out + lstrlenA(out), "%slong_range", out[0] ? ", " : "");
+    if (s->physical_evade)
+        wsprintfA(out + lstrlenA(out), "%sphysical_evade 100", out[0] ? ", " : "");
+    if (s->lend_count) {
+        wsprintfA(out + lstrlenA(out), "%sscripts lent:", out[0] ? ", " : "");
+        for (k = 0; k < s->lend_count && k < STATE_LENDS_MAX; k++)
+            wsprintfA(out + lstrlenA(out), " %02x", (unsigned)s->lend_slot[k]);
+    }
+    if (s->view_raise || s->view_back)
+        wsprintfA(out + lstrlenA(out), "%sview_raise %u, view_back %u%%", out[0] ? ", " : "", (unsigned)s->view_raise, (unsigned)s->view_back);
+    if (s->pointer_raise)
+        wsprintfA(out + lstrlenA(out), "%spointer_raise %u", out[0] ? ", " : "", (unsigned)s->pointer_raise);
+}
+
+/* The load-time lines of the keys above, and what is odd about a script_NN. */
+static void state_keys_said(int id, const struct limit_state *s)
+{
+    char text[256];
+    int k;
+
+    state_keys_text(text, s);
+    if (!text[0])
+        return;
+    log_line("character %d state %s: %s", id, s->name, text);
+    for (k = 0; k < STATE_SCRIPTS; k++)
+        if (s->attack_targets == STATE_TARGETS_ALL_ENEMIES && state_bytes_wait(s->script[k], s->script_length[k])) {
+            log_line("character %d state %s: attack_targets = all_enemies: attack script %d of 5 (first, next, last, only, next2) has a 9e, which waits for ONE target: an action that plays it keeps its own targets",
+                     id, s->name, k + 1);
+            break;
+        }
+    for (k = 0; k < s->lend_count && k < STATE_LENDS_MAX; k++) {
+        const BYTE *bytes = s->lend[k];
+        int length = s->lend_length[k], slot = s->lend_slot[k];
+        BYTE last = length ? bytes[length - 1] : 0xee;
+
+        if (last != 0xee && last != 0x9e && last != 0xf1 && last != 0xc0)
+            log_line("character %d state %s: script_%02x ends in %02x, not in a byte that ends a script (ee, 9e, f1, or fe c0): it is stopped after its last byte",
+                     id, s->name, slot, (int)last);
+        if (state_lend_standing(slot) && length && bytes[0] >= 0x8e && last == 0xc0)
+            log_line("character %d state %s: script_%02x begins with %02x, a command: a script that loops (fe c0) is started again from its FIRST byte as its animation's number, so begin it with the animation",
+                     id, s->name, slot, (int)bytes[0]);
+    }
 }
 
 /* When the whole file has been read: which state each limit's `state` names (its section may
@@ -24322,6 +26990,12 @@ static void finish_states(void)
 
             if (!s->name[0])
                 continue;
+            if (s->attack_targets == STATE_TARGETS_ALL_ENEMIES && s->hits > 1) {
+                /* several hits a turn are shown at ONE target (SHOWING THE HITS); a turn at every enemy is one hit each */
+                log_line("character %d state %s: attack_targets = all_enemies is ignored: hits is %d, and a turn's several hits go at one target",
+                         id, s->name, (int)s->hits);
+                c->state[k].attack_targets = STATE_TARGETS_AS_CHOSEN;
+            }
             limits[0] = 0;
             for (i = 0; i < 12; i++)
                 if (c->limit_state[i] == k + 1)
@@ -24351,7 +27025,7 @@ static void finish_states(void)
                      id, s->name, (int)s->line, (int)s->hits, commands, s->commands, ends, s->retarget ? "yes" : "no", (int)s->hit_gap,
                      s->stop_step ? "yes" : "no", scripts,
                      limits[0] ? "limit " : "no limit: nothing names it",
-                     limits, s->hits < 2 ? "; with hits = 1 it changes nothing yet" : "",
+                     limits, s->hits < 2 && !state_changes_attacks(s) ? "; with hits = 1 it changes nothing yet" : "",
                      s->commands & (1u << 0x18 | 1u << 0x1a)
                          ? "; slash_all and flash go at several targets at once: they are left as the game has them" : "");
             /* stage C: what stays with the actor */
@@ -24389,6 +27063,7 @@ static void finish_states(void)
                          s->idle_weak_length ? " (slot 1)" : s->idle_length ? " (slot 1 gets idle_script: no stance of its own near death)" : " (the model's own)",
                          s->prop[0] || s->prop_weapon ? "" : "; no prop",
                          s->prop_hide && !s->prop[0] && !s->prop_weapon ? "; prop_hide without a prop does nothing" : "");
+            state_keys_said(id, s);
         }
     }
 }
@@ -24490,6 +27165,7 @@ static void finish_limit(struct spell_draft *draft, struct new_character *c, int
         c->limit_seq_frame[index][i] = limit_seq_draft_frame[i];
         c->limit_seq_flags[index][i] = limit_seq_draft_flags[i];
         c->limit_seq_skip[index][i] = limit_seq_draft_skip[i];
+        c->limit_seq_native[index][i] = limit_seq_draft_native[i];
         c->limit_hit_element[index][i] = limit_element_draft[i];
     }
     if (limit_seq_draft_count || limit_element_draft_count)
@@ -24916,15 +27592,21 @@ static void load_limits(void)
                         problem = "the script is empty";
                     limit_script_draft_length[which] = problem ? 0 : length;
                 } else if (word_is(start, key_end, "spell_effects")) {
-                    /* [limit] number : frame [all] [visual], ...   one for each hit (or step) */
+                    /* [limit | effect] number : frame [all] [visual], ... or hit:frame   one for each hit (or step) */
                     char *q = value, *word_end;
-                    int is_limit = 0, is_skip = 0;
+                    int is_limit = 0, is_skip = 0, is_native = 0;
 
                     limit_seq_draft_count = 0;
                     while (!problem && (word_end = next_word(&q, stop)) != NULL) {
                         DWORD effect, frame;
 
-                        if (is_skip) {
+                        if (limit_seq_draft_count && (limit_seq_draft_flags[limit_seq_draft_count - 1] & SEQ_HIT) && !is_limit && !is_native &&
+                            (word_is(q, word_end, "all") || word_is(q, word_end, "visual") || word_is(q, word_end, "skip"))) {
+                            problem = "spell_effects: a `hit:frame` entry (a bare hit, no effect) takes nothing after it: no all, visual or skip";
+                        } else if (limit_seq_draft_count && (limit_seq_draft_flags[limit_seq_draft_count - 1] & SEQ_NATIVE) && !is_limit && !is_native &&
+                            (word_is(q, word_end, "visual") || word_is(q, word_end, "skip"))) {
+                            problem = "spell_effects: an `effect N:frame` entry (a native effect) takes `all` only, not visual or skip";
+                        } else if (is_skip) {
                             DWORD frames;
 
                             if (!parse_number(&q, word_end, &frames) || q != word_end || frames > 255)
@@ -24932,32 +27614,51 @@ static void load_limits(void)
                             else
                                 limit_seq_draft_skip[limit_seq_draft_count - 1] = (BYTE)frames;
                             is_skip = 0;
-                        } else if (word_is(q, word_end, "skip") && limit_seq_draft_count && !is_limit) {
+                        } else if (word_is(q, word_end, "skip") && limit_seq_draft_count && !is_limit && !is_native) {
                             is_skip = 1;
-                        } else if (word_is(q, word_end, "limit")) {
+                        } else if (word_is(q, word_end, "limit") && !is_native) {
                             is_limit = 1;
-                        } else if (word_is(q, word_end, "all") && limit_seq_draft_count && !is_limit) {
+                        } else if (word_is(q, word_end, "effect") && !is_limit && !is_native) {
+                            is_native = 1;
+                        } else if (word_is(q, word_end, "all") && limit_seq_draft_count && !is_limit && !is_native) {
                             limit_seq_draft_flags[limit_seq_draft_count - 1] |= SEQ_ALL;
-                        } else if (word_is(q, word_end, "visual") && limit_seq_draft_count && !is_limit) {
+                        } else if (word_is(q, word_end, "visual") && limit_seq_draft_count && !is_limit && !is_native) {
                             limit_seq_draft_flags[limit_seq_draft_count - 1] |= SEQ_VISUAL;
+                        } else if (!is_limit && !is_native && word_end - q >= 3 && word_is(q, q + 3, "hit") && (word_end - q == 3 || q[3] == ':')) {
+                            /* hit:frame, a bare hit (SEQ_HIT): no effect, the step's hit shown at its frame */
+                            if (limit_seq_draft_count == LIMIT_SEQ_MAX)
+                                problem = "spell_effects is up to 24 of  [limit | effect] number:frame [all] [visual], or hit:frame  (0x1b:40, limit 178:60 all visual, effect 0x200:10 all, hit:70)";
+                            else if (word_end - q == 3 || (q += 4, !parse_number(&q, word_end, &frame)) || q != word_end || frame > 2000)
+                                problem = "spell_effects: a bare hit is hit:frame, the frame 0 to 2000 (hit:70)";
+                            else {
+                                limit_seq_draft_effect[limit_seq_draft_count] = 0;
+                                limit_seq_draft_flags[limit_seq_draft_count] = SEQ_HIT;
+                                limit_seq_draft_skip[limit_seq_draft_count] = 0;
+                                limit_seq_draft_native[limit_seq_draft_count] = 0;
+                                limit_seq_draft_frame[limit_seq_draft_count++] = (WORD)frame;
+                            }
                         } else if (limit_seq_draft_count == LIMIT_SEQ_MAX || !parse_number(&q, word_end, &effect) ||
-                                   (is_limit ? effect < 0x80 || effect > 0xb7 : effect > 0xff) ||
+                                   (is_limit ? effect < 0x80 || effect > 0xb7 : is_native ? effect < EFFECT_COPY_FIRST || effect > EFFECT_COPY_LAST
+                                                                                         : effect > 0xff) ||
                                    q == word_end || *q != ':' || (q++, !parse_number(&q, word_end, &frame)) || q != word_end ||
                                    frame > 2000) {
-                            problem = "spell_effects is up to eight of  [limit] number:frame [all] [visual]  (0x1b:40, limit 178:60 all visual)";
+                            problem = is_native ? "spell_effects: `effect` is followed by a native effect's number (0x100 up, an [effect N] section with play =) and its frame: effect 0x200:0 all"
+                                                : "spell_effects is up to 24 of  [limit | effect] number:frame [all] [visual], or hit:frame  (0x1b:40, limit 178:60 all visual, effect 0x200:10 all, hit:70)";
                         } else {
-                            limit_seq_draft_effect[limit_seq_draft_count] = (BYTE)(is_limit ? effect - 0x80 : effect);
-                            limit_seq_draft_flags[limit_seq_draft_count] = (BYTE)(is_limit ? SEQ_LIMIT : 0);
+                            limit_seq_draft_effect[limit_seq_draft_count] = (BYTE)(is_limit ? effect - 0x80 : is_native ? 0 : effect);
+                            limit_seq_draft_flags[limit_seq_draft_count] = (BYTE)(is_limit ? SEQ_LIMIT : is_native ? SEQ_NATIVE : 0);
                             limit_seq_draft_skip[limit_seq_draft_count] = 0;
+                            limit_seq_draft_native[limit_seq_draft_count] = (WORD)(is_native ? effect : 0);
                             limit_seq_draft_frame[limit_seq_draft_count++] = (WORD)frame;
-                            is_limit = 0;
+                            is_limit = is_native = 0;
                         }
                         q = word_end;
                     }
-                    if (problem || is_limit || is_skip) {
+                    if (problem || is_limit || is_skip || is_native) {
                         if (!problem)
                             problem = is_skip ? "spell_effects: `skip` must be followed by a number of frames"
-                                              : "spell_effects: `limit` must be followed by number:frame";
+                                      : is_native ? "spell_effects: `effect` must be followed by number:frame"
+                                                  : "spell_effects: `limit` must be followed by number:frame";
                         limit_seq_draft_count = 0;
                     }
                 } else if (word_is(start, key_end, "hit_elements")) {
@@ -24973,7 +27674,7 @@ static void load_limits(void)
                             piece_end++;
                         if (limit_element_draft_count == LIMIT_SEQ_MAX ||
                             !parse_flags(q, piece_end, element_flags, 0xffff, &mask))
-                            problem = "hit_elements is up to eight element sets separated by commas: fire, ice, lightning";
+                            problem = "hit_elements is up to 24 element sets separated by commas: fire, ice, lightning";
                         else
                             limit_element_draft[limit_element_draft_count++] = (WORD)mask;
                         q = piece_end < stop ? piece_end + 1 : stop;
@@ -25117,7 +27818,7 @@ static int install_limit_hooks(void)
 
     for (i = 0; i < (int)(sizeof limit_command_sites / sizeof limit_command_sites[0]); i++)
         ok += patch_call(limit_command_sites[i], FN_LIMIT_COMMAND, limit_command_hook);
-    ok += patch_call(SITE_BATTLE_START_PARTY, FN_BATTLE_START_PARTY, battle_start_party_hook);
+    ok += (battle_start_hooked = patch_call(SITE_BATTLE_START_PARTY, FN_BATTLE_START_PARTY, battle_start_party_hook));
     ok += patch_call(SITE_LIMIT_LEARNING, FN_LIMIT_LEARNING, limit_learning_hook);
     /* a limit's `state`: the weapon set-up, handler 0x0e, as action_setup_hook has handler 0x0c. Not counted
        with the hooks above: without it everything else works, and states change no hits */
@@ -25126,6 +27827,18 @@ static int install_limit_hooks(void)
     log_line("limit states: the weapon set-up (handler 0x0e, table entry %08lx -> %08lx) is %s", ADDR_WEAPON_SETUP_ENTRY,
              FN_WEAPON_SETUP, weapon_hook_live ? "followed: a state's attacks are noted"
                                                : "NOT followed (the entry is not the game's): states are entered but change nothing");
+    /* a state's physical_evade: the hit-step table's entry 0. Not counted either: only that key needs it */
+    if (!evade_hook_live)
+        evade_hook_live = install_evade_hook();
+    log_line("limit states: the physical hit check (hit-step table entry %08lx -> %08lx) is %s", ADDR_HIT_STEP_PHYSICAL,
+             FN_HIT_CHECK_PHYSICAL, evade_hook_live ? "followed: a state's physical_evade applies"
+                                                    : "NOT followed: a state's physical_evade changes nothing");
+    /* a state's attack_targets = all_enemies in the battle menu: the target cursor's set-up. Not counted either */
+    if (!menu_all_live)
+        menu_all_live = install_menu_target_hook();
+    log_line("limit states: the battle menu's target set-up (%08lx, %08lx -> %08lx) is %s", SITE_MENU_TARGET_A, SITE_MENU_TARGET_B,
+             FN_MENU_TARGET_SETUP, menu_all_live ? "followed: an attack that goes at every enemy is aimed at every enemy"
+                                                 : "NOT followed: an attack that goes at every enemy is still aimed at one");
     /* the per-turn call of the hit loop. The site must be a call; if it no longer goes to the game's
        routine (another DLL's hook) it is chained: both run, this DLL's part after the other's. */
     if (!turn_hook_live)
@@ -25170,7 +27883,8 @@ static int install_limit_hooks(void)
 /* Every weapon, armour and accessory has a 16-bit mask of the character IDs
    that can equip it. The bits of the seats (12 to 15) are worked out here, for
    each seat's occupant: it can equip whatever the character named by its
-   `equip_like` can, and whatever names it in an `equip` list of the weapon,
+   `equip_like` can (equip_like = none: whatever all nine can), and whatever
+   names it in an `equip` list of the weapon,
    armour or accessory file (kept per roster character in *_roster_equip, since
    a list may name characters that are not seated). Run after every kernel load
    (which resets the kernel's tables), after the files are read, and whenever a
@@ -25191,6 +27905,16 @@ static DWORD character_equip_names(const struct new_character *c)
     return set;
 }
 
+/* The equip_like half of that test: may `c` equip a piece of this mask through its equip_like? One of the
+   nine: that one's bit. EQUIP_LIKE_NONE: only a piece every one of the nine can equip (bits 0 to 8 all set;
+   so no original character's own weapon, nor a piece only some of them can wear). */
+static BOOL equip_like_allows(const struct new_character *c, WORD mask)
+{
+    if (c->equip_like == EQUIP_LIKE_NONE)
+        return (mask & EQUIP_ALL_NINE) == EQUIP_ALL_NINE;
+    return c->equip_like >= 0 && c->equip_like < 16 && (mask & (1u << c->equip_like)) != 0;
+}
+
 static WORD seat_mask_bits(WORD mask, DWORD roster_equip)
 {
     int seat;
@@ -25199,7 +27923,7 @@ static WORD seat_mask_bits(WORD mask, DWORD roster_equip)
     for (seat = 0; seat < seat_count; seat++) {
         const struct new_character *c = new_character(NEW_CHARACTER_FIRST_ID + seat);
 
-        if (c && ((mask & (1 << c->equip_like)) || (roster_equip & character_equip_names(c))))
+        if (c && (equip_like_allows(c, mask) || (roster_equip & character_equip_names(c))))
             mask |= (WORD)(1 << (NEW_CHARACTER_FIRST_ID + seat));
     }
     return mask;
@@ -25914,6 +28638,14 @@ static void sxc2_part_sums(const BYTE *slot, BYTE *out)
    not on; 1: the DLL's own list, the switch on), then the rows: a dword each, the number low, the
    quantity high, ffffffff empty.
 
+   (STAGE 4) VERSION 3, the whole list of any length: 2 bytes rows (`count`: even, 512 or more; the
+   highest row in use + 1, rounded up), 1 byte bytes a row (4), 1 byte source (as above), 2 bytes
+   `shown` (the rows of its writer's list, wide_bound: even, 510 or more; rows 0 to shown - 1 were
+   its own list, every row past them a row it carried), 2 bytes `picture` (1: the save's 320 words
+   are the COMPACT picture of rows 0 to shown - 1; 0: they are rows 0-319 row for row), then the
+   `count` rows. A narrow row the writer did not show is never below `shown`. No upper bound on
+   `count` or `shown`: a well-formed section of any length is read (sxc3_take_list2).
+
    STAGE 2 (wide items): the same section, the same version. A row may hold a number above 511
    (a wide item: 1024-9999 in this build). The save's own 320 words hold ffff in such a row's
    place, so the section is THE TRUTH for those rows at a load (sxc3_take_wide_rows):
@@ -25939,19 +28671,26 @@ static void sxc2_part_sums(const BYTE *slot, BYTE *out)
 #define SXC3_SECTION_CARRIED    0x0001u
 #define SXC3_ITEM_VERSION       1
 #define SXC3_ITEM_VERSION_LIST  2       /* (stage 3) the whole list of 510 rows in the player's order; the save's words are its COMPACT picture (sxc3_take_list2) */
-#define SXC3_ITEM_BYTES         (4 + WIDE_ROWS * 4)
-#define SXC3_KEPT_ROOM          (SXC3_SECTIONS_ROOM - SXC3_SECTION_HEAD - SXC3_ITEM_BYTES)      /* a list of this build's own always fits beside what is carried */
+#define SXC3_ITEM_VERSION_LONG  3       /* (stage 4) the whole list of any length in the player's order; `shown` and `picture` say how its save's words picture it */
+#define SXC3_ITEM_BYTES         (4 + WIDE_V2_ROWS * 4)                              /* versions 1 and 2 */
+#define SXC3_ITEM_BYTES_MAX     (8 + WIDE_ROWS_MAX * 4)                             /* (stage 4) the longest item list this build writes (version 3, WIDE_ROWS_MAX rows) */
+#define SXC3_ITEM_ROWS_ROOM     ((SXC3_SECTIONS_ROOM - SXC3_SECTION_HEAD - 8) / 4) /* (stage 4) the most rows a version-3 list can have in any file (its readers' arrays) */
+#define SXC3_KEPT_ROOM          (SXC3_SECTIONS_ROOM - SXC3_SECTION_HEAD - SXC3_ITEM_BYTES_MAX)  /* a list of this build's own always fits beside what is carried (stage 4: its longest) */
+#define SXC3_WORN_ROOM          (SXC3_SECTION_HEAD + 4 + 125 * 8)                   /* (stage 4b, fix pass) the longest WORN section (GEAR_WORN_MAX entries: checked where that is defined) */
+#define SXC3_KEPT_ROOM_WHOLE    (SXC3_SECTIONS_ROOM - SXC3_WORN_ROOM - FLDX_SECTION) /* (stage 4b, fix pass) the same when the loaded file's item list is CARRIED WHOLE: no list of this build's own is written beside it, so its room is free; the longest WORN and FLDX sections this build may write still fit (the box's own room is its cap's: box_kinds_allowed) */
 #define SXC3_DIFFERENCES_LOGGED 12
 static BYTE sxc3_kept[SXC3_SECTIONS_ROOM];          /* sections of the loaded save's file that the files of this game carry forward, head and contents, one after another */
 static DWORD sxc3_kept_size;
 static int sxc3_kept_count;
 static int sxc3_item_carried;                       /* one of them is an item list (it holds what the game's 320 words cannot, or is of a version this build does not know): no list of this build's own is written beside it */
+static int sxc3_list_whole;                         /* (stage 4b, fix pass) the file being loaded holds an item list this run carries whole (its first, of a version it cannot read): known before any of its sections is kept, whatever their order */
 static int sxc3_built_item;                         /* the last file built: 1 it has the shadow list, 0 none, -1 the list failed its own check and was left out */
 static int sxc3_built_row;
 static int sxc3_built_held, sxc3_built_no_room;     /* (stage 2) rows of that list the slot's 320 words do not hold (wide items; carried rows); carried rows that found no row in it */
 static int sxc3_built_version, sxc3_built_differs;  /* (stage 3) the version of that list (1, or 2: the whole list of 510 rows); words of the slot that are not the compact picture of a version-2 list (always 0) */
 static int sxc2_index_beyond = -1;                  /* (stage 3) what the index says of the key last asked: the rows its version-2 item list held beyond the save's words; -1: no such note */
 static int sxc2_index_none;                         /* (C0) 1: the index's newest line of the key last asked says "sxc2=none": that save needed no companion */
+static int sxc2_index_worn = -1;                    /* (wide gear in the item list) what the index says of the key last asked: the wide pieces its companion's WORN section held (worn and kept; " worn=N"); -1: no such note */
 
 static BOOL sxc3_is(const BYTE *data)
 {
@@ -26025,19 +28764,48 @@ static const BYTE *sxc3_find_section(const BYTE *data, DWORD size, const BYTE *t
     return NULL;
 }
 
-/* What is wrong with an item list section of version 1 (`head`: its head; the length was checked
+/* (Stage 4) An item list section's rows: 510 for versions 1 and 2; version 3: its count. Row i of it. Its `shown` rows (the
+   rows its writer's list had: 510 for versions 1 and 2) and its picture (1 compact: version 2 always; version 3 says). */
+static int sxc3_item_rows(const BYTE *head)
+{
+    return get16(head + 6) == SXC3_ITEM_VERSION_LONG ? (int)get16(head + SXC3_SECTION_HEAD) : WIDE_V2_ROWS;
+}
+
+static DWORD sxc3_item_row(const BYTE *head, int i)
+{
+    return get32(head + SXC3_SECTION_HEAD + (get16(head + 6) == SXC3_ITEM_VERSION_LONG ? 8 : 4) + i * 4);
+}
+
+static int sxc3_item_shown(const BYTE *head)
+{
+    return get16(head + 6) == SXC3_ITEM_VERSION_LONG ? (int)get16(head + SXC3_SECTION_HEAD + 4) : WIDE_V2_ROWS;
+}
+
+static BOOL sxc3_item_compact(const BYTE *head)
+{
+    return get16(head + 6) == SXC3_ITEM_VERSION_LONG ? get16(head + SXC3_SECTION_HEAD + 6) != 0 : TRUE;
+}
+
+/* What is wrong with an item list section of version 1 or 2 (stage 4: or 3) (`head`: its head; the length was checked
    against the file); NULL if nothing is. */
 static const char *sxc3_item_fault(const BYTE *head)
 {
     const BYTE *body = head + SXC3_SECTION_HEAD;
-    int i;
+    int i, rows = WIDE_V2_ROWS;
 
-    if (get32(head + 8) != SXC3_ITEM_BYTES || get16(body) != WIDE_ROWS || body[2] != 4)
+    if (get16(head + 6) == SXC3_ITEM_VERSION_LONG) {
+        /* (stage 4) version 3: any even count of 512 or more, its length to match; shown even and 510 or more; picture 0 or 1 */
+        rows = (int)get16(body);
+        if (get32(head + 8) != 8 + (DWORD)rows * 4 || rows < WIDE_V2_ROWS + 2 || (rows & 1) || body[2] != 4)
+            return "its length or its row count is not this version's";
+        if (get16(body + 4) < WIDE_V2_ROWS || (get16(body + 4) & 1) || get16(body + 6) > 1)
+            return "its shown rows or its picture field is not one this version has";
+    } else if (get32(head + 8) != SXC3_ITEM_BYTES || get16(body) != WIDE_V2_ROWS || body[2] != 4)
         return "its length or its row count is not this version's";
     if (body[3] > 1)
         return "its source byte is not one this version has";
-    for (i = 0; i < WIDE_ROWS; i++) {
-        DWORD row = get32(body + 4 + i * 4);
+    for (i = 0; i < rows; i++) {
+        DWORD row = sxc3_item_row(head, i);
 
         if (row != WIDE_EMPTY && ((row & 0xffffu) > WIDE_NUMBER_MAX || (row >> 16) > 0x7fffu))
             return "a row holds a number or a quantity that cannot be one";
@@ -26050,10 +28818,10 @@ static const char *sxc3_item_fault(const BYTE *head)
    `words` (320 words, two bytes each). */
 static int sxc3_item_narrow(const BYTE *head, BYTE *words, int *wide_rows, int *beyond, int *unpaintable)
 {
-    static DWORD wide[WIDE_ROWS];
+    static DWORD wide[WIDE_V2_ROWS];
     int i, used = 0;
 
-    for (i = 0; i < WIDE_ROWS; i++) {
+    for (i = 0; i < WIDE_V2_ROWS; i++) {
         wide[i] = get32(head + SXC3_SECTION_HEAD + 4 + i * 4);
         used += wide[i] != WIDE_EMPTY;
     }
@@ -26131,8 +28899,10 @@ static BOOL sxc3_keep_section(const BYTE *head)
 {
     DWORD bytes = SXC3_SECTION_HEAD + get32(head + 8);
 
-    /* (the box) with the box at work one place more, and the bytes of an empty box section, stay free for the box of this build's own */
-    if (sxc3_kept_size + bytes > SXC3_KEPT_ROOM - (box_live ? BOX_SECTION_FIXED : 0) || sxc3_kept_count >= SXC3_SECTIONS_MAX - 1 - (box_live != 0) - (gear_wide_live != 0)) {       /* (stage B5: and one for the WORN section, whose bytes are in the box's reserve) */     /* (one place of the SXC3_SECTIONS_MAX always stays free for this build's own list) */
+    /* (the box) with the box at work one place more, and the bytes of an empty box section, stay free for the box of this build's own.
+       (Stage 4b, fix pass) when the file's item list is carried whole (sxc3_list_whole), the room of this build's own list is free too:
+       without it a box kept beside a long list (rows + box kinds above about 13,000) would not be carried by a run that cannot read the list */
+    if (sxc3_kept_size + bytes > (DWORD)((sxc3_list_whole ? SXC3_KEPT_ROOM_WHOLE : SXC3_KEPT_ROOM) - (box_live ? BOX_SECTION_FIXED : 0)) || sxc3_kept_count >= SXC3_SECTIONS_MAX - 1 - (box_live != 0) - (gear_wide_live != 0)) {       /* (stage B5: and one for the WORN section, whose bytes are in the box's reserve) */     /* (one place of the SXC3_SECTIONS_MAX always stays free for this build's own list) */
         log_line("SXC3: *** no room to carry section '%s' (%lu bytes) forward: it is NOT in the files this game writes; it stays in %s ***",
                  sxc3_tag_text(head), bytes, sxc2_load_name[0] ? sxc2_load_name : "the loaded file");
         return FALSE;
@@ -26152,30 +28922,39 @@ static BOOL sxc3_keep_section(const BYTE *head)
    the list is of version 1, as before. A build that does not know it (the build before this
    one; this build when the list has 320 rows) carries it whole, as any version it does not know.
 
-   Can this run read an item list section (version 1 always; version 2 with 510 rows)? */
+   Can this run read an item list section (version 1 always; version 2 with 510 rows; stage 4: versions 2 and 3 with 510
+   rows or more)? */
 static BOOL sxc3_item_readable(const BYTE *head)
 {
-    return get16(head + 6) == SXC3_ITEM_VERSION || (get16(head + 6) == SXC3_ITEM_VERSION_LIST && wide_bound == WIDE_ROWS);
+    return get16(head + 6) == SXC3_ITEM_VERSION || ((get16(head + 6) == SXC3_ITEM_VERSION_LIST || get16(head + 6) == SXC3_ITEM_VERSION_LONG) && wide_bound >= WIDE_V2_ROWS);
 }
 
 /* The rows of a (checked) item list section of version 1 or 2 that the save's own 320 words do
    NOT hold, by the section's own rule: version 1: a number above 511, a row past the game's 320,
-   a row no word can hold; version 2: the rows its compact picture leaves out. `flags` (WIDE_ROWS
+   a row no word can hold; version 2: the rows its compact picture leaves out. `flags` (WIDE_V2_ROWS
    bytes; may be NULL): 1 for each such row. `words` (may be NULL): the picture, 320 words of two
-   bytes. Returns their count. */
+   bytes. Returns their count.
+   (Stage 4) Version 3: the picture its writer painted (sxc3_item_compact: the compact picture of rows 0 to shown - 1, or rows
+   0-319 row for row) and every row in use it leaves out, past `shown` too. `flags` has sxc3_item_rows(head) bytes. */
 static int sxc3_item_beyond(const BYTE *head, BYTE *flags, BYTE *words)
 {
-    static DWORD wide[WIDE_ROWS];
+    static DWORD wide[SXC3_ITEM_ROWS_ROOM];
     static WORD picture[WIDE_GAME_ROWS];
     static short map[WIDE_GAME_ROWS];
-    int i, n = 0;
+    int i, n = 0, rows = sxc3_item_rows(head);
 
-    for (i = 0; i < WIDE_ROWS; i++)
-        wide[i] = get32(head + SXC3_SECTION_HEAD + 4 + i * 4);
-    if (get16(head + 6) != SXC3_ITEM_VERSION_LIST) {
+    for (i = 0; i < rows; i++)
+        wide[i] = sxc3_item_row(head, i);
+    if (get16(head + 6) == SXC3_ITEM_VERSION_LONG) {
+        int pictured = sxc3_item_shown(head) < rows ? sxc3_item_shown(head) : rows;
+
+        n = sxc3_item_compact(head) ? wide_compact_picture(wide, pictured, picture, map) : wide_row_picture(wide, pictured, picture, map);
+        for (i = pictured; i < rows; i++)
+            n += wide[i] != WIDE_EMPTY;
+    } else if (get16(head + 6) != SXC3_ITEM_VERSION_LIST) {
         int a, b, c;
 
-        for (i = 0; i < WIDE_ROWS; i++) {
+        for (i = 0; i < WIDE_V2_ROWS; i++) {
             if (flags)
                 flags[i] = (BYTE)wide_row_beyond_words(wide[i], i);
             n += wide_row_beyond_words(wide[i], i);
@@ -26183,9 +28962,9 @@ static int sxc3_item_beyond(const BYTE *head, BYTE *flags, BYTE *words)
         if (words)
             wide_narrow_picture(wide, words, &a, &b, &c);
         return n;
-    }
-    n = wide_compact_picture(wide, picture, map);
-    for (i = 0; flags && i < WIDE_ROWS; i++)
+    } else
+        n = wide_compact_picture(wide, WIDE_V2_ROWS, picture, map);
+    for (i = 0; flags && i < rows; i++)
         flags[i] = wide[i] != WIDE_EMPTY;
     for (i = 0; i < WIDE_GAME_ROWS; i++) {
         if (flags && map[i] >= 0)
@@ -26214,7 +28993,7 @@ static int sxc3_shadow_compare(const BYTE *head, const BYTE *words, BOOL fallbac
     }
     if (!differences)
         log_line("wide list shadow: AGREE: the item list of %s (%d rows, %d in use), turned into the game's %d words, equals the stock of the save (slot %d, key %08lx)",
-                 sxc2_load_name, WIDE_ROWS, used, WIDE_GAME_ROWS, sxc2_loaded_slot_number + 1, sxc2_loaded_key);
+                 sxc2_load_name, WIDE_V2_ROWS, used, WIDE_GAME_ROWS, sxc2_loaded_slot_number + 1, sxc2_loaded_key);
     else
         log_line("wide list shadow: %d ROW(S) DIFFER between the item list of %s and the stock of the save (slot %d, key %08lx)%s%s", differences,
                  sxc2_load_name, sxc2_loaded_slot_number + 1, sxc2_loaded_key, differences > SXC3_DIFFERENCES_LOGGED ? "; not all listed" : "",
@@ -26233,10 +29012,10 @@ static int sxc3_shadow_compare(const BYTE *head, const BYTE *words, BOOL fallbac
    (sxc3_item_wide_numbers: the rows of a list, anywhere in it, with a number above 511.) */
 static int sxc3_item_wide_numbers(const BYTE *head)
 {
-    int i, n = 0;
+    int i, n = 0, rows = sxc3_item_rows(head);
 
-    for (i = 0; i < WIDE_ROWS; i++) {
-        DWORD row = get32(head + SXC3_SECTION_HEAD + 4 + i * 4);
+    for (i = 0; i < rows; i++) {
+        DWORD row = sxc3_item_row(head, i);
 
         n += row != WIDE_EMPTY && (row & 0xffffu) > WIDE_NARROW_MAX;
     }
@@ -26245,7 +29024,7 @@ static int sxc3_item_wide_numbers(const BYTE *head)
 
 static void sxc3_take_wide_rows(const BYTE *head, const BYTE *words, BOOL fallback)
 {
-    static BYTE narrow[WIDE_GAME_ROWS * 2], left[WIDE_ROWS];
+    static BYTE narrow[WIDE_GAME_ROWS * 2], left[WIDE_V2_ROWS];
     int wide_rows, beyond, unpaintable, i, differ = 0, first = 0, home = 0, moved = 0, carried = 0, rows = 0;
     DWORD first_number = 0;
 
@@ -26256,7 +29035,7 @@ static void sxc3_take_wide_rows(const BYTE *head, const BYTE *words, BOOL fallba
             first = i;
     if (wide_live && !wide_admitted)
         wide_items_admit("the companion file of the loaded save holds wide items");
-    for (i = 0; i < WIDE_ROWS; i++) {
+    for (i = 0; i < WIDE_V2_ROWS; i++) {
         DWORD row = get32(head + SXC3_SECTION_HEAD + 4 + i * 4);
 
         left[i] = 0;
@@ -26269,7 +29048,7 @@ static void sxc3_take_wide_rows(const BYTE *head, const BYTE *words, BOOL fallba
         else
             left[i] = 1;
     }
-    for (i = 0; i < WIDE_ROWS; i++)
+    for (i = 0; i < WIDE_V2_ROWS; i++)
         if (left[i]) {
             if (wide_take_row(get32(head + SXC3_SECTION_HEAD + 4 + i * 4), i, 1) == 1)
                 moved++;
@@ -26278,8 +29057,9 @@ static void sxc3_take_wide_rows(const BYTE *head, const BYTE *words, BOOL fallba
         }
     if (wide_items_ready())
         log_line("load: wide items: the item list of %s holds %d row(s) the save's 320 words do not hold (%d with a number above 511; the first: number %lu, \"%s\"): %d are back at their own rows, %d at another free row, %d are CARRIED UNSEEN%s",
-                 sxc2_load_name, rows, wide_rows, first_number, wide_item_log_name((int)first_number), home, moved, carried,
-                 carried ? " (a number outside the item band 1024-9999, or no free row: written again in the companion at every save, never dropped)" : "");
+                 sxc2_load_name, rows, wide_rows, first_number, wide_thing_log_name((int)first_number), home, moved, carried,
+                 carried ? (gear_wide_live ? " (a number this run cannot show, or no free row: written again in the companion at every save, never dropped)"
+                                           : " (a number outside the item band 1024-9999, or no free row: written again in the companion at every save, never dropped)") : "");
     else
         log_line("load: wide items: %d row(s) of the item list of %s that the save's 320 words do not hold (%d with a number above 511; the first: number %lu) are CARRIED UNSEEN in this run: %s. They are NOT in the bag; they are written again in the companion file at every save and nothing of them is lost; they are back in the bag at a load with wide_items = on and the switch on",
                  carried, sxc2_load_name, wide_rows, first_number,
@@ -26309,14 +29089,24 @@ static int wide_list_unknown;
        MERGED BY NUMBER with the save's words (wide_merge_words): numbers 0-511 follow the SAVE,
        each where it stood; the rows the picture did not hold come from the FILE. One *** line.
    A row this run cannot show (a wide number while wide items are not admitted, or outside the
-   item band) is carried unseen, as ever. */
+   item band) is carried unseen, as ever.
+   (Stage 4) Any run with 510 rows or more, and version 3 too. The section's picture is the one its writer painted
+   (sxc3_item_beyond: version 3 over its `shown` rows only). Rows below this run's wide_bound are taken where they stand;
+   a version-2 list in a longer run fills its 510 and the rest of the run's rows are empty. THE SPLIT: a row in use at or
+   past wide_bound (a list longer than this run's) that this run can show (any narrow one; a wide one as the rows below
+   wide_bound are shown) is MOVED into the lowest free row below wide_bound (the thing stays in the bag; its place changes),
+   else (no free row, or a wide number this run cannot show) CARRIED with its row as its home. The merge by number follows
+   the save's words into the carried NARROW rows too (wide_merge_carried). Carried rows go back to their homes at the next
+   load by a run that reaches them (wide_section_list3). The list is never carried whole in such a run. */
 static void sxc3_take_list2(const BYTE *head, const BYTE *words, BOOL fallback)
 {
-    static BYTE picture[WIDE_GAME_ROWS * 2], beyond[WIDE_ROWS];
+    static BYTE picture[WIDE_GAME_ROWS * 2], beyond[SXC3_ITEM_ROWS_ROOM];
     static WORD base[WIDE_GAME_ROWS], theirs[WIDE_GAME_ROWS];
-    static DWORD before[WIDE_ROWS];
-    int k, aided = 0;
+    static DWORD before[WIDE_ROWS_MAX];
+    static short aid_first[WIDE_NARROW_MAX + 1];       /* (stage 4b) the testing aids' re-give: the first row of each number 0-511 */
+    int k, aid_free, aided = 0, version = get16(head + 6), rows = sxc3_item_rows(head);
     int i, differ = 0, first = 0, used = 0, past = 0, unheld, back = 0, back_wide = 0, carried = 0, wide_rows = sxc3_item_wide_numbers(head);
+    int over = 0, moved = 0, over_carried = 0, over_narrow = 0, over_game = 0, over_gone = 0, first_moved = -1, first_moved_row = -1, free_row = 0;
 
     unheld = sxc3_item_beyond(head, beyond, picture);
     for (i = 0; i < WIDE_GAME_ROWS; i++) {
@@ -26327,12 +29117,12 @@ static void sxc3_take_list2(const BYTE *head, const BYTE *words, BOOL fallback)
     }
     if (wide_rows && wide_live && !wide_admitted)
         wide_items_admit("the companion file of the loaded save holds wide items");
-    for (i = 0; i < WIDE_ROWS; i++)
+    for (i = 0; i < wide_bound; i++)
         before[i] = wide_list[i];       /* the save's words, widened, and what the testing aids of this load did to them since */
-    for (i = 0; i < WIDE_ROWS; i++) {
-        DWORD row = get32(head + SXC3_SECTION_HEAD + 4 + i * 4);
+    for (i = 0; i < wide_bound; i++) {
+        DWORD row = i < rows ? sxc3_item_row(head, i) : WIDE_EMPTY;      /* (stage 4) a version-2 list in a longer run: the rest is empty */
         BOOL shown = row != WIDE_EMPTY && (wide_row_is_narrow(row) ||
-                                           (wide_items_ready() && wide_item_number((int)(row & 0xffffu)) && (row >> 16) <= WIDE_WORD_QUANTITY_MAX));
+                                           (wide_items_ready() && (wide_item_number((int)(row & 0xffffu)) || (gear_wide_live && gear_wide_kind((int)(row & 0xffffu)) >= 0)) && (row >> 16) <= WIDE_WORD_QUANTITY_MAX));     /* (wide gear in the item list) a wide piece's row too */
 
         wide_list[i] = shown ? row : WIDE_EMPTY;
         if (row == WIDE_EMPTY)
@@ -26344,46 +29134,100 @@ static void sxc3_take_list2(const BYTE *head, const BYTE *words, BOOL fallback)
         else if (beyond[i])
             back++, back_wide += (row & 0xffffu) > WIDE_NARROW_MAX;
     }
-    wide_wrote("a load (the companion's item list of 510 rows taken)", 0);
+    for (i = wide_bound; i < rows; i++) {
+        /* (stage 4) THE SPLIT: the rows past this run's */
+        DWORD row = sxc3_item_row(head, i);
+
+        BOOL shown;
+
+        if (row == WIDE_EMPTY)
+            continue;
+        used++, past++, over++;
+        shown = wide_row_is_narrow(row) ||
+                (wide_items_ready() && (wide_item_number((int)(row & 0xffffu)) || (gear_wide_live && gear_wide_kind((int)(row & 0xffffu)) >= 0)) && (row >> 16) <= WIDE_WORD_QUANTITY_MAX);
+        /* (stage 4, fix pass) a row this run can show, narrow or wide (the test of the loop above), is MOVED into the lowest free
+           row; carried only when none is free, or when it is a wide row this run cannot show */
+        if (shown) {
+            for (; free_row < wide_bound && wide_list[free_row] != WIDE_EMPTY; free_row++)
+                ;
+            if (free_row < wide_bound) {
+                wide_list[free_row] = row;
+                moved++;
+                if (first_moved < 0)
+                    first_moved = (int)(row & 0xffffu), first_moved_row = i;
+                continue;
+            }
+        }
+        if (wide_row_is_narrow(row)) {
+            over_narrow++;
+            over_game += wide_game_kind(row & 0xffffu);
+        }
+        wide_carry(row, i), over_carried++;
+    }
+    wide_wrote(version == SXC3_ITEM_VERSION_LIST ? "a load (the companion's item list of 510 rows taken)" : "a load (the companion's long item list taken)", 0);
     if (!differ) {
+        if (version == SXC3_ITEM_VERSION_LIST)
         log_line("load: item list: the item list of %s is of version 2, the whole list in its order (%d rows in use, %d of them past row %d); the save's 320 words ARE its picture: AGREE. The list is taken whole: %d row(s) the save's words do not hold are back in their places (%d with a number above 511), %d are CARRIED UNSEEN%s",
                  sxc2_load_name, used, past, WIDE_GAME_ROWS - 1, back, back_wide, carried,
                  carried ? " (a number this run cannot show: written again in the companion at every save, never dropped)" : "");
+        else
+            log_line("load: item list: the item list of %s is of version 3, the whole list in its order (%d rows in use, %d of them past row %d; %d rows in the file, %d in the list of the run that wrote it, %d in this run's); the save's 320 words ARE its picture: AGREE. %d row(s) the save's words do not hold are back in their places (%d with a number above 511), %d are CARRIED UNSEEN%s",
+                     sxc2_load_name, used, past, WIDE_GAME_ROWS - 1, rows, sxc3_item_shown(head), wide_bound, back, back_wide, carried,
+                     carried ? " (a number this run cannot show: written again in the companion at every save, never dropped)" : "");
     } else {
         int changed, gone, added, merged, no_row;
 
+        wide_merge_carried = 1;
         wide_merge_words(base, theirs, &changed, &gone, &added, &merged, &no_row);
-        log_line("load: *** item list: the save's 320 words are NOT the picture of the item list of %s (version 2, %d rows in use; %d word(s) differ; the first: word %d, the file's list makes %04x, the save holds %04x)%s. Merged BY NUMBER: numbers 0 to 511 follow the SAVE (%d row(s) took the save's quantity, %d row(s) the save no longer holds are gone, %d new row(s) went to free rows, %d were added to a row of the same number); the %d row(s) the save's words could not hold come from the FILE (%d CARRIED UNSEEN). No row changed its place ***",
-                 sxc2_load_name, used, differ, first, base[first], theirs[first],
+        wide_merge_carried = 0;
+        over_gone = wide_merge_emptied;     /* (stage 4, fix pass) carried rows of the split the save's words no longer hold: gone, not carried */
+        over_carried -= over_gone, over_narrow -= over_gone, over_game -= wide_merge_emptied_game;
+        log_line("load: *** item list: the save's 320 words are NOT the picture of the item list of %s (version %d, %d rows in use; %d word(s) differ; the first: word %d, the file's list makes %04x, the save holds %04x)%s. Merged BY NUMBER: numbers 0 to 511 follow the SAVE (%d row(s) took the save's quantity, %d row(s) the save no longer holds are gone, %d new row(s) went to free rows, %d were added to a row of the same number); the %d row(s) the save's words could not hold come from the FILE (%d CARRIED UNSEEN). No row changed its place ***",
+                 sxc2_load_name, version, used, differ, first, base[first], theirs[first],
                  fallback ? ": the file was found by the FALLBACK search" : ": the save was changed without this DLL, by an older build, or in a run with 320 rows, after the file was written",
-                 changed, gone, added, merged, unheld, carried + no_row);
+                 changed, gone, added, merged, unheld, carried + no_row + over_carried);
+    }
+    if (over) {
+        log_line("load: item list: %d row(s) of the item list of %s lie past this run's %d rows (the list of the run that wrote it had %d): %d moved to free rows (the thing stays in the bag, its place changes%s%d, from row %d), %d CARRIED UNSEEN (no free row was left, or a wide number this run cannot show: written again in the companion at every save at their own rows, never dropped)%s",
+                 over, sxc2_load_name, wide_bound, sxc3_item_shown(head), moved, moved ? "; the first: number " : "", moved ? first_moved : 0, moved ? first_moved_row : 0, over_carried,
+                 over_gone ? "; the rest are GONE: the save's words no longer hold them (the merge above)" : "");
+        if (over_carried)
+            log_line("load: *** item list: %d thing(s) of the item list of %s are NOT IN THE BAG in this run (%d of numbers 0 to 511, %d of them of the game's own kinds; the rest wide): the list has %d rows here and they lie past them. They are in the companion file of every save of this game and back in the bag at a load with wide_rows = %d or more ***",
+                     over_carried, sxc2_load_name, over_narrow, over_game, wide_bound, rows < WIDE_ROWS_MAX ? rows : WIDE_ROWS_MAX);
     }
     /* the testing aids of a load (items_on_load, give_on_load) ran on the list as the words gave it, before this: what they
        gave (a number, or a quantity, that the save's own words do not hold) is given again on the list just taken */
-    for (i = 0; i < WIDE_ROWS; i++) {
+    for (i = 0, aid_free = -1; i < wide_bound; i++) {
         DWORD row = before[i], number = row & 0xffffu, quantity = row >> 16;
-        int free_row = -1;
 
         if (row == WIDE_EMPTY || !wide_row_is_narrow(row))
             continue;
         if (i < WIDE_GAME_ROWS && wide_row_of_word(theirs[i]) == row)
             continue;           /* as the save held it: the list was filled from these words, row for row */
-        for (k = 0; k < WIDE_ROWS; k++) {
-            if (wide_list[k] == WIDE_EMPTY)
-                free_row = free_row < 0 ? k : free_row;
-            else if ((wide_list[k] & 0xffffu) == number)
-                break;
+        if (aid_free < 0) {
+            /* (stage 4b) once, at the first such row: the first row of each number 0-511 (any row of it), and the first free row */
+            for (k = 0; k <= (int)WIDE_NARROW_MAX; k++)
+                aid_first[k] = -1;
+            for (k = wide_bound - 1; k >= 0; k--)
+                if (wide_list[k] != WIDE_EMPTY && (wide_list[k] & 0xffffu) <= WIDE_NARROW_MAX)
+                    aid_first[wide_list[k] & 0xffffu] = (short)k;
+            for (aid_free = 0; aid_free < wide_bound && wide_list[aid_free] != WIDE_EMPTY; aid_free++)
+                ;
         }
-        if (k < WIDE_ROWS) {
+        k = aid_first[number];
+        if (k >= 0) {
             if ((wide_list[k] >> 16) < quantity)
                 wide_list[k] = number | quantity << 16, aided++;
-        } else if (free_row >= 0) {
-            wide_list[free_row] = row, aided++;
+        } else if (aid_free < wide_bound) {
+            wide_list[aid_free] = row, aided++;
+            aid_first[number] = (short)aid_free;
+            for (aid_free++; aid_free < wide_bound && wide_list[aid_free] != WIDE_EMPTY; aid_free++)
+                ;
         }
     }
     if (aided)
         log_line("load: item list: %d row(s) that a testing aid of this load gave or raised (items_on_load, give_on_load) are given again on the list taken from %s", aided, sxc2_load_name);
-    wide_sync("a load (the companion's item list of 510 rows taken)");
+    wide_sync(version == SXC3_ITEM_VERSION_LIST ? "a load (the companion's item list of 510 rows taken)" : "a load (the companion's long item list taken)");
 }
 
 /* ==== THE BOX (stage B1), the companion's side, its section: begin ====
@@ -26404,7 +29248,12 @@ static void sxc3_take_list2(const BYTE *head, const BYTE *words, BOOL fallback)
    flags not 0; entries not four bytes; a length that does not agree; numbers not ascending; a
    number above 32767; a count of 0; a second `BOX `) is REFUSED: carried byte for byte, its file
    never removed for it, and the box LOCKED. N above the cap of this build is NOT a fault. */
-typedef char box_check_room[BOX_FILE_ROOM == SXC3_SECTIONS_ROOM && BOX_ITEM_SECTION == SXC3_SECTION_HEAD + SXC3_ITEM_BYTES && BOX_NUMBERS == WIDE_NUMBER_MAX + 1 ? 1 : -1];
+typedef char box_check_room[BOX_FILE_ROOM == SXC3_SECTIONS_ROOM && BOX_ITEM_SECTION == SXC3_SECTION_HEAD + SXC3_ITEM_BYTES_MAX && BOX_NUMBERS == WIDE_NUMBER_MAX + 1 ? 1 : -1];
+/* (Stage 4b) WIDE_ROWS_MAX: an even number; the box's room beside the longest list this build writes (nothing carried forward)
+   holds its whole cap of kinds (box_kinds_allowed): 3350 rows is the most for that (12 + 8 + 4 x 3350 = 13,420 bytes); rows and
+   homes fit the DLL's types (a home is a WORD with a 0x8000 mark; the Box screen's view holds BOX_VIEW_ROOM rows) */
+typedef char box_check_max[!(WIDE_ROWS_MAX & 1) && WIDE_ROWS_MAX >= WIDE_V2_ROWS + 2 && ((long)BOX_FILE_ROOM - BOX_ITEM_SECTION - BOX_SECTION_FIXED - BOX_RESERVE) / 4 >= BOX_KINDS_MAX &&
+                           WIDE_ROWS_MAX + WIDE_GUARD_ROWS < 0x8000 && WIDE_ROWS_MAX <= BOX_VIEW_ROOM ? 1 : -1];
 #define SXC2_FLAG_HAS_BOX       0x0001u
 #define SXC2_FLAG_BOX_NEW       0x0002u     /* (box = auto) the box of this save WOKE and its Box screen has not been opened since: the Box row reads "Box new" */
 #define BOX_VERSION             1
@@ -26417,6 +29266,7 @@ static const char *box_index_override;      /* the field of an index line that i
 static int box_selftest_running;            /* the self-test is at work: the companion's two places are folders of its own */
 static int box_warn;                        /* the Box row is in the warning colour until the next save (a note of the last load) */
 static int sxc2_near_box;                   /* the last fallback search: the kinds in the box of the nearest file it did not take (sxc2_near_name); 0 none */
+static int sxc2_near_worn;                  /* (wide gear in the item list) and the wide pieces of its WORN section (counted apart: they no longer keep a box awake); 0 none */
 
 /* What is wrong with a `BOX ` section of version 1 (`head`: its head; the length was checked
    against the file); NULL if nothing is. */
@@ -26549,7 +29399,7 @@ static const char *box_index_field(const char *outcome)
     if (outcome[0] != 'w' && outcome[0] != 's' && outcome[0] != 'F' && outcome[0] != 'n')     /* (C0: "none" too) */
         return "";
     if (box_acts())
-        wsprintfA(field, " box=%d", box_kinds + (gear_worn_writes() && !box_selftest_running ? gear_worn_count() : 0));       /* (fix pass of B5, finding 2) and the worn wide pieces: a box of 0 kinds beside a WORN section is not "never had a box"; nothing added unless wide gear is at work */
+        wsprintfA(field, " box=%d", box_kinds);        /* (wide gear in the item list) the worn wide pieces are no longer counted here: they have their own field, " worn=N" (gear_index_field) */
     else if (box_dormant())
         lstrcpyA(field, " box=0");      /* (box = auto) a sleeping box is an empty one: the line says so, as box = on says it of a box never used (so a save of a new game over a boxed slot is not taken for a foreign save at its next load: condition 3) */
     else if (box_live && (box_state == BOX_MISSING || box_state == BOX_NO_GAME) && box_named_have)
@@ -26557,11 +29407,30 @@ static const char *box_index_field(const char *outcome)
     else if (box_live && (box_state == BOX_MISSING || box_state == BOX_NO_GAME))
         lstrcpyA(field, " box=missing:unknown");
     else if (box_carried_kinds >= 0)
-        wsprintfA(field, " box=%d", box_carried_kinds + (gear_worn_writes() && !box_selftest_running ? gear_worn_count() : 0));       /* (fix pass of B5, finding 2) as above */
+        wsprintfA(field, " box=%d", box_carried_kinds);
     else if (box_carried_kinds == -2)
         lstrcpyA(field, " box=refused");
     else
         return "";
+    return field;
+}
+
+/* (Wide gear in the item list) The field ` worn=N` of an index line, after the box's: N = the wide pieces the companion's
+   WORN section holds (worn and KEPT), whenever wide gear is at work and N > 0, in every state of the box. Only the lines of
+   a save (written, same, FAILED, none). A load that finds no companion reads it (sxc2_index_report) and says with *** that
+   the characters wear the stand-ins until that file is back. Not the box's: it never makes a box MISSING. The installed
+   build of before ignores a field it does not know. */
+static const char *gear_index_field(const char *outcome)
+{
+    static char field[24];
+    int n;
+
+    if (!gear_wide_live || box_selftest_running || (outcome[0] != 'w' && outcome[0] != 's' && outcome[0] != 'F' && outcome[0] != 'n'))
+        return "";
+    n = gear_worn_count();
+    if (n <= 0)
+        return "";
+    wsprintfA(field, " worn=%d", n);
     return field;
 }
 /* ==== THE BOX (stage B1), the companion's side, its section: end ==== */
@@ -26589,21 +29458,30 @@ static const char *box_index_field(const char *outcome)
 
    AT A LOAD (A14), after the box of the load is decided and the characters' records are in
    place: an entry whose record is in this game, whose byte still is the stand-in, read from the
-   save's OWN companion (the box KNOWN), is lent a slot and worn again. An entry whose byte is
-   another (the equipment was changed without this DLL), whose record is remade at every load, or
-   that came from a file that is not the save's own (the box TAKEN) sends its piece TO THE BOX
-   with a line. An entry of a record that is not in this game (a character no file defines now),
-   and every entry while the box is LOCKED, is CARRIED as it is into the files this game writes.
+   save's OWN companion (sxc2_load_own: wide gear in the item list, whatever the box's state), is
+   lent a slot and worn again. An entry whose byte is another (the equipment was changed without
+   this DLL), whose record is remade at every load, or that came from a file that is not the
+   save's own sends its piece TO A STORE (the item list, the box, else KEPT) with a line. An entry
+   of a record that is not in this game (a character no file defines now) is CARRIED as it is into
+   the files this game writes; a KEPT entry (a lent-range byte) stays KEPT until a store has room.
+
+   A SHEET'S PIECE (the character file: `weapon = 10000` ...). A character made from its sheet wears
+   it through the same ledger (character_wide_wear): the piece is MADE then, lent a slot, byte and
+   entry written together, a sleeping box woken. In a load that comes AFTER the entries above, so
+   that a character remade at every load (remake_on_load) whose sheet names the very piece of its
+   entry wears that entry's piece again instead of a second one.
 
    THE CHECKS (A15), at every frame of the main menu's list, at every save, before every Equip
    list and after every piece the Equip menu moves: a ledger entry whose record no longer holds
-   its slot (the name screen's record copy, the arena, another mod) sends its piece to the box
-   with a line; a byte in a lent range that no entry explains is set to its stand-in with ***.
+   its slot (the name screen's record copy, the arena, another mod) sends its piece to a store
+   with a line; the KEPT pieces go to a store that has room; a byte in a lent range that no entry
+   explains is set to its stand-in with ***.
    Nothing here acts unless gear_wide_live. */
 #define GEAR_HOLDER_STASH       9
 #define GEAR_HOLDER_ROSTER      10
 #define GEAR_HOLDERS            (GEAR_HOLDER_ROSTER + ROSTER_MAX)
 #define GEAR_WORN_MAX           (9 * 3 + 2 + ROSTER_MAX * 3)        /* 125: every (record, kind) there can be, each once */
+typedef char gear_check_worn_room[SXC3_WORN_ROOM == SXC3_SECTION_HEAD + 4 + GEAR_WORN_MAX * 8 ? 1 : -1];    /* (stage 4b, fix pass) the carry room's reserve for it */
 #define GEAR_WORN_VERSION       1
 #define GEAR_WORN_STASH_CODE    0x80        /* (b5b, finding 2) NOT 0x10: 16 is the ID of the fifth character of the character file (12-43) */
 #define GEAR_WORN_LINES         200         /* lines about worn wide pieces in one run */
@@ -26620,6 +29498,13 @@ static BYTE *gear_holder_override;          /* (the self-test) a COPY that stand
 static const char *gear_worn_refused_why;   /* the last load: why its WORN section was REFUSED (NULL: it was not) */
 static long gear_worn_boxed, gear_worn_swept;       /* since the start: pieces the checks sent to the box; bytes set to a stand-in */
 static int gear_worn_said;
+/* (Wide gear in the item list) The load just decided was read from THIS SAVE'S OWN companion: the file of the slot's key,
+   from either place or box_backup, with the slot's play time (set first thing in box_load_decided, for every load, box or
+   no box; 0 for the fallback search, the old way, no companion, and until a load decides). Its WORN entries are put on. */
+static int sxc2_load_own;
+static WORD gear_kept_said[GEAR_WORN_MAX];  /* the KEPT pieces whose "stays KEPT" line was said (once a piece, not every frame) */
+static int gear_kept_said_count;
+static int gear_worn_cut_said;              /* the last cut of the WORN section said (gear_worn_build) */
 
 static int gear_text_sites_in(void);        /* (the two are with the gate, among the sites) */
 static BOOL gear_tables_ours(void);
@@ -26714,10 +29599,41 @@ static const char *gear_kind_text(int kind)
     return kind == 0 ? "weapon" : kind == 1 ? "armour" : "accessory";
 }
 
+/* (equip_like = none) The first weapon roster character `c` may equip by the tables as they are now: of
+   the game's 128 in their order, then of the weapon file's (320-383) that are defined; by the test
+   seat_mask_bits makes (equip_like_allows, or the weapon's `equip` list names it or one it is a copy of),
+   asked of the tables' masks and lists, never of a seat's bit, so it answers for a character that is not
+   seated too. Returns the weapon's byte (0-255), or -1: there is none. character_may_equip_weapon is that
+   test for one weapon byte (FALSE for a lent slot, 128-191, and for an undefined weapon of the file). */
+static BOOL character_may_equip_weapon(const struct new_character *c, int w)
+{
+    WORD mask;
+
+    if (w < 0 || w >= WEAPON_COUNT_EXTENDED)
+        return FALSE;
+    if (w >= WEAPON_COUNT_ORIGINAL && (w < NEW_WEAPON_FIRST || defined_new_kind(ITEM_ID_WEAPON_BASE + w) != 1))
+        return FALSE;           /* a lent slot (128-191) or a weapon the weapon file does not define */
+    mask = *(const WORD *)(weapon_table + w * WEAPON_RECORD_SIZE + WEAPON_EQUIP_MASK);
+    return equip_like_allows(c, mask) || (w >= NEW_WEAPON_FIRST && (weapon_roster_equip[w - NEW_WEAPON_FIRST] & character_equip_names(c)));
+}
+
+static int character_first_weapon(const struct new_character *c)
+{
+    int w;
+
+    for (w = 0; w < WEAPON_COUNT_EXTENDED; w++)
+        if (character_may_equip_weapon(c, w))
+            return w;
+    return -1;
+}
+
 /* THE STAND-IN of a holder's byte (F7: by the record's CHARACTER, not by where the record lies):
    a weapon: the first of the game's 128 that the character can wear (the bit of its ID in the
    record's mask: Cloud 0, Barret 32, Tifa 16 ...; a character of the character file: the one it
    equips like; the stash: Cloud's); armour 0; no accessory. A byte the unmodified game reads. */
+/* (equip_like = none) A character of the character file with equip_like = none: the first weapon it
+   may equip (character_first_weapon: a weapon of the weapon file when no game weapon is for all nine;
+   its record is the DLL's alone, in the companion file), else its base's first, which it may not equip. */
 static int gear_stand_in(int holder, int kind, const BYTE *record)
 {
     int id, w;
@@ -26727,6 +29643,11 @@ static int gear_stand_in(int holder, int kind, const BYTE *record)
     if (kind == 2)
         return 0xff;
     id = holder < GEAR_HOLDER_STASH ? (record ? record[0] : holder) : holder == GEAR_HOLDER_STASH ? 0 : new_characters[holder - GEAR_HOLDER_ROSTER].equip_like;
+    if (id == EQUIP_LIKE_NONE && holder >= GEAR_HOLDER_ROSTER) {
+        if ((w = character_first_weapon(&new_characters[holder - GEAR_HOLDER_ROSTER])) >= 0)
+            return w;
+        id = new_characters[holder - GEAR_HOLDER_ROSTER].base;
+    }
     if (id < 0 || id > 10)
         return 0;
     for (w = 0; w < WEAPON_COUNT_ORIGINAL; w++)
@@ -26769,6 +29690,19 @@ static BOOL gear_worn_holds(int number)
     return FALSE;
 }
 
+/* (Wide gear in the item list) Does anybody WEAR this number (the ledger alone: a KEPT piece is worn by nobody and holds no
+   lent slot)? */
+static BOOL gear_worn_wears(int number)
+{
+    int h, k;
+
+    for (h = 0; h < GEAR_HOLDERS; h++)
+        for (k = 0; k < 3; k++)
+            if (gear_worn[h][k] == number)
+                return TRUE;
+    return FALSE;
+}
+
 /* The entries of the WORN section as this game would write it NOW, 8 bytes each, into `out`
    (room for GEAR_WORN_MAX): the ledger's, then the kept ones as they are. Returns how many. */
 static int gear_worn_build(BYTE *out)
@@ -26790,6 +29724,12 @@ static int gear_worn_build(BYTE *out)
         }
     for (i = 0; i < gear_kept_count && n < GEAR_WORN_MAX; i++, n++)
         copy_bytes(out + n * 8, gear_kept[i], 8);
+    if (n < gear_worn_count() && gear_worn_count() != gear_worn_cut_said) {
+        /* (wide gear in the item list, M1) no KEPT entry is made past the cap; this is a ledger grown past it beside kept entries */
+        gear_worn_cut_said = gear_worn_count();
+        log_line("*** WORN: %d worn and kept wide pieces and a WORN section holds %d: %d of them (the last kept ones) are NOT in the section built now. STOP and keep this log ***",
+                 gear_worn_count(), GEAR_WORN_MAX, gear_worn_count() - n);
+    }
     return n;
 }
 
@@ -26917,37 +29857,170 @@ static void gear_kept_drop(int i)
     gear_kept_count--;
 }
 
-/* A piece that is on nobody any more goes to the box (as a piece that comes off: it may pass the
-   cap of kinds by BOX_RETURN_OVER). If the box cannot take it, it is KEPT as an entry of the
-   WORN section under its record (it is put on again, or boxed, at a later load): never dropped
-   while there is a place for it. Returns 1 boxed, 0 kept, -1 lost (said with ***). */
-static int gear_piece_to_box(int number, int holder, int kind, int byte)
+/* ==== (Wide gear in the item list, stages 1 and 2) A PIECE ON NOBODY: the item list, the box, or KEPT ====
+
+   A wide piece that is on nobody any more (it came off; a check found its record changed; a load did not put it on;
+   another file's WORN section) goes "TO A STORE":
+     1. box = on and the box acts: the box (R4; it may pass the cap of kinds by BOX_RETURN_OVER);
+     2. a row of the item list: the DLL's own add (never the game's routine: nothing fed to FFNx's 006cbe5f);
+     3. the box acts (auto, awake): the box;
+     4. else (the box sleeps or is LOCKED): KEPT, an entry of the companion file's WORN section that is a LABEL only: the
+        first value of the kind's lent range in its byte (no record of a save holds it, so no load ever puts it on), under
+        a record of the piece's own kind that holds no kept entry of that kind and does not wear that very number (the
+        wearer's first). The WORN format and its reader are unchanged. No entry past GEAR_WORN_MAX (the reader refuses a
+        longer section): the box then takes it (a sleeping box wakes for it: overflow), else it is LOST with ***.
+   A KEPT piece is PLACED (gear_kept_place) at every quiet moment (each frame of the main menu, a save, the end of a load:
+   a sleeping box WAKES for it there, overflow) and when the Equip menu takes a piece out of the list (the row it frees,
+   no wake). A sleeping box is never written to: the box is reached only while it acts or right after it woke. */
+
+/* A KEPT entry for `number` (kind `kind`): its holder, or -1 (no place; GEAR_WORN_MAX entries already). `holder`: the
+   place tried first (-1 none); `avoid`: a holder never used (-1 none). */
+static int gear_kept_new(int number, int holder, int kind, int avoid)
 {
-    int code = gear_worn_code(holder);
+    int pass, h;
 
-    if (box_put_back(number, 1)) {
-        gear_worn_boxed++;
+    if (kind < 0 || kind > 2 || gear_wide_kind(number) != kind || gear_worn_count() >= GEAR_WORN_MAX || gear_kept_count >= GEAR_WORN_MAX)
+        return -1;
+    for (pass = 0; pass < 2; pass++)
+        for (h = 0; h < GEAR_HOLDERS; h++) {
+            BYTE *e;
+
+            if ((pass == 0 && h != holder) || h == avoid || kind >= gear_holder_kinds(h) || gear_worn[h][kind] == number || gear_kept_find(gear_worn_code(h), kind) >= 0)
+                continue;
+            e = gear_kept[gear_kept_count++];
+            e[0] = (BYTE)gear_worn_code(h), e[1] = (BYTE)kind, e[4] = (BYTE)GEAR_LENT_FIRST(kind), e[5] = e[6] = e[7] = 0;     /* (B1) always the lent range's first value: never put on */
+            put16(e + 2, (unsigned)number);
+            return h;
+        }
+    return -1;
+}
+
+/* A KEPT entry (a lent-range byte) of this number, under any record: its place, or -1. */
+static int gear_kept_number(int number)
+{
+    int i;
+
+    for (i = 0; i < gear_kept_count; i++)
+        if (gear_kept[i][1] <= 2 && gear_slot_lendable(gear_kept[i][1], gear_kept[i][4]) && (int)get16(gear_kept[i] + 2) == number)
+            return i;
+    return -1;
+}
+
+/* Steps 1-3 above, and with `wake` a sleeping box woken (overflow: the item list has no row for it). Never KEPT here.
+   Returns 1 the box, 2 the item list, 0 neither took it (nothing changed). */
+static int gear_piece_place(int number, BOOL wake, const char *how)
+{
+    if (box_acts() && box_routes(number) && box_put_back(number, 1))
         return 1;
-    }
-    if (gear_kept_find(code, kind) < 0 && gear_kept_count < GEAR_WORN_MAX) {
-        BYTE *e = gear_kept[gear_kept_count++];
+    if (wide_live && !box_list_cannot_save(number) && list_room(number) >= 1 && list_add_checked(number, 1, "add (a wide piece on nobody, to the item list)") == 1)
+        return 2;
+    if (wake && box_dormant())
+        box_wake(number, 1, how);
+    if (box_acts() && box_put_back(number, 1))
+        return 1;
+    return 0;
+}
 
-        e[0] = (BYTE)code, e[1] = (BYTE)kind, e[4] = (BYTE)(kind == 2 && byte == 0xff ? 0xff : GEAR_LENT_FIRST(kind)), e[5] = e[6] = e[7] = 0;       /* (b5b, finding 3) NOT the record's byte, which is a real piece: a value of the lent range, which no record of a save holds, so a load never puts this piece on over what the record wears; an empty accessory place alone is kept as it is */
-        put16(e + 2, (unsigned)number);
-        log_line("*** box: wide %s %d \"%s\" is on nobody any more and the BOX cannot take it (%s): it is KEPT in the companion file's list of worn pieces under %s (the record's byte: %d) until a load can box it, or put it on in an empty place ***",
-                 gear_kind_text(kind), number, gear_wide_log_name(number), box_held(number) ? "it would pass 65535 of it" : "it holds all the kinds it can, and more", gear_holder_text(holder), byte);
+/* Why neither store took a piece, for a line. */
+static const char *gear_store_why(int number)
+{
+    static char text[200];
+
+    wsprintfA(text, "the item list %s; the box %s", !wide_live ? "is not the DLL's" : box_list_cannot_save(number) ? "cannot be saved with it in this run"
+              : !box_number_defined(number) ? "takes no piece nothing defines now" : "has no row for it",
+              !box_live ? "is not at work" : box_dormant() ? "sleeps (box = auto)" : !box_acts() ? "is LOCKED" : box_held(number) ? "would pass 65535 of it" : "holds all the kinds it can, and more");
+    return text;
+}
+
+static const char *gear_store_text(int went)
+{
+    return went == 1 ? "the BOX" : went == 2 ? "the ITEM LIST" : went == 0 ? "KEPT (the companion file's list of worn pieces)" : "NOWHERE: it is LOST";
+}
+
+/* A piece on nobody goes TO A STORE (steps 1-4). Returns 1 the box, 2 the item list, 0 KEPT, -1 lost (said with ***). */
+static int gear_piece_to_store(int number, int holder, int kind, int avoid, const char *moment)
+{
+    int went = gear_piece_place(number, FALSE, moment), h;
+
+    if (went) {
+        gear_worn_boxed += went == 1;
+        return went;
+    }
+    h = gear_kept_new(number, holder, kind, avoid);
+    if (h >= 0) {
+        log_line("box: wide %s %d \"%s\" is on nobody any more (%s) and no store takes it now (%s): it is KEPT in the companion file's list of worn pieces (under %s: a label only, never put on) and goes to the item list or the box at the next moment one has room",
+                 gear_kind_text(kind), number, gear_wide_log_name(number), moment, gear_store_why(number), gear_holder_text(h));
         return 0;
     }
-    log_line("*** box: wide %s %d \"%s\" is on nobody any more, the BOX cannot take it (%s) and the list of worn pieces has no place for it: IT IS LOST. STOP and keep this log ***",
-             gear_kind_text(kind), number, gear_wide_log_name(number), box_held(number) ? "it would pass 65535 of it" : "it holds all the kinds it can, and more");
+    went = gear_piece_place(number, TRUE, moment);      /* (M1) no place in the list of worn pieces: the box takes it, a sleeping box waking for it */
+    if (went) {
+        gear_worn_boxed += went == 1;
+        return went;
+    }
+    log_line("*** box: wide %s %d \"%s\" is on nobody any more (%s), no store takes it (%s) and the list of worn pieces has no place for it (%d of %d entries): IT IS LOST. STOP and keep this log ***",
+             gear_kind_text(kind), number, gear_wide_log_name(number), moment, gear_store_why(number), gear_worn_count(), GEAR_WORN_MAX);
     return -1;
+}
+
+/* Was the "stays KEPT" line said of this number (and, `say`, note it now)? */
+static BOOL gear_kept_said_of(int number, BOOL say)
+{
+    int i;
+
+    for (i = 0; i < gear_kept_said_count; i++)
+        if (gear_kept_said[i] == number)
+            return TRUE;
+    if (say && gear_kept_said_count < GEAR_WORN_MAX)
+        gear_kept_said[gear_kept_said_count++] = (WORD)number;
+    return FALSE;
+}
+
+static void gear_kept_said_drop(int number)
+{
+    int i;
+
+    for (i = 0; i < gear_kept_said_count; i++)
+        if (gear_kept_said[i] == number) {
+            gear_kept_said[i] = gear_kept_said[--gear_kept_said_count];
+            return;
+        }
+}
+
+/* THE KEPT PIECES ARE PLACED: every entry with a lent-range byte (B1: an entry carried for a record that is not in this
+   game holds a stand-in and is never placed) goes to a store if one has room now; `wake`: a sleeping box wakes for it
+   (a quiet moment) or not (the Equip menu, mid-swap). Nothing while the stand-ins of a save are written. */
+static void gear_kept_place(const char *moment, BOOL wake)
+{
+    int i;
+
+    if (!gear_wide_live || gear_standins_on)
+        return;
+    for (i = 0; i < gear_kept_count; i++) {
+        const BYTE *e = gear_kept[i];
+        int kind = e[1], number = (int)get16(e + 2), went, h = gear_worn_holder(e[0]);
+
+        if (kind > 2 || !gear_slot_lendable(kind, e[4]))
+            continue;
+        went = gear_piece_place(number, wake, moment);
+        if (!went) {
+            if (!gear_kept_said_of(number, TRUE))
+                log_line("box: KEPT wide %s %d \"%s\" (under %s) stays KEPT (%s): %s. It is in the companion file of every save meanwhile; said once",
+                         gear_kind_text(kind), number, gear_wide_log_name(number), h < 0 ? "?" : gear_holder_text(h), moment, gear_store_why(number));
+            continue;
+        }
+        gear_kept_drop(i--);
+        gear_kept_said_drop(number);
+        gear_worn_boxed += went == 1;
+        if (gear_worn_may_say())
+            log_line("box: KEPT wide %s %d \"%s\" is placed (%s): it goes to %s", gear_kind_text(kind), number, gear_wide_log_name(number), moment, gear_store_text(went));
+    }
 }
 
 /* (Fix pass of B5, finding 3) From box_fill_taken, once the box ALONE has been taken from a file
    that is not the save's own ("Take the box"; the fallback for an old-format slot): the pieces
-   that file's WORN section names go TO THE BOX, each with a *** line (never onto a character:
-   the file is another state's); one the box cannot take is KEPT under its record, as
-   gear_piece_to_box does. A WORN section that cannot be read is left where it is, with ***.
+   that file's WORN section names go TO A STORE (wide gear in the item list: the item list or the
+   box, else KEPT: gear_piece_to_store), each with a *** line (never onto a character: the file is
+   another state's). A WORN section that cannot be read is left where it is, with ***.
    Nothing unless wide gear is at work. */
 static void gear_worn_take_file(const BYTE *file, DWORD size, const char *name)
 {
@@ -26970,25 +30043,35 @@ static void gear_worn_take_file(const BYTE *file, DWORD size, const char *name)
         const BYTE *e = body + 4 + i * 8;
         int h = gear_worn_holder(e[0]), k = e[1], number = (int)get16(e + 2);
 
-        if (gear_piece_to_box(number, h, k, e[4]) > 0)
-            log_line("*** WORN: wide %s %d \"%s\", worn by %s in %s, is NOT put on: the file is not this save's own. The piece goes to the BOX (it holds %d of it now) ***",
-                     gear_kind_text(k), number, gear_wide_log_name(number), gear_holder_text(h), name, box_held(number));
+        int went = gear_piece_to_store(number, h, k, -1, "another file's list of worn pieces");
+
+        if (went > 0)
+            log_line("*** WORN: wide %s %d \"%s\", worn by %s in %s, is NOT put on: the file is not this save's own. The piece goes to %s (the box holds %d of it now) ***",
+                     gear_kind_text(k), number, gear_wide_log_name(number), gear_holder_text(h), name, gear_store_text(went), box_held(number));
     }
 }
 
-/* A record gets a wide piece of a kind while a KEPT entry names that record and kind (entries
-   carried through a LOCKED load, then "Start an empty box"): the kept piece goes to the box. */
-static void gear_kept_displace(int holder, int kind)
+/* A record puts on wide piece `number` of a kind while a kept entry names that record and kind: an entry carried as it
+   is (a stand-in byte: through a load, then "Start an empty box") goes to a store; a KEPT one (a lent-range byte, a
+   label only) moves only if it names that very number (the reader refuses one record's piece twice), to a store or
+   KEPT under another record. */
+static void gear_kept_displace(int holder, int kind, int number)
 {
-    int i = gear_kept_find(gear_worn_code(holder), kind), number;
+    int i, kept, went, code = gear_worn_code(holder);
 
-    if (i < 0)
-        return;
-    number = (int)get16(gear_kept[i] + 2);
-    gear_kept_drop(i);
-    if (gear_piece_to_box(number, holder, kind, gear_stand_in(holder, kind, gear_holder_record(holder))) > 0)
-        log_line("box: worn pieces: %s puts on another wide %s while the companion file's list of worn pieces still named wide %s %d \"%s\" for it (carried through a load with the box LOCKED): that piece goes to the BOX; the box holds %d of it now",
-                 gear_holder_text(holder), gear_kind_text(kind), gear_kind_text(kind), number, gear_wide_log_name(number), box_held(number));
+    for (i = 0; i < gear_kept_count; i++) {
+        if (gear_kept[i][0] != code || gear_kept[i][1] != kind)
+            continue;
+        kept = (int)get16(gear_kept[i] + 2);
+        if (gear_slot_lendable(kind, gear_kept[i][4]) && kept != number)
+            continue;
+        gear_kept_drop(i--);
+        gear_kept_said_drop(kept);
+        went = gear_piece_to_store(kept, -1, kind, holder, "a record puts on a piece its kept entry named");
+        if (went > 0)
+            log_line("box: worn pieces: %s puts on wide %s %d while the companion file's list of worn pieces still named wide %s %d \"%s\" under it: that piece goes to %s; the box holds %d of it now",
+                     gear_holder_text(holder), gear_kind_text(kind), number, gear_kind_text(kind), kept, gear_wide_log_name(kept), gear_store_text(went), box_held(kept));
+    }
 }
 
 /* THE LEDGER AGAINST THE RECORDS, first half (A15): an entry whose record no longer holds its
@@ -27021,17 +30104,18 @@ static void gear_worn_settle(const char *moment)
                 continue;
             }
             if (record && h < GEAR_HOLDER_STASH && k < 2 && slot >= 0 && gear_stash_in_use() && stash[k] == slot && !gear_worn[GEAR_HOLDER_STASH][k]) {       /* (fix pass of B5, findings 1 and 5: only while the two bytes are equipment) */
+                gear_kept_displace(GEAR_HOLDER_STASH, k, number);      /* (fix round, ledger 3) a KEPT label of this very number under the stash moves: the reader refuses one record's piece twice */
                 gear_worn[GEAR_HOLDER_STASH][k] = (WORD)number;
                 if (gear_worn_may_say())
                     log_line("box: worn pieces (%s): the %s of %s, wide %s %d \"%s\" (lent slot %d), was put away in the flashback's stash by the game (%s): it is the stash's piece until the game puts it back",
                              moment, gear_kind_text(k), gear_holder_text(h), gear_kind_text(k), number, gear_wide_log_name(number), slot, k == 0 ? "00dc07d8" : "00dc07d9");
                 continue;
             }
-            went = gear_piece_to_box(number, h, k, byte < 0 ? gear_stand_in(h, k, record) : byte);
+            went = gear_piece_to_store(number, h, k, -1, moment);
             if (went > 0)
-                log_line("*** box: worn pieces (%s): %s no longer wears wide %s %d \"%s\": %s. Something changed the record without the Equip menu (the name screen's copy of a record, the arena, another mod, a definition taken out). The piece goes to the BOX: it holds %d of it now ***",
+                log_line("*** box: worn pieces (%s): %s no longer wears wide %s %d \"%s\": %s. Something changed the record without the Equip menu (the name screen's copy of a record, the arena, another mod, a definition taken out; or a piece taken off while no store had room). The piece goes to %s: the box holds %d of it now ***",
                          moment, gear_holder_text(h), gear_kind_text(k), number, gear_wide_log_name(number),
-                         !record ? "the record is gone" : slot < 0 ? "the piece has no lent slot any more" : "its byte is not the lent slot", box_held(number));
+                         !record ? "the record is gone" : slot < 0 ? "the piece has no lent slot any more" : "its byte is not the lent slot", gear_store_text(went), box_held(number));
         }
     }
 }
@@ -27050,7 +30134,7 @@ static void gear_worn_sweep(const char *moment)
     if (!gear_wide_live || gear_standins_on)
         return;
     for (h = 0; h < GEAR_HOLDERS; h++) {
-        BYTE *record = h == GEAR_HOLDER_STASH ? NULL : gear_holder_record(h);
+        BYTE *record = h == GEAR_HOLDER_STASH || (gear_holder_override && h) ? NULL : gear_holder_record(h);     /* (wide gear in the item list) during the self-test (its copy of record 0) no other record is swept: its ledger is the test's, not theirs */
 
         for (k = 0; record && k < 3; k++) {
             int byte = record[SAVE_RECORD_WEAPON + k], number, stand_in;
@@ -27059,6 +30143,7 @@ static void gear_worn_sweep(const char *moment)
                 continue;
             number = gear_lent[k][byte];
             if (h < GEAR_HOLDER_STASH && k < 2 && number && gear_worn[GEAR_HOLDER_STASH][k] == number && !gear_worn[h][k]) {
+                gear_kept_displace(h, k, number);      /* (fix round, ledger 3) a KEPT label of this very number under the record moves first */
                 gear_worn[h][k] = (WORD)number;
                 gear_worn[GEAR_HOLDER_STASH][k] = 0;
                 if (gear_worn_may_say())
@@ -27081,7 +30166,7 @@ static void gear_slots_free(void)
 
     for (kind = 0; kind < 3; kind++)
         for (slot = GEAR_LENT_FIRST(kind); slot < GEAR_LENT_FIRST(kind) + GEAR_LENT_COUNT(kind); slot++)
-            if (gear_lent[kind][slot] && !gear_listed[kind][slot] && !gear_worn_holds(gear_lent[kind][slot]))
+            if (gear_lent[kind][slot] && !gear_listed[kind][slot] && !gear_worn_wears(gear_lent[kind][slot]))      /* (wide gear in the item list) a KEPT piece holds no slot */
                 gear_slot_release(kind, slot);
 }
 
@@ -27093,6 +30178,7 @@ static void gear_worn_check(const char *moment)
         return;
     gear_worn_settle(moment);
     gear_off_pending[0] = gear_off_pending[1] = gear_off_pending[2] = 0;       /* (the game's write after its call has happened by now) */
+    gear_kept_place(moment, TRUE);      /* (wide gear in the item list) the KEPT pieces to a store that has room now; a sleeping box wakes for them (overflow) */
     gear_worn_sweep(moment);
     gear_window_quiet(moment);      /* (stage B6) outside the Equip menu's list no slot stays with the window; nothing unless a list in the window's form was open */
     gear_slots_free();
@@ -27101,8 +30187,10 @@ static void gear_worn_check(const char *moment)
 /* From the three routines that take the game's OLD word of a piece that comes off a character
    ((byte + base) | 0x200), before anything else looks at it: is the byte a LENT slot? The kind is
    known by the call (the address it returns to; the DLL's own strip of a seat: an accessory).
-   TRUE: it was, and the piece is dealt with here: it goes to the BOX (a wide piece is never in
-   the item list), and the ledger learns of it as soon as the game has written the record's byte.
+   TRUE: it was, and the piece is dealt with here: (wide gear in the item list) it goes to the
+   item list or the box (gear_piece_place: box = on the box first; never KEPT here), else it is
+   KEPT once by the branch below (M2), and the ledger learns of it as soon as the game has
+   written the record's byte.
    A value of a lent range that stands for no piece adds NOTHING (decoded by 9 bits it would be
    another kind's number). FALSE: an identity byte: the caller goes on as before this stage. */
 static BOOL gear_wide_came_off(DWORD word, DWORD caller, int from)
@@ -27123,12 +30211,14 @@ static BOOL gear_wide_came_off(DWORD word, DWORD caller, int from)
     if (gear_off_pending[kind] && (from == BOX_FROM_SEAT_STRIP || caller == BOX_RETURN_EQUIP_OFF || caller == BOX_RETURN_STRIP))
         gear_worn_settle("a piece came off");      /* (fix pass of B5, finding 6) the piece of an EARLIER take-off or strip, whose byte the game has written by now, leaves the ledger first; these three callers add BEFORE the byte is written, so this piece's own entry still agrees */
     gear_off_pending[kind] = number;
-    went = box_put_back(number, 1);
-    if (went)
+    went = gear_piece_place(number, FALSE, box_equip_caller(caller, from));     /* (wide gear in the item list, M2) the item list or the box; never KEPT here: the branch below keeps it, once */
+    if (went == 1)
         box_equip_returned[1]++;
-    box_equip_went = 1;
+    else if (went == 2)
+        box_equip_returned[0]++;
+    box_equip_went = went != 2;
     if (!went) {
-        /* (fix pass of B5, finding 4) the box cannot take it: KEPT as an entry of the list of worn pieces under its wearer's record, as the checks do (gear_piece_to_box says so with ***); lost only when no entry can be made */
+        /* (fix pass of B5, finding 4) no store can take it now: KEPT as an entry of the list of worn pieces (wide gear in the item list: under its wearer's record if the reader takes it there, else under another: gear_piece_to_store), as the checks do; lost only when no entry can be made and the box cannot take it either */
         int h, wearer = -1;
 
         if (from == BOX_FROM_SEAT_STRIP || caller == BOX_RETURN_EQUIP_OFF || caller == BOX_RETURN_STRIP) {
@@ -27149,14 +30239,11 @@ static BOOL gear_wide_came_off(DWORD word, DWORD caller, int from)
                 break;
             }
         }
-        if (wearer < 0)
-            log_line("*** box: a piece comes off: wide %s %d \"%s\" (%s, asked by %08lx; lent slot %d): the BOX cannot take it (%s), a wide piece cannot be in the item list and the ledger names no wearer to keep it under: IT IS LOST. STOP and keep this log ***",
-                     gear_kind_text(kind), number, gear_wide_log_name(number), box_equip_caller(caller, from), caller, slot, box_held(number) ? "it would pass 65535 of it" : "it holds all the kinds it can, and more");
-        else
-            gear_piece_to_box(number, wearer, kind, gear_stand_in(wearer, kind, gear_holder_record(wearer)));
+        gear_worn_settle("a piece came off");      /* (wide gear in the item list) the swap wrote the wearer's byte already: its ledger entry goes first, quietly (this piece is pending), so that the KEPT entry may stand under the wearer */
+        gear_piece_to_store(number, wearer, kind, -1, "a piece came off");     /* (wearer -1: the ledger names none; kept under any record) */
     } else if (box_equip_may_say())
-        log_line("box: a piece comes off: wide %s %d \"%s\" (%s, asked by %08lx; lent slot %d): it goes to the BOX (a wide piece lives in the box or on a character); the box holds %d of it now, %d kinds, %lu pieces%s",
-                 gear_kind_text(kind), number, gear_wide_log_name(number), box_equip_caller(caller, from), caller, slot, box_held(number), box_kinds, box_pieces,
+        log_line("box: a piece comes off: wide %s %d \"%s\" (%s, asked by %08lx; lent slot %d): it goes to %s; the box holds %d of it now, %d kinds, %lu pieces%s",
+                 gear_kind_text(kind), number, gear_wide_log_name(number), box_equip_caller(caller, from), caller, slot, gear_store_text(went), box_held(number), box_kinds, box_pieces,
                  box_equip_said == BOX_EQUIP_LINES ? " (no more such lines in this run)" : "");
     gear_worn_settle("a piece came off");
     return TRUE;
@@ -27164,13 +30251,18 @@ static BOOL gear_wide_came_off(DWORD word, DWORD caller, int from)
 
 /* From the routine that takes the piece chosen in the Equip menu (007075c7), before anything else
    looks at its old word: is the chosen byte a LENT slot (the kind: the Equip menu's, 00dca5c4)?
-   TRUE: it was: the piece leaves the BOX (never through the remove routine 006cbe5f), and the
-   record the game just wrote the byte into (007073c1 / 0070749f / 0070758c, before this call)
-   wears it in the ledger. *answer: what the list's remove gives for a row it emptied. */
+   TRUE: it was: the piece leaves the store that holds it (wide gear in the item list: box = on
+   the box first, then the item list; auto: the item list first, then the box; from the box never
+   through the remove routine 006cbe5f; from the list through the DLL's own wide_remove, which
+   never feeds a number above 511 to it; a piece that came off a moment ago and was KEPT is taken
+   back from the kept entries), and the record the game just wrote the byte into (007073c1 /
+   0070749f / 0070758c, before this call) wears it in the ledger; then the KEPT pieces go to the
+   row this may have freed (the game added the old piece BEFORE this call). *answer: what the
+   list's remove gives for a row it emptied. */
 static BOOL gear_wide_taken(DWORD word, DWORD caller, DWORD *answer)
 {
-    int kind = *(const int *)ADDR_EQUIP_KIND, slot, number, h;
-    BOOL again;
+    int kind = *(const int *)ADDR_EQUIP_KIND, slot, number, h, from = 0, i;
+    BOOL again, box_first;
 
     if (!gear_wide_live || caller != BOX_RETURN_EQUIP_TAKE || kind < 0 || kind > 2)
         return FALSE;
@@ -27187,28 +30279,46 @@ static BOOL gear_wide_taken(DWORD word, DWORD caller, DWORD *answer)
     again = gear_off_pending[kind] == number;
     if (again)
         gear_off_pending[kind] = 0;         /* the very piece that came off a moment ago goes on again (the record's byte never changed): its entry stays */
-    if (box_take(number, 1)) {
-        box_equip_taken[1]++;
-        if (box_equip_may_say())
-            log_line("box: the Equip menu takes wide %s %d \"%s\" (asked by %08lx; lent slot %d): from the BOX (NOT through the remove routine 006cbe5f); the box holds %d of it now, %d kinds, %lu pieces%s",
-                     gear_kind_text(kind), number, gear_wide_log_name(number), caller, slot, box_held(number), box_kinds, box_pieces, box_equip_said == BOX_EQUIP_LINES ? " (no more such lines in this run)" : "");
-    } else {
-        log_line("*** box: the Equip menu takes wide %s %d \"%s\" (asked by %08lx; lent slot %d): THE BOX HOLDS NONE OF IT. The piece is worn all the same (the game wrote the record). STOP and keep this log ***",
-                 gear_kind_text(kind), number, gear_wide_log_name(number), caller, slot);
+    box_first = box_acts() && box_routes(number);     /* (wide gear in the item list) box = on: the box first (R5) */
+    if (box_first && box_take(number, 1))
+        from = 1;
+    if (!from && wide_live && wide_find((DWORD)number, caller, "find (the Equip menu takes a wide piece)") != WIDE_EMPTY
+        && wide_remove((DWORD)number, 1, caller, "remove (the Equip menu takes a wide piece)") != WIDE_EMPTY)
+        from = 2;
+    if (!from && !box_first && box_acts() && box_take(number, 1))
+        from = 1;
+    if (!from && (i = gear_kept_number(number)) >= 0) {
+        gear_kept_drop(i);                  /* a piece KEPT a moment ago (it came off and no store had room) goes on again: taken back, not made */
+        gear_kept_said_drop(number);
+        from = 3;
     }
-    box_equip_went = 1;
+    if (from == 1)
+        box_equip_taken[1]++;
+    else if (from == 2)
+        box_equip_taken[0]++;
+    if (!from)
+        log_line("*** box: the Equip menu takes wide %s %d \"%s\" (asked by %08lx; lent slot %d): NEITHER THE ITEM LIST NOR THE BOX HOLDS IT, nor a kept entry. The piece is worn all the same (the game wrote the record). STOP and keep this log ***",
+                 gear_kind_text(kind), number, gear_wide_log_name(number), caller, slot);
+    else if (box_equip_may_say())
+        log_line("box: the Equip menu takes wide %s %d \"%s\" (asked by %08lx; lent slot %d): from %s%s; the item list holds %d of it now, the box %d%s",
+                 gear_kind_text(kind), number, gear_wide_log_name(number), caller, slot, from == 1 ? "the BOX" : from == 2 ? "the ITEM LIST" : "the KEPT entries",
+                 from == 1 ? " (NOT through the remove routine 006cbe5f)" : from == 2 ? " (the DLL's own remove: a number above 511 is never fed to 006cbe5f)" : "",
+                 (int)(wide_live && wide_find((DWORD)number, caller, "find (the Equip menu takes a wide piece)") != WIDE_EMPTY ? wide_find((DWORD)number, caller, "find (the Equip menu takes a wide piece)") >> 16 : 0),
+                 box_held(number), box_equip_said == BOX_EQUIP_LINES ? " (no more such lines in this run)" : "");
+    box_equip_went = from != 2;
     for (h = again ? GEAR_HOLDERS : 0; h < GEAR_HOLDERS; h++) {
         BYTE *record = gear_holder_record(h);
 
         if (!record || h == GEAR_HOLDER_STASH || record[SAVE_RECORD_WEAPON + kind] != slot || gear_worn[h][kind])
             continue;
-        gear_kept_displace(h, kind);
+        gear_kept_displace(h, kind, number);
         gear_worn[h][kind] = (WORD)number;
         break;
     }
     if (h == GEAR_HOLDERS && !again)
         log_line("*** box: the Equip menu took wide %s %d and no record holds its lent slot %d without wearing it already: the ledger has no wearer for it ***", gear_kind_text(kind), number, slot);
     *answer = (DWORD)number | 1u << 16;
+    gear_kept_place("the Equip menu took a wide piece", FALSE);     /* (wide gear in the item list) the old piece, KEPT a moment ago with a full list, into the row the chosen piece just freed; no wake here */
     return TRUE;
 }
 
@@ -27222,6 +30332,179 @@ static BOOL gear_wide_wears(const struct wide_gear *g, int character)
     if (new_characters_live)
         mask = seat_mask_bits(mask, g->roster_equip);
     return (mask & (1u << (character & 0x1f))) != 0;
+}
+
+/* (a sheet's wide piece) May roster character `c` wear a wide piece? The two tests seat_mask_bits
+   makes for a seat's occupant (the bit of the one it equips like in the definition's mask, or all nine's
+   bits for equip_like = none: equip_like_allows; the `equip` list names it or one it is a copy of), asked
+   of the character itself: seated or not. */
+static BOOL gear_wide_wears_roster(const struct wide_gear *g, const struct new_character *c)
+{
+    WORD mask = *(const WORD *)(g->record + (g->kind == 0 ? WEAPON_EQUIP_MASK : g->kind == 1 ? ARMOUR_EQUIP_MASK : ACCESSORY_EQUIP_MASK));
+
+    return equip_like_allows(c, mask) || (g->roster_equip & character_equip_names(c)) != 0;
+}
+
+/* What a character created without its sheet's piece wears in its place, for a line of the log. */
+static const char *character_stand_in_text(const struct new_character *c, int kind, int byte)
+{
+    static char text[160];
+
+    if (kind == 0 && c->equip_like == EQUIP_LIKE_NONE && character_first_weapon(c) < 0)
+        wsprintfA(text, "the stand-in, weapon %d (equip_like = none, and no weapon it may equip is defined: its base's first, which it may not equip)", ITEM_ID_WEAPON_BASE + byte);
+    else if (kind == 0 && c->equip_like == EQUIP_LIKE_NONE)
+        wsprintfA(text, "the stand-in, weapon %d (the first weapon it may equip: equip_like = none)", ITEM_ID_WEAPON_BASE + byte);
+    else if (kind == 0)
+        wsprintfA(text, "the stand-in, weapon %d (the first of the game's weapons its equip_like character can wear)", ITEM_ID_WEAPON_BASE + byte);
+    else if (kind == 1)
+        wsprintfA(text, "the stand-in, armour %d", ITEM_ID_ARMOUR_BASE + byte);
+    else
+        lstrcpyA(text, byte == 0xff ? "the stand-in, no accessory" : "the stand-in");
+    return text;
+}
+
+/* (a sheet's wide piece) THE SHEET'S WIDE PIECES ARE PUT ON. build_character_record made the record
+   with the stand-in in the place of each wide piece the sheet names, and set a bit of
+   gear_wish_pending; each is resolved here ONCE: at once after a creation outside a load (a field
+   script's join, the PHS, the SpellExt menu: before the caller copies the weapon's data into a party
+   slot), and in a load after the save's WORN entries (character_wide_wear_pending, from
+   gear_worn_after_load), so that a remade character's own piece is worn again there rather than
+   made a second time. The piece is MADE by the sheet (it is not taken from a store), except the
+   save's own piece of that number when this load kept it under this record (a remade character not
+   created at the load) or KEPT it under any record (wide gear in the item list: a KEPT entry is a
+   label), and, for a character with remake_on_load, a piece of that number in the item list or the
+   box (the save's own that this load put there, or one the Equip menu put there): that one is
+   taken back (box = on: the box first), so remaking never adds a piece. Byte and ledger are
+   written together (alone, the checks would set the byte back or store the piece). (Wide gear in
+   the item list) No box is needed and a sleeping box does NOT wake for a piece that is worn.
+   Every way it cannot be worn leaves the stand-in, with ONE line, never ***: wide gear not at
+   work, the number not defined now; a piece that cannot be worn (the character may not equip it,
+   no lent slot of the kind is free) goes to a store (the item list, the box, a sleeping box waking
+   for it only when the list has no row: overflow), or stays where it is, or is not made when no
+   store can take it, or when the character has remake_on_load (it would be made again at every
+   load). */
+static int gear_take_from_store(int number);       /* (below) */
+static void character_wide_wear(struct new_character *c, const char *moment)
+{
+    int h = GEAR_HOLDER_ROSTER + (int)(c - new_characters), id = character_file_id(c), k;
+
+    if (character_wide_defer)
+        return;
+    for (k = 0; k < 3; k++) {
+        int number = c->start_wide[k], from_box = (c->gear_wish_pending >> (4 + k)) & 1, stand_in, slot, kept, own, in_box, made, went;
+        BYTE *record;
+        const struct wide_gear *g;
+        const char *why;
+
+        if (!(c->gear_wish_pending & (1 << k)))
+            continue;
+        c->gear_wish_pending &= (BYTE)~(0x11 << k);
+        if (!number || !c->defined)
+            continue;
+        record = gear_holder_record(h);
+        stand_in = gear_stand_in(h, k, record);
+        if (!gear_wide_live) {
+            log_line("character %d: %s %d of its sheet is a piece of WIDE GEAR, and wide gear is not at work in this run (%s): it is created wearing %s instead",
+                     id, gear_kind_text(k), number, box_live ? "no wide piece was defined when the game started, or wide gear was refused: see the \"box: wide gear\" line of the start"
+                                                            : "the box is not at work: see the \"box:\" line of the start", character_stand_in_text(c, k, stand_in));
+            continue;
+        }
+        if (record && gear_worn[h][k] == number && gear_slot_of(k, number) == record[SAVE_RECORD_WEAPON + k])
+            continue;       /* worn again from the save's WORN entry (remake_on_load): said there */
+        g = wide_gear(number);
+        if (!g) {
+            log_line("character %d: wide %s %d of its sheet is not defined by the %s file now: it is created wearing %s instead",
+                     id, gear_kind_text(k), number, gear_kind_text(k), character_stand_in_text(c, k, stand_in));
+            continue;
+        }
+        if (!record) {
+            log_line("character %d: wide %s %d of its sheet is NOT made: the character has no record now (%s)", id, gear_kind_text(k), number, moment);
+            continue;
+        }
+        if (gear_worn[h][k] || record[SAVE_RECORD_WEAPON + k] != stand_in) {
+            log_line("character %d: wide %s %d of its sheet is NOT made: its record holds %s byte %d, not the stand-in %d it was made with%s",
+                     id, gear_kind_text(k), number, gear_kind_text(k), record[SAVE_RECORD_WEAPON + k], stand_in,
+                     gear_worn[h][k] ? ", and wears another wide piece of the kind" : "");
+            continue;
+        }
+        kept = gear_kept_find(gear_worn_code(h), k);
+        if ((kept < 0 || (int)get16(gear_kept[kept] + 2) != number) && (from_box || c->remake_on_load > 0))
+            kept = gear_kept_number(number);        /* (wide gear in the item list, B1) a KEPT piece of that number under any record: a kept entry is a label. (Fix round, ledger 1) only for the character whose own piece a load sent away (the take-back bit) or that is made anew at every load: a character that simply joins MAKES its piece, and another record's KEPT piece stays where it is */
+        own = kept >= 0 && (int)get16(gear_kept[kept] + 2) == number;     /* the save's own piece, carried under this record or KEPT: this is it */
+        in_box = !own && (from_box || c->remake_on_load > 0) && (box_held(number) > 0 || (wide_live && wide_find((DWORD)number, 0, "find (a character's sheet takes its piece back)") != WIDE_EMPTY));    /* (fix round) a remade character takes its piece from a store that holds one: what a load stored, what the Equip menu put there, what a TAKEN box brought (wide gear in the item list: the item list or the box) */
+        slot = gear_wide_wears_roster(g, c) ? gear_slot_lend(k, number) : -2;
+        why = slot == -2 ? "its equip list names neither the character nor the one it equips like" : "every lent slot of the kind is in use";
+        if (slot < 0 && !own && !in_box && c->remake_on_load > 0) {
+            /* (fix round) a piece made here would go to the box at EVERY load: the character is made anew each time */
+            log_line("character %d: wide %s %d of its sheet is NOT made: it cannot be worn (%s; lent slots in use: %d of %d) and the character is made anew at every load (remake_on_load), so a piece made each time would pile up in the box; it is created wearing %s",
+                     id, gear_kind_text(k), number, why, gear_slots_lent(k), GEAR_LENT_COUNT(k), character_stand_in_text(c, k, stand_in));
+            continue;
+        }
+        made = 0;
+        if (slot < 0) {
+            if (own) {
+                gear_kept_drop(kept);
+                gear_kept_said_drop(number);
+                went = gear_piece_to_store(number, h, k, -1, "a character's sheet names a KEPT piece it cannot wear");
+            } else if (in_box)
+                went = 3;       /* it stays where it is */
+            else {
+                made = 1;
+                went = gear_piece_place(number, TRUE, "a character's sheet makes a piece it cannot wear");     /* (a new piece: like any thing that arrives, a sleeping box wakes for it only when the list has no row) */
+            }
+            if (went > 0)
+                log_line("character %d cannot wear wide %s %d \"%s\" of its sheet (%s; lent slots in use: %d of %d): the piece %s %s (the box holds %d of it now); the character is created wearing %s",
+                         id, gear_kind_text(k), number, gear_wide_log_name(number), why, gear_slots_lent(k), GEAR_LENT_COUNT(k), made ? "is made and goes to" : in_box ? "stays in" : "goes to",
+                         went == 3 ? "the store that holds it" : gear_store_text(went), box_held(number), character_stand_in_text(c, k, stand_in));
+            else if (made)
+                log_line("character %d: wide %s %d of its sheet is NOT made: it cannot be worn (%s) and no store can take it (%s); the character is created wearing %s",
+                         id, gear_kind_text(k), number, why, gear_store_why(number), character_stand_in_text(c, k, stand_in));
+            continue;       /* (not made: nothing is lost, the piece never existed; one taken back and not stored: gear_piece_to_store said so) */
+        }
+        went = 0;
+        if (own) {
+            gear_kept_drop(kept);
+            gear_kept_said_drop(number);
+        } else if (!in_box || !(went = gear_take_from_store(number)))
+            made = 1;
+        gear_kept_displace(h, k, number);
+        record[SAVE_RECORD_WEAPON + k] = (BYTE)slot;
+        gear_worn[h][k] = (WORD)number;
+        if (gear_worn_may_say())
+            log_line("character %d (%s) is created wearing wide %s %d \"%s\" from its sheet: lent slot %d in the place of the stand-in %d. %s; it is saved in the companion file's WORN section and the save holds the stand-in",
+                     id, moment, gear_kind_text(k), number, gear_wide_log_name(number), slot, stand_in,
+                     made ? "The piece is MADE by the sheet (not taken from a store)" : own ? "It is the save's own piece, taken back (not made a second time)"
+                     : went == 2 ? (from_box ? "It is the save's own piece, taken back from the ITEM LIST (not made a second time)" : "It is TAKEN FROM THE ITEM LIST, which held one (remake_on_load: not made a second time)")
+                     : from_box ? "It is the save's own piece, taken back (not made a second time)" : "It is TAKEN FROM THE BOX, which held one (remake_on_load: not made a second time)");
+    }
+}
+
+/* (Wide gear in the item list) One of a number taken out of the store that holds it, for a piece that goes on (box = on:
+   the box first; else the item list first; from the list by the DLL's own remove, never fed to 006cbe5f). Returns 1 the
+   box, 2 the item list, 0 neither holds it (nothing changed). */
+static int gear_take_from_store(int number)
+{
+    BOOL box_first = box_acts() && box_routes(number);
+
+    if (box_first && box_take(number, 1))
+        return 1;
+    if (wide_live && wide_find((DWORD)number, 0, "find (a wide piece goes on)") != WIDE_EMPTY && wide_remove((DWORD)number, 1, 0, "remove (a wide piece goes on)") != WIDE_EMPTY)
+        return 2;
+    if (!box_first && box_take(number, 1))
+        return 1;
+    return 0;
+}
+
+/* (a sheet's wide piece) In a load, after the save's WORN entries: every wish the load's creations
+   left is resolved (character_wide_wear). Also with wide gear not at work: each wish's one line. */
+static void character_wide_wear_pending(const char *moment)
+{
+    int n;
+
+    character_wide_defer = 0;
+    for (n = 0; n < ROSTER_MAX; n++)
+        if (new_characters[n].gear_wish_pending)
+            character_wide_wear(&new_characters[n], moment);
 }
 
 /* ==== THE BOX (stage B6), the window: begin ====
@@ -27524,17 +30807,21 @@ static int gear_window_faults(int scroll, int rows)
 /* ==== THE BOX (stage B6), the window: end ==== */
 
 /* THE EQUIP MENU'S LIST, FORM A (from box_equip_list, after the pieces of both stores that have a
-   byte of their own): every wide piece of the kind that the box holds, that a file defines and
-   that the character may wear is LENT A SLOT and listed by it, ascending by number, after the
-   others. The slots of the list built before are given back first (those nobody wears).
+   byte of their own; wide gear in the item list: also from gear_equip_plain, after the game's own
+   list when the box does not act): every wide piece of the kind that the ITEM LIST holds (in row
+   order) and then that the box holds while it acts (ascending), each number once, that a file
+   defines and that the character may wear is LENT A SLOT and listed by it, after the others. The
+   slots of the list built before are given back first (those nobody wears).
    (Stage B6) When the pieces need MORE slots than are free, the list is built in THE WINDOW's
    form instead (above): all of them listed, only the entries on screen holding a slot. Only when
    the window cannot be used (its site was refused; fewer slots free than the rows on screen + 1)
-   the rest is NOT offered, with a line, as in stage B5. Returns the new count; *boxed and *cut
-   are added to. */
-static int gear_equip_wide(int kind, int character, BYTE *list, int n, int room, int *boxed, int *cut)
+   the rest is NOT offered, with a line, as in stage B5. Returns the new count; *listed (from the
+   item list), *boxed and *cut are added to. */
+static int gear_equip_wide(int kind, int character, BYTE *list, int n, int room, int *listed, int *boxed, int *cut)
 {
-    int first = WIDE_GEAR_FIRST + kind * GEAR_WIDE_BAND, number, k, slot, offered = 0, short_of = 0;
+    static WORD cand[GEAR_WIDE_BAND];
+    static BYTE seen[GEAR_WIDE_BAND];
+    int first = WIDE_GEAR_FIRST + kind * GEAR_WIDE_BAND, number, k, slot, offered = 0, short_of = 0, cands = 0, from_list = 0, i;
 
     if (!gear_wide_live || kind < 0 || kind > 2)
         return n;
@@ -27544,6 +30831,29 @@ static int gear_equip_wide(int kind, int character, BYTE *list, int n, int room,
             gear_listed[k][slot] = 0;
     gear_worn_settle("the Equip menu's list");
     gear_slots_free();
+    /* (wide gear in the item list) THE CANDIDATES: the item list's wide pieces of the kind, in row order; then the box's, ascending, while
+       it acts; each number once */
+    for (i = 0; i < GEAR_WIDE_BAND; i++)
+        seen[i] = 0;
+    for (i = 0; wide_live && i < wide_bound; i++) {
+        DWORD row = wide_list[i];
+        const struct wide_gear *g;
+
+        number = (int)(row & 0xffffu);
+        if (row == WIDE_EMPTY || !(row >> 16) || gear_wide_kind(number) != kind || seen[number - first] || (g = wide_gear(number)) == NULL || !gear_wide_wears(g, character))
+            continue;
+        seen[number - first] = 1;
+        cand[cands++] = (WORD)number;
+    }
+    from_list = cands;
+    for (number = first; box_acts() && box_kinds && number < first + GEAR_WIDE_BAND; number++) {
+        const struct wide_gear *g;
+
+        if (!box_count[number] || seen[number - first] || (g = wide_gear(number)) == NULL || !gear_wide_wears(g, character))
+            continue;
+        seen[number - first] = 1;
+        cand[cands++] = (WORD)number;
+    }
     {
         /* (stage B6, THE WINDOW) the wide pieces the character can wear are counted first, and those that hold no slot yet (a piece somebody
            wears has one). No more than the slots that are free: the lines of stage B5 below, unchanged. More: the list takes them ALL (as far
@@ -27552,14 +30862,10 @@ static int gear_equip_wide(int kind, int character, BYTE *list, int n, int room,
         static WORD numbers[BOX_EQUIP_ROOM];
         int wide = 0, need = 0, more = 0, free_slots, rows;
 
-        for (number = first; box_kinds && number < first + GEAR_WIDE_BAND; number++) {
-            const struct wide_gear *g;
-
-            if (!box_count[number] || (g = wide_gear(number)) == NULL || !gear_wide_wears(g, character))
-                continue;
-            need += gear_slot_of(kind, number) < 0;
+        for (i = 0; i < cands; i++) {
+            need += gear_slot_of(kind, cand[i]) < 0;
             if (n + wide < room && n + wide < BOX_EQUIP_ROOM)
-                numbers[wide++] = (WORD)number;
+                numbers[wide++] = cand[i];
             else
                 more++;
         }
@@ -27568,10 +30874,11 @@ static int gear_equip_wide(int kind, int character, BYTE *list, int n, int room,
             rows = gear_window_rows(n + wide);
             if (gear_window_live && free_slots >= rows + 1) {
                 gear_window_open(kind, list, n, numbers, wide, free_slots);
-                *boxed += wide;
+                *listed += wide < from_list ? wide : from_list;
+                *boxed += wide < from_list ? 0 : wide - from_list;
                 *cut += more;
                 if (gear_window_may_say())
-                    log_line("box: the Equip menu's list: THE WINDOW: character %d can wear %d wide %s(s) of the box; %d of them hold no lent slot and %d slots of the kind are free (%d of %d in use by the pieces worn): ALL %d are listed, after the %d piece(s) with a byte of their own (entries %d to %d of the list), and only the entries on screen hold a slot (%d rows + %d at most; %d lent for the first screen)%s",
+                    log_line("box: the Equip menu's list: THE WINDOW: character %d can wear %d wide %s(s) of the item list and the box; %d of them hold no lent slot and %d slots of the kind are free (%d of %d in use by the pieces worn): ALL %d are listed, after the %d piece(s) with a byte of their own (entries %d to %d of the list), and only the entries on screen hold a slot (%d rows + %d at most; %d lent for the first screen)%s",
                              character, wide + more, gear_kind_text(kind), need, free_slots, GEAR_LENT_COUNT(kind) - free_slots, GEAR_LENT_COUNT(kind), wide, n, n, n + wide - 1, rows, 1 + 2 * GEAR_WINDOW_MARGIN, gear_window_held,
                              gear_window_said == GEAR_WINDOW_LINES ? " (no more such lines in this run)" : "");
                 return n + wide;
@@ -27581,11 +30888,8 @@ static int gear_equip_wide(int kind, int character, BYTE *list, int n, int room,
                          wide + more, gear_kind_text(kind), character, !gear_window_live ? (gear_window_refusal ? "it was REFUSED when the game started: see the line \"box: the window (stage B6): REFUSED\" of the start" : "its site is not written") : "fewer lent slots are free than the rows on screen + 1");
         }
     }
-    for (number = first; box_kinds && number < first + GEAR_WIDE_BAND; number++) {
-        const struct wide_gear *g;
-
-        if (!box_count[number] || (g = wide_gear(number)) == NULL || !gear_wide_wears(g, character))
-            continue;
+    for (i = 0; i < cands; i++) {
+        number = cand[i];
         if (n >= room) {
             ++*cut;
             continue;
@@ -27597,13 +30901,43 @@ static int gear_equip_wide(int kind, int character, BYTE *list, int n, int room,
         }
         gear_listed[kind][slot] = 1;
         list[n++] = (BYTE)slot;
-        ++*boxed;
+        if (i < from_list)
+            ++*listed;
+        else
+            ++*boxed;
         offered++;
     }
     if (short_of)
-        log_line("box: the Equip menu's list: %d wide %s(s) of the box that character %d can wear are NOT offered: every lent slot of the kind is in use (%d slots: by the pieces worn and the %d offered here). Nothing is changed in either store; the pieces stay in the box",
+        log_line("box: the Equip menu's list: %d wide %s(s) of the item list or the box that character %d can wear are NOT offered: every lent slot of the kind is in use (%d slots: by the pieces worn and the %d offered here). Nothing is changed in either store; the pieces stay where they are",
                  short_of, gear_kind_text(kind), character, GEAR_LENT_COUNT(kind), offered);
     return n;
+}
+
+/* (Wide gear in the item list, stage 2) From equip_list_hook when the DLL's builder did not run (the box sleeps or is
+   LOCKED: the game's builder and the DLL's additions made the list): the item list's wide pieces of the kind that the
+   character may wear are added after them (gear_equip_wide: lent slots, or the window's form), the count written, and ff
+   over what a longer list of the DLL's left (box_equip_high). Nothing unless wide gear is at work and the call that
+   takes the chosen piece (007075c7) is the DLL's (else a piece would be worn AND stay in the list). */
+static void gear_equip_plain(int kind)
+{
+    BYTE *list = (BYTE *)ADDR_EQUIP_LIST;
+    int *count = (int *)ADDR_EQUIP_LIST_COUNT, character, n, i, listed = 0, boxed = 0, cut = 0;
+
+    if (!gear_wide_live || !wide_live || kind < 0 || kind > 2 || !box_equip_take_ours() || *count < 0 || *count > BOX_EQUIP_ROOM)
+        return;
+    character = ((const BYTE *)ADDR_PARTY)[*(int *)ADDR_EQUIP_MENU_SLOT];
+    n = gear_equip_wide(kind, character, list, *count, BOX_EQUIP_ROOM, &listed, &boxed, &cut);
+    for (i = n; i < box_equip_high && i < BOX_EQUIP_ROOM; i++)
+        list[i] = 0xff;
+    if (n > box_equip_high)
+        box_equip_high = n;
+    *count = n;
+    if (cut && !box_equip_cut_said++)
+        log_line("*** box: the Equip menu's list: character %d can wear %d more %s than the game's list has room for (%d): the last %d are not offered. Nothing is changed in either store; said once ***",
+                 character, cut, kind == 0 ? "weapons" : kind == 1 ? "armours" : "accessories", BOX_EQUIP_ROOM, cut);
+    if (listed && box_equip_may_say())
+        log_line("box: the Equip menu's list: %d wide %s character %d can wear, from the item list, after the game's own list (the box %s)%s", listed,
+                 kind == 0 ? "weapon(s)" : kind == 1 ? "armour(s)" : "accessory(ies)", character, box_dormant() ? "sleeps" : "does not act", box_equip_said == BOX_EQUIP_LINES ? " (no more such lines in this run)" : "");
 }
 
 /* The shop's "Equipped" figure, WHOLE (F1: the game's own count adds a base to the byte, which a
@@ -27724,6 +31058,7 @@ static void gear_worn_forget(void)
     int h, k, slot;
 
     gear_kept_count = 0;
+    gear_kept_said_count = 0;       /* (wide gear in the item list) the "stays KEPT" lines belong to that game */
     gear_worn_refused_why = NULL;
     gear_standins_on = gear_standin_count = 0;
     gear_off_pending[0] = gear_off_pending[1] = gear_off_pending[2] = 0;
@@ -27737,63 +31072,103 @@ static void gear_worn_forget(void)
             gear_slot_release(k, slot);
 }
 
-/* The testing aid `give_on_load = yes` of a wide piece's section: one goes INTO THE BOX at a load
-   unless the save owns one (in the box, worn, or kept in the list of worn pieces). */
+/* The testing aid `give_on_load = yes` of a wide piece's section: one is given at a load unless the
+   save owns one (wide gear in the item list: a row of the item list, the box, worn, or kept in the
+   list of worn pieces; a line says which). Given like a wide item: into a free row of the item list
+   (box = on: the box, as it stores all gear: box_aid_give); with no row the box (box = auto: a
+   sleeping box WAKES for it, overflow), else not given, with a line. */
 static void gear_wide_give(void)
 {
     int i;
 
     if (!gear_wide_live)
         return;
-    for (i = 0; box_dormant() && i < wide_gear_count; i++)     /* (box = auto) the first wide piece given wakes the sleeping box */
-        if (wide_gears[i].given && !gear_worn_holds(wide_gears[i].number))
-            box_wake(wide_gears[i].number, 1, "give_on_load (wide gear)", TRUE);
-    if (!box_acts())
-        return;
     for (i = 0; i < wide_gear_count; i++) {
         const struct wide_gear *g = &wide_gears[i];
+        int row, empty = -1, held;
+        BOOL listed;
 
-        if (!g->given || box_held(g->number) || gear_worn_holds(g->number))
+        if (!g->given)
             continue;
-        if (box_put(g->number, 1))
-            log_line("box: give_on_load (wide gear): 1 of wide %s %d \"%s\" put in the BOX; the box holds %d kinds, %lu pieces", gear_kind_text(g->kind), g->number, gear_wide_log_name(g->number), box_kinds, box_pieces);
-        else
-            log_line("box: give_on_load (wide gear): wide %s %d \"%s\" NOT given: the box holds all the kinds it can", gear_kind_text(g->kind), g->number, gear_wide_log_name(g->number));
+        listed = wide_live && wide_find(g->number, 0, "find (give_on_load, wide gear)") != WIDE_EMPTY;
+        if (listed || box_held(g->number) || gear_worn_holds(g->number)) {
+            log_line("box: give_on_load (wide gear): wide %s %d \"%s\" is not given: the save owns one (%s)", gear_kind_text(g->kind), g->number, gear_wide_log_name(g->number),
+                     listed ? "in the item list" : box_held(g->number) ? "in the box" : gear_worn_wears(g->number) ? "worn" : "KEPT in the list of worn pieces");
+            continue;
+        }
+        if (box_live && (box_state == BOX_MISSING || box_state == BOX_REFUSED)) {
+            /* (fix round, ledger 5) as the DLL before this stage: the box this save had is not here (MISSING, REFUSED) and may hold
+               one; a piece given now would be a second one once that box is back */
+            log_line("box: give_on_load (wide gear): wide %s %d \"%s\" NOT given: the box is LOCKED (missing or refused) and may hold one; it is given at a load whose box is known",
+                     gear_kind_text(g->kind), g->number, gear_wide_log_name(g->number));
+            continue;
+        }
+        for (row = 0; wide_live && row < stock_rows() && empty < 0; row++)
+            if (!stock_row(row, &held, NULL))
+                empty = row;
+        if (box_live && box_aid_give(g->number, 1, empty >= 0, "give_on_load (wide gear)"))
+            continue;       /* (box = on: R1; no row in the list, or a run that cannot save it there: the box, a sleeping one waking) said there */
+        if (empty < 0 || box_list_cannot_save(g->number)) {
+            log_line("box: give_on_load (wide gear): wide %s %d \"%s\" NOT given: %s", gear_kind_text(g->kind), g->number, gear_wide_log_name(g->number), gear_store_why(g->number));
+            continue;
+        }
+        stock_row_put(empty, g->number, 1, "give_on_load (wide gear)");      /* (painted by the load's last look, as the wide items' give_on_load) */
+        log_line("box: give_on_load (wide gear): 1 of wide %s %d \"%s\" put in row %d of the ITEM LIST", gear_kind_text(g->kind), g->number, gear_wide_log_name(g->number), empty);
     }
 }
 
 /* AT A LOAD (A14), from load_accepted_hook once the box of the load is decided and every
    character's record is where it will be read: the entries of the loaded file's WORN section
-   (gear_worn_section_met left them in the kept list) are put on, boxed, or carried on. */
+   (gear_worn_section_met left them in the kept list) are put on, sent to a store, or carried on.
+   (Wide gear in the item list) Whatever the box's state (asleep, LOCKED, awake): the entries are
+   this save's own when sxc2_load_own says so; a KEPT entry (a lent-range byte, under any record)
+   stays KEPT and is placed by the check at the end; a piece not put on goes TO A STORE. */
 static void gear_worn_after_load(void)
 {
-    int i, keep = 0, lent = 0, boxed = 0, carried = 0;
+    static struct { WORD number; BYTE holder, kind, again; const char *why; } off[GEAR_WORN_MAX];
+    int i, keep = 0, lent = 0, boxed = 0, listed = 0, carried = 0, kept = 0, offs = 0;
 
     if (!gear_wide_live)
         return;
     for (i = 0; i < gear_kept_count; i++) {
         BYTE *e = gear_kept[i];
-        int h = gear_worn_holder(e[0]), k = e[1], number = (int)get16(e + 2), slot = -1, went;
+        int h = gear_worn_holder(e[0]), k = e[1], number = (int)get16(e + 2), slot = -1;
         BYTE *record = h < 0 ? NULL : gear_holder_record(h);
         BOOL remade = h >= GEAR_HOLDER_ROSTER && new_characters[h - GEAR_HOLDER_ROSTER].defined && new_characters[h - GEAR_HOLDER_ROSTER].remake_on_load > 0;
+        struct new_character *sheet = remade ? &new_characters[h - GEAR_HOLDER_ROSTER] : NULL;
+        BOOL again = sheet && record && (sheet->gear_wish_pending & (1 << k)) && sheet->start_wide[k] == number;   /* (a sheet's wide piece) the remade record's sheet names this very piece: it is worn again, not made a second time */
         const char *why = NULL;
 
-        if ((!record && !remade && h != GEAR_HOLDER_STASH) || !box_acts()) {
-            /* not in this game (a character no file defines now, or one without a record), or the box is LOCKED: carried verbatim */
+        if (gear_slot_lendable(k, e[4])) {
+            /* (wide gear in the item list, B1) a KEPT entry (gear_piece_to_store): a label under any record, never put on: it stays
+               KEPT and goes to a store at the check below (gear_kept_place), or later */
+            if (keep != i)
+                copy_bytes(gear_kept[keep], e, 8);
+            keep++;
+            kept++;
+            continue;
+        }
+        if (!record && (!remade || sheet->start_wide[k] == number) && h != GEAR_HOLDER_STASH) {
+            /* not in this game (a character no file defines now, or one without a record): carried verbatim.
+               (fix round) Also a remade character not created at this load whose sheet names this very piece: the entry is its
+               piece, which character_wide_wear takes back when the character is created (stored here, the sheet would make another).
+               (Wide gear in the item list) No longer while the box is LOCKED or asleep: those entries are put on below */
             if (keep != i)
                 copy_bytes(gear_kept[keep], e, 8);
             keep++;
             carried++;
             continue;
         }
-        if (remade)
+        if (remade && !again)
             why = "the character's record is made anew at every load (remake_on_load)";
+        else if (again && wide_gear(number) && !gear_wide_wears_roster(wide_gear(number), sheet))     /* (fix round) remade from its sheet: the sheet's equip test, as for a piece the sheet makes */
+            why = sheet->equip_like == EQUIP_LIKE_NONE
+                ? "the character, remade from its sheet at this load, may not wear it now (its equip list does not name the character, and it is not for all nine: equip_like = none)"
+                : "the character, remade from its sheet at this load, may not wear it now (its equip list names neither the character nor the one it equips like)";
         else if (!record)       /* (fix pass of B5, finding 1) the stash's entry alone comes here without a record */
             why = "the game's put-away bytes (00dc07d8, 00dc07d9) hold no equipment now: outside the flashback they are the second stolen materia";
-        else if (box_state != BOX_KNOWN)
-            why = "the companion file is not this save's own (see the BOX line above): its worn pieces are not put on another state's characters";
-        else if (gear_slot_lendable(k, e[4]))       /* (b5b, finding 3) a KEPT entry (gear_piece_to_box): never put on over what the record wears */
-            why = "it was KEPT under this record because it was on nobody and the box could not take it; the record wears another piece";
+        else if (!sxc2_load_own)
+            why = "the companion file is not this save's own (the fallback search's, another play time, or none): its worn pieces are not put on another state's characters";
         else if (record[SAVE_RECORD_WEAPON + k] != e[4])
             why = "the record no longer holds the stand-in the save was written with: the equipment was changed without this DLL (the unmodified game, an older build, box = off)";
         else if (gear_worn[h][k])
@@ -27804,31 +31179,34 @@ static void gear_worn_after_load(void)
             record[SAVE_RECORD_WEAPON + k] = (BYTE)slot;
             gear_worn[h][k] = (WORD)number;
             lent++;
-            if (gear_worn_may_say())
+            if (again)
+                log_line("WORN: %s, remade from its sheet at this load, wears wide %s %d \"%s\" again: the sheet names the same piece, which is not made a second time (lent slot %d in the place of the stand-in %d)",
+                         gear_holder_text(h), gear_kind_text(k), number, gear_wide_log_name(number), slot, e[4]);
+            else if (gear_worn_may_say())
                 log_line("WORN: %s wears wide %s %d \"%s\" again: lent slot %d in the place of the stand-in %d", gear_holder_text(h), gear_kind_text(k), number, gear_wide_log_name(number), slot, e[4]);
             continue;
         }
-        went = box_put_back(number, 1);
-        if (went) {
-            boxed++;
-            gear_worn_boxed++;
-            log_line("*** WORN: wide %s %d \"%s\", worn by %s when the save was made, is NOT put on: %s. The piece goes to the BOX (it holds %d of it now); the record's %s byte stays %d ***",
-                     gear_kind_text(k), number, gear_wide_log_name(number), gear_holder_text(h), why, box_held(number), gear_kind_text(k), record ? record[SAVE_RECORD_WEAPON + k] : e[4]);
-        } else {
-            if (keep != i)
-                copy_bytes(gear_kept[keep], e, 8);
-            keep++;
-            carried++;
-            log_line("*** WORN: wide %s %d \"%s\", worn by %s when the save was made, is NOT put on: %s; and the BOX cannot take it: its entry is CARRIED as it is in the files this game writes ***",
-                     gear_kind_text(k), number, gear_wide_log_name(number), gear_holder_text(h), why);
-        }
+        /* (wide gear in the item list) not put on: TO A STORE, once the kept list is whole again (below) */
+        off[offs].number = (WORD)number, off[offs].holder = (BYTE)h, off[offs].kind = (BYTE)k, off[offs].again = (BYTE)again, off[offs++].why = why;
     }
     gear_kept_count = keep;
+    for (i = 0; i < offs; i++) {
+        int number = off[i].number, h = off[i].holder, k = off[i].kind, went = gear_piece_to_store(number, h, k, -1, "a load");
+        const BYTE *record = gear_holder_record(h);
+
+        if (went >= 0 && off[i].again)
+            new_characters[h - GEAR_HOLDER_ROSTER].gear_wish_pending |= (BYTE)(0x10 << k);     /* (a sheet's wide piece) the sheet's piece is this one, now in a store or KEPT: character_wide_wear takes it back rather than make another */
+        boxed += went == 1, listed += went == 2, kept += went == 0;
+        log_line("*** WORN: wide %s %d \"%s\", worn by %s when the save was made, is NOT put on: %s. The piece goes to %s (the box holds %d of it now); the record's %s byte stays %d ***",
+                 gear_kind_text(k), number, gear_wide_log_name(number), gear_holder_text(h), off[i].why, gear_store_text(went), box_held(number), gear_kind_text(k),
+                 record ? record[SAVE_RECORD_WEAPON + k] : -1);
+    }
+    character_wide_wear_pending("a load");     /* (a sheet's wide piece) after the WORN entries (a remade character's own piece is worn again above), before the checks and give_on_load (which then sees it worn) */
     gear_worn_check("a load");
     gear_wide_give();
-    if (lent || boxed || carried)
-        log_line("WORN: %d pieces lent (worn again through a lent slot); %d sent to the box; %d carried as they are (%s). Lent slots in use: %d of %d weapon, %d of %d armour, %d of %d accessory",
-                 lent, boxed, carried, !box_acts() ? "the box is LOCKED: nothing goes on or in" : "records that are not in this game", gear_slots_lent(0), GEAR_LENT_COUNT(0), gear_slots_lent(1), GEAR_LENT_COUNT(1),
+    if (lent || boxed || listed || carried || kept)
+        log_line("WORN: %d pieces lent (worn again through a lent slot); %d sent to the box, %d to the item list; %d carried as they are (records that are not in this game); %d KEPT (placed in a store by the check at the end of the load, or later). Lent slots in use: %d of %d weapon, %d of %d armour, %d of %d accessory",
+                 lent, boxed, listed, carried, kept, gear_slots_lent(0), GEAR_LENT_COUNT(0), gear_slots_lent(1), GEAR_LENT_COUNT(1),
                  gear_slots_lent(2), GEAR_LENT_COUNT(2));
 }
 
@@ -27863,8 +31241,13 @@ static void sxc3_take_sections(const BYTE *file, DWORD size, const BYTE *words, 
         wide_list_unknown = 1;      /* (re-check of the fix pass) an SXC2 companion gives no item list either */
         return;
     }
-    for (n = 0; n < count; n++)
+    sxc3_list_whole = 0;
+    for (n = 0; n < count; n++) {
         boxes += sxc3_tag_is(heads[n], box_tag);    /* (the box) */
+        if (sxc3_tag_is(heads[n], (const char *)item_tag) && !items++)
+            sxc3_list_whole = !sxc3_item_readable(heads[n]);    /* (stage 4b, fix pass) only the first item list counts, as below; known before any section is kept */
+    }
+    items = 0;
     gear_worn_prescan(heads, count);                /* (the box, stage B5) is the file's WORN section one this build reads? nothing unless wide gear is at work */
     if (count <= 0)
         wide_list_unknown = 1;      /* (fix pass, finding 5) a file of the new format without any section is one whose sections were REFUSED (cut off, see the *** line above): no build writes one */
@@ -27872,6 +31255,8 @@ static void sxc3_take_sections(const BYTE *file, DWORD size, const BYTE *words, 
         const BYTE *head = heads[n];
 
         if (!sxc3_tag_is(head, (const char *)item_tag)) {
+            if (fields_fldx_met(head, !fallback))   /* (field capacity, stage 2) the save's real place: taken, never carried forward */
+                continue;
             if (box_section_met(head, boxes))       /* (the box) a box section with the box at work: read, or REFUSED and kept; with the box off: only noted */
                 continue;
             if (gear_worn_section_met(head))        /* (the box, stage B5) the WORN section with wide gear at work: read, or REFUSED and kept; otherwise carried as any section this build does not know */
@@ -27893,8 +31278,14 @@ static void sxc3_take_sections(const BYTE *file, DWORD size, const BYTE *words, 
             if (get16(head + 6) == SXC3_ITEM_VERSION_LIST && !sxc3_item_fault(head))
                 /* (stage 3) a list of 510 rows met by a run with 320: carried whole, as the build before this one carries it */
                 log_line("load: *** item list: version 2 is THE LIST OF 510 ROWS (a save made with wide_rows = 510 while a row past the game's 320 was in use). This run's item list has 320 rows (%s): the bag is the save's own 320 words (every game kind is there); %d row(s) of the list are NOT in the bag: they stay in the companion file, which is carried as it is and never removed by a save of this game. Rows of this game that the save's words cannot hold (wide items) are NOT written while it is carried. Start the game with wide_items = on and wide_rows = 510 to have the whole list back ***",
-                         wide_rows_refused ? "wide_rows = 510 was REFUSED in this run" : wide_rows_wanted == WIDE_ROWS ? "wide_rows = 510 needs wide_items = on and the switch on" : "wide_rows = 320",
+                         wide_rows_refused ? "wide_rows = 510 was REFUSED in this run" : wide_rows_wanted >= WIDE_V2_ROWS ? "wide_rows = 510 needs wide_items = on and the switch on" : "wide_rows = 320",
                          sxc3_item_beyond(head, NULL, NULL));
+            else if (get16(head + 6) == SXC3_ITEM_VERSION_LONG && !sxc3_item_fault(head))
+                /* (stage 4) a long list met by a run with 320: carried whole, as a version-2 list is */
+                log_line("load: *** item list: version 3 is THE WHOLE LIST of a run with %d rows (a save made with wide_rows = %d, or one that carried a longer list). This run's item list has 320 rows (%s): the bag is the save's own 320 words; %d row(s) of the list are NOT in the bag: they stay in the companion file, which is carried as it is and never removed by a save of this game. Rows of this game that the save's words cannot hold (wide items) are NOT written while it is carried. Start the game with wide_items = on and wide_rows = %d to have the whole list back ***",
+                         sxc3_item_shown(head), sxc3_item_shown(head),
+                         wide_rows_refused ? "the long list was REFUSED in this run" : wide_rows_wanted >= WIDE_V2_ROWS ? "wide_rows needs wide_items = on and the switch on" : "wide_rows = 320",
+                         sxc3_item_beyond(head, NULL, NULL), sxc3_item_shown(head) <= WIDE_ROWS_MAX ? sxc3_item_shown(head) : WIDE_ROWS_MAX);
             continue;
         }
         fault = sxc3_item_fault(head);
@@ -27907,8 +31298,8 @@ static void sxc3_take_sections(const BYTE *file, DWORD size, const BYTE *words, 
                          sxc2_load_name);
             continue;
         }
-        if (get16(head + 6) == SXC3_ITEM_VERSION_LIST) {
-            sxc3_take_list2(head, words, fallback);         /* (stage 3) the whole list of 510 rows, in its order */
+        if (get16(head + 6) == SXC3_ITEM_VERSION_LIST || get16(head + 6) == SXC3_ITEM_VERSION_LONG) {
+            sxc3_take_list2(head, words, fallback);         /* (stage 3) the whole list of 510 rows, in its order (stage 4: or version 3, any length; the split) */
             continue;
         }
         if (!sxc3_item_plain(head)) {
@@ -27930,6 +31321,18 @@ static void sxc3_take_sections(const BYTE *file, DWORD size, const BYTE *words, 
         log_line("wide list shadow: %s has no item list section: nothing to compare", sxc2_load_name);
 }
 
+/* (field capacity, stage 2) Is there room in the companion file being built for one more section of `bytes` (head
+   included), beside what sxc3_add_sections writes now (the same tests it makes) and every section carried? */
+static BOOL sxc3_room_for(DWORD bytes)
+{
+    BOOL item = (wide_shadow_on() || wide_carried_count) && !sxc3_item_carried;
+    BOOL box = box_writes_own(), worn = gear_worn_writes();
+    DWORD sum = (item ? SXC3_SECTION_HEAD + SXC3_ITEM_BYTES_MAX : 0) + (box ? box_section_size() : 0) + (worn ? gear_worn_section_size() : 0) + sxc3_kept_size + bytes;     /* (stage 4: the longest item list this build writes) */
+    int sections = (item != 0) + (box != 0) + (worn != 0) + sxc3_kept_count + 1;
+
+    return sum <= SXC3_SECTIONS_ROOM && sections <= SXC3_SECTIONS_MAX;
+}
+
 /* For sxc2_build: the sections of the file being built, after its characters' part (`size`
    bytes at `data`, the header and the entries; `slot`: the save as it goes to disk). With nothing
    to write it returns `size` and the file stays an SXC2 file, byte for byte as before this stage.
@@ -27938,13 +31341,21 @@ static void sxc3_take_sections(const BYTE *file, DWORD size, const BYTE *words, 
    unseen: with wide_items off too) unless an item list of a version this build does not know is
    carried, then every carried section. The list is the slot's 320 words widened, plus (stage 2)
    the rows the words do not hold: wide_section_rows. Returns the length so far (the file's
-   checksum is the caller's). */
+   checksum is the caller's).
+   (Stage 4) Which version, by content, in a run with more than 320 rows: version 1 while no row past the game's 320 is in
+   use and every carried row fits it as before; version 2 while one is, no row from 510 up is in use (a run of any length)
+   and every carried row fits it as before; else VERSION 3 (wide_section_list3). The rows are made before the room is tested, and the room is tested at
+   every save, with the item list's own length. */
 static DWORD sxc3_add_sections(BYTE *data, DWORD size, const BYTE *slot)
 {
-    static DWORD wide[WIDE_ROWS];
+    static DWORD wide[WIDE_ROWS_MAX];
     BOOL item = (wide_shadow_on() || wide_carried_count) && !sxc3_item_carried;
     BOOL box = box_writes_own();    /* (the box) FALSE with the box off, LOCKED, or never used */
     BOOL worn = gear_worn_writes(); /* (the box, stage B5) FALSE unless wide gear is at work and a piece is worn or kept */
+    DWORD fldx = fields_fldx_bytes();   /* (field capacity, stage 2) the real place of a save made in a registered field; 0 none */
+    DWORD item_bytes = SXC3_ITEM_BYTES; /* (stage 4) the item list's contents: 2044 bytes (versions 1 and 2), 8 + 4 x count (version 3) */
+    int item_rows = WIDE_V2_ROWS;
+    BYTE compact = 0;
     BYTE *p;
     int i;
 
@@ -27963,40 +31374,69 @@ static DWORD sxc3_add_sections(BYTE *data, DWORD size, const BYTE *slot)
         if (lost)
             log_line("save: *** wide items: %d row(s) of this game that the save's 320 words do not hold are NOT written: the loaded companion's item list is of a version this build does not know and is carried in the list's place. Use a build that knows it ***", lost);
     }
-    if (box_live) {
-        /* (the box, C8) the file's room, asserted: with the cap at arrival this cannot fail; if it does NO file is written */
-        DWORD sum = (item ? SXC3_SECTION_HEAD + SXC3_ITEM_BYTES : 0) + (box ? box_section_size() : 0) + (worn ? gear_worn_section_size() : 0) + sxc3_kept_size;
-        int sections = (item != 0) + (box != 0) + (worn != 0) + sxc3_kept_count;
+    if (fldx && !sxc3_room_for(fldx)) {
+        /* (field capacity, stage 2) cannot be: fields_save_guard_begin asked the same a moment ago; the save then holds the fallback alone */
+        log_line("save: *** the companion file has no room for the FLDX section (the real place of a save made in a registered field): left out; this save loads at fields_fallback ***");
+        fldx = 0;
+    }
+    if (item) {
+        /* (stage 4) the rows first (their version decides the length) */
+        BOOL long_run = wide_live && wide_bound > WIDE_GAME_ROWS;
+        int tail = 0;
+
+        for (i = WIDE_V2_ROWS; i < wide_bound; i++)
+            tail += wide_list[i] != WIDE_EMPTY;     /* (stage 4, fix pass) rows in use from row 510 up: none, and version 2 holds the list */
+        if (long_run && wide_compact_now() && !tail) {
+            /* (stage 3) a row past the game's 320 is in use: VERSION 2, the whole list in its order; the slot's words are its compact picture.
+               (Stage 4, fix pass) from a run with more than 510 rows too while no row from 510 up is in use: the compact picture over its
+               rows is then the one over 510 rows, which is what a version-2 reader computes, and the stage-3 build can play the save */
+            sxc3_built_version = SXC3_ITEM_VERSION_LIST;
+            wide_section_list(wide, slot + SLOT_STOCK, &sxc3_built_held, &sxc3_built_no_room, &sxc3_built_differs);
+        } else if (!long_run || !wide_compact_now()) {
+            wide_section_rows(wide, slot + SLOT_STOCK, &sxc3_built_held, &sxc3_built_no_room);      /* (with no wide row and nothing carried: the words, widened, as before stage 2) */
+        } else
+            wide_section_misfit = 1;        /* (stage 4) more than 510 rows, a row past the 320 in use: version 3 */
+        if (long_run && (wide_section_misfit || sxc3_built_no_room)) {
+            /* (stage 4) VERSION 3: a list longer than 510 rows, or carried rows versions 1 and 2 cannot hold as their readers need */
+            sxc3_built_version = SXC3_ITEM_VERSION_LONG;
+            wide_section_list3(wide, slot + SLOT_STOCK, &sxc3_built_held, &sxc3_built_no_room, &sxc3_built_differs, &item_rows, &compact);
+            item_bytes = 8 + (DWORD)item_rows * 4;
+        }
+    }
+    {
+        /* (the box, C8) the file's room, asserted: with the cap at arrival this cannot fail; if it does NO file is written.
+           (Stage 4) at every save, box or not, with the item list's own length */
+        DWORD sum = (item ? SXC3_SECTION_HEAD + item_bytes : 0) + (box ? box_section_size() : 0) + (worn ? gear_worn_section_size() : 0) + sxc3_kept_size + fldx;
+        int sections = (item != 0) + (box != 0) + (worn != 0) + sxc3_kept_count + (fldx != 0);
 
         if (sum > SXC3_SECTIONS_ROOM || sections > SXC3_SECTIONS_MAX) {
             log_line("save: *** the companion file's sections do NOT FIT: %lu bytes in %d sections (the item list %d, the box %lu with %d kinds, carried %lu); a file holds %d bytes in %d sections. NO companion file is built ***",
-                     sum, sections, item ? SXC3_SECTION_HEAD + SXC3_ITEM_BYTES : 0, box ? box_section_size() : 0, box_kinds, sxc3_kept_size, SXC3_SECTIONS_ROOM, SXC3_SECTIONS_MAX);
+                     sum, sections, item ? SXC3_SECTION_HEAD + item_bytes : 0, box ? box_section_size() : 0, box_kinds, sxc3_kept_size, SXC3_SECTIONS_ROOM, SXC3_SECTIONS_MAX);
+            sxc3_built_held = sxc3_built_no_room = sxc3_built_differs = 0;
+            sxc3_built_version = SXC3_ITEM_VERSION;
             return 0;
         }
     }
-    if (!item && !sxc3_kept_size && !box && !worn)
+    if (!item && !sxc3_kept_size && !box && !worn && !fldx)
         return size;
     data[3] = '3';
     put32(data + size, crc32_of(data, size, 0));
     p = data + size + 4;
     if (item) {
-        if (wide_live && wide_compact_now()) {
-            /* (stage 3) a row past the game's 320 is in use: VERSION 2, the whole list in its order; the slot's words are its compact picture */
-            sxc3_built_version = SXC3_ITEM_VERSION_LIST;
-            wide_section_list(wide, slot + SLOT_STOCK, &sxc3_built_held, &sxc3_built_no_room, &sxc3_built_differs);
-        } else {
-            wide_section_rows(wide, slot + SLOT_STOCK, &sxc3_built_held, &sxc3_built_no_room);      /* (with no wide row and nothing carried: the words, widened, as before stage 2) */
-        }
         p[0] = 'I', p[1] = 'T', p[2] = 'E', p[3] = 'M';
         put16(p + 4, 0);
         put16(p + 6, (WORD)sxc3_built_version);
-        put32(p + 8, SXC3_ITEM_BYTES);
-        put16(p + 12, WIDE_ROWS);
+        put32(p + 8, item_bytes);
+        put16(p + 12, (WORD)item_rows);
         p[14] = 4;
         p[15] = (BYTE)(wide_live != 0);     /* the source: 0 a shadow, built from the game's words; 1 the switch is on: the slot's words ARE the picture of the DLL's list */
-        for (i = 0; i < WIDE_ROWS; i++)
-            put32(p + 16 + i * 4, wide[i]);
-        p += SXC3_SECTION_HEAD + SXC3_ITEM_BYTES;
+        if (sxc3_built_version == SXC3_ITEM_VERSION_LONG) {
+            put16(p + 16, (WORD)wide_bound);    /* (stage 4) shown: the rows of this run's list */
+            put16(p + 18, compact);             /* (stage 4) the picture of the slot's words: 1 compact, 0 row for row */
+        }
+        for (i = 0; i < item_rows; i++)
+            put32(p + SXC3_SECTION_HEAD + item_bytes - (DWORD)item_rows * 4 + i * 4, wide[i]);
+        p += SXC3_SECTION_HEAD + item_bytes;
         sxc3_built_item = 1;
     }
     if (box) {
@@ -28006,6 +31446,8 @@ static DWORD sxc3_add_sections(BYTE *data, DWORD size, const BYTE *slot)
     }
     if (worn)
         p = gear_worn_section_write(p);     /* (the box, stage B5, A11) after the box, before everything carried: from the LEDGER (A13), never from the records, which hold stand-ins now */
+    if (fldx)
+        p = fields_fldx_write(p);           /* (field capacity, stage 2) after the worn pieces, before everything carried */
     copy_bytes(p, sxc3_kept, (int)sxc3_kept_size);
     p += sxc3_kept_size;
     return (DWORD)(p - data);
@@ -28030,14 +31472,24 @@ static void sxc3_say_saved(DWORD key, const BYTE *file, DWORD size, const BYTE *
     head = sxc3_find_section(file, size, item_tag);
     if (sxc3_built_item != 1 || !head)
         return;
-    if (get16(head + 6) == SXC3_ITEM_VERSION_LIST) {
-        /* (stage 3) the whole list of 510 rows: its compact picture against the slot's words */
-        int unheld = sxc3_item_beyond(head, NULL, narrow), past = 0, i;
+    if (get16(head + 6) == SXC3_ITEM_VERSION_LIST || get16(head + 6) == SXC3_ITEM_VERSION_LONG) {
+        /* (stage 3) the whole list of 510 rows: its compact picture against the slot's words (stage 4: or version 3: the
+           picture its writer painted, over its shown rows) */
+        int unheld = sxc3_item_beyond(head, NULL, narrow), past = 0, i, rows = sxc3_item_rows(head);
 
-        for (i = 0, used = 0; i < WIDE_ROWS; i++) {
-            used += get32(head + SXC3_SECTION_HEAD + 4 + i * 4) != WIDE_EMPTY;
-            past += i >= WIDE_GAME_ROWS && get32(head + SXC3_SECTION_HEAD + 4 + i * 4) != WIDE_EMPTY;
+        for (i = 0, used = 0; i < rows; i++) {
+            used += sxc3_item_row(head, i) != WIDE_EMPTY;
+            past += i >= WIDE_GAME_ROWS && sxc3_item_row(head, i) != WIDE_EMPTY;
         }
+        if (get16(head + 6) == SXC3_ITEM_VERSION_LONG) {
+            if (bytes_differ(narrow, slot + SLOT_STOCK, WIDE_GAME_ROWS * 2, &first) || unheld != sxc3_built_held || sxc3_built_differs)
+                log_line("save: *** item list: the item list written in %08lx.sxc (version 3, the whole list: %d rows, %d shown in this run) does NOT have the slot's 320 words as its picture (the first difference at word %d; %d row(s) the words do not hold, %d meant). Nothing is lost: a load merges the two by number, with a line like this one ***",
+                         key, rows, sxc3_item_shown(head), first / 2, unheld, sxc3_built_held);
+            else
+                log_line("save: item list: %08lx.sxc holds THE WHOLE LIST in its order (version 3: %d rows in the file, %d of them in use, %d past row %d; the first %d are this run's list and the slot's 320 words are their %s picture: AGREE). %d row(s) are held by the companion file ALONE (%d with a number above 511; %d of them rows CARRIED UNSEEN in this run): this save needs its companion file for them. A build from before the long list (stage 4) must not play this save: tools\\sxc2.py --fold makes it a version-2 list when its rows fit in 510",
+                         key, rows, used, past, WIDE_GAME_ROWS - 1, sxc3_item_shown(head), sxc3_item_compact(head) ? "compact" : "row-for-row", unheld, sxc3_item_wide_numbers(head),
+                         wide_carried_count - sxc3_built_no_room);
+        } else
         if (bytes_differ(narrow, slot + SLOT_STOCK, WIDE_GAME_ROWS * 2, &first) || unheld != sxc3_built_held || sxc3_built_differs)
             log_line("save: *** item list: the item list written in %08lx.sxc (version 2, the whole list of 510 rows) does NOT have the slot's 320 words as its picture (the first difference at word %d; %d row(s) the words do not hold, %d meant). Nothing is lost: a load merges the two by number, with a line like this one ***",
                      key, first / 2, unheld, sxc3_built_held);
@@ -28045,7 +31497,7 @@ static void sxc3_say_saved(DWORD key, const BYTE *file, DWORD size, const BYTE *
             log_line("save: item list: %08lx.sxc holds THE WHOLE LIST in its order (version 2: %d rows in use, %d of them past row %d). The slot's 320 words are its picture (every game kind, then what fits, in list order): AGREE. %d row(s) are held by the companion file ALONE (%d with a number above 511; %d of them rows CARRIED UNSEEN in this run): this save needs its companion file for them",
                      key, used, past, WIDE_GAME_ROWS - 1, unheld, sxc3_item_wide_numbers(head), wide_carried_count - sxc3_built_no_room);
         if (sxc3_built_no_room)
-            log_line("save: *** wide items: %d row(s) found NO free row in the item list of %08lx.sxc and are NOT in it. The companion file of the save this game was loaded from still holds them: it is not removed by this save ***",
+            log_line("save: *** wide items: %d row(s) found NO free row in the item list of %08lx.sxc and are NOT in it. A row carried from the companion file of the save this game was loaded from is still in that file, which this save does not remove; a row of numbers 0 to 511 that the loaded save's own 320 words gave (the merge at the load) is held by THAT SAVE alone, and is LOST if this save was made over it ***",
                      sxc3_built_no_room, key);
         return;
     }
@@ -28054,37 +31506,86 @@ static void sxc3_say_saved(DWORD key, const BYTE *file, DWORD size, const BYTE *
         log_line("save: *** wide list shadow: the item list written in %08lx.sxc does NOT turn back into the stock of the slot (the first difference at row %d; %d row(s) the words do not hold, %d meant) ***",
                  key, first / 2, wide_rows + beyond + unpaintable, sxc3_built_held);
     else
-        log_line("save: wide list shadow: the item list written in %08lx.sxc (%d rows, %d in use) turns back into the stock of the slot: AGREE", key, WIDE_ROWS, used);
+        log_line("save: wide list shadow: the item list written in %08lx.sxc (%d rows, %d in use) turns back into the stock of the slot: AGREE", key, WIDE_V2_ROWS, used);
     if (sxc3_built_held)
         log_line("save: wide items: the item list of %08lx.sxc holds %d row(s) the slot's 320 words do not hold (%d with a number above 511; %d of them past the game's row 320); %d of them are rows CARRIED UNSEEN in this run. The save itself holds ffff in their places",
                  key, sxc3_built_held, sxc3_item_wide_numbers(head), beyond, wide_carried_count - sxc3_built_no_room);
     if (sxc3_built_no_room)
-        log_line("save: *** wide items: %d row(s) found NO free row in the item list of %08lx.sxc and are NOT in it. The companion file of the save this game was loaded from still holds them: it is not removed by this save ***",
+        log_line("save: *** wide items: %d row(s) found NO free row in the item list of %08lx.sxc and are NOT in it. A row carried from the companion file of the save this game was loaded from is still in that file, which this save does not remove; a row of numbers 0 to 511 that the loaded save's own 320 words gave (the merge at the load) is held by THAT SAVE alone, and is LOST if this save was made over it ***",
                  sxc3_built_no_room, key);
+}
+
+/* (Wide gear in the item list) Does the new file (`new_file`, `size`: checked) hold this number anywhere a thing can live:
+   a row of its item list (`new_head`: checked; NULL none), an entry of its box (a `BOX ` section this build reads), an entry
+   of its list of worn pieces (a `WORN` section this build reads)? */
+static BOOL sxc3_file_holds_number(const BYTE *new_file, DWORD new_size, const BYTE *new_head, DWORD number)
+{
+    const BYTE *head;
+    DWORD i, n;
+
+    for (i = 0; new_head && i < (DWORD)sxc3_item_rows(new_head); i++) {
+        DWORD other = sxc3_item_row(new_head, (int)i);
+
+        if (other != WIDE_EMPTY && (other & 0xffffu) == number)
+            return TRUE;
+    }
+    head = new_file ? sxc3_find_section(new_file, new_size, (const BYTE *)box_tag) : NULL;
+    if (head && get16(head + 6) == BOX_VERSION && !box_section_fault(head))
+        for (n = get32(head + SXC3_SECTION_HEAD + 4), i = 0; i < n; i++)
+            if (get16(head + SXC3_SECTION_HEAD + 8 + i * 4) == number)
+                return TRUE;
+    head = new_file ? sxc3_find_section(new_file, new_size, (const BYTE *)gear_worn_tag) : NULL;
+    if (head && get16(head + 6) == GEAR_WORN_VERSION && !gear_worn_fault(head))
+        for (n = get16(head + SXC3_SECTION_HEAD), i = 0; i < n; i++)
+            if (get16(head + SXC3_SECTION_HEAD + 4 + i * 8 + 2) == number)
+                return TRUE;
+    return FALSE;
+}
+
+/* (Stage 4b) Every number sxc3_file_holds_number would find in the new file, as one bit each in `held` (0x10000 bits): the rows
+   of its item list, the entries of its box, the entries of its list of worn pieces; the same three tests, made once. */
+static void sxc3_file_numbers(const BYTE *new_file, DWORD new_size, const BYTE *new_head, BYTE *held)
+{
+    const BYTE *head;
+    DWORD i, n, number;
+
+    for (i = 0; i < 0x10000 / 8; i++)
+        held[i] = 0;
+    for (i = 0; new_head && i < (DWORD)sxc3_item_rows(new_head); i++) {
+        DWORD other = sxc3_item_row(new_head, (int)i);
+
+        if (other != WIDE_EMPTY)
+            number = other & 0xffffu, held[number >> 3] |= (BYTE)(1 << (number & 7));
+    }
+    head = new_file ? sxc3_find_section(new_file, new_size, (const BYTE *)box_tag) : NULL;
+    if (head && get16(head + 6) == BOX_VERSION && !box_section_fault(head))
+        for (n = get32(head + SXC3_SECTION_HEAD + 4), i = 0; i < n; i++)
+            number = get16(head + SXC3_SECTION_HEAD + 8 + i * 4), held[number >> 3] |= (BYTE)(1 << (number & 7));
+    head = new_file ? sxc3_find_section(new_file, new_size, (const BYTE *)gear_worn_tag) : NULL;
+    if (head && get16(head + 6) == GEAR_WORN_VERSION && !gear_worn_fault(head))
+        for (n = get16(head + SXC3_SECTION_HEAD), i = 0; i < n; i++)
+            number = get16(head + SXC3_SECTION_HEAD + 4 + i * 8 + 2), held[number >> 3] |= (BYTE)(1 << (number & 7));
 }
 
 /* (Stage 2.) For the removal: how many rows of an old file's item list (`old`: checked, version 1)
    hold something the save's 320 words do not hold (a wide item) whose NUMBER the new file's item
    list (`new_head`: checked, version 1; NULL: the new file has none) does not hold in any row.
-   Such a file is KEPT: it holds wide rows the new one lacks. */
-static int sxc3_item_rows_lost(const BYTE *old, const BYTE *new_head)
+   Such a file is KEPT: it holds wide rows the new one lacks. (Wide gear in the item list) A
+   number also counts as held when the new file's box or its list of worn pieces holds it (a row
+   moved into the box, a piece put on): sxc3_file_holds_number. */
+static int sxc3_item_rows_lost(const BYTE *old, const BYTE *new_head, const BYTE *new_file, DWORD new_size)
 {
-    static BYTE beyond[WIDE_ROWS];
-    int i, j, lost = 0;
+    static BYTE beyond[SXC3_ITEM_ROWS_ROOM], held[0x10000 / 8];
+    int i, lost = 0, rows = sxc3_item_rows(old);
 
-    sxc3_item_beyond(old, beyond, NULL);    /* (stage 3: by the old list's own version: version 2, the rows its compact picture leaves out) */
-    for (i = 0; i < WIDE_ROWS; i++) {
-        DWORD row = get32(old + SXC3_SECTION_HEAD + 4 + i * 4);
+    sxc3_item_beyond(old, beyond, NULL);    /* (stage 3: by the old list's own version: version 2, the rows its compact picture leaves out; stage 4: version 3, by its writer's picture) */
+    sxc3_file_numbers(new_file, new_size, new_head, held);     /* (stage 4b: once, not once a row: linear in the rows and the box's kinds) */
+    for (i = 0; i < rows; i++) {
+        DWORD number = sxc3_item_row(old, i) & 0xffffu;
 
         if (!beyond[i])
             continue;
-        for (j = 0; new_head && j < WIDE_ROWS; j++) {
-            DWORD other = get32(new_head + SXC3_SECTION_HEAD + 4 + j * 4);
-
-            if (other != WIDE_EMPTY && (other & 0xffffu) == (row & 0xffffu))
-                break;
-        }
-        lost += !new_head || j == WIDE_ROWS;
+        lost += !(held[number >> 3] & (1 << (number & 7)));
     }
     return lost;
 }
@@ -28111,14 +31612,28 @@ static int sxc3_sections_lost(const BYTE *old, DWORD old_size, const BYTE *new_f
     for (n = 0; n < count; n++) {
         if (sxc3_tag_is(heads[n], (const char *)item_tag) && sxc3_item_plain(heads[n]))
             continue;
+        if (sxc3_tag_is(heads[n], fields_fldx_tag))
+            continue;       /* (field capacity, stage 2) the place of the save that is replaced: nothing a later save keeps */
         if (box_live && sxc3_tag_is(heads[n], box_tag) && get16(heads[n] + 6) == BOX_VERSION && !box_section_fault(heads[n])) {
             /* (the box, C7) a box this build reads is never "lost" by its bytes: LINEAGE decides whether its file may leave (sxc2_retire_old) */
             box_lost_kinds += (int)get32(heads[n] + SXC3_SECTION_HEAD + 4);
             continue;
         }
-        if (gear_wide_live && box_live && sxc3_tag_is(heads[n], gear_worn_tag) && get16(heads[n] + 6) == GEAR_WORN_VERSION && !gear_worn_fault(heads[n])) {
-            /* (the box, stage B5) a WORN section this build reads is never "lost" by its bytes either (it changes with every piece put on): LINEAGE decides, with the box's */
-            box_lost_kinds += (int)get16(heads[n] + SXC3_SECTION_HEAD);
+        if (gear_wide_live && sxc3_tag_is(heads[n], gear_worn_tag) && get16(heads[n] + 6) == GEAR_WORN_VERSION && !gear_worn_fault(heads[n])) {
+            /* (the box, stage B5) a WORN section this build reads is never "lost" by its bytes (it changes with every piece put on).
+               (Wide gear in the item list) Nor by lineage, which needs a box that acts: it is lost (the old file KEPT) unless every
+               number it names is held somewhere in the new file (its item list, its box, its list of worn pieces) */
+            const BYTE *new_item = sxc3_find_section(new_file, new_size, item_tag);
+            int e, entries = (int)get16(heads[n] + SXC3_SECTION_HEAD), gone = 0;
+
+            if (new_item && (!sxc3_item_readable(new_item) || sxc3_item_fault(new_item)))
+                new_item = NULL;
+            for (e = 0; e < entries; e++)
+                gone += !sxc3_file_holds_number(new_file, new_size, new_item, get16(heads[n] + SXC3_SECTION_HEAD + 4 + e * 8 + 2));
+            if (!gone)
+                continue;
+            if (!lost++)
+                lstrcpyA(tag, sxc3_tag_text(heads[n]));
             continue;
         }
         for (m = 0; m < new_count; m++)
@@ -28134,7 +31649,7 @@ static int sxc3_sections_lost(const BYTE *old, DWORD old_size, const BYTE *new_f
 
             if (new_item && (!sxc3_item_readable(new_item) || sxc3_item_fault(new_item)))
                 new_item = NULL;
-            if (!wide_list_unknown && !sxc3_item_rows_lost(heads[n], new_item))
+            if (!wide_list_unknown && !sxc3_item_rows_lost(heads[n], new_item, new_file, new_size))
                 continue;       /* (stage 2) every wide row's number is in the new file's list. (Fix pass, finding 5: not asked while this game was loaded without its list: the file is kept) */
         }
         if (!lost++)
@@ -28166,9 +31681,11 @@ static void sxc2_forget_loaded(void)
     box_forget();                   /* (the box) so did the box, its lineage and its mark */
     gear_worn_forget();             /* (the box, stage B5) and whoever wore a wide piece: no ledger, no lent slot, nothing kept */
     box_read = 0, box_refused_why = NULL, sxc2_near_box = 0;    /* (the box) */
+    sxc2_near_worn = 0, sxc2_load_own = 0;                      /* (wide gear in the item list) */
     wide_list_unknown = 0;
     sxc3_kept_size = 0;             /* (the format step) the loaded file's sections are forgotten with it */
-    sxc3_kept_count = sxc3_item_carried = 0;
+    sxc3_kept_count = sxc3_item_carried = sxc3_list_whole = 0;
+    fields_fldx_forget();           /* (field capacity, stage 2) the loaded save's FLDX section went with it */
     sxc2_kept_said = sxc2_kept_no_room = 0;
     sxc2_refused_argument = 0;
     sxc2_displaced = 0;
@@ -28282,8 +31799,8 @@ static DWORD sxc2_build(BYTE *data, const BYTE *slot, int *carried)
     data[0] = 'S', data[1] = 'X', data[2] = 'C', data[3] = '2';
     put16(data + 4, header);
     put16(data + 6, get16(data + 6) & ~SXC2_KNOWN_FLAGS);       /* this build sets none of its own */
-    if ((box_acts() && box_kinds) || gear_worn_writes())
-        box_mark = 1;               /* (the box, A1) the first box written marks the save for good (stage B5: so does the first WORN section) */
+    if (box_acts() && box_kinds)
+        box_mark = 1;               /* (the box, A1) the first box written marks the save for good (wide gear in the item list: a WORN section no longer does: it is read whatever the box) */
     if (box_live && box_mark)
         put16(data + 6, get16(data + 6) | SXC2_FLAG_HAS_BOX);   /* (the box, C2) in every state of a box at work; with the box off the loaded header's own bit goes on above */
     if (box_live && box_mark)
@@ -28499,16 +32016,16 @@ static void sxc2_index_append(DWORD key, const BYTE *slot, int file_number, int 
         place[i] = slot[SLOT_PREVIEW_PLACE + i] < 0x5f ? (char)(slot[SLOT_PREVIEW_PLACE + i] + 0x20) : '?';
     place[i] = 0;
     GetLocalTime(&now);
-    if ((outcome[0] == 'w' || outcome[0] == 's') && sxc3_built_item == 1 && sxc3_built_version == SXC3_ITEM_VERSION_LIST)
+    if ((outcome[0] == 'w' || outcome[0] == 's') && sxc3_built_item == 1 && sxc3_built_version >= SXC3_ITEM_VERSION_LIST)
         /* (stage 3) the file just written holds a version-2 item list: how many of its rows the save's own words do not hold
            (what a load of this save without the file would lack). No other line changes */
-        n = wsprintfA(line, "key=%08lx time=%lu gil=%lu file=%02d slot=%02d chars=%d bytes=%lu sxc2=%s beyond=%d%s date=%04d-%02d-%02d %02d:%02d:%02d place=%s\r\n",
+        n = wsprintfA(line, "key=%08lx time=%lu gil=%lu file=%02d slot=%02d chars=%d bytes=%lu sxc2=%s beyond=%d%s%s date=%04d-%02d-%02d %02d:%02d:%02d place=%s\r\n",
                       key, get32(slot + SLOT_PLAY_TIME), get32(slot + SLOT_GIL), file_number, slot_number + 1, count, size, outcome, sxc3_built_held, box_index_field(outcome),
-                      now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute, now.wSecond, place);
+                      gear_index_field(outcome), now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute, now.wSecond, place);
     else
-    n = wsprintfA(line, "key=%08lx time=%lu gil=%lu file=%02d slot=%02d chars=%d bytes=%lu sxc2=%s%s date=%04d-%02d-%02d %02d:%02d:%02d place=%s\r\n",
+    n = wsprintfA(line, "key=%08lx time=%lu gil=%lu file=%02d slot=%02d chars=%d bytes=%lu sxc2=%s%s%s date=%04d-%02d-%02d %02d:%02d:%02d place=%s\r\n",
                   key, get32(slot + SLOT_PLAY_TIME), get32(slot + SLOT_GIL), file_number, slot_number + 1, count, size, outcome, box_index_field(outcome),      /* (the box) "" unless the box acts or a box section is carried */
-                  now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute, now.wSecond, place);
+                  gear_index_field(outcome), now.wYear, now.wMonth, now.wDay, now.wHour, now.wMinute, now.wSecond, place);      /* (wide gear in the item list) " worn=N" */
     for (where = 0; where < SXC2_PLACES; where++) {
         sxc2_place_path(path, where);
         lstrcatA(path, "\\" SXC2_INDEX_NAME);
@@ -28561,6 +32078,7 @@ static int sxc2_index_report(DWORD key)
     BOOL more;
 
     sxc2_index_beyond = -1;
+    sxc2_index_worn = -1;
     sxc2_index_none = 0;
     wsprintfA(want, "key=%08lx ", key);         /* 13 characters, at the start of a line */
     for (j = 0; j < 20; j++)
@@ -28624,6 +32142,16 @@ static int sxc2_index_report(DWORD key)
                             for (value = 0, b += 8; line[b] >= '0' && line[b] <= '9' && value < 1000; b++)
                                 value = value * 10 + (line[b] - '0');
                     sxc2_index_beyond = value;
+                }
+                {
+                    /* (wide gear in the item list) the note " worn=N" of a written line: the wide pieces its WORN section held */
+                    int b, value = -1;
+
+                    for (b = 12; what == 1 && line[b] && value < 0; b++)
+                        if (line[b] == ' ' && line[b + 1] == 'w' && line[b + 2] == 'o' && line[b + 3] == 'r' && line[b + 4] == 'n' && line[b + 5] == '=')
+                            for (value = 0, b += 6; line[b] >= '0' && line[b] <= '9' && value < 1000; b++)
+                                value = value * 10 + (line[b] - '0');
+                    sxc2_index_worn = value;
                 }
                 for (k = 0; k < 19 && line[j + k]; k++)
                     newest[k] = line[j + k];
@@ -28720,6 +32248,7 @@ static int sxc2_fallback_search(const BYTE *slot, BYTE *out, DWORD *out_size, ch
     sxc2_near_name[0] = 0;
     sxc2_near_wide = 0;
     sxc2_near_box = 0;      /* (the box) */
+    sxc2_near_worn = 0;     /* (wide gear in the item list) */
     *out_size = 0;
     sxc3_fallback_refused = NULL;
     for (place = 0; place < SXC2_PLACES; place++)
@@ -28768,16 +32297,17 @@ static int sxc2_fallback_search(const BYTE *slot, BYTE *out, DWORD *out_size, ch
                                 const BYTE *box_head = sxc3_find_section(sxc2_back, got, (const BYTE *)box_tag);
 
                                 sxc2_near_box = box_head && get16(box_head + 6) == BOX_VERSION && !box_section_fault(box_head) ? (int)get32(box_head + SXC3_SECTION_HEAD + 4) : 0;
+                                sxc2_near_worn = 0;     /* (fix round, ledger 4) the nearer file's own count, not a farther one's */
                                 if (gear_wide_live) {
                                     /* (fix pass of B5, finding 2) and its worn wide pieces */
                                     const BYTE *worn_head = sxc3_find_section(sxc2_back, got, (const BYTE *)gear_worn_tag);
 
                                     if (worn_head && get16(worn_head + 6) == GEAR_WORN_VERSION && !gear_worn_fault(worn_head))
-                                        sxc2_near_box += (int)get16(worn_head + SXC3_SECTION_HEAD);
+                                        sxc2_near_worn = (int)get16(worn_head + SXC3_SECTION_HEAD);     /* (wide gear in the item list) apart from the box: worn pieces no longer keep a box awake */
                                 }
                             }
                             sxc2_near_wide = 0;
-                            if (head && (get16(head + 6) == SXC3_ITEM_VERSION || get16(head + 6) == SXC3_ITEM_VERSION_LIST) && !sxc3_item_fault(head))
+                            if (head && (get16(head + 6) == SXC3_ITEM_VERSION || get16(head + 6) == SXC3_ITEM_VERSION_LIST || get16(head + 6) == SXC3_ITEM_VERSION_LONG) && !sxc3_item_fault(head))
                                 sxc2_near_wide = sxc3_item_beyond(head, NULL, NULL);     /* (stage 3: by the list's own version) */
                         }
                     }
@@ -29465,6 +32995,7 @@ static void box_load_decided(int how, const BYTE *file)
     int tests, named = 0, kinds = -1, first = -1, missing;
     const char *where;
 
+    sxc2_load_own = (how == 1 || how == 2) && file && get32(file + 12) == slot_time;     /* (wide gear in the item list, M4) THIS SAVE'S OWN companion decided the load: its WORN entries are put on, whatever the box */
     box_loaded_file = -1;
     box_warn = 0;
     if (!box_live) {
@@ -29567,20 +33098,24 @@ static void box_load_decided(int how, const BYTE *file)
                  tests & 1 ? "[1] the companion's header carries the box's mark" : "", tests & 2 ? " [2] the index knows this key with a box" : "",
                  tests & 4 ? " [3] the last box of this save file's slot was under another key" : "", box_why);
         if (kinds > 0)
-            log_line("box: the index says that box held %d kinds%s", kinds, gear_wide_live ? " and worn wide pieces" : "");       /* (fix pass of B5, finding 2) */
+            log_line("box: the index says that box held %d kinds%s", kinds, gear_wide_live ? " (a line written before wide gear lived in the item list counted the worn wide pieces in it too)" : "");       /* (fix pass of B5, finding 2) */
         return;
     }
     box_state = BOX_KNOWN;
     if (!(how == 4 && sxc2_near_name[0] && sxc2_near_box > 0 && !sxc2_index_none) && box_settle_auto())      /* (box = auto) this save never had a box: it sleeps (fix pass, finding 6: not when the nearest companion holds a box: awake, with the red row) */
-        log_line("box: DORMANT (box = auto; this save never had a box: no box section, no mark in its companion, nothing in the index for its key or its slot): no Box row, and everything goes as with box = off, until something arrives that the item list has no row for, or a piece of wide gear: then the box WAKES for this save");
+        log_line("box: DORMANT (box = auto; this save never had a box: no box section, no mark in its companion, nothing in the index for its key or its slot): no Box row, and everything goes as with box = off, until something arrives that the item list has no row for: then the box WAKES for this save");
     else
     log_line("box: KNOWN, empty (this save never had a box: no box section, no mark in its companion, nothing in the index for its key or its slot)");
     if (how == 4 && sxc2_near_name[0] && sxc2_near_box > 0 && !sxc2_index_none) {      /* (C0: the index says this save needed no companion: nothing nearer is its) */
         /* (the fourth test, C3) a warning, never a lock */
         box_warn = 1;
         log_line("box: NOTE: no companion file decided this load, and the nearest companion at or before this save's play time, %s, holds a box of %d kinds%s. If this save continues that one (saved without this DLL), give it that file (a copy named %08lx.sxc: sxc2.py --relink) and load again BEFORE putting anything in the box. The box is not locked",
-                 sxc2_near_name, sxc2_near_box, gear_wide_live ? " and worn wide pieces" : "", key);      /* (fix pass of B5, finding 2) */
+                 sxc2_near_name, sxc2_near_box, sxc2_near_worn > 0 ? " and worn wide pieces" : "", key);      /* (fix pass of B5, finding 2) */
     }
+    if (how == 4 && sxc2_near_name[0] && sxc2_near_worn > 0 && sxc2_near_box <= 0 && !sxc2_index_none)
+        /* (wide gear in the item list) the nearest companion holds worn wide pieces and no box: a note, and no box is kept awake for it */
+        log_line("load: NOTE: no companion file decided this load, and the nearest companion at or before this save's play time, %s, holds %d worn or kept wide piece(s). If this save continues that one (saved without this DLL), give it that file (a copy named %08lx.sxc: sxc2.py --relink) and load again BEFORE saving: the characters wear the stand-ins meanwhile",
+                 sxc2_near_name, sxc2_near_worn, key);
 }
 
 /* Is a box at stake in a save that would get no companion file? A box that acts and holds
@@ -29884,7 +33419,7 @@ static void box_gate(void)
     log_line("box: %s (access %s, backup %d)%s%s", box_is_auto() ? "auto" : "on", box_wanted[BOX_KEY_ALWAYS] ? "always" : "save", box_wanted[BOX_KEY_BACKUP],
              box_wanted[BOX_KEY_BACKUP] ? ": a replaced companion that holds a box is MOVED to FF7_SpellExt_Saves\\box_backup (box_backup = 0 deletes it instead, as before the box)"
                                         : ": box_backup = 0: a replaced companion that holds a box is DELETED once everything is in order",
-             box_is_auto() ? ". THE BOX ON DEMAND: in a save that never had a box it SLEEPS (no Box row; everything as with box = off) until something arrives that the item list has no row for, or a piece of wide gear arrives: then it WAKES for that save, takes the thing, and the Box row appears (\"Box new\" until the Box screen is opened). Awake it takes only what the item list has no row for, and wide gear (no gear is routed to it on arrival). A save that has a box loads awake" : "");
+             box_is_auto() ? ". THE BOX ON DEMAND: in a save that never had a box it SLEEPS (no Box row; everything as with box = off) until something arrives that the item list has no row for (wide gear included: it lives in the item list too): then it WAKES for that save, takes the thing, and the Box row appears (\"Box new\" until the Box screen is opened). Awake it takes only what the item list has no row for (no gear is routed to it on arrival). A save that has a box loads awake" : "");
 }
 /* ==== THE BOX (stage B1), the companion's side, the files: end ==== */
 
@@ -30036,6 +33571,11 @@ static void sxc2_load_decide(void)
         if (!sxc2_load_source && (known == 1 || known == 2 || there || outcome < 0 || sxc2_slot_names_seats(slot)))
             sxc2_say_nearest();
         if (!sxc2_load_source && (known == 1 || known == 2 || there || outcome < 0)) {
+            if (sxc2_index_worn > 0)
+                /* (wide gear in the item list, M3) the companion of this key held worn or kept wide pieces: read only here, where no companion
+                   decided the load (never by the box's MISSING test) */
+                log_line("load: *** wide gear: this load has NO companion file (see above), and the index says the companion of this save held %d wide piece(s), worn or kept, in its list of worn pieces: the characters wear the STAND-INS in this game and those pieces are in %08lx.sxc alone. Nothing is written by a load: put %08lx.sxc back in FF7_SpellExt_Saves (or give the save that file: tools\\sxc2.py --relink) and load again BEFORE saving over this slot ***",
+                         sxc2_index_worn, sxc2_loaded_key, sxc2_loaded_key);
             if (sxc2_index_beyond > 0)
                 /* (stage 3) the companion of this key held the whole list of 510 rows: how many rows the save's own words lack */
                 log_line("load: *** item list: this load has NO item list from a companion file (see above), and the index says the companion of this save held %d row(s) of the item list that the save's own 320 words do NOT hold (rows a list of 510 had no room for in the save, and wide items): those %d row(s) are NOT in the bag in this game. The bag is the save's 320 words: every game kind is there. Nothing is written by a load: put %08lx.sxc back and load again BEFORE saving over this slot ***",
@@ -30171,7 +33711,7 @@ static struct {
     HANDLE log;
     int passed, failed, skipped;
     WORD count[BOX_NUMBERS];
-    DWORD list[WIDE_ROWS];
+    DWORD list[WIDE_ROWS_MAX];
     int kinds, state, mark, loaded_have, written_count, carried_kinds, keep, warn;
     DWORD pieces, loaded_key, written[BOX_KEYS_WRITTEN];
     int named_have, read, near_box;         /* (fix pass of B1, finding 5) */
@@ -30232,7 +33772,7 @@ static DWORD box_st_sum(void)
 
 static DWORD box_st_list_sum(void)
 {
-    return crc32_of((const BYTE *)wide_list, WIDE_ROWS * 4, 0);
+    return crc32_of((const BYTE *)wide_list, (DWORD)wide_bound * 4, 0);      /* (stage 4: the run's rows; 510 with 510 rows, as before) */
 }
 
 /* A box of `kinds` kinds made up in memory: numbers first, first + step, ... each with a count. */
@@ -30275,6 +33815,43 @@ static void box_st_delete(DWORD key, int where)     /* 0, 1 the two places (the 
     DeleteFileA(path);
 }
 
+/* (Stage 4b) The self-test's FULL item lists with more rows than numbers 0-511 can fill: once those numbers are used up, the
+   next empty rows take WIDE ITEMS that the items file defines and this run can hold (wide items admitted: rows the guard keeps),
+   each once and not one the list holds, a row of 1 each, from 1024 up. Before, such a list could not be made up and its checks
+   were SKIPPED; they still are when too few wide items are defined. box_st_wide_reset before each list that is filled. */
+static BYTE box_st_wide_held[(WIDE_ITEM_BAND + 7) / 8];
+static int box_st_wide_next;            /* the next number to try; 0: the list's own wide rows not looked at yet */
+static void box_st_wide_reset(void)
+{
+    box_st_wide_next = 0;
+}
+
+static int box_st_wide_filler(void)
+{
+    int k;
+
+    if (!wide_items_ready())
+        return -1;
+    if (!box_st_wide_next) {
+        for (k = 0; k < (int)sizeof box_st_wide_held; k++)
+            box_st_wide_held[k] = 0;
+        for (k = 0; k < wide_bound; k++) {
+            int bit = (int)(wide_list[k] & 0xffffu) - WIDE_ITEM_FIRST;
+
+            if (wide_list[k] != WIDE_EMPTY && bit >= 0 && bit < WIDE_ITEM_BAND)
+                box_st_wide_held[bit >> 3] |= (BYTE)(1 << (bit & 7));
+        }
+        box_st_wide_next = WIDE_ITEM_FIRST;
+    }
+    for (; box_st_wide_next <= WIDE_ITEM_LAST; box_st_wide_next++) {
+        int bit = box_st_wide_next - WIDE_ITEM_FIRST;
+
+        if (!(box_st_wide_held[bit >> 3] & (1 << (bit & 7))) && wide_item_usable(box_st_wide_next))
+            return box_st_wide_next++;
+    }
+    return -1;
+}
+
 /* (box = auto, the self-test) The item list made FULL from the list as it is: every empty row
    gets one of a number of 0-511 the list does not hold yet (first `held_item`, if the list does not
    hold it; never one of `keep_out`). Returns how many rows stayed empty (0: the list is full). As
@@ -30292,6 +33869,7 @@ static int box_st_full_list(int held_item, const int *keep_out, int keep_outs)
     for (k = 0; k < keep_outs; k++)
         if (keep_out[k] >= 0 && keep_out[k] <= (int)WIDE_NARROW_MAX && keep_out[k] != held_item)
             held[keep_out[k]] = 2;
+    box_st_wide_reset();
     for (k = 0; k < wide_bound; k++) {
         if (wide_list[k] != WIDE_EMPTY)
             continue;
@@ -30303,7 +33881,12 @@ static int box_st_full_list(int held_item, const int *keep_out, int keep_outs)
         while (filler <= (int)WIDE_NARROW_MAX && held[filler])
             filler++;
         if (filler > (int)WIDE_NARROW_MAX) {
-            empties++;
+            int wide = box_st_wide_filler();        /* (stage 4b) a list longer than numbers 0-511 can fill */
+
+            if (wide < 0)
+                empties++;
+            else
+                wide_list[k] = (DWORD)wide | 1u << 16;
             continue;
         }
         wide_list[k] = (DWORD)filler++ | 1u << 16;
@@ -30505,7 +34088,7 @@ static void box_selftest_run(void)
             number = (int)(box_st.list[k] & 0xffffu);
             for (row = 0; row < wide_bound && (row == k || box_st.list[row] == WIDE_EMPTY || (int)(box_st.list[row] & 0xffffu) != number); row++)
                 ;
-            if (row < wide_bound || (sxc3_item_carried && (number > (int)WIDE_NARROW_MAX || wide_bound == WIDE_ROWS || !wide_game_kind((DWORD)number)))) {
+            if (row < wide_bound || (sxc3_item_carried && (number > (int)WIDE_NARROW_MAX || wide_bound > WIDE_GAME_ROWS || !wide_game_kind((DWORD)number)))) {
                 /* (fix pass of B2, finding 3) a number held in a second row (a row put in whole could not all come back: the list's room is
                    the other row's), or one a Take out refuses in this run (finding 1): not tried, and never the script checks' consumable */
                 untried += row > k;         /* (a kind once: at its first row) */
@@ -30620,7 +34203,7 @@ static void box_selftest_run(void)
     /* ---- (stage B3) where a thing goes when it ARRIVES, on the item list as loaded and an EMPTY box that acts. The DLL calls its
        own arrival routine as each kind of arrival would; no remove routine is called at all; everything is put back below ---- */
     {
-        static BYTE copy6[WIDE_ROWS * 6];
+        static BYTE copy6[WIDE_ROWS_MAX * 6];
         static BYTE in_list[WIDE_NARROW_MAX + 1];
         static const DWORD callers[5] = { BOX_RETURN_STITM, BOX_RETURN_FLITM, BOX_RETURN_SHOP_BUY, 0x00401234u, 0 };
         long arrived_was[3] = { box_arrived_box, box_arrived_full, box_arrived_surplus }, fed_was = wide_fed_calls;
@@ -30717,6 +34300,7 @@ static void box_selftest_run(void)
             }
             /* 17. a FULL item list: a consumable the list does not hold goes to the box; the spoils' pick follows the game's order */
             B3_PUT_BACK();
+            box_st_wide_reset();
             for (filler = 0, empties = 0, k = 0; k < wide_bound; k++) {
                 if (wide_list[k] != WIDE_EMPTY)
                     continue;
@@ -30728,7 +34312,12 @@ static void box_selftest_run(void)
                 while (filler <= (int)WIDE_NARROW_MAX && (in_list[filler] || filler == absent[0] || filler == absent[1]))
                     filler++;
                 if (filler > (int)WIDE_NARROW_MAX) {
-                    empties++;
+                    int wide = box_st_wide_filler();    /* (stage 4b) a list longer than numbers 0-511 can fill */
+
+                    if (wide < 0)
+                        empties++;
+                    else
+                        wide_list[k] = (DWORD)wide | 1u << 16;
                     continue;
                 }
                 wide_list[k] = (DWORD)filler++ | 1u << 16;      /* (a number once: a list as the DLL's own add could make it) */
@@ -30922,7 +34511,7 @@ static void box_selftest_run(void)
                 /* 41. the mark: which state a load leaves, and the companion's header */
                 B3_PUT_BACK();
                 box_unseen = 0;
-                bad = box_settle_auto() == worn7 || box_state != (worn7 ? BOX_KNOWN : BOX_DORMANT);         /* KNOWN, no mark, empty: it sleeps (not with wide pieces worn) */
+                bad = !box_settle_auto() || box_state != BOX_DORMANT;         /* KNOWN, no mark, empty: it sleeps (wide gear in the item list: with wide pieces worn too) */
                 box_state = BOX_KNOWN, box_mark = 1;
                 bad += box_settle_auto() || box_state != BOX_KNOWN;                                        /* marked: awake */
                 box_mark = 0;
@@ -30934,7 +34523,7 @@ static void box_selftest_run(void)
                 box_rules_override = 1;
                 box_state = BOX_DORMANT, box_mark = 0, box_unseen = 0;
                 size7 = sxc2_build(sxc2_data, sxc2_loaded_slot, &k7);
-                bad += !size7 || (!worn7 && ((get16(sxc2_data + 6) & 3) != (kept7 & 3) || box_mark));       /* asleep: the loaded header's own bits, nothing of this build's */
+                bad += !size7 || (get16(sxc2_data + 6) & 3) != (kept7 & 3) || box_mark;       /* asleep: the loaded header's own bits, nothing of this build's (wide gear in the item list: a WORN section marks nothing) */
                 box_state = BOX_KNOWN, box_mark = 1, box_unseen = 1;
                 size7 = sxc2_build(sxc2_data, sxc2_loaded_slot, &k7);
                 bad += !size7 || (get16(sxc2_data + 6) & 3) != 3;                                              /* woke, not seen: HAS_BOX and BOX_NEW */
@@ -30942,7 +34531,7 @@ static void box_selftest_run(void)
                 bad += box_unseen || !box_seen_now;
                 size7 = sxc2_build(sxc2_data, sxc2_loaded_slot, &k7);
                 bad += !size7 || (get16(sxc2_data + 6) & 3) != 1;                                              /* seen: HAS_BOX alone */
-                box_st_check(!bad, "box = auto, the mark: a load of a save with no mark and an empty box leaves the box DORMANT; marked, holding something, or box = on: KNOWN; asleep the companion's header is the loaded one's; woke: HAS_BOX and BOX_NEW; once the Box screen is opened: HAS_BOX alone");
+                box_st_check(!bad, "box = auto, the mark: a load of a save with no mark and an empty box leaves the box DORMANT (wide pieces worn or not); marked, holding something, or box = on: KNOWN; asleep the companion's header is the loaded one's; woke: HAS_BOX and BOX_NEW; once the Box screen is opened: HAS_BOX alone");
                 B3_PUT_BACK();
                 box_rules_override = 0;
                 box_unseen = st_unseen_was, box_seen_now = st_seen_now_was, box_woke = st_woke_was;
@@ -31049,10 +34638,12 @@ static void box_selftest_run(void)
         for (kind = 0; kind < 3; kind++) {
             character = ((const BYTE *)ADDR_PARTY)[*(const int *)ADDR_EQUIP_MENU_SLOT];
             n = box_equip_build(kind, character, cand, BOX_EQUIP_ROOM, &listed, &boxed, &cut);
-            bad += !box_equip_list(kind) || *(const int *)ADDR_EQUIP_LIST_COUNT != n;
+            bad += !box_equip_list(kind) || *(const int *)ADDR_EQUIP_LIST_COUNT < n;
             for (k = 0; k < n; k++)
                 bad += ((const BYTE *)ADDR_EQUIP_LIST)[k] != cand[k];
-            for (k = n; k < BOX_EQUIP_PAD; k++)
+            for (k = n; k < *(const int *)ADDR_EQUIP_LIST_COUNT; k++)       /* (wide gear in the item list) the item list's wide pieces after them: a lent slot, or ff (the window) */
+                bad += !gear_wide_live || (!gear_slot_lendable(kind, ((const BYTE *)ADDR_EQUIP_LIST)[k]) && ((const BYTE *)ADDR_EQUIP_LIST)[k] != 0xff);
+            for (k = *(const int *)ADDR_EQUIP_LIST_COUNT; k < BOX_EQUIP_PAD; k++)
                 bad += ((const BYTE *)ADDR_EQUIP_LIST)[k] != 0xff;
         }
         box_state = BOX_MISSING;
@@ -31196,7 +34787,8 @@ static void box_selftest_run(void)
         counters_was[0] = gear_lends, counters_was[1] = gear_releases, counters_was[2] = gear_worn_boxed, counters_was[3] = gear_worn_swept;
         moved_was[0] = box_equip_returned[0], moved_was[1] = box_equip_returned[1], moved_was[2] = box_equip_taken[0], moved_was[3] = box_equip_taken[1];
         said5_was[0] = gear_worn_said, said5_was[1] = box_equip_said, said5_was[2] = box_equip_odd_said, said5_was[3] = box_equip_cut_said;
-#define B5_CLEAN() do { int h_, k_, s_; gear_kept_count = 0; gear_worn_refused_why = NULL; gear_standins_on = gear_standin_count = 0; \
+#define B5_CLEAN() do { int h_, k_, s_; gear_kept_count = 0; gear_kept_said_count = 0; gear_worn_refused_why = NULL; gear_standins_on = gear_standin_count = 0; \
+        copy_bytes((BYTE *)wide_list, (const BYTE *)box_st.list, sizeof box_st.list); wide_wrote("the box's self-test (wide gear)", 0); wide_paint(); \
         for (h_ = 0; h_ < GEAR_HOLDERS; h_++) gear_worn[h_][0] = gear_worn[h_][1] = gear_worn[h_][2] = 0; \
         for (k_ = 0; k_ < 3; k_++) { gear_off_pending[k_] = 0; for (s_ = GEAR_LENT_FIRST(k_); s_ < GEAR_LENT_FIRST(k_) + GEAR_LENT_COUNT(k_); s_++) gear_slot_release(k_, s_); } \
         box_empty(); box_state = BOX_KNOWN; box_mark = 0; copy_bytes(record_copy, (const BYTE *)ADDR_SAVE_RECORDS, SAVE_RECORD_SIZE); \
@@ -31220,9 +34812,11 @@ static void box_selftest_run(void)
                   gear_text_sites_in());
         box_st_check(!bad5, say5);
 
-        /* 42. (box = auto) a piece of WIDE gear wakes the sleeping box, whatever room the item list has: it goes into the box */
+        /* 42. (box = auto; wide gear in the item list) a piece of WIDE gear arriving with room goes to the ITEM LIST and the sleeping box
+           stays asleep, by an arrival and by a testing aid; with NO ROW (a full list) it wakes the box and goes into it (overflow) */
         {
-            int w42 = -1;
+            int w42 = -1, have42 = 0, full42 = 0;
+            DWORD r42;
 
             for (k = 0; k < 3 && w42 < 0; k++)
                 if (wide_gear(number5[k]))
@@ -31230,16 +34824,32 @@ static void box_selftest_run(void)
             box_rules_override = 1;
             B5_CLEAN();
             box_state = BOX_DORMANT, box_unseen = 0;
-            bad5 = w42 < 0 || box_arrive((DWORD)w42, 1, 0, "add (the box's self-test, a wide piece)", BOX_FROM_DLL) != 1 || box_state != BOX_KNOWN || !box_mark || !box_unseen || box_held(w42) != 1;
-            B5_CLEAN();
-            box_state = BOX_DORMANT, box_unseen = 0;
-            bad5 += w42 < 0 || !box_aid_give(w42, 1, TRUE, "the box's self-test (a wide piece, as a testing aid)") || box_state != BOX_KNOWN || box_held(w42) != 1;
+            if (w42 < 0 || list_room(w42) < 2) {
+                box_st.skipped++;
+                box_st_line("SKIP  box = auto, a wide piece arriving: no gear file defines a wide piece, or the item list has no room for one (a row of 98, or a free row)");
+            } else {
+                r42 = wide_find((DWORD)w42, 0, "find (the box's self-test)");
+                have42 = r42 == WIDE_EMPTY ? 0 : (int)(r42 >> 16);
+                bad5 = box_arrive((DWORD)w42, 1, 0, "add (the box's self-test, a wide piece)", BOX_FROM_DLL) != 0 || box_state != BOX_DORMANT || box_mark || box_unseen || box_held(w42);
+                r42 = wide_find((DWORD)w42, 0, "find (the box's self-test)");
+                bad5 += r42 == WIDE_EMPTY || (int)(r42 >> 16) != have42 + 1;
+                B5_CLEAN();
+                box_state = BOX_DORMANT, box_unseen = 0;
+                bad5 += box_aid_give(w42, 1, TRUE, "the box's self-test (a wide piece, as a testing aid)") || box_state != BOX_DORMANT || box_held(w42);
+                B5_CLEAN();
+                box_state = BOX_DORMANT, box_unseen = 0;
+                if (!have42 && !sxc3_item_carried && !box_st_full_list(-1, NULL, 0)) {
+                    full42 = 1;
+                    bad5 += box_arrive((DWORD)w42, 1, 0, "add (the box's self-test, a wide piece, a full list)", BOX_FROM_DLL) != 1 || box_state != BOX_KNOWN || !box_mark || !box_unseen || box_held(w42) != 1;
+                }
+                wsprintfA(say5, "box = auto, wide gear in the item list: a piece of WIDE gear (%d) arriving with room goes to the ITEM LIST and the sleeping box stays asleep, by an arrival and by a testing aid%s",
+                          w42, full42 ? "; with a full item list it WAKES the box and goes into it" : " (the full list's wake: not tried, the list holds the piece or cannot be filled here)");
+                box_st_check(!bad5, say5);
+            }
             B5_CLEAN();
             box_rules_override = 0;
             box_unseen = st_unseen_was, box_seen_now = st_seen_now_was, box_woke = st_woke_was;
             lstrcpyA(box_woke_text, st_woke_text_was);
-            wsprintfA(say5, "box = auto: a piece of WIDE gear (%d) wakes the sleeping box, by an arrival and by a testing aid, though the item list has room: it goes into the box", w42);
-            box_st_check(!bad5, say5);
         }
 
         /* 26. the byte as a number, nothing lent: every byte of every kind is the game's or the mod's piece of that index, or none */
@@ -31312,7 +34922,9 @@ static void box_selftest_run(void)
         }
         {
             const BYTE *heads5[1];
+            int own_was5 = sxc2_load_own;
 
+            sxc2_load_own = 1;          /* (wide gear in the item list) the section read back is this save's own */
             heads5[0] = section5;
             gear_worn_prescan(heads5, 1);
             bad5 += gear_worn_refused_why != NULL || !gear_worn_section_met(section5) || gear_kept_count != 3;
@@ -31342,11 +34954,14 @@ static void box_selftest_run(void)
                 bad5 += gear_worn_fault(hostile) == NULL || gear_worn_refused_why == NULL;
             }
             gear_worn_refused_why = NULL;
+            sxc2_load_own = own_was5;
         }
         box_st_check(!bad5, "wide gear, a load: the WORN section just written, read back onto the copy holding the stand-ins: the three pieces are lent slots and worn again, nothing is kept or boxed; six damaged sections (a kind, a number, a record, a piece twice, a length, a spare byte) are each REFUSED");
 
-        /* 30. the ledger against the record (A15): a byte changed behind the DLL's back sends the piece to the box; one the game's own call returned goes quietly; a byte nothing explains is set to its stand-in */
+        /* 30. the ledger against the record (A15): a byte changed behind the DLL's back sends the piece to the box; one the game's own call returned goes quietly; a byte nothing explains is set to its stand-in
+           (wide gear in the item list: checks 30 and 31 go by box = on's rules, where wide gear goes to the box; 43 and 44 by auto's) */
         bad5 = 0;
+        box_rules_override = 0;
         record_copy[SAVE_RECORD_WEAPON] = 5;
         gear_worn_check("the self-test");
         bad5 += gear_worn[0][0] != 0 || box_held(number5[0]) != 1 || gear_slot_of(0, number5[0]) >= 0;
@@ -31386,9 +35001,97 @@ static void box_selftest_run(void)
         *(int *)ADDR_EQUIP_KIND = kind_was;
         gear_worn_check("the self-test");
         bad5 += gear_slot_of(0, number5[0]) >= 0 || gear_worn[0][0] != other || record_copy[SAVE_RECORD_WEAPON] != other_slot;
-        wsprintfA(say5, "wide gear, the Equip menu's swap by lent slots: wide weapon %d comes off into the box and wide weapon %d leaves it for the record, by the two routines the game's calls go to (decoded by the call, not by 9 bits); one piece worn and one boxed before and after; a byte of the game's own gear is left to the routines of before; the shop's Equipped count goes by the number (a lent slot is nothing else's)",
+        wsprintfA(say5, "wide gear, the Equip menu's swap by lent slots (box = on's rules): wide weapon %d comes off into the box and wide weapon %d leaves it for the record, by the two routines the game's calls go to (decoded by the call, not by 9 bits); one piece worn and one boxed before and after; a byte of the game's own gear is left to the routines of before; the shop's Equipped count goes by the number (a lent slot is nothing else's)",
                   number5[0], other);
         box_st_check(!bad5, say5);
+        box_rules_override = -1;
+
+        /* 43. (wide gear in the item list, box = auto, the box asleep) a defined wide piece taken off goes to the ITEM LIST (the box stays
+           asleep); chosen again, the Equip menu takes it from the ITEM LIST; worn + item list is the same throughout */
+        {
+            int w43 = -1, k43 = -1, s43, have43, after43;
+            DWORD r43;
+            static const DWORD back43[3] = { BOX_RETURN_EQUIP_WEAPON, BOX_RETURN_EQUIP_ARMOUR, BOX_RETURN_EQUIP_ACCESSORY };
+
+            for (k = 0; k < 3 && w43 < 0; k++)
+                if (wide_gear(number5[k]))
+                    w43 = number5[k], k43 = k;
+            box_rules_override = 1;
+            B5_CLEAN();
+            box_state = BOX_DORMANT, box_unseen = 0;
+            if (w43 < 0 || list_room(w43) < 1) {
+                box_st.skipped++;
+                box_st_line("SKIP  wide gear in the item list, a piece taken off and put on again: no gear file defines a wide piece, or the item list has no room for one");
+            } else {
+                r43 = wide_find((DWORD)w43, 0, "find (the box's self-test)");
+                have43 = r43 == WIDE_EMPTY ? 0 : (int)(r43 >> 16);
+                s43 = gear_slot_lend(k43, w43);
+                record_copy[SAVE_RECORD_WEAPON + k43] = (BYTE)s43;
+                gear_worn[0][k43] = (WORD)w43;
+                *(int *)ADDR_EQUIP_KIND = k43;
+                record_copy[SAVE_RECORD_WEAPON + k43] = 0;                      /* the game writes the new byte first (a piece of the game's own) ... */
+                bad5 = s43 < 0 || !gear_wide_came_off((DWORD)(s43 + gear_base[k43]) | 0x200, back43[k43], BOX_FROM_GAME);       /* ... and returns the old piece */
+                r43 = wide_find((DWORD)w43, 0, "find (the box's self-test)");
+                after43 = r43 == WIDE_EMPTY ? 0 : (int)(r43 >> 16);
+                bad5 += after43 != have43 + 1 || box_held(w43) || box_state != BOX_DORMANT || gear_worn[0][k43] || gear_kept_count;
+                record_copy[SAVE_RECORD_WEAPON + k43] = (BYTE)s43;              /* chosen again from the list: the byte, then the take */
+                bad5 += !gear_wide_taken((DWORD)(s43 + gear_base[k43]) | 0x200, BOX_RETURN_EQUIP_TAKE, &answer5);
+                r43 = wide_find((DWORD)w43, 0, "find (the box's self-test)");
+                bad5 += (r43 == WIDE_EMPTY ? 0 : (int)(r43 >> 16)) != have43 || gear_worn[0][k43] != w43 || box_held(w43) || box_state != BOX_DORMANT || gear_kept_count;
+                *(int *)ADDR_EQUIP_KIND = kind_was;
+                wsprintfA(say5, "wide gear in the item list (box = auto, asleep): wide %s %d taken off goes to the ITEM LIST (it held %d, then %d) and the box stays asleep; chosen again, it is taken from the ITEM LIST and worn; nothing is kept",
+                          gear_kind_text(k43), w43, have43, after43);
+                box_st_check(!bad5, say5);
+            }
+            /* 44. the swap with a FULL item list: the old piece is KEPT a moment, the chosen piece (a row of 1) leaves the list, and the old
+               piece goes into the row it freed: no wake. Needs two wide pieces of one kind that a file defines */
+            {
+                int a44 = -1, b44 = -1, k44 = -1, sa44, sb44, j;
+
+                for (k = 0; k < 3 && a44 < 0; k++)
+                    for (j = 0, a44 = b44 = -1; j < wide_gear_count && b44 < 0; j++)
+                        if (wide_gears[j].kind == k) {
+                            if (a44 < 0)
+                                a44 = wide_gears[j].number, k44 = k;
+                            else
+                                b44 = wide_gears[j].number;
+                        }
+                if (b44 < 0)
+                    a44 = -1;
+                B5_CLEAN();
+                box_state = BOX_DORMANT, box_unseen = 0;
+                for (j = 0; a44 >= 0 && j < wide_bound; j++)
+                    if (wide_list[j] != WIDE_EMPTY && ((int)(wide_list[j] & 0xffffu) == a44 || (int)(wide_list[j] & 0xffffu) == b44))
+                        wide_list[j] = WIDE_EMPTY;         /* (the loaded list's rows of the two: out for the check; B5_CLEAN puts the list back) */
+                if (a44 < 0 || sxc3_item_carried || box_st_full_list(-1, NULL, 0)) {
+                    box_st.skipped++;
+                    box_st_line("SKIP  wide gear in the item list, the swap with a full item list: two wide pieces of one kind that a gear file defines are needed, and an item list that can be filled here");
+                } else {
+                    for (j = wide_bound - 1; j >= 0 && (wide_list[j] & 0xffffu) > WIDE_NARROW_MAX; j--)
+                        ;
+                    wide_list[j] = (DWORD)b44 | 1u << 16;                       /* the chosen piece: a row of 1 in the full list */
+                    sa44 = gear_slot_lend(k44, a44);
+                    sb44 = gear_slot_lend(k44, b44);
+                    record_copy[SAVE_RECORD_WEAPON + k44] = (BYTE)sa44;
+                    gear_worn[0][k44] = (WORD)a44;
+                    *(int *)ADDR_EQUIP_KIND = k44;
+                    record_copy[SAVE_RECORD_WEAPON + k44] = (BYTE)sb44;          /* the byte of the chosen piece first ... */
+                    bad5 = sa44 < 0 || sb44 < 0 || !gear_wide_came_off((DWORD)(sa44 + gear_base[k44]) | 0x200, back43[k44], BOX_FROM_GAME);      /* ... the old piece: no row, the box asleep: KEPT ... */
+                    bad5 += gear_kept_number(a44) < 0 || box_state != BOX_DORMANT || box_held(a44);
+                    bad5 += !gear_wide_taken((DWORD)(sb44 + gear_base[k44]) | 0x200, BOX_RETURN_EQUIP_TAKE, &answer5);       /* ... the chosen piece leaves its row, and the KEPT one goes into it */
+                    bad5 += gear_kept_count || wide_find((DWORD)a44, 0, "find (the box's self-test)") == WIDE_EMPTY || wide_find((DWORD)b44, 0, "find (the box's self-test)") != WIDE_EMPTY ||
+                            gear_worn[0][k44] != b44 || box_state != BOX_DORMANT || box_kinds;
+                    *(int *)ADDR_EQUIP_KIND = kind_was;
+                    wsprintfA(say5, "wide gear in the item list (box = auto, asleep), the swap with a FULL item list: wide %s %d comes off and is KEPT a moment, wide %s %d (a row of 1) leaves the list for the record, and %d goes into the row it freed; no wake, nothing kept after",
+                              gear_kind_text(k44), a44, gear_kind_text(k44), b44, a44);
+                    box_st_check(!bad5, say5);
+                }
+            }
+            B5_CLEAN();
+            box_rules_override = -1;
+            box_unseen = st_unseen_was, box_seen_now = st_seen_now_was, box_woke = st_woke_was;
+            lstrcpyA(box_woke_text, st_woke_text_was);
+        }
 
         /* ---- stage B6: the window (tier 1). A made-up list as long as the game's list has room for, on the game's own list
            memory (put back), with a made-up piece worn on the COPY of record 0; scrolled end to end by the DLL's own routines ---- */
@@ -31806,15 +35509,18 @@ static struct {
 static BOOL save_work_on(void)
 {
     static int said;
-    BOOL wanted = new_characters_live || wide_live;
+    BOOL wanted = new_characters_live || wide_live || fields_save_wanted();     /* (field capacity, stage 2) the save guard keeps the real place in the companion file */
     BOOL on = wanted && save_prepare_live && load_slot_live && load_accepted_live && save_write_live;
 
     if (!on && new_characters_live && !said++)
-        log_line("save work: NOT fully on (hooks in: prepare %ld, load slot %ld, load accepted %ld, save write %ld): saves are made as stage 1 made them (the record in the save block, the old companion), nothing is cleaned and no companion file is ever removed; said once",
-                 save_prepare_live, load_slot_live, load_accepted_live, save_write_live);
+        log_line("save work: NOT fully on (hooks in: prepare %ld, load slot %ld, load accepted %ld, save write %ld): saves are made as stage 1 made them (the record in the save block, the old companion), nothing is cleaned and no companion file is ever removed%s; said once",
+                 save_prepare_live, load_slot_live, load_accepted_live, save_write_live,
+                 fields_save_wanted() ? "; the field capacity's save guard (fields_fallback) is off with it: a save in a registered field is made as it is" : "");
     else if (!on && wanted && !said++)
-        log_line("save work: NOT fully on (hooks in: prepare %ld, load slot %ld, load accepted %ld, save write %ld): no new character is defined, and without these hooks no save of this run can have a companion file: wide items are not admitted and the box does not work; said once",
-                 save_prepare_live, load_slot_live, load_accepted_live, save_write_live);
+        log_line("save work: NOT fully on (hooks in: prepare %ld, load slot %ld, load accepted %ld, save write %ld): no new character is defined, and without these hooks no save of this run can have a companion file:%s%s%s; said once",
+                 save_prepare_live, load_slot_live, load_accepted_live, save_write_live,
+                 wide_live ? " wide items are not admitted and the box does not work" : "", wide_live && fields_save_wanted() ? ";" : "",
+                 fields_save_wanted() ? " the field capacity's save guard (fields_fallback) cannot keep a registered field's real place: a save there is made as it is" : "");
     return on;
 }
 
@@ -32271,6 +35977,11 @@ static void sxc2_retire_old(int file_number, int slot, DWORD key, const BYTE *ne
         else if (by_fallback)
             log_line("save: old companion %08lx.sxc is KEPT: %s can find its characters only in this file, by the fallback search (%d slot(s) in all)", old_key,
                      who, by_fallback);
+        else if (sxc3_built_no_room)
+            /* (wide gear in the item list, fix round: ledger 2) rows carried unseen found no row in the new file's item list: the
+               number test of sxc3_item_rows_lost may find their numbers in the new file's box or WORN section, but those rows
+               are other pieces: the old file is what holds them */
+            log_line("save: old companion %08lx.sxc is KEPT: %d row(s) of its item list found no row in the new one", old_key, sxc3_built_no_room);
         else if (box_old > 0 && !box_may_leave(old_key))
             /* (the box, A5) removal by LINEAGE, never by tag */
             log_line("save: old companion %08lx.sxc is KEPT: it holds a box of %d kinds, and this game's box %s: only a box that this game was loaded from, or wrote itself, may leave its folder",
@@ -32443,6 +36154,16 @@ static void sxc2_after_save2(DWORD argument, unsigned result)
     }
 }
 
+/* (field capacity, stage 2) From save_write_hook, before the companion file is built: a save in a registered field
+   holds fields_fallback, and its companion the real place, when a companion can be written with room for it. */
+static void fields_save_guard_begin(void)
+{
+    if (!fields_save_place_registered())
+        return;
+    fields_save_begin(!save_work_on() ? "the save work is not on (see the save work lines above): no companion file can keep the real place"
+                      : !sxc3_room_for(FLDX_SECTION) ? "the companion file has no room for one more section (see the SXC3 lines above)" : NULL);
+}
+
 /* On the Save menu's call of the game's writer (006ffe46; FFNx's routine is there first and is
    called in the writer's place). With the save work on: step 0 before the writer (which may
    refuse the save: the game is then told the save failed, as after a file that cannot be opened),
@@ -32459,10 +36180,14 @@ static unsigned __cdecl save_write_hook(DWORD argument)
     sxc2_save.nothing = 0;          /* (C0) */
     wide_watch("a save (before the game's writer)", FALSE);     /* (the wide list, shadow) reads only */
     gear_worn_save_begin();         /* (the box, stage B5, A13) the ledger checked, then every byte of a lent slot becomes its stand-in, BEFORE the companion is built; nothing unless wide gear is at work */
+    fields_save_guard_begin();      /* (field capacity, stage 2) a save in a registered field: the fallback into the block, BEFORE the companion is built (it gets the real place) */
     if (save_work_on() && !sxc2_before_save(argument)) {
         gear_worn_save_end(-1);     /* (A13, F9) the refusal too puts every byte back */
+        fields_save_end(NULL);      /* (field capacity, stage 2) and the place */
         return 1;       /* refused: nothing was written anywhere */
     }
+    if (sxc2_save.mode != 2)
+        fields_save_end("no companion file is written before the game writes this save (see the save lines above)");     /* (field capacity, stage 2) the real place stays in the save */
     save_write_armed = 1;
     result = ((unsigned (__cdecl *)(DWORD))save_write_next)(argument);
     if (*(const BYTE *)ADDR_TIMER_HOLD) {
@@ -32479,6 +36204,7 @@ static unsigned __cdecl save_write_hook(DWORD argument)
     sxc2_save.mode = 0;
     sxc2_save.nothing = 0;          /* (C0) */
     gear_worn_save_end((int)(result & 0xffffu));     /* (the box, stage B5, A13) every byte of a lent slot is put back, whatever the writer answered; nothing unless the stand-ins are in */
+    fields_save_end(NULL);          /* (field capacity, stage 2) the real place back in the game's memory, whatever the writer answered */
     return result;
 }
 
@@ -32514,7 +36240,9 @@ static void learn_limits(const struct new_character *c, BYTE *record);
 /* A character's first record, from its sheet, in `record`; byte 0 (the ID) is `id_byte`. */
 static void build_character_record(struct new_character *c, BYTE *record, int id)
 {
-    int i, materia_given_count;
+    static const int new_first[3] = { NEW_WEAPON_FIRST_ITEM, NEW_ARMOUR_FIRST_ITEM, NEW_ACCESSORY_FIRST_ITEM };
+    static const int new_count[3] = { NEW_WEAPON_COUNT, NEW_ARMOUR_COUNT, NEW_ACCESSORY_COUNT };
+    int i, k, materia_given_count;
 
     if (c->from_sheet) {
         /* first weapon of each of the nine, for when the sheet names none */
@@ -32532,7 +36260,18 @@ static void build_character_record(struct new_character *c, BYTE *record, int id
         }
         record[0x0e] = 1;                               /* limit level */
         *(WORD *)(record + 0x22) = c->own_limits ? c->limit_start : c->limits_like >= 0;   /* limits learned */
-        record[0x1c] = first_weapon[c->equip_like];
+        if (c->equip_like >= 0 && c->equip_like < 9) {
+            record[0x1c] = first_weapon[c->equip_like];
+        } else {
+            /* equip_like = none: the first weapon it may equip (as the stand-in); without one, its base's
+               first, which it may not equip: said unless the sheet names its weapon (applied below) */
+            int w = character_first_weapon(c);
+
+            record[0x1c] = w >= 0 ? (BYTE)w : first_weapon[c->base >= 0 && c->base < 9 ? c->base : 0];
+            if (w < 0 && !c->start_set[SAVE_RECORD_WEAPON] && !c->start_wide[0])
+                log_line("character %d: equip_like = none, and no weapon it may equip is defined (no weapon file's equip list names it, and no weapon is for all nine): it is created wearing weapon %d, its base's first, which it may not equip. Give it weapon = on its sheet, or name it in a weapon's equip list",
+                         character_file_id(c), ITEM_ID_WEAPON_BASE + record[0x1c]);
+        }
         record[0x1e] = 0xff;                            /* no accessory */
         record[0x20] = 0xff;                            /* front row */
         hp = curve_value(c, 6, level);
@@ -32545,6 +36284,12 @@ static void build_character_record(struct new_character *c, BYTE *record, int id
         *(DWORD *)(record + 0x80) = curve_experience(c, level) - experience;   /* experience to the next level */
     } else {
         copy_bytes(record, (const BYTE *)ADDR_SAVE_RECORDS + c->base * SAVE_RECORD_SIZE, SAVE_RECORD_SIZE);
+        /* (equip_like = none) the base's weapon is kept, as for any base; said when the character may not equip it
+           and the sheet names no weapon of its own (a lent slot, 128-191, is not judged) */
+        if (c->equip_like == EQUIP_LIKE_NONE && !c->start_set[SAVE_RECORD_WEAPON] && !c->start_wide[0]
+            && (record[0x1c] < WEAPON_COUNT_ORIGINAL || record[0x1c] >= NEW_WEAPON_FIRST) && !character_may_equip_weapon(c, record[0x1c]))
+            log_line("character %d: equip_like = none, and its sheet names no weapon: it is created wearing its base's weapon %d, which it may not equip (it is not for all nine, and no weapon file's equip list names it). Give it weapon = on its sheet",
+                     character_file_id(c), ITEM_ID_WEAPON_BASE + record[0x1c]);
     }
     record[0] = (BYTE)id;
     copy_bytes(record + RECORD_NAME, c->name, sizeof c->name);
@@ -32559,6 +36304,23 @@ static void build_character_record(struct new_character *c, BYTE *record, int id
     for (i = 1; i < (int)sizeof c->start; i++)      /* never the ID byte */
         if (c->start_set[i])
             record[i] = c->start[i];
+    /* (a sheet's wide piece) What the sheet names and a byte cannot hold now: a WIDE piece is a
+       wish (the stand-in a save would hold, and a bit for character_wide_wear, which the caller
+       runs: at once, or in a load after the save's WORN entries); a piece of the gear files
+       (320-447) that no file defines now would be a blank record: the stand-in, with a line. */
+    c->gear_wish_pending = 0;
+    for (k = 0; k < 3; k++) {
+        int holder = GEAR_HOLDER_ROSTER + (int)(c - new_characters), item = gear_base[k] + record[SAVE_RECORD_WEAPON + k];
+
+        if (c->start_wide[k]) {
+            record[SAVE_RECORD_WEAPON + k] = (BYTE)gear_stand_in(holder, k, record);
+            c->gear_wish_pending |= (BYTE)(1 << k);
+        } else if (c->start_set[SAVE_RECORD_WEAPON + k] && item >= new_first[k] && item < new_first[k] + new_count[k] && defined_new_kind(item) != k + 1) {
+            record[SAVE_RECORD_WEAPON + k] = (BYTE)gear_stand_in(holder, k, record);
+            log_line("character %d: %s %d of its sheet is not defined by the %s file now: it is created wearing %s instead", character_file_id(c),
+                     gear_kind_text(k), item, gear_kind_text(k), character_stand_in_text(c, k, record[SAVE_RECORD_WEAPON + k]));
+        }
+    }
     if (c->level_like >= 0) {
         record[1] = (BYTE)followed_level(c);
         if (c->level_like < 9)
@@ -32584,6 +36346,7 @@ static void create_new_character(int id, const char *why)
              c->from_sheet ? "from its own sheet, borrowing from" : "as a copy of", c->base, record[1],
              character_file_id(c) == STORED_CHARACTER ? "" : " (kept by the save's companion file)", (DWORD)record);
     learn_all_limits(id);       /* (the testing aid learn_all_on_load, whenever the character is made) */
+    character_wide_wear(c, why);        /* (a sheet's wide piece) before the caller copies the weapon's data into a party slot (FN_COPY_WEAPON); in a load, later */
 }
 
 /* A new character joins when a field script puts its ID in the party or
@@ -33128,6 +36891,7 @@ static void set_up_new_characters(void)
             learn_limits(c, c->record);
             log_line("character %d made on load without a seat (level %d): the PHS shows it as a stand-in", character_file_id(c),
                      c->record[1]);
+            character_wide_wear(c, "on load");     /* (a sheet's wide piece) in a load: after the save's WORN entries */
         }
     }
     give_limit_item_on_load();
@@ -33269,10 +37033,12 @@ static BOOL parse_equip(char *p, char *end, DWORD *mask, DWORD *roster)
     return TRUE;
 }
 
-/* Icon names, as the first kernel weapon that shows that icon. */
+/* Icon names, as the first kernel weapon that shows that icon; (weapon icon) the other kinds' icons as their values. */
 static const struct flag_name icon_names[] = {
     { "sword", 0 }, { "glove", 16 }, { "gunarm", 32 }, { "headdress", 48 }, { "staff", 62 },
-    { "spear", 73 }, { "shuriken", 87 }, { "megaphone", 101 }, { "gun", 114 }, { NULL, 0 },
+    { "spear", 73 }, { "shuriken", 87 }, { "megaphone", 101 }, { "gun", 114 },
+    { "armour", WEAPON_ICON_ARMOUR }, { "armor", WEAPON_ICON_ARMOUR }, { "accessory", WEAPON_ICON_ACCESSORY },
+    { "item", WEAPON_ICON_ITEM }, { NULL, 0 },
 };
 
 static const struct flag_name bonus_names[] = {
@@ -33347,7 +37113,7 @@ static const char *apply_weapon_key(struct weapon_draft *draft, char *key, char 
         if (icon_names[i].name)
             draft->icon = (int)icon_names[i].value;
         else if (!parse_kernel_weapon(value, end, &draft->icon) || draft->icon >= WEAPON_COUNT_ORIGINAL)
-            return "icon must be sword, glove, gunarm, headdress, staff, spear, shuriken, megaphone, gun, or a kernel weapon";
+            return "icon must be sword, glove, gunarm, headdress, staff, spear, shuriken, megaphone, gun, armour, accessory, item, or a kernel weapon";
     } else if (word_is(key, key_end, "price")) {
         if (!parse_number(&p, end, &n) || p != end || n > 0x7fffffff)
             return "price must be a number";
@@ -35384,6 +39150,384 @@ static void load_shop_file(void)
     log_line("shop file: %d addition(s), %d line(s) with problems", shop_add_count - before, problems);
 }
 
+/* ==== BREAKING LIMITS BEGIN (item 1: wide battle skeletons, models above 48 bones; FF7FF8Fusion/Notes/FF8_Ultimecia_Study.md
+   section 2, FF7FF8Fusion/Notes/Breaking_Limits_Stage1.md) ====
+   The game keeps two bone tables for each battle actor inside its 0x1aec-byte record (00be1178 + actor*0x1aec, actors 0-9):
+   the bone places at +0xbac (00be1d24: 50 entries of 3 floats, up to the actor's camera matrix at 00be1f7c) and the bone
+   matrices at +0xe44 (00be1fbc: 50 entries of 16 floats, ending 0x28 bytes before the next record). The skeleton walk
+   (draw_3d_model 006840da, or FFNx's own when enable_external_mesh is on) stores entry 0 and entry bone + 1 of both through
+   the model's pointers +0x8c / +0x90, which battle_draw_actor_model 0042f3e8 sets just before its call of
+   model_battle_draw_body 005e0d3c, with no bound: past bone 48 it writes over the actor's camera matrix and then into the
+   next actor's record. The battle animation decoder 005e7de4 decodes each frame into a 500-int stack buffer, 10 ints a
+   track: root + 49 bones fit, one more track overwrites its 4096.0 divisor, more its return address.
+   Two calls are chained, in code FFNx neither replaces nor reads (it reads 0042f3e8's calls at +0x756 and +0xe2a and blanks
+   78 bytes at +0xd7d; it does not touch 005e82de, 005e7680-005e806a or 00691e5e-006921ce):
+     0042fab2  call 005e0d3c (e8 85 12 1b 00, after push eax, before add esp,0x10): a model above 48 bones is lent this
+               block's tables of 128 entries for its draw. The game's 50 entries are copied in before and back after, and
+               the model's two pointers are given back, so every reader of 00be1d24 / 00be1fbc sees what it always saw.
+     005e83c2  call 005e7de4 (e8 1d fa ff ff, after push edx, before add esp,0x10) in anim_battle_load_file 005e82de (every
+               battle model's animation file and every limit pack): an animation above 49 tracks is decoded by this
+               block's copy of the record loop, with a buffer of 10 * tracks + 4 ints, calling the game's frame decoder
+               005e7680 and record builders 00691f03 / 00692020 / 0069210d as 005e7de4 does, with the same arithmetic.
+   And one store is replaced, also in code FFNx neither replaces nor reads (it patches 00424b4b at +0x13e and +0x316 only):
+     00424b8a  mov dx,[eax+0x10] / mov [ecx+00be1188],dx (66 8b 50 10 66 89 91 88 11 be 00) in battle_update_3d_model_data
+               00424b4b, every frame: the actor's bone count (record +0x10), from its skeleton. It becomes a call of
+               bl_bone_count_stub and six nops: the count stored is the skeleton's, but at most 49. The game's readers of
+               the count index its 50 per-bone records (+0x174 + k * 0x34) and its two tables: the loops over the bones
+               (0042c0a7 at a death, 00430266, the height loops 004458b4 and 004e8165) and the random bones, the count as
+               the divisor, for 005d2e00 (in 004abdf1, 004f7824, 004f880e, 00539883, 00551ccc, 0055415c, 005b992e,
+               005d442f, 005d4817, 005d4a58, 005d7226). With a wide model's count they ran past them, into the actor's
+               camera matrix and the next actor's record. The walk takes the count from the skeleton, not from here, so
+               the model is still drawn whole; the game's effects see its first 49 bones.
+   wide_skeletons = all (a testing aid) sends every model and every animation through both paths: an ordinary battle then
+   shows them doing what the game does. With breaking_limits off (the default) nothing here is patched or run. */
+#define BL_SITE_DRAW_BODY       0x0042fab2u  /* 50 | e8 85 12 1b 00 | 83 c4 10: push eax / call 005e0d3c / add esp,0x10 */
+#define BL_FN_DRAW_BODY         0x005e0d3cu  /* model_battle_draw_body (pack flag, animation, frame, model), cdecl */
+#define BL_SITE_ANIM_DECODE     0x005e83c2u  /* 52 | e8 1d fa ff ff | 83 c4 10: push edx / call 005e7de4 / add esp,0x10 */
+#define BL_FN_ANIM_DECODE       0x005e7de4u  /* (y sign flag, tracks, frames, data): the animation record, cdecl */
+#define BL_FN_FRAME_DECODE      0x005e7680u  /* (buffer, tracks, bit position, data): the next bit position, 0 after the last frame */
+#define BL_FN_ANIM_NEW          0x00691f03u  /* (frames, bones, 0x20001): a new animation record (the game's allocator), or 0 */
+#define BL_FN_ANIM_ROOT         0x00692020u  /* (6, frame, 6 floats: rotation x y z, position x y z, record) */
+#define BL_FN_ANIM_BONE         0x0069210du  /* (0 / 1 / 2: x / y / z, frame, bone, 3 floats, record) */
+#define BL_ADDR_ANGLE_FACTOR    0x007b77f0u  /* float 360.0: the decoder's angle * factor / 4096 */
+#define BL_SITE_BONE_COUNT      0x00424b8au  /* 66 8b 50 10 | 66 89 91 88 11 be 00: mov dx,[eax+0x10] / mov [ecx+00be1188],dx (eax the
+                                                skeleton, ecx actor * 0x1aec; edx and the flags are written again before they are read) */
+#define BL_ADDR_BONE_COUNT      0x00be1188u  /* actor 0's bone count (short, record +0x10); bl_bone_count_stub names it as 0x00be1188 */
+#define BL_COUNT_MOST           49           /* the count the game's readers get at most: bones 0-48, entries 1-49 of its tables */
+#define BL_STR_(x)              #x
+#define BL_STR(x)               BL_STR_(x)
+#define BL_DECODER_FIRST        0x005e7680u  /* the decoder family, checked whole (FNV-1a): 005e7680, 005e7b7b, 005e7c40, 005e7ce4, 005e7de4 */
+#define BL_DECODER_END          0x005e806au
+#define BL_DECODER_SUM          0x5630e7bbu
+#define BL_RECORDS_FIRST        0x00691e5eu  /* the record family, checked whole: 00691e5e, 00691e8e, 00691f03, 00692020, 0069210d */
+#define BL_RECORDS_END          0x006921ceu
+#define BL_RECORDS_SUM          0xe1ae5d0du
+#define BL_ADDR_PLACES          0x00be1d24u  /* actor 0's bone places (actor record 00be1178 + 0xbac) */
+#define BL_ADDR_MATRICES        0x00be1fbcu  /* actor 0's bone matrices (+0xe44) */
+#define BL_ACTOR_STRIDE         0x1aecu
+#define BL_ACTORS               10
+#define BL_GAME_ENTRIES         50           /* entries of each game table: 0 the root, bone n at n + 1 */
+#define BL_WIDE_ENTRIES         128          /* entries of this block's tables: models of up to 127 bones */
+#define BL_GAME_BONES           48           /* models of up to 48 bones (vanilla's largest) are left to the game's tables */
+#define BL_TRACKS_MOST          1024         /* tracks of an animation this block decodes (its buffer is 10 * tracks + 4 ints) */
+#define BL_LOG_MAX              32           /* run-time lines of each kind a run: draws (a model lent tables or refused),
+                                                decodes (an animation decoded or refused) */
+#define BL_OFF                  0
+#define BL_ON                   1
+#define BL_ALL                  2            /* a testing aid: every model and animation through the wide paths */
+
+static LONG bl_master_asked, bl_wide_asked, bl_wide_given;    /* this reading of the game file */
+static LONG bl_mode = BL_OFF, bl_settled;                     /* taken at the first reading, for the run */
+static LONG bl_logged_draws, bl_logged_decodes;
+static DWORD bl_last_model[BL_ACTORS];                        /* for the log: one line when an actor's model changes */
+static float bl_places[BL_ACTORS][BL_WIDE_ENTRIES][3];
+static float bl_matrices[BL_ACTORS][BL_WIDE_ENTRIES][16];
+
+typedef void (__cdecl *bl_draw_body_fn)(int, int, int, BYTE *);
+typedef int (__cdecl *bl_anim_decode_fn)(int, int, int, const BYTE *);
+typedef int (__cdecl *bl_frame_decode_fn)(int *, int, int, const BYTE *);
+typedef int (__cdecl *bl_anim_new_fn)(int, int, int);
+typedef void (__cdecl *bl_anim_root_fn)(int, int, const void *, int);
+typedef void (__cdecl *bl_anim_bone_fn)(int, int, int, const float *, int);
+
+static BOOL bl_may_log(LONG *count)
+{
+    return InterlockedIncrement(count) <= BL_LOG_MAX;
+}
+
+static DWORD bl_sum(DWORD first, DWORD end)
+{
+    DWORD h = 2166136261u, a;
+
+    for (a = first; a < end; a++)
+        h = (h ^ *(const BYTE *)a) * 16777619u;
+    return h;
+}
+
+/* The actor whose game tables `model`'s two pointers name (0-9), or -1 (then the model is left to the game). */
+static int bl_actor_of(const BYTE *model)
+{
+    DWORD places = *(const DWORD *)(model + 0x8c), matrices = *(const DWORD *)(model + 0x90);
+    DWORD offset = places - BL_ADDR_PLACES;
+
+    if (offset % BL_ACTOR_STRIDE || offset / BL_ACTOR_STRIDE >= BL_ACTORS || matrices != places + (BL_ADDR_MATRICES - BL_ADDR_PLACES))
+        return -1;
+    return (int)(offset / BL_ACTOR_STRIDE);
+}
+
+/* At 0042fab2, in place of the game's call of model_battle_draw_body. */
+static void __cdecl bl_draw_body_hook(int pack, int animation, int frame, BYTE *model)
+{
+    const BYTE *skeleton;
+    DWORD *pointers, game_places, game_matrices;
+    int actor, bones = -1;
+
+    if (bl_mode == BL_OFF || !model || (actor = bl_actor_of(model)) < 0) {
+        ((bl_draw_body_fn)BL_FN_DRAW_BODY)(pack, animation, frame, model);
+        return;
+    }
+    skeleton = *(BYTE *const *)(model + 4);
+    if (skeleton)
+        bones = *(const int *)(skeleton + 0x10);
+    if (bl_mode != BL_ALL && bones <= BL_GAME_BONES) {
+        ((bl_draw_body_fn)BL_FN_DRAW_BODY)(pack, animation, frame, model);
+        return;
+    }
+    if (bones >= BL_WIDE_ENTRIES) {     /* the game's tables would be overrun, and so would these: not drawn */
+        if (bl_last_model[actor] != (DWORD)model && bl_may_log(&bl_logged_draws))
+            log_line("wide_skeletons: actor %d's model has %d bones, above the 127 the wide tables hold: it is NOT drawn", actor, bones);
+        bl_last_model[actor] = (DWORD)model;
+        return;
+    }
+    if (bl_last_model[actor] != (DWORD)model && bl_may_log(&bl_logged_draws))
+        log_line("wide_skeletons: actor %d's model (%d bones) is drawn with the DLL's bone tables (128 entries); entries 0-49 are copied back to the game's",
+                 actor, bones);
+    bl_last_model[actor] = (DWORD)model;
+    pointers = (DWORD *)(model + 0x8c);
+    game_places = pointers[0];
+    game_matrices = pointers[1];
+    copy_bytes((BYTE *)bl_places[actor], (const BYTE *)game_places, BL_GAME_ENTRIES * 12);
+    copy_bytes((BYTE *)bl_matrices[actor], (const BYTE *)game_matrices, BL_GAME_ENTRIES * 64);
+    pointers[0] = (DWORD)bl_places[actor];
+    pointers[1] = (DWORD)bl_matrices[actor];
+    ((bl_draw_body_fn)BL_FN_DRAW_BODY)(pack, animation, frame, model);
+    pointers[0] = game_places;
+    pointers[1] = game_matrices;
+    copy_bytes((BYTE *)game_places, (const BYTE *)bl_places[actor], BL_GAME_ENTRIES * 12);
+    copy_bytes((BYTE *)game_matrices, (const BYTE *)bl_matrices[actor], BL_GAME_ENTRIES * 64);
+}
+
+/* 005e7de4's record loop with a buffer of 10 * tracks + 4 ints (the game's has 500): the same calls with the same values.
+   The buffer is laid out as the game's: the frame decoder puts track t's three angles as ints at byte t * 40 + 0x10
+   (shorts at t * 40) and the root's position as floats at 0x1c, 0x20, 0x24. */
+static int bl_decode_wide(int flip_y, int tracks, int frames, const BYTE *data)
+{
+    int *buffer = VirtualAlloc(NULL, (DWORD)(tracks * 10 + 4) * 4, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    union { float f; DWORD d; } root[6];
+    float angles[3];
+    const float factor = *(const float *)BL_ADDR_ANGLE_FACTOR;
+    int record, position = 0, frame = 0, bone, k;
+
+    if (!buffer) {
+        if (bl_may_log(&bl_logged_decodes))
+            log_line("wide_skeletons: no memory for an animation of %d tracks: it is NOT loaded", tracks);
+        return 0;
+    }
+    record = ((bl_anim_new_fn)BL_FN_ANIM_NEW)(frames, tracks - 1, 0x20001);
+    if (record) {
+        do {
+            const BYTE *b = (const BYTE *)buffer;
+
+            position = ((bl_frame_decode_fn)BL_FN_FRAME_DECODE)(buffer, tracks, position, data);
+            root[3].d = *(const DWORD *)(b + 0x1c);
+            if (flip_y)
+                root[4].f = -*(const float *)(b + 0x20);
+            else
+                root[4].d = *(const DWORD *)(b + 0x20);
+            root[5].d = *(const DWORD *)(b + 0x24);
+            for (k = 0; k < 3; k++)
+                root[k].f = (float)buffer[4 + k] / 4096.0f * factor;
+            ((bl_anim_root_fn)BL_FN_ANIM_ROOT)(6, frame, root, record);
+            for (bone = 0; bone < tracks - 1; bone++) {
+                for (k = 0; k < 3; k++)
+                    angles[k] = (float)buffer[4 + (bone + 1) * 10 + k] / 4096.0f * factor;
+                for (k = 0; k < 3; k++)
+                    ((bl_anim_bone_fn)BL_FN_ANIM_BONE)(k, frame, bone, angles, record);
+            }
+            frame++;
+        } while (position != 0);
+    }
+    VirtualFree(buffer, 0, MEM_RELEASE);
+    if (bl_may_log(&bl_logged_decodes))
+        log_line("wide_skeletons: an animation of %d tracks (%d bones), %d frames, decoded by the DLL's loop (%d frames read)%s",
+                 tracks, tracks - 1, frames, frame, record ? "" : ": the game made no record (no memory)");
+    return record;
+}
+
+/* At 005e83c2, in place of the game's call of 005e7de4. */
+static int __cdecl bl_anim_decode_hook(int flip_y, int tracks, int frames, const BYTE *data)
+{
+    if (bl_mode == BL_OFF || tracks < 1 || (bl_mode != BL_ALL && tracks <= BL_GAME_BONES + 1))
+        return ((bl_anim_decode_fn)BL_FN_ANIM_DECODE)(flip_y, tracks, frames, data);
+    if (tracks > BL_TRACKS_MOST) {
+        if (bl_may_log(&bl_logged_decodes))
+            log_line("wide_skeletons: an animation of %d tracks, above the %d the DLL decodes: it is NOT loaded", tracks, BL_TRACKS_MOST);
+        return 0;
+    }
+    return bl_decode_wide(flip_y, tracks, frames, data);
+}
+
+/* Called at 00424b8a in place of the game's two moves (eax: the skeleton, ecx: actor * 0x1aec): stores the skeleton's bone
+   count (its short at +0x10) as the actor's, at most BL_COUNT_MOST. Writes edx and the flags only, as the game's moves
+   write dx (the code after them writes edx and the flags again before reading either). */
+__attribute__((naked)) void bl_bone_count_stub(void)
+{
+    __asm__(
+        "movswl 0x10(%eax), %edx\n"
+        "cmpl $" BL_STR(BL_COUNT_MOST) ", %edx\n"
+        "jle 1f\n"
+        "movl $" BL_STR(BL_COUNT_MOST) ", %edx\n"
+        "1:\n"
+        "movw %dx, 0x00be1188(%ecx)\n"
+        "ret\n"
+    );
+}
+
+static const BYTE bl_count_site[11] = { 0x66, 0x8b, 0x50, 0x10, 0x66, 0x89, 0x91, 0x88, 0x11, 0xbe, 0x00 };
+
+/* The bytes at `site` made `bytes` (the code's protection given back). FALSE: VirtualProtect refused, nothing written. */
+static BOOL bl_write_code(DWORD site, const BYTE *bytes, int count)
+{
+    DWORD old_protect;
+
+    if (!VirtualProtect((void *)site, count, PAGE_EXECUTE_READWRITE, &old_protect)) {
+        log_line("wide_skeletons: the code at %08lx could not be written (VirtualProtect error %lu)", site, GetLastError());
+        return FALSE;
+    }
+    copy_bytes((BYTE *)site, bytes, count);
+    VirtualProtect((void *)site, count, old_protect, &old_protect);
+    FlushInstructionCache(GetCurrentProcess(), (void *)site, count);
+    return TRUE;
+}
+
+/* The three sites and the routines the block copies or calls, as the exe has them; all of them, or nothing is patched. */
+static BOOL bl_sites_are_the_games(void)
+{
+    static const BYTE draw_site[] = { 0x50, 0xe8, 0x85, 0x12, 0x1b, 0x00, 0x83, 0xc4, 0x10 };
+    static const BYTE decode_site[] = { 0x52, 0xe8, 0x1d, 0xfa, 0xff, 0xff, 0x83, 0xc4, 0x10 };
+    BOOL good = TRUE;
+    DWORD sum;
+
+    if (!bytes_are(BL_SITE_BONE_COUNT, bl_count_site, sizeof bl_count_site)) {
+        log_line("wide_skeletons: the code at %08lx is not the game's (mov dx,[eax+0x10] / mov [ecx+00be1188],dx)", BL_SITE_BONE_COUNT);
+        good = FALSE;
+    }
+
+    if (!bytes_are(BL_SITE_DRAW_BODY - 1, draw_site, sizeof draw_site)) {
+        log_line("wide_skeletons: the code at %08lx is not the game's (push eax / call 005e0d3c / add esp,0x10)", BL_SITE_DRAW_BODY - 1);
+        good = FALSE;
+    }
+    if (!bytes_are(BL_SITE_ANIM_DECODE - 1, decode_site, sizeof decode_site)) {
+        log_line("wide_skeletons: the code at %08lx is not the game's (push edx / call 005e7de4 / add esp,0x10)", BL_SITE_ANIM_DECODE - 1);
+        good = FALSE;
+    }
+    if ((sum = bl_sum(BL_DECODER_FIRST, BL_DECODER_END)) != BL_DECODER_SUM) {
+        log_line("wide_skeletons: the animation decoder %08lx-%08lx is not the game's (sum %08lx, expected %08lx)", BL_DECODER_FIRST, BL_DECODER_END, sum, BL_DECODER_SUM);
+        good = FALSE;
+    }
+    if ((sum = bl_sum(BL_RECORDS_FIRST, BL_RECORDS_END)) != BL_RECORDS_SUM) {
+        log_line("wide_skeletons: the animation record routines %08lx-%08lx are not the game's (sum %08lx, expected %08lx)", BL_RECORDS_FIRST, BL_RECORDS_END, sum, BL_RECORDS_SUM);
+        good = FALSE;
+    }
+    return good;
+}
+
+/* Patches both calls and the count's store (all or nothing) and sets the mode. FALSE: nothing patched, the game's limit
+   stands. */
+static BOOL bl_install(LONG mode)
+{
+    BYTE count_call[sizeof bl_count_site];
+    int k;
+
+    if (!bl_sites_are_the_games())
+        return FALSE;
+    if (!patch_call(BL_SITE_DRAW_BODY, BL_FN_DRAW_BODY, bl_draw_body_hook))
+        return FALSE;
+    if (!patch_call(BL_SITE_ANIM_DECODE, BL_FN_ANIM_DECODE, bl_anim_decode_hook)) {
+        if (!patch_call(BL_SITE_DRAW_BODY, (DWORD)bl_draw_body_hook, (void *)BL_FN_DRAW_BODY))
+            log_line("wide_skeletons: the call at %08lx could not be given back: it stays on the DLL's draw (which calls the game's)", BL_SITE_DRAW_BODY);
+        return FALSE;
+    }
+    count_call[0] = 0xe8;               /* call bl_bone_count_stub, then nops up to the next instruction (00424b95) */
+    *(DWORD *)(count_call + 1) = (DWORD)bl_bone_count_stub - (BL_SITE_BONE_COUNT + 5);
+    for (k = 5; k < (int)sizeof count_call; k++)
+        count_call[k] = 0x90;
+    if (!bl_write_code(BL_SITE_BONE_COUNT, count_call, sizeof count_call)) {
+        if (!patch_call(BL_SITE_ANIM_DECODE, (DWORD)bl_anim_decode_hook, (void *)BL_FN_ANIM_DECODE))
+            log_line("wide_skeletons: the call at %08lx could not be given back: it stays on the DLL's decode (which calls the game's)", BL_SITE_ANIM_DECODE);
+        if (!patch_call(BL_SITE_DRAW_BODY, (DWORD)bl_draw_body_hook, (void *)BL_FN_DRAW_BODY))
+            log_line("wide_skeletons: the call at %08lx could not be given back: it stays on the DLL's draw (which calls the game's)", BL_SITE_DRAW_BODY);
+        return FALSE;
+    }
+    bl_mode = mode;
+    return TRUE;
+}
+
+/* ---- the game file's keys ---- */
+static void bl_keys_begin(void)
+{
+    bl_master_asked = 0;
+    bl_wide_asked = BL_ON;          /* each item is on when breaking_limits is, unless its own key says off */
+    bl_wide_given = 0;
+}
+
+/* 0: not a key of this block; 1: read; -1: a mistake (*fault says what; the key keeps its default). */
+static int bl_key_line(char *start, char *key_end, char *value, char *stop, const char **fault)
+{
+    if (word_is(start, key_end, "breaking_limits")) {
+        if (word_is(value, stop, "on") || word_is(value, stop, "yes"))
+            bl_master_asked = 1;
+        else if (word_is(value, stop, "off") || word_is(value, stop, "no"))
+            bl_master_asked = 0;
+        else {
+            bl_master_asked = 0;
+            *fault = "breaking_limits must be on or off: off is used";
+            return -1;
+        }
+        return 1;
+    }
+    if (word_is(start, key_end, "wide_skeletons")) {
+        bl_wide_given = 1;
+        if (word_is(value, stop, "on") || word_is(value, stop, "yes"))
+            bl_wide_asked = BL_ON;
+        else if (word_is(value, stop, "off") || word_is(value, stop, "no"))
+            bl_wide_asked = BL_OFF;
+        else if (word_is(value, stop, "all"))
+            bl_wide_asked = BL_ALL;
+        else {
+            bl_wide_asked = BL_OFF;
+            *fault = "wide_skeletons must be on, off or all (all: a testing aid, every battle model through the wide path): off is used";
+            return -1;
+        }
+        return 1;
+    }
+    return 0;
+}
+
+/* After each reading of the game file: the calls are patched once, at the first reading; a later change waits for the next start. */
+static void bl_keys_settle(void)
+{
+    LONG wanted = bl_master_asked ? bl_wide_asked : BL_OFF;
+    static const char *const names[] = { "off", "on", "all" };
+
+    if (InterlockedExchange(&bl_settled, 1)) {
+        if (wanted != bl_mode)
+            log_line("breaking limits: the game file now asks for wide_skeletons %s; it is %s for this run (taken at start-up): restart the game for the change",
+                     names[wanted], names[bl_mode]);
+        return;
+    }
+    if (!bl_master_asked) {
+        if (bl_wide_given)
+            log_line("breaking limits: off (breaking_limits is not on): wide_skeletons is not taken; battle skeletons keep the game's limit of 48 bones");
+        return;
+    }
+    if (wanted == BL_OFF) {
+        log_line("breaking limits: on; wide_skeletons off: battle skeletons keep the game's limit of 48 bones");
+        return;
+    }
+    if (!bl_install(wanted)) {
+        log_line("breaking limits: wide_skeletons NOT on (see the line above): nothing patched; battle skeletons keep the game's limit of 48 bones");
+        return;
+    }
+    if (wanted == BL_ALL)
+        log_line("TESTING AID on: wide_skeletons = all: every battle model is drawn with the DLL's bone tables and every battle animation decoded by the DLL's loop (calls at %08lx and %08lx; the bone count the game's effects read is kept to %d at %08lx); set it to on when done",
+                 BL_SITE_DRAW_BODY, BL_SITE_ANIM_DECODE, BL_COUNT_MOST, BL_SITE_BONE_COUNT);
+    else
+        log_line("breaking limits: wide_skeletons on: battle models above 48 bones (up to 127) are drawn with the DLL's bone tables, their animations decoded by the DLL's loop (calls at %08lx and %08lx); the game's effects see their first %d bones (count kept at %08lx)",
+                 BL_SITE_DRAW_BODY, BL_SITE_ANIM_DECODE, BL_COUNT_MOST, BL_SITE_BONE_COUNT);
+}
+/* ==== BREAKING LIMITS END ==== */
+
 /* ---- Game settings: test_battle (a testing aid) -----------------------------------------
    Every battle the game starts becomes the one named, until the line is removed. FUN_00408243,
    called only from the swirl's mode (0x17) in the main loop when the swirl hands over to the
@@ -35486,6 +39630,7 @@ static void load_game_settings(void)
 
     debug_menu = FALSE;
     field_entities_mode = 0;
+    atb_follows_dex = 0;            /* (atb_follows_dexterity) no unless the file says yes */
     field_model_check = 1;
     {
         int k;
@@ -35495,7 +39640,7 @@ static void load_game_settings(void)
     }
     items_on_load_count = 0;
     wide_items_asked = WIDE_OFF;    /* (the wide list) the key's default; taken for the run at the first reading only (wide_items_settle) */
-    wide_rows_asked = WIDE_ROWS;        /* (stage 3) the same for wide_rows: 510 unless the file says 320 (owner, 2026-10-14) */
+    wide_rows_asked = WIDE_V2_ROWS;     /* (stage 3) the same for wide_rows: 510 unless the file says 320 (owner, 2026-10-14) (stage 4: or another number) */
     wide_rows_given = FALSE;
     box_keys_begin();               /* (the box) its keys' defaults; taken for the run at the first reading only (box_keys_settle) */
     test_fill_rows = 0;
@@ -35505,6 +39650,7 @@ static void load_game_settings(void)
     shop_add_count = 0;
     test_battle = TEST_BATTLE_OFF;  /* (test_battle) off unless this reading names a battle */
     fields_keys_begin();            /* (field capacity) fields_file, fields_table_size, field_buffer_bytes: their defaults */
+    bl_keys_begin();                /* (breaking limits) breaking_limits, wide_skeletons: their defaults */
     text = read_whole_file(GAME_FILE_NAME, &size);
     if (text) {
         file_end = text + size;
@@ -35639,18 +39785,24 @@ static void load_game_settings(void)
                 }
             } else if (word_is(start, key_end, "wide_rows")) {
                 if (!wide_rows_key(value, stop)) {
-                    log_line("game file line %d: wide_rows must be 320 or 510", line_number);
+                    log_line("game file line %d: wide_rows must be 320 or an even number from 510 to %d: 510 is used", line_number, WIDE_ROWS_MAX);
                     problems++;
                 }
             } else if (word_is(start, key_end, "test_fill_rows")) {
                 DWORD rows = 0;
 
                 p = value;
-                if (!parse_number(&p, stop, &rows) || p != stop || rows < 1 || rows > WIDE_ROWS) {
-                    log_line("game file line %d: test_fill_rows takes one number, 1 to 510 (a testing aid: the rows of the item list to fill at every load)", line_number);
+                if (!parse_number(&p, stop, &rows) || p != stop || rows < 1 || rows > WIDE_ROWS_MAX) {
+                    log_line("game file line %d: test_fill_rows takes one number, 1 to %d (a testing aid: the rows of the item list to fill at every load)", line_number, WIDE_ROWS_MAX);
                     problems++;
                 } else {
                     test_fill_rows = (int)rows;
+                }
+            } else if (word_is(start, key_end, "atb_follows_dexterity")) {
+                if (!parse_yes_no(value, stop, &atb_follows_dex)) {
+                    atb_follows_dex = 0;
+                    log_line("game file line %d: atb_follows_dexterity must be yes or no", line_number);
+                    problems++;
                 }
             } else if (word_is(start, key_end, "achievement_materia_view")) {
                 if (!parse_yes_no(value, stop, &ach_view_on)) {
@@ -35663,6 +39815,11 @@ static void load_game_settings(void)
                     problems++;
                 }
             } else if ((box_answer = fields_key_line(start, key_end, value, stop, &box_fault)) != 0) {   /* (field capacity) fields_file, fields_table_size, field_buffer_bytes */
+                if (box_answer < 0) {
+                    log_line("game file line %d: %s", line_number, box_fault);
+                    problems++;
+                }
+            } else if ((box_answer = bl_key_line(start, key_end, value, stop, &box_fault)) != 0) {      /* (breaking limits) breaking_limits, wide_skeletons */
                 if (box_answer < 0) {
                     log_line("game file line %d: %s", line_number, box_fault);
                     problems++;
@@ -35697,6 +39854,7 @@ static void load_game_settings(void)
     wide_items_settle();
     box_keys_settle();              /* (the box) */
     fields_keys_settle();           /* (field capacity) built once at start-up: a later change is said, not taken */
+    bl_keys_settle();               /* (breaking limits) the calls are patched once, at start-up */
     test_battle_settle();           /* (test_battle) */
     {
         static LONG fixed_hooked;
@@ -35720,6 +39878,8 @@ static void load_game_settings(void)
     log_line("damage limit against enemies: %lu HP, %lu MP%s (%d line(s) with problems)", hp_limit, mp_limit,
              text ? "" : " (no " GAME_FILE_NAME ", the game's own)", problems);
     log_line("debug = %s: the main menu %s its SpellExt entry", debug_menu ? "true" : "false", debug_menu ? "has" : "does not have");
+    if (atb_follows_dex)
+        log_line("atb_follows_dexterity = yes: a party member's dexterity changed in battle (a battle script's store to 40a0) reaches its time gauge at the next action's set-up");
     if (test_drop_count || test_steal_count)
         log_line("TESTING AIDS on: test_drop (%d entries: added to the spoils of the next battle won) and test_steal (%d IDs: each replaces the next item gained in a battle); remove the lines when done",
                  test_drop_count, test_steal_count);
@@ -35822,7 +39982,15 @@ static void load_game_settings(void)
        zoom = fov                      ; FF8's H as the battle's H, the game's field of view (the default), dolly
                                        ; (the eye moved), or none
        blend = 12                      ; FF8's `04 N`: a sine blend back to the battle view over the effect's last
-                                       ; N frames (1-255), in place of the cut */
+                                       ; N frames (1-255), in place of the cut
+
+   The action's clock (tools/work/ff8cam_limit_clock/design/DESIGN.md): one more header key of an engine = ff8 camera,
+       clock = action                  ; frame 0 is the action's effect step (ec); played on the action's own clock
+                                       ; through every step of it (a limit's spell_effects steps too) until the next
+                                       ; action is set up or another camera runs; `effect` (the default) is as above
+   (blend = is refused with it: the action's clock has no last frames), and two references: home (the caster's home spot,
+   latched at its action's set-up, on the floor, the offset unturned as caster) and frame0.home (FF8's frame 0 from that
+   home spot to the target, or to the centre of the box round several). An older SpellExt refuses a file with either. */
 /* CAMERA TEXT PURE BEGIN */
 #define CAMERA_FOLDER_NAME      "cameras"
 #define MAX_OWN_CAMERAS         128          /* (camera stage 3: 64 before; the converter's 53 FF8 spell cameras and the installed ones together) */
@@ -35830,7 +39998,7 @@ static void load_game_settings(void)
 #define CAMERA_NUMBER_LIMIT     0x2000
 #define CAMERA_ROLL_LINES       32           /* camera stage 0: [roll] lines of one camera */
 #define CAMERA_ROLL_MAX         8192         /* a roll: 4096ths of a turn either way (two turns); FUN_00662ad8 takes any short */
-#define CAMERA_ROLL_FRAMES      NFX_LENGTH_MAX   /* `at` 0..479 and `over` 0..480: a roll is played on a native effect's clock */
+#define CAMERA_ROLL_FRAMES      NFX_LENGTH_MAX   /* `at` 0..599 and `over` 0..600: a roll is played on a native effect's clock */
 #define CAMERA_ROLL_EASE        0x01         /* eased in and out (smoothstep) rather than linear */
 
 struct camera_roll_line {
@@ -35844,7 +40012,7 @@ struct camera_roll_line {
                                                 converter's 53 sequence cameras keep 2,415; chain_first / ff8_first are shorts) */
 #define CAMERA_FF8_CHAIN        16           /* segments in the chain played */
 #define CAMERA_FF8_KEYS         32           /* keys a segment: FF8's record holds 32 (key times at +0x24..+0x63); 3 or more: its spline (camera stage 2) */
-#define CAMERA_FF8_FRAMES       480          /* a key's frames at most */
+#define CAMERA_FF8_FRAMES       NFX_LENGTH_MAX   /* a key's frames at most: a native effect's length (480 before 2026-10-24) */
 #define CAMERA_FF8_SEGMENT_FRAMES 2047       /* (camera stage 2) a segment's frames at most: FF8 counts 16 a frame in a short (FUN_00503c70, +0xe) */
 #define CAMERA_FF8_ZOOM_FOV     0            /* (camera stage 2) zoom = fov (the default): H played as the battle's H (00c05f7c), which the game makes the field of view */
 #define CAMERA_FF8_ZOOM_DOLLY   1            /* zoom = dolly: H played as the eye moved along the line of sight */
@@ -35867,6 +40035,13 @@ struct camera_roll_line {
 #define CAMERA_FF8_GROUP        6            /* 0xb0 (and every byte 0xb0-0xff FUN_0050d790 does not name): 01d99b70, a half
                                                 turn about y when no party member is among the targets, at the target point */
 #define CAMERA_FF8_EFFECT       7            /* 0xf9: 01d99ab0, the effect module's own frame (Death's object): the target's place here */
+/* the action's clock and the home spot (no FF8 code: FF8 measures its frame 0 from the entity, which stays at its seat while
+   the model moves; FF7 moves the actor itself, so its seat is latched at the action's set-up) */
+#define CAMERA_FF8_HOME         9            /* home: the caster's home spot, latched at its action's set-up; on the floor, the
+                                                offset unturned (as caster) */
+#define CAMERA_FF8_FRAME_HOME   10           /* frame0.home: FF8's frame 0 from that home spot to the target(s) */
+#define CAMERA_CLOCK_EFFECT     0            /* own_camera.clock: played on a native effect's frames (the default, as before) */
+#define CAMERA_CLOCK_ACTION     1            /* clock = action: from the action's effect step (ec) on, on the action's own clock */
 #define CAMERA_FF8_EMPTY        0x08         /* (reading) an `empty` chain: FF8's lone ffff */
 #define CAMERA_FF8_SEQ_BYTES    2048         /* a [sequence] program's bytes (FF8's longest: 314) */
 #define CAMERA_FF8_SEQ_LABELS   256          /* its labels */
@@ -35913,6 +40088,7 @@ struct own_camera {
     short seq_at, seq_length;           /* the assembled program in camera_pool */
     short chain_first[16][8];           /* chain A.V in camera_ff8_pool */
     BYTE chain_count[16][8];            /* its segments (0: empty) */
+    BYTE clock;                         /* CAMERA_CLOCK_EFFECT (the default) or CAMERA_CLOCK_ACTION (clock = action) */
 };
 static struct camera_ff8_segment camera_ff8_pool[CAMERA_FF8_SEGMENTS];
 static int camera_ff8_used;
@@ -35924,7 +40100,7 @@ typedef char camera_ff8_limits_check[32768LL * CAMERA_FF8_SCALE_MAX <= 0x7ffffff
 /* the arithmetic below (camera_roll_glide): (to - from) x a frame and x 1024 within an int, a frame x 1024 too */
 typedef char camera_roll_check[CAMERA_ROLL_MAX * 2LL * CAMERA_ROLL_FRAMES <= 0x7fffffffLL && CAMERA_ROLL_MAX * 2LL * 1024 <= 0x7fffffffLL &&
                                CAMERA_ROLL_FRAMES * 1024LL <= 0x7fffffffLL &&
-                               CAMERA_ROLL_FRAMES == 480 && CAMERA_ROLL_LINES == 32 && CAMERA_ROLL_MAX == 8192 ? 1 : -1];
+                               CAMERA_ROLL_FRAMES == 600 && CAMERA_FF8_FRAMES == 600 && CAMERA_ROLL_LINES == 32 && CAMERA_ROLL_MAX == 8192 ? 1 : -1];
 static struct own_camera own_cameras[MAX_OWN_CAMERAS];
 static int own_camera_count;
 static BYTE camera_pool[CAMERA_POOL_BYTES];
@@ -36052,7 +40228,7 @@ static const char *camera_roll_line(struct own_camera *camera, char *p, char *st
     if (!(word_end = next_word(&p, stop)) || !parse_signed(p, word_end, &at))
         return shape;
     if (at < 0 || at >= CAMERA_ROLL_FRAMES)
-        return "at: the frame is 0 to 479 (a native effect's frames, 0 = its first)";
+        return "at: the frame is 0 to 599 (a native effect's frames, 0 = its first)";
     p = word_end;
     if (!(word_end = next_word(&p, stop)) || !word_is(p, word_end, "roll"))
         return shape;
@@ -36068,7 +40244,7 @@ static const char *camera_roll_line(struct own_camera *camera, char *p, char *st
             if (!(word_end = next_word(&p, stop)) || !parse_signed(p, word_end, &over))
                 return "over is followed by the glide's frames";
             if (over < 0 || over > CAMERA_ROLL_FRAMES)
-                return "over: the glide is 0 to 480 frames";
+                return "over: the glide is 0 to 600 frames";
         } else if (word_is(p, word_end, "ease") && !ease)
             ease = 1;
         else
@@ -36124,8 +40300,8 @@ static int camera_ff8_scale(const char *p, const char *end)
     return whole >= 1 && whole <= CAMERA_FF8_SCALE_MAX ? whole : -1;
 }
 
-/* A reference of a key, [p, stop) at *p: camera, focus, world, frame0-frame4, target, caster, target.bone N,
-   caster.bone N. Moves *p past it; NULL or what is wrong. */
+/* A reference of a key, [p, stop) at *p: camera, focus, world, frame0-frame4, frame0.home, target, caster, home,
+   target.bone N, caster.bone N. Moves *p past it; NULL or what is wrong. */
 static const char *camera_ff8_ref(char **p, char *stop, struct camera_ff8_point *point)
 {
     char *word_end = next_word(p, stop);
@@ -36174,6 +40350,13 @@ static const char *camera_ff8_ref(char **p, char *stop, struct camera_ff8_point 
         point->ref = CAMERA_FF8_FOCUS;
     else if (word_is(*p, word_end, "world"))
         point->ref = CAMERA_FF8_WORLD;
+    else if (word_is(*p, word_end, "home"))
+        point->ref = CAMERA_FF8_HOME;   /* (the home spot) */
+    else if (word_is(*p, word_end, "frame0.home")) {
+        point->ref = CAMERA_FF8_FRAME_HOME;
+        point->bone = 0;
+    } else if (word_is(*p, word_end, "home.bone"))
+        return "home is a spot on the floor and has no bones (home, or caster.bone N)";
     else if (word_end - *p == 6 && word_is(*p, *p + 5, "frame") && (*p)[5] >= '0' && (*p)[5] <= '4') {
         point->ref = CAMERA_FF8_FRAME;
         point->bone = (BYTE)((*p)[5] - '0');
@@ -36186,7 +40369,7 @@ static const char *camera_ff8_ref(char **p, char *stop, struct camera_ff8_point 
             return "target.bone and caster.bone are followed by the bone, 0 to 63";
         point->bone = (BYTE)n;
     } else
-        return "a reference is camera, focus, world, frame0 to frame4, target, caster, target.bone N, caster.bone N, group, effect or #hhhh";
+        return "a reference is camera, focus, world, frame0 to frame4, frame0.home, target, caster, home, target.bone N, caster.bone N, group, effect or #hhhh";
     *p = word_end;
     return NULL;
 }
@@ -36268,7 +40451,7 @@ static const char *camera_ff8_line(struct camera_ff8_segment *s, char *p, char *
     if (!(word_end = next_word(&p, stop)) || !camera_ff8_number(p, word_end, &a))
         return key_shape;
     if (a < 0 || a > CAMERA_FF8_FRAMES)
-        return "key: the frames are 0 to 480";
+        return "key: the frames are 0 to 600";
     s->key[k].frames = (short)a;
     p = word_end;
     for (i = 0; i < 2; i++) {
@@ -37250,6 +41433,7 @@ static const char *parse_camera_text(char *text, DWORD size, struct own_camera *
     int variants[3], variant_count = 0, kind = -1, line_number = 0, i, roll_section = 0;
     int engine_given = 0, scale_given = 0, select_given = 0, zoom_given = 0, blend_given = 0;
     int mode_given = 0, seq_line = 0, cur_a = 0, cur_v = 0, last_a = -1, last_v = -1;   /* (camera stage 3) */
+    int clock_given = 0;                /* (the action's clock) */
     char *seq_from = NULL;              /* (camera stage 3) the [sequence] section's first line */
     BYTE chain_seen[16];                /* (camera stage 3) the chains a heading has named (a bit a variant) */
     BYTE *start = NULL;
@@ -37267,6 +41451,7 @@ static const char *parse_camera_text(char *text, DWORD size, struct own_camera *
     camera->sequence = camera->anims = 0;   /* (camera stage 3) */
     camera->mode[0] = 0, camera->mode[1] = 1;
     camera->seq_at = camera->seq_length = 0;
+    camera->clock = CAMERA_CLOCK_EFFECT;    /* (the action's clock) */
     for (i = 0; i < 16 * 8; i++) {
         camera->chain_first[i / 8][i % 8] = 0;
         camera->chain_count[i / 8][i % 8] = 0;
@@ -37472,6 +41657,18 @@ static const char *parse_camera_text(char *text, DWORD size, struct own_camera *
                 camera->mode[1] = (BYTE)(k == 2 ? m[1] : m[0]);
                 continue;
             }
+            if (equals < stop && word_is(p, key_end, "clock")) {
+                /* the action's clock: clock = effect (a native effect's frames, the default) | action (from the action's
+                   effect step, through every step of the action) */
+                trim(&value, &stop);
+                if (clock_given++)
+                    return "clock is given twice";
+                if (word_is(value, stop, "action"))
+                    camera->clock = CAMERA_CLOCK_ACTION;
+                else if (!word_is(value, stop, "effect"))
+                    return "clock is effect (a native effect's frames, the default) or action (the action's own clock from its effect step)";
+                continue;
+            }
             if (equals < stop && (word_is(p, key_end, "zoom") || word_is(p, key_end, "blend"))) {
                 /* camera stage 2: zoom = fov | dolly | none, blend = N */
                 trim(&value, &stop);
@@ -37627,6 +41824,8 @@ static const char *parse_camera_text(char *text, DWORD size, struct own_camera *
         if (!camera->ff8_count)
             return camera->sequence ? "a select = sequence camera needs one segment at least ([anim A variant V] sections)"
                                     : "no [anim A variant V] section for the chain select names";
+        if (camera->clock == CAMERA_CLOCK_ACTION && camera->blend)
+            return "blend = counts the effect's last frames, which the action's clock does not have (clock = action): use a [sequence]'s blend N";
         if (camera_pool_used + 4 > CAMERA_POOL_BYTES)
             return "too much camera script in all (32768 bytes)";
         start = camera_pool + camera_pool_used;
@@ -37650,6 +41849,8 @@ static const char *parse_camera_text(char *text, DWORD size, struct own_camera *
         return "zoom and blend belong to an engine = ff8 camera";
     else if (mode_given)
         return "camera_mode belongs to an engine = ff8 camera with select = sequence";
+    else if (clock_given)
+        return "clock belongs to an engine = ff8 camera";
     for (i = 0; i < 6; i++)
         if (!camera->script[i])
             return "all three variants need a position and a focus script";
@@ -37715,20 +41916,22 @@ static void load_own_cameras(void)
         if (camera->engine == CAMERA_ENGINE_FF8) {
             /* (camera stage 1; stage 2: the zoom, the roll, the splines, the blend) */
             int splines = 0;
+            const char *clock = camera->clock == CAMERA_CLOCK_ACTION ? "on the action's clock from its effect step (clock = action)"
+                                                                     : "on a native effect's frames from its first";
 
             for (i = 0; i < camera->ff8_count; i++)
                 splines += camera_ff8_pool[camera->ff8_first + i].keys >= 3;
             if (camera->sequence)       /* (camera stage 3) */
-                log_line("camera %x: engine ff8, select sequence: a program of %d byte(s), %d animation(s), %d segment(s) in its chains (%d of three keys or more: splines), camera_mode %d, %d, unit_scale %d.%03d, zoom %s, %s, %s (played on a native effect's frames from its first; scripts made: the battle's home view)",
+                log_line("camera %x: engine ff8, select sequence: a program of %d byte(s), %d animation(s), %d segment(s) in its chains (%d of three keys or more: splines), camera_mode %d, %d, unit_scale %d.%03d, zoom %s, %s, %s (played %s; scripts made: the battle's home view)",
                          camera->number, camera->seq_length, camera->anims, camera->ff8_count, splines, camera->mode[0], camera->mode[1],
                          camera->unit_scale / 1000, camera->unit_scale % 1000,
                          camera->zoom == CAMERA_FF8_ZOOM_FOV ? "fov" : camera->zoom == CAMERA_FF8_ZOOM_DOLLY ? "dolly" : "none",
-                         camera->ff8_rolls ? "a roll (exact)" : "no roll", camera->blend ? "a blend back at the end" : "a cut at the end");
+                         camera->ff8_rolls ? "a roll (exact)" : "no roll", camera->blend ? "a blend back at the end" : "a cut at the end", clock);
             else
-                log_line("camera %x: engine ff8, anim %d variant %d: %d segment(s) (%d of three keys or more: splines), %d frame(s), unit_scale %d.%03d, zoom %s, %s, %s (played on a native effect's frames from its first; scripts made: the battle's home view)",
+                log_line("camera %x: engine ff8, anim %d variant %d: %d segment(s) (%d of three keys or more: splines), %d frame(s), unit_scale %d.%03d, zoom %s, %s, %s (played %s; scripts made: the battle's home view)",
                          camera->number, camera->anim, camera->variant, camera->ff8_count, splines, camera->ff8_frames, camera->unit_scale / 1000,
                          camera->unit_scale % 1000, camera->zoom == CAMERA_FF8_ZOOM_FOV ? "fov" : camera->zoom == CAMERA_FF8_ZOOM_DOLLY ? "dolly" : "none",
-                         camera->ff8_rolls ? "a roll (exact)" : "no roll", camera->blend ? "a blend back at the end" : "a cut at the end");
+                         camera->ff8_rolls ? "a roll (exact)" : "no roll", camera->blend ? "a blend back at the end" : "a cut at the end", clock);
         }
     } while (FindNextFileA(search, &found));
     FindClose(search);
@@ -37978,6 +42181,10 @@ static void camera_roll_battle_start(void)
 #define ADDR_CAMERA_FOCUS       0x00bfb1a0u  /* 3 shorts: the point looked at (pushed at 0042d974) */
 #define ADDR_CAMERA_LOOKAT      0x00bf2130u  /* FUN_005c68b7's look-at (pushed at 0042d97e): 9 shorts, 3 ints at +0x12 */
 #define CAMERA_FF8_LOGS         30           /* log lines a battle */
+#define CAMERA_CLOCK_LOGS       24           /* (the action's clock) its own log lines a battle: a clock play's start, its
+                                                display over and its end, and the refusals (camera_clock_say), written
+                                                even once the 30 above are spent (a [sequence]'s lines can spend them
+                                                within a dozen frames) */
 #define CAMERA_FF8_CHECKS       10           /* self-check lines a cast */
 /* camera stage 2: the body points (frames 1-4) */
 #define ADDR_CAMERA_BODY_POINT  0x00be11a3u  /* per actor (+ x 0x1aec), signed byte: its model's point 0, a bone entry of
@@ -38024,9 +42231,44 @@ static struct {
     BYTE fov_refused;                   /* (camera stage 2) no H can be written this play: zoom = fov is played as a dolly */
     int view_frame;                     /* (camera stage 2) the frame the game's view below was read at (FFNx's 30/60 fps repeat it) */
     short view[2][3];                   /* the game's own eye and point that frame: what the blend goes to */
+    /* (the action's clock) the play's own caster and targets (camera_ff8_begin): a native effect's actor and mask, or
+       the actor of the effect step that started the action's clock and the record's results then */
+    BYTE clock;                         /* CAMERA_CLOCK_ACTION: the play is the action's clock's (camera_clock) */
+    BYTE over_said;                     /* the "display is over" line said, once a clock play */
+    int actor, mask;
 } camera_ff8 = { 0, 1, 0, 0, 0, -1, 0, { { 0, 0, 0 }, { 0, 0, 0 } }, 0, 0, 0, { -1, 0, -1, { { { 0 } } }, { { 0 } }, 512, 0, { 512, 512 }, { 0, 0 },
-                 { 0 }, { { { 0 } } }, { { { 0 } } }, -1, 0 }, 0, 0, -1, { { 0, 0, 0 }, { 0, 0, 0 } } };
+                 { 0 }, { { { 0 } } }, { { { 0 } } }, -1, 0 }, 0, 0, -1, { { 0, 0, 0 }, { 0, 0, 0 } }, 0, 0, 0, 0 };
 static LONG camera_ff8_logs;
+static LONG camera_clock_logs;          /* (the action's clock) CAMERA_CLOCK_LOGS */
+/* (the action's clock) An engine = ff8 camera with clock = action is played by a task of this DLL's own in the list of 60
+   (camera_clock_task), started at the action's effect step (camera_clock_effect_step, from summon_effect_hook: the
+   game's three calls of FUN_00427c22, script `ec`), counting the action's frames itself. The list of 60 is the one
+   nothing waits on: 00bf2128 ("every actor finished", FUN_0042d808 at 0042d860-0042d887) tests the actors' finished
+   bytes and the list of 100's count 00c05ebc only, so the task never holds a record open. Both lists run after the
+   camera's choice (0042da8d) and before the build (0041bda4) in FUN_0042d992 (0042dabb the list of 60, only while
+   009ad1ac != 0; 0042dac0 the list of 100), so the eye it writes is the one the frame is built from, as native_task's.
+   It owns the player (camera_ff8.serial = its serial, ++native_serial); a native effect started under the same camera
+   meanwhile (a limit's spell_effects step) begins no play of its own (camera_clock_keeps), so the camera does not start
+   over at each step. It ends at the next action's set-up (action_setup_hook, weapon_setup_hook), when the running camera
+   00c05eb8 changes, at CAMERA_CLOCK_FRAMES, at a battle start, when the battle's 3D is freed, or when the player is
+   taken by a play of another camera. While 00bf2128 is 1 (the action's display over: the game shows its home view) the
+   player writes nothing (camera_ff8_step). */
+#define CAMERA_CLOCK_FRAMES     2400         /* the action's frames at most (160 s at 15 a second): a cap, not a length */
+#define CAMERA_CLOCK_CALLS      (CAMERA_CLOCK_FRAMES * 4 + 60)   /* calls at most (FFNx's frames between at 60 fps: four a frame) */
+#define ADDR_CAMERA_HOME_Y      0x00be12e0u  /* per actor, short: its place y (battle_model_state.modelPosition.y; x 00be12de, z 00be12e2) */
+/* (the list of 60 as the states' task takes it: FN_NEW_WATCH_TASK FUN_005bed92, its first bytes 55 8b ec 51 66 c7 checked
+   once (watch_task_state), ADDR_WATCH_TASK_FNS 00bfb1b0, _DATA 00bfc3a0, _INDEX 00bf2df4, _COUNT 00be10e8, WATCH_TASKS 60) */
+static struct {
+    BYTE running;                       /* a clock runs: its task is in the list of 60 with `serial` in word 3 */
+    BYTE second_said, fixed_said, full_said;
+    WORD serial;                        /* the player's owner while it runs (from native_serial: never an effect's) */
+    int actor, mask, camera;            /* the effect step's actor, the record's results then, the camera (00c05eb8) */
+    int frame, calls;                   /* the action's frame (not counted while the effects are paused), the task's calls */
+} camera_clock;
+/* (the home spot) each actor's place at its last action's set-up (handler 0x0c, action_setup_hook) */
+static short camera_home[10][3];
+static BYTE camera_home_set[10];
+static BYTE camera_home_said;
 /* (camera stage 2) the zoom (zoom = fov): the battle's H */
 static struct {
     BYTE active;                        /* the value at 00c05f7c is this DLL's (or its base) for the play */
@@ -38048,6 +42290,12 @@ static int camera_true_hook;            /* 0 not yet, 1 in at 0041bda4, -1 refus
 static BOOL camera_ff8_say(void)
 {
     return InterlockedIncrement(&camera_ff8_logs) <= CAMERA_FF8_LOGS;
+}
+
+/* (the action's clock) a clock line's own budget: the lines that tell a clock play's start and end */
+static BOOL camera_clock_say(void)
+{
+    return InterlockedIncrement(&camera_clock_logs) <= CAMERA_CLOCK_LOGS;
 }
 
 static const struct own_camera *camera_ff8_find(int number)
@@ -38092,6 +42340,38 @@ static void camera_ff8_body(int actor, int out[3])
     camera_ff8_actor(actor, point >= 0 && point < *(const short *)(ADDR_NATIVE_BONES + base) ? point : CAMERA_FF8_PLACE, out);
 }
 
+/* (the home spot) The actor's place at its last action's set-up (camera_home_latch), on the floor (x, 0, z). Not latched
+   this battle (an actor whose action passed no attack set-up): its place now, said once a battle. */
+static void camera_ff8_home(int actor, int out[3])
+{
+    if (actor >= 0 && actor < 10 && camera_home_set[actor]) {
+        out[0] = camera_home[actor][0];
+        out[1] = 0;
+        out[2] = camera_home[actor][2];
+        return;
+    }
+    camera_ff8_actor(actor, CAMERA_FF8_PLACE, out);
+    if (!camera_home_said && camera_ff8_say())
+        log_line("camera %x (engine ff8): no home spot was latched for actor %d this battle (its action passed no attack set-up): home is its place now (%d, 0, %d)",
+                 camera_ff8.camera, actor, out[0], out[2]);
+    camera_home_said = 1;
+}
+
+/* (the home spot) Handler 0x0c's entry (action_setup_hook), for every action with an attack record: the acting actor's
+   place, where it rests between actions (one action is wholly displayed before the next is set up), is its home spot. */
+static void camera_home_latch(int actor)
+{
+    DWORD base;
+
+    if (actor < 0 || actor >= 10)
+        return;
+    base = (DWORD)actor * ACTOR_EFFECT_STRIDE;
+    camera_home[actor][0] = *(const short *)(ADDR_NATIVE_PLACE_X + base);
+    camera_home[actor][1] = *(const short *)(ADDR_CAMERA_HOME_Y + base);
+    camera_home[actor][2] = *(const short *)(ADDR_NATIVE_PLACE_Z + base);
+    camera_home_set[actor] = 1;
+}
+
 /* camera_ff8_base_fn for the game: camera / focus the play's own last eye and point; target the highest-numbered
    target (FUN_0050d300's loop leaves 01d99aaa at the mask's last set bit),
    caster the effect's actor (target the caster when the effect has none); frameN FF8's effect frame N
@@ -38099,7 +42379,9 @@ static void camera_ff8_body(int actor, int out[3])
    centre of the box round them (FUN_005020a0: (min + max) / 2 of x and of z), on the floor; frames 1-4 (camera stage
    2) from the caster's body point (FF8's 0xf0 for frames 1 and 2, 0xf1 for 3 and 4) to the target's (0xf0 for 1
    and 3, 0xf1 for 2 and 4), with several targets to the box's centre at the height of the caster's point (FF8's
-   own choice at 0050d3f0). */
+   own choice at 0050d3f0). home: the caster's home spot (camera_ff8_home); frame0.home: frame0 from it. The caster
+   and the targets are the play's own (camera_ff8.actor, .mask: a native effect's actor and targets, or the action's
+   clock's). */
 static int camera_ff8_base(void *context, int ref, int bone, int out[3], int m[9])
 {
     struct camera_ff8_play *play = (struct camera_ff8_play *)context;
@@ -38112,7 +42394,7 @@ static int camera_ff8_base(void *context, int ref, int bone, int out[3], int m[9
         return 0;
     }
     for (t = 0; t < 10; t++)
-        if (native_play.mask >> t & 1) {
+        if (camera_ff8.mask >> t & 1) {
             int x = *(const short *)(ADDR_NATIVE_PLACE_X + (DWORD)t * ACTOR_EFFECT_STRIDE);
             int z = *(const short *)(ADDR_NATIVE_PLACE_Z + (DWORD)t * ACTOR_EFFECT_STRIDE);
 
@@ -38124,7 +42406,7 @@ static int camera_ff8_base(void *context, int ref, int bone, int out[3], int m[9
             n++;
         }
     if (ref == CAMERA_FF8_CASTER || (ref == CAMERA_FF8_TARGET && last < 0)) {
-        camera_ff8_actor(native_play.actor, bone, out);
+        camera_ff8_actor(camera_ff8.actor, bone, out);
         return 0;
     }
     if (ref == CAMERA_FF8_TARGET) {
@@ -38135,7 +42417,7 @@ static int camera_ff8_base(void *context, int ref, int bone, int out[3], int m[9
         /* (camera stage 3) FF8's 0xf9 is 01d99ab0, a frame the effect module itself writes every frame (Death's task
            copies its own object's matrix there, 008b6fc3: rep movs from its record + 0x70); FF7's effects have no such
            frame: the target's place on the floor, the world's axes, scale 1.0 (the offset x unit_scale) */
-        camera_ff8_actor(last >= 0 ? last : native_play.actor, CAMERA_FF8_PLACE, out);
+        camera_ff8_actor(last >= 0 ? last : camera_ff8.actor, CAMERA_FF8_PLACE, out);
         return 0;
     }
     if (ref == CAMERA_FF8_GROUP) {
@@ -38150,17 +42432,24 @@ static int camera_ff8_base(void *context, int ref, int bone, int out[3], int m[9
         else if (n > 1)
             out[0] = (box[0] + box[1]) / 2, out[1] = 0, out[2] = (box[2] + box[3]) / 2;
         else
-            camera_ff8_actor(native_play.actor, CAMERA_FF8_PLACE, out);
+            camera_ff8_actor(camera_ff8.actor, CAMERA_FF8_PLACE, out);
         for (k = 0; k < 9; k++)
             m[k] = 0;
-        m[0] = m[8] = native_play.mask & 7 ? 4096 : -4096;
+        m[0] = m[8] = camera_ff8.mask & 7 ? 4096 : -4096;
         m[4] = 4096;
         return 1;
     }
-    if (bone == 0)
-        camera_ff8_actor(native_play.actor, CAMERA_FF8_PLACE, from);
+    if (ref == CAMERA_FF8_HOME || ref == CAMERA_FF8_FRAME_HOME) {
+        /* (the home spot) home: the caster's seat on the floor, the offset unturned (as caster); frame0.home: frame 0 from
+           there, the rest as frame0 */
+        camera_ff8_home(camera_ff8.actor, ref == CAMERA_FF8_HOME ? out : from);
+        if (ref == CAMERA_FF8_HOME)
+            return 0;
+        bone = 0;
+    } else if (bone == 0)
+        camera_ff8_actor(camera_ff8.actor, CAMERA_FF8_PLACE, from);
     else
-        camera_ff8_body(native_play.actor, from);       /* (FF8's 0xf0 and 0xf1 are the same point here) */
+        camera_ff8_body(camera_ff8.actor, from);       /* (FF8's 0xf0 and 0xf1 are the same point here) */
     if (n == 1) {
         if (bone == 0)
             camera_ff8_actor(last, CAMERA_FF8_PLACE, to);
@@ -38241,7 +42530,7 @@ static int camera_ff8_seq_read(void *context, int v)
 
     (void)context;
     for (t = 0; t < 10; t++)
-        if (native_play.mask >> t & 1)
+        if (camera_ff8.mask >> t & 1)
             last = t, n++;
     if (v < 8)
         value = camera_seq.var[v];
@@ -38271,7 +42560,7 @@ static int camera_ff8_seq_read(void *context, int v)
         case 0x16:
             /* 005096d6: the target's shown statuses; bit 0 set for a character in its weak pose (0x41021) and cleared for a
                monster, bit 1 KO: FF7's bit 1 = Death, bit 0 = a party target shown in its weak idle (00bf2df8 == 1) */
-            t = last >= 0 ? last : native_play.actor;
+            t = last >= 0 ? last : camera_ff8.actor;
             value = (*(const DWORD *)(ADDR_CAMERA_SEQ_STATUS + (DWORD)t * 0x68) & 1 ? 2 : 0) |
                     (t < 3 && *(const signed char *)(ADDR_CAMERA_SEQ_IDLE + (DWORD)t) == 1 ? 1 : 0);
             break;
@@ -38279,10 +42568,10 @@ static int camera_ff8_seq_read(void *context, int v)
             value = 0;          /* FUN_0050a6d0: the action's byte +0x11 (not 0: the programs' "no camera"); FF7 has none */
             break;
         case 0x18:
-            value = camera_ff8_entity(native_play.actor);       /* 0050970f: the caster, 01d99b95 */
+            value = camera_ff8_entity(camera_ff8.actor);       /* 0050970f: the caster, 01d99b95 */
             break;
         case 0x19:
-            value = camera_ff8_entity(last >= 0 ? last : native_play.actor);   /* 00509718: 01d99aaa, the mask's last target */
+            value = camera_ff8_entity(last >= 0 ? last : camera_ff8.actor);   /* 00509718: 01d99aaa, the mask's last target */
             break;
         case 0x1a:
             value = n;                                          /* 00509721: 01d99b94, the targets */
@@ -38595,6 +42884,144 @@ static int camera_battle_h_now(void)
     return *(const short *)ADDR_BATTLE_H;
 }
 
+/* ---- A state's home view: `view_raise`, `view_back` (the camera's side) ----------------------------------------
+   The battle's resting view is the formation's camera (009a8764 + 00bfcb28 x 0xc: the eye, then the point looked at,
+   three shorts each; from the scene's data). FUN_005c20ce (each frame, called at 0042da8d: the call FFNx 1.24.3 takes
+   when its analogue camera is on, and its wrapper then writes the eye of the formation's camera itself) chooses what
+   the eye 00bf2158 and the point 00bfb1a0 are: the running camera's variant, or that home view (FUN_005c22a9: halfway
+   there each frame; FUN_005c22bd: at once, with the Config menu's fixed camera). The home view is chosen in target
+   selection, with no camera (-1), and after a camera when every actor has finished (00bf2128 == 1); view_home_shown
+   is that choice, branch by branch. The camera is then built from the eye and the point once a frame (the call at
+   0041bda4, not while paused) and everything drawn the next frame reads that build (see the camera roll above).
+   So a state's lift touches neither the formation's camera nor the eye and point the game and FFNx keep: around the
+   build only (camera_true_build, the hook at 0041bda4 that camera_true_install puts in), while the game shows its home
+   view and an actor is in a state with the keys, the eye and the point are written raised by `view_raise` units (up
+   is -y) with the eye `view_back` per cent farther from the point, the game's build is run, and the game's values are
+   written back. The lift blends in and out (a fifth of the way a frame) as the home view comes and goes, so an
+   action's camera starts from the game's own eye with no jump. view_lift_wanted (set by the states' side) gives the
+   largest lift of the actors in such a state; NULL: none. */
+#define ADDR_CAMERA_FINISHED    0x00bf2128u  /* byte: 1 = every actor finished and the list of 100 empty (FUN_0042d808) */
+#define ADDR_BATTLE_SCENE_WORD  0x009a8750u  /* word: FUN_005c20ce: 0x4e drops the fixed camera and shows no home view
+                                                after a camera */
+#define VIEW_LIFT_ONE           4096         /* the blend: 0 the game's view, 4096 the whole lift */
+#define VIEW_LIFT_LINES         20           /* log lines a battle */
+
+static struct {
+    int blend;                          /* 0 - VIEW_LIFT_ONE */
+    int raise, back;                    /* the lift blended (the last asked for, kept while it blends out) */
+    BYTE swapped;                       /* the eye and the point hold the lifted values (between begin and end) */
+    short eye[3], focus[3];             /* the game's, while swapped */
+    int lines;
+} view_lift;
+static void (*view_lift_wanted)(int *raise, int *back);
+
+/* FUN_005c20ce's choice: is the formation's (home) view what the game shows this frame? (00bf2e04, the battle
+   menu's state 0091ef9c, the summon's time stop 00bfb2ec, the camera 00c05eb8, 00bf2128, the Config option 00dc0e12,
+   the word 009a8750.) */
+static int view_home_shown(int camera, int result_x4, int menu_state, int time_stop, int finished, unsigned option, unsigned scene)
+{
+    int fixed = (option & CAMERA_FIXED_MASK) == CAMERA_FIXED && scene != 0x4e;
+
+    if (result_x4 == 'd')
+        return fixed;
+    if (menu_state == 0 && time_stop == 0)
+        return 1;
+    if (camera == -2)
+        return 0;
+    if (camera == -1)
+        return 1;
+    if (fixed) {
+        if (camera == 0x3b || camera == 0x3c || camera == 0x45 || camera == 0x59 || camera == 0x6d || camera == 0x77 || camera == 0xcb)
+            return finished == 1;
+        return 1;
+    }
+    return finished == 1 && scene != 0x4e;
+}
+
+/* One frame's step of the blend toward `target` (0 or VIEW_LIFT_ONE): a fifth of the way, at least 1. */
+static int view_lift_step(int blend, int target)
+{
+    int d = target - blend, step = d / 5;
+
+    if (!step)
+        step = d > 0 ? 1 : d < 0 ? -1 : 0;
+    return blend + step;
+}
+
+/* The lifted eye and point: the eye `back` per cent farther from the point, then both `raise` units up, each times
+   blend / 4096; kept within shorts. */
+static void view_lift_point(const short eye[3], const short focus[3], int raise, int back, int blend, short out_eye[3], short out_focus[3])
+{
+    int i;
+
+    for (i = 0; i < 3; i++) {
+        long long e = (long long)focus[i] + ((long long)eye[i] - focus[i]) * (409600LL + (long long)back * blend) / 409600LL;
+        long long f = focus[i];
+
+        if (i == 1) {
+            e -= (long long)raise * blend / VIEW_LIFT_ONE;
+            f -= (long long)raise * blend / VIEW_LIFT_ONE;
+        }
+        out_eye[i] = (short)(e < -32768 ? -32768 : e > 32767 ? 32767 : e);
+        out_focus[i] = (short)(f < -32768 ? -32768 : f > 32767 ? 32767 : f);
+    }
+}
+
+static void view_lift_battle_start(void)
+{
+    view_lift.blend = view_lift.raise = view_lift.back = 0;
+    view_lift.swapped = 0;
+    view_lift.lines = 0;
+}
+
+/* Before the game's build (the hook at 0041bda4): the blend's step and, while it is not 0, the lifted eye and point. */
+static void view_lift_begin(void)
+{
+    int raise = 0, back = 0, home, was = view_lift.blend;
+    short *eye = (short *)ADDR_CAMERA_EYE, *focus = (short *)ADDR_CAMERA_FOCUS;
+    int i;
+
+    view_lift.swapped = 0;
+    if (!view_lift_wanted && !was)
+        return;
+    if (view_lift_wanted)
+        view_lift_wanted(&raise, &back);
+    home = view_home_shown(*(const short *)ADDR_CAMERA_NUMBER, *(const signed char *)ADDR_CAMERA_RESULT_X4,
+                           *(const short *)ADDR_BATTLE_MENU_STATE, *(const signed char *)ADDR_SUMMON_ACTIVE,
+                           *(const signed char *)ADDR_CAMERA_FINISHED, *(const WORD *)ADDR_CAMERA_OPTION,
+                           *(const WORD *)ADDR_BATTLE_SCENE_WORD);
+    if (raise || back)
+        view_lift.raise = raise, view_lift.back = back;
+    view_lift.blend = view_lift_step(was, home && (raise || back) ? VIEW_LIFT_ONE : 0);
+    if (view_lift.lines < VIEW_LIFT_LINES && ((!was && view_lift.blend) || (was && !view_lift.blend)
+                                               || (was < VIEW_LIFT_ONE && view_lift.blend == VIEW_LIFT_ONE))) {
+        view_lift.lines++;
+        log_line(!was ? "home view: lifting (view_raise %d, view_back %d%%): the game shows its home view (camera %d)"
+                 : view_lift.blend ? "home view: lifted whole (view_raise %d, view_back %d%%, camera %d)"
+                                   : "home view: the game's own again (view_raise %d, view_back %d%% blended out; camera %d)",
+                 view_lift.raise, view_lift.back, (int)*(const short *)ADDR_CAMERA_NUMBER);
+    }
+    if (!view_lift.blend)
+        return;
+    for (i = 0; i < 3; i++)
+        view_lift.eye[i] = eye[i], view_lift.focus[i] = focus[i];
+    view_lift_point(view_lift.eye, view_lift.focus, view_lift.raise, view_lift.back, view_lift.blend, eye, focus);
+    view_lift.swapped = 1;
+}
+
+/* After the build: the game's eye and point back. */
+static void view_lift_end(void)
+{
+    short *eye = (short *)ADDR_CAMERA_EYE, *focus = (short *)ADDR_CAMERA_FOCUS;
+    int i;
+
+    if (!view_lift.swapped)
+        return;
+    for (i = 0; i < 3; i++)
+        eye[i] = view_lift.eye[i], focus[i] = view_lift.focus[i];
+    view_lift.swapped = 0;
+}
+
 /* ---- camera stage 2: the true roll (route B of FF8_Camera_Emulation_Plan.md) ----
    FF8 (FUN_005033e0) rolls its view by r as lookat(Rz eye, Rz target) x Rz, Rz = RotMatrix(0, 0, r) ((c, -s, 0),
    (s, c, 0), (0, 0, 1): FUN_0056ce30 -> FUN_0056d090): the same eye and line of sight as the level view, with the
@@ -38646,8 +43073,18 @@ static int camera_true_compare(const BYTE *a, const BYTE *b, int *largest)
 }
 
 /* The hook at 0041bda4 (in place of `call FUN_0042d971`): the game's build first, always; then, when the step
-   armed it this frame, the self-check (once a play) and the rolled build. */
+   armed it this frame, the self-check (once a play) and the rolled build. All of it between view_lift_begin and
+   view_lift_end (a state's home view: nothing while no state asks for it). */
+static void camera_true_build_rolled(void);
+
 static void __cdecl camera_true_build(void)
+{
+    view_lift_begin();
+    camera_true_build_rolled();
+    view_lift_end();
+}
+
+static void camera_true_build_rolled(void)
 {
     static const int level[3] = { 0, CAMERA_UP, 0 };
     BYTE game[0x3c], again[0x3c];
@@ -38749,17 +43186,22 @@ static void camera_ff8_stop(WORD serial, const char *why)
         return;
     camera_zoom_end();
     camera_ff8.active = camera_ff8.wrote = 0;
-    if (camera_ff8_say())
+    if (camera_ff8.clock ? camera_clock_say() : camera_ff8_say())    /* (a clock play's end on the clock's budget) */
         log_line("camera %x (engine ff8): ends (%s): the game's own view from this frame (the battle's home view); self-check: %d of %d frame(s) built from the eye written, largest difference %d",
                  camera_ff8.camera, why, camera_ff8.matched, camera_ff8.checks, camera_ff8.worst);
 }
 
-/* A native effect's task starts (native_effect_step): it owns the play from now on; nothing is written yet. */
-static void camera_ff8_begin(WORD serial)
+/* A native effect's task starts (native_effect_step), or the action's clock (camera_clock_effect_step, clock
+   CAMERA_CLOCK_ACTION): it owns the play from now on, for `actor` on the targets of `mask`; nothing is written yet. */
+static void camera_ff8_begin(WORD serial, int actor, int mask, int clock)
 {
     camera_ff8_stop(camera_ff8.serial, "a newer effect starts");
     camera_ff8.serial = serial;
     camera_ff8.active = camera_ff8.done = camera_ff8.wrote = 0;
+    camera_ff8.actor = actor;
+    camera_ff8.mask = mask & 0x3ff;
+    camera_ff8.clock = (BYTE)clock;
+    camera_ff8.over_said = 0;
 }
 
 /* The self-check: the eye the game's last look-at was built from, against the eye written by the last call. */
@@ -38803,6 +43245,18 @@ static void camera_ff8_step(WORD serial, int frame, int length, DWORD effect)
     c = camera_ff8_find(camera);
     camera_true.armed = 0;
     fixed = (*(const WORD *)ADDR_CAMERA_OPTION & CAMERA_FIXED_MASK) == CAMERA_FIXED;
+    /* (the action's clock) a clock = action camera is played on the action's clock only, never on a native effect's
+       frames (no clock runs: it could not start, or it ended): the battle's home view, as its refusals say */
+    if (c && c->clock == CAMERA_CLOCK_ACTION && !camera_ff8.clock) {
+        if (!camera_ff8.active) {
+            camera_ff8.done = 1;
+            if (camera_clock_say())
+                log_line("camera %x (engine ff8): clock = action: not played on native effect %04lx's frames (no action's clock runs): the battle's home view",
+                         camera, effect);
+            return;
+        }
+        c = NULL;                       /* (it became the running camera during the effect's play: the game's view) */
+    }
     if (!camera_ff8.active) {
         BOOL zoom, roll = TRUE;
 
@@ -38829,18 +43283,28 @@ static void camera_ff8_step(WORD serial, int frame, int length, DWORD effect)
             roll = camera_true_install() && !camera_true.failed;
         camera_true.camera = camera;
         camera_true.skipped = 0;
-        if (camera_ff8_say()) {
+        if (camera_ff8.clock ? camera_clock_say() : camera_ff8_say()) {    /* (a clock play's start on the clock's budget) */
+            char head[160];
+
+            if (camera_ff8.clock) {     /* (the action's clock) */
+                int home[3];
+
+                camera_ff8_home(camera_ff8.actor, home);
+                wsprintfA(head, "actor %d's effect step on the action's clock (clock = action), frame %d, targets %04x, home (%d, 0, %d)",
+                          camera_ff8.actor, frame, camera_ff8.mask, home[0], home[2]);
+            } else
+                wsprintfA(head, "native effect %04lx's frame %d", effect, frame);
             if (c->sequence)            /* (camera stage 3) */
-                log_line("camera %x (engine ff8): starts at native effect %04lx's frame %d: select sequence (%d byte(s), %d segment(s) in its chains), var00 %d (camera_mode %d, %d), unit_scale %d.%03d; from the game's eye (%d, %d, %d) and point (%d, %d, %d); zoom %s%s%s",
-                         camera, effect, frame, c->seq_length, c->ff8_count, camera_seq.var[0], c->mode[0], c->mode[1], c->unit_scale / 1000,
+                log_line("camera %x (engine ff8): starts at %s: select sequence (%d byte(s), %d segment(s) in its chains), var00 %d (camera_mode %d, %d), unit_scale %d.%03d; from the game's eye (%d, %d, %d) and point (%d, %d, %d); zoom %s%s%s",
+                         camera, head, c->seq_length, c->ff8_count, camera_seq.var[0], c->mode[0], c->mode[1], c->unit_scale / 1000,
                          c->unit_scale % 1000, camera_ff8.play.out[0][0], camera_ff8.play.out[0][1], camera_ff8.play.out[0][2],
                          camera_ff8.play.out[1][0], camera_ff8.play.out[1][1], camera_ff8.play.out[1][2],
                          c->zoom == CAMERA_FF8_ZOOM_NONE ? "none" : c->zoom == CAMERA_FF8_ZOOM_DOLLY ? "dolly" : zoom ? "fov" : "dolly (no fov can be written)",
                          c->ff8_rolls ? (roll ? "; its roll exact (0041bda4)" : "; its roll NOT played") : "",
                          c->blend ? "; a blend back over the last frames" : "; a cut at the end");
             else
-                log_line("camera %x (engine ff8): starts at native effect %04lx's frame %d: anim %d variant %d, %d segment(s), %d frame(s), unit_scale %d.%03d; from the game's eye (%d, %d, %d) and point (%d, %d, %d); zoom %s%s%s",
-                         camera, effect, frame, c->anim, c->variant, c->ff8_count, c->ff8_frames, c->unit_scale / 1000, c->unit_scale % 1000,
+                log_line("camera %x (engine ff8): starts at %s: anim %d variant %d, %d segment(s), %d frame(s), unit_scale %d.%03d; from the game's eye (%d, %d, %d) and point (%d, %d, %d); zoom %s%s%s",
+                         camera, head, c->anim, c->variant, c->ff8_count, c->ff8_frames, c->unit_scale / 1000, c->unit_scale % 1000,
                          camera_ff8.play.out[0][0], camera_ff8.play.out[0][1], camera_ff8.play.out[0][2], camera_ff8.play.out[1][0],
                          camera_ff8.play.out[1][1], camera_ff8.play.out[1][2],
                          c->zoom == CAMERA_FF8_ZOOM_NONE ? "none" : c->zoom == CAMERA_FF8_ZOOM_DOLLY ? "dolly" : zoom ? "fov" : "dolly (no fov can be written)",
@@ -38855,7 +43319,7 @@ static void camera_ff8_step(WORD serial, int frame, int length, DWORD effect)
         if (c->ff8_rolls)
             camera_true_install();      /* (camera stage 2: the first camera of the effect may not have rolled) */
     }
-    if (camera_ff8.wrote)
+    if (camera_ff8.wrote && !view_lift.blend)     /* (a resting-view lift still fading out: the eye is not the player's alone) */
         camera_ff8_check(frame);
     camera_ff8.wrote = 0;
     if (!c) {
@@ -38925,9 +43389,20 @@ static void camera_ff8_step(WORD serial, int frame, int length, DWORD effect)
     if (frame - camera_ff8.origin >= frames && !camera_ff8.ended_said) {
         camera_ff8.ended_said = 1;
         if (camera_ff8_say())
-            log_line("camera %x (engine ff8): its chain ends at frame %d: held at eye (%d, %d, %d), point (%d, %d, %d) until the effect ends",
+            log_line("camera %x (engine ff8): its chain ends at frame %d: held at eye (%d, %d, %d), point (%d, %d, %d) until the %s ends",
                      camera, camera_ff8.origin + frames, camera_ff8.play.out[0][0], camera_ff8.play.out[0][1], camera_ff8.play.out[0][2],
-                     camera_ff8.play.out[1][0], camera_ff8.play.out[1][1], camera_ff8.play.out[1][2]);
+                     camera_ff8.play.out[1][0], camera_ff8.play.out[1][1], camera_ff8.play.out[1][2], camera_ff8.clock ? "action's clock" : "effect");
+    }
+    /* (the action's clock) the action's display over (00bf2128 == 1: every actor finished, the list of 100 empty;
+       FUN_005c20ce shows the formation's home view after a camera then): the game's own view until the clock ends. Not
+       tested for a native effect's play: the flag cannot be 1 while its task is in the list of 100 */
+    if (camera_ff8.clock && *(const signed char *)ADDR_CAMERA_FINISHED == 1) {
+        if (!camera_ff8.over_said && camera_clock_say())
+            log_line("camera %x (engine ff8): the action's display is over at frame %d (every actor finished): the game's own view until the clock ends",
+                     camera, frame);
+        camera_ff8.over_said = 1;
+        camera_zoom_write(CAMERA_FF8_H_HOME);
+        return;
     }
     /* the game drawing its home view (target selection): its own eye and point; the chain goes on underneath */
     if (!camera_roll_scripted_shown(*(const signed char *)ADDR_CAMERA_RESULT_X4, *(const short *)ADDR_BATTLE_MENU_STATE,
@@ -39004,6 +43479,7 @@ static void camera_ff8_battle_start(void)
     camera_ff8.done = 1;
     camera_true.armed = 0;
     InterlockedExchange(&camera_ff8_logs, 0);
+    InterlockedExchange(&camera_clock_logs, 0);   /* (the action's clock) */
     /* (camera stage 3) FUN_005041e0 at FF8's battle start: the variables 00-07 and the mask 0 (the locals 78-7f too
        here), the chain tasks' pool made anew (FUN_00508300), the records free, 01d9771e the base; FF8's random runs on
        from the game's seed: this DLL's own, started once from the clock */
@@ -39017,6 +43493,14 @@ static void camera_ff8_battle_start(void)
     camera_seq.running = 0;
     if (!camera_seq.seed)
         camera_seq.seed = GetTickCount() | 1u;
+    /* (the action's clock) its task went with the lists (FUN_005beec6 empties them); the home spots are the new battle's */
+    if (camera_clock.running)
+        log_line("camera %x (engine ff8): the action's clock still on as a battle starts (its frame %d): dropped", camera_clock.camera,
+                 camera_clock.frame);
+    camera_clock.running = camera_clock.second_said = camera_clock.fixed_said = camera_clock.full_said = 0;
+    for (i = 0; i < 10; i++)
+        camera_home_set[i] = 0;
+    camera_home_said = 0;
 }
 
 /* native_task's camera calls, at each call of the effect's task with native_clock_step's `todo` (here so that the
@@ -39037,7 +43521,332 @@ static void native_task_cameras(WORD serial, int frame, int length, DWORD effect
     camera_roll_stop(serial, why);
     camera_ff8_stop(serial, why);
 }
+
+/* ---- The action's clock (clock = action; see camera_clock above) ---- */
+
+/* The clock ends (`why`): the player stops (its "ends" line, with the action's frame and the task's calls), nothing is
+   written; the task ends itself at its next call (`running` 0). */
+static void camera_clock_stop(const char *why)
+{
+    char text[128];
+
+    if (!camera_clock.running)
+        return;
+    camera_clock.running = 0;
+    wsprintfA(text, "%s; the action's frame %d, %d call(s)", why, camera_clock.frame, camera_clock.calls);
+    camera_ff8_stop(camera_clock.serial, text);
+}
+
+/* The task, in the list of 60 (FUN_005bf1c2 runs it after the camera's choice and before the build; not while the
+   battle is paused with Start). Each call writes the eye and point of the action's frame (camera_ff8_step); the frame
+   advances only when the effects are not paused (00dc0e6c: also FFNx's frames between at 30/60 fps, which repeat it). */
+static void __cdecl camera_clock_task(void)
+{
+    int index = *(const short *)ADDR_WATCH_TASK_INDEX, camera;
+    short *task;
+    char why[64];
+
+    if (index < 0 || index >= WATCH_TASKS)
+        return;
+    task = (short *)(ADDR_WATCH_TASK_DATA + index * 0x20);
+    if (!camera_clock.running || camera_clock.serial != (WORD)task[3]) {
+        *task = -1;                     /* an older clock's task, or a battle started, or the clock was stopped */
+        return;
+    }
+    if (!*(const DWORD *)ADDR_BATTLE_3D) {
+        camera_clock_stop("the battle is over");    /* (its 3D data freed, FUN_00428f59: nothing more is drawn) */
+        *task = -1;
+        return;
+    }
+    if (camera_ff8.serial != camera_clock.serial || camera_ff8.done) {
+        camera_clock.running = 0;       /* the player was taken (a native effect under another camera) or refused it */
+        *task = -1;
+        return;
+    }
+    camera = *(const short *)ADDR_CAMERA_NUMBER;
+    if (camera != camera_clock.camera) {
+        wsprintfA(why, "the running camera changed to %x", camera & 0xffff);
+        camera_clock_stop(why);
+        *task = -1;
+        return;
+    }
+    if (++camera_clock.calls > CAMERA_CLOCK_CALLS || camera_clock.frame >= CAMERA_CLOCK_FRAMES) {
+        wsprintfA(why, "the clock's limit of %d frames", CAMERA_CLOCK_FRAMES);
+        camera_clock_stop(why);
+        *task = -1;
+        return;
+    }
+    camera_ff8_step(camera_clock.serial, camera_clock.frame, CAMERA_CLOCK_FRAMES, 0);
+    if (!*(const BYTE *)ADDR_NATIVE_PAUSED)
+        camera_clock.frame++;
+}
+
+/* The action's effect step (summon_effect_hook: script `ec` of actor 0-9, before the game's FUN_00427c22): if the
+   running camera is an engine = ff8 one with clock = action, its clock starts (or goes on: a second effect step of the
+   same action under it). A camera without the key: nothing (its play, if any, is a native effect's, as before). */
+static void camera_clock_effect_step(int actor)
+{
+    static const BYTE first[6] = { 0x55, 0x8b, 0xec, 0x51, 0x66, 0xc7 };   /* FUN_005bed92 (as state_stay_start) */
+    const BYTE *at = (const BYTE *)FN_NEW_WATCH_TASK;
+    const DWORD *fns = (const DWORD *)ADDR_WATCH_TASK_FNS;
+    int camera = *(const short *)ADDR_CAMERA_NUMBER, i, slot, from = *(const short *)ADDR_WATCH_TASK_INDEX;
+    const struct own_camera *c;
+    short *task;
+
+    if (actor < 0 || actor >= 10)
+        return;
+    c = camera_ff8_find(camera);
+    if (!c || c->clock != CAMERA_CLOCK_ACTION)
+        return;
+    if (camera_clock.running && camera == camera_clock.camera && camera_ff8.serial == camera_clock.serial && !camera_ff8.done) {
+        if (!camera_clock.second_said && camera_ff8_say())
+            log_line("camera %x (engine ff8): a second effect step (actor %d) at the action's frame %d: the clock goes on", camera, actor,
+                     camera_clock.frame);
+        camera_clock.second_said = 1;
+        return;
+    }
+    camera_clock_stop("a newer effect step starts the clock again");
+    /* the Config menu's fixed camera: not played (camera_ff8_step's rule at its first call, here before a task is taken) */
+    if ((*(const WORD *)ADDR_CAMERA_OPTION & CAMERA_FIXED_MASK) == CAMERA_FIXED && (!c->sequence || !CAMERA_FF8_SEQ_FIXED_AS_FF8)) {
+        if (!camera_clock.fixed_said && camera_clock_say())
+            log_line("camera %x (engine ff8): not played (the Config menu's camera is fixed)", camera);
+        camera_clock.fixed_said = 1;
+        return;
+    }
+    if (!camera_roll_sites_ok())
+        return;                         /* (said once: camera roll: OFF; no camera of this DLL's is played) */
+    if (!watch_task_state) {
+        watch_task_state = 1;
+        for (i = 0; i < 6 && at[0] != 0xe9; i++)
+            if (at[i] != first[i]) {
+                log_line("the list of 60: %08lx does not start as expected (byte %d is %02x): no task of this DLL's in it: no camera on an action's clock, no state prop, and ko / frog are noticed at the actor's next attack only",
+                         FN_NEW_WATCH_TASK, i, at[i]);
+                watch_task_state = -1;
+                break;
+            }
+    }
+    if (watch_task_state < 0) {
+        if (!camera_clock.full_said && camera_clock_say())
+            log_line("camera %x (engine ff8): not played on the action's clock: %08lx is not as expected (the list of 60's line above): the battle's home view",
+                     camera, FN_NEW_WATCH_TASK);
+        camera_clock.full_said = 1;
+        return;
+    }
+    for (i = from < 0 ? 0 : from; i < WATCH_TASKS && fns[i]; i++)
+        ;
+    slot = i < WATCH_TASKS ? ((short (__cdecl *)(DWORD))FN_NEW_WATCH_TASK)((DWORD)camera_clock_task) : -1;
+    if (slot >= 0 && slot < WATCH_TASKS && fns[slot] != (DWORD)camera_clock_task)
+        slot = -1;                      /* (another module's version of the routine may give a slot without adding) */
+    if (slot < 0 || slot >= WATCH_TASKS) {
+        if (!camera_clock.full_said && camera_clock_say())
+            log_line("camera %x (engine ff8): no free task in the list of 60 (%d in it): not played on the action's clock; the battle's home view",
+                     camera, (int)*(const short *)ADDR_WATCH_TASK_COUNT);
+        camera_clock.full_said = 1;
+        return;
+    }
+    task = (short *)(ADDR_WATCH_TASK_DATA + slot * 0x20);
+    for (i = 1; i < 16; i++)            /* FUN_005bed92 sets word 0 only */
+        task[i] = 0;
+    camera_clock.serial = ++native_serial;  /* (the effects' counter: a serial is never shared with an effect's) */
+    task[2] = (short)actor;
+    task[3] = (short)camera_clock.serial;
+    camera_clock.actor = actor;
+    camera_clock.mask = *(const WORD *)ADDR_EFFECT_TARGETS & 0x3ff;   /* the record's results (what an effect is handed here) */
+    camera_clock.camera = camera;
+    camera_clock.frame = camera_clock.calls = 0;
+    camera_clock.second_said = 0;
+    camera_clock.running = 1;
+    camera_ff8_begin(camera_clock.serial, actor, camera_clock.mask, CAMERA_CLOCK_ACTION);
+}
+
+/* A native effect starts (native_start): TRUE when the action's clock keeps the camera (it runs, under the same camera,
+   and owns the player): the effect then begins no play of its own (its [roll], stage, actors, sounds and hits as
+   always), so the camera goes on through the action's steps without starting over. */
+static BOOL camera_clock_keeps(DWORD effect)
+{
+    if (!camera_clock.running || *(const short *)ADDR_CAMERA_NUMBER != camera_clock.camera || camera_ff8.serial != camera_clock.serial ||
+        camera_ff8.done)
+        return FALSE;
+    if (camera_ff8_say())
+        log_line("camera %x (engine ff8): native effect %04lx starts at the action's frame %d: the camera keeps the action's clock",
+                 camera_clock.camera, effect, camera_clock.frame);
+    return TRUE;
+}
 /* CAMERA PLAY END */
+
+/* ---- A state's home view: the states' side (`view_raise`, `view_back`; the camera's side is above) ----------------
+   The lift asked for: the largest `view_raise` and the largest `view_back` of the party actors in a state with them,
+   standing in it: not knocked out (status bit 0), not a frog (0x800: the frog stands on the floor), not in the
+   victory or escape pose (009ab0f2: 0x0e, 0x0c, 0x0d; the pose is played on the floor). When none is, the lift
+   blends out. */
+static void view_lift_from_states(int *raise, int *back)
+{
+    int a;
+
+    *raise = *back = 0;
+    for (a = 0; a < 3; a++) {
+        const struct limit_state *s = &state_run[a].state;
+        BYTE base = *(const BYTE *)(ADDR_IDLE_BASE + (DWORD)a * 0x68);
+
+        if (!state_run[a].on || !(s->view_raise || s->view_back) || (state_actor_status(a) & 0x801)
+            || base == 0x0e || base == 0x0c || base == 0x0d)
+            continue;
+        if (s->view_raise > *raise)
+            *raise = s->view_raise;
+        if (s->view_back > *back)
+            *back = s->view_back;
+    }
+}
+
+/* From state_enter: a state with `view_raise` or `view_back` has been entered. The camera's build is followed
+   (camera_true_install: the bytes of the call at 0041bda4 and of FUN_00430b7b checked, its own line) and the lift is
+   asked for from here on; once a run. */
+static void view_lift_install(int actor)
+{
+    const struct limit_state *s = &state_run[actor].state;
+
+    if (!(s->view_raise || s->view_back))
+        return;
+    if (!view_lift_wanted && camera_true_install())
+        view_lift_wanted = view_lift_from_states;
+    log_line("state %s actor %d: view_raise %u, view_back %u%%: %s", s->name, actor, (unsigned)s->view_raise, (unsigned)s->view_back,
+             view_lift_wanted ? "the battle's home view is lifted while the actor stands in the state (the camera's build at 0041bda4 is followed)"
+                              : "NOT lifted: the camera's build at 0041bda4 could not be followed (see the camera roll's line)");
+}
+
+/* ---- A state's pointer raised: `pointer_raise` ----------------------------------------------------------------
+   The yellow pyramid over the party member whose command menu is open is the model MARK.DAT (data\battle\mark.dat,
+   loaded by FUN_00428b12 into the battle's 3D data + 0x0c; its points are 970 to 1,185 units up, up being -y).
+   FUN_0042f3e8 (one actor's draw) calls FUN_005b9b30, which calls FUN_005b9c8e for the actor of the open command
+   window (window 1, actor 00dc3c7c; also for a manipulated enemy, window 0x13). FUN_005b9c8e draws it turning at
+   the actor's place across the floor (00be12de / 00be12e2 + actor * 0x1aec) and at the height of the word 00bf23e6 +
+   actor * 0x74 (read at 005b9ccb and 005b9dba), added to the model's own points: NOT at a bone and not at the
+   model's place up and down. That word is word 6 of the actor's ab file (0 for most, -200 for a tall model, 500 for
+   a short one), copied by FUN_0042b66a (the party: the battle's set-up FUN_0042ae73, a script's model reload, the
+   frog's change FUN_005bd5e9) and FUN_0042bc15 (enemies; the frog's model); nothing else reads it. So a model held
+   up by its animations' root keeps the pyramid at its standing height.
+   While a party actor is in a state with `pointer_raise = N` and stands in it (not knocked out, not a frog, not in
+   the victory or escape pose: as `view_raise`), the word is the game's value minus N; otherwise the game's value.
+   The state's task (the list of 60, every frame that is not paused) keeps it: when the game has written the word
+   again (a reload) its new value is the game's from then on. The state's end puts the game's value back if the word
+   is still ours; a battle's start forgets (its set-up writes the word afresh). No code is patched: the two reads are
+   checked once a run to be the game's bytes, else nothing is raised (one line).
+   Not moved (they need not be or are not asked for): the target hand (FUN_006d163d / FUN_006d1894, the screen point
+   00bf2e20 of the bone the ab file's byte 0x12 names, projected each frame by FUN_0042f3e8 from the posed skeleton)
+   and the damage numbers (FUN_005bb410: that bone's place, FUN_005d2e00) follow the bones, so the lift; the status
+   marks (FUN_005ba7c0 / FUN_005ba893: the height word 00bf23ea, word 8 of the ab file) stay at the standing height. */
+#define ADDR_MARK_HEIGHT        0x00bf23e6u  /* short, 0x74 per actor: the pointer's height, added to MARK.DAT's points */
+#define SITE_MARK_HEIGHT_A      0x005b9ccbu  /* FUN_005b9c8e: mov dx, [eax+00bf23e6] (into the pyramid's own record) */
+#define SITE_MARK_HEIGHT_B      0x005b9dbau  /* FUN_005b9c8e: movsx eax, word [edx+00bf23e6] (its matrix's height) */
+#define POINTER_LINES           12          /* per battle */
+
+static struct {
+    BYTE ours;                          /* the word holds `written`: the game's `base` raised */
+    short base, written;
+} pointer_lift[3];
+static int pointer_live;                /* 0 not looked at, 1 the two reads are the game's, -1 not */
+static int pointer_lines;
+
+static BOOL pointer_reads_ok(void)
+{
+    static const BYTE a[7] = { 0x66, 0x8b, 0x90, 0xe6, 0x23, 0xbf, 0x00 };
+    static const BYTE b[7] = { 0x0f, 0xbf, 0x82, 0xe6, 0x23, 0xbf, 0x00 };
+
+    if (!pointer_live)
+        pointer_live = bytes_are(SITE_MARK_HEIGHT_A, a, 7) && bytes_are(SITE_MARK_HEIGHT_B, b, 7) ? 1 : -1;
+    return pointer_live > 0;
+}
+
+/* The raise the actor's state asks for now: 0 when none, or when the actor does not stand in the state. */
+static int pointer_raise_wanted(int a)
+{
+    const struct limit_state *s = &state_run[a].state;
+    BYTE base = *(const BYTE *)(ADDR_IDLE_BASE + (DWORD)a * 0x68);
+
+    if (!state_run[a].on || !s->pointer_raise || (state_actor_status(a) & 0x801) || base == 0x0e || base == 0x0c || base == 0x0d)
+        return 0;
+    return s->pointer_raise;
+}
+
+static void pointer_raise_battle_start(void)
+{
+    int i;
+
+    for (i = 0; i < 3; i++)
+        pointer_lift[i].ours = 0;       /* (the set-up loads the models and writes the words afresh) */
+    pointer_lines = 0;
+}
+
+/* From state_enter: a state with `pointer_raise` has been entered. */
+static void pointer_raise_install(int actor)
+{
+    const struct limit_state *s = &state_run[actor].state;
+
+    if (!s->pointer_raise)
+        return;
+    log_line("state %s actor %d: pointer_raise %u: %s", s->name, actor, (unsigned)s->pointer_raise,
+             pointer_reads_ok() ? "the pointer over the acting actor is raised while the actor stands in the state (its height 00bf23e6, kept by the state's task)"
+                                : "NOT raised: FUN_005b9c8e does not read its height at 005b9ccb / 005b9dba as the game does");
+}
+
+/* Every frame of the actor's state task. */
+static void pointer_raise_step(int actor)
+{
+    short *word = (short *)(ADDR_MARK_HEIGHT + (DWORD)actor * 0x74);
+    const char *name = state_run[actor].state.name;
+    int want = pointer_live > 0 ? pointer_raise_wanted(actor) : 0;
+    long value;
+
+    if (pointer_lift[actor].ours && *word != pointer_lift[actor].written) {
+        pointer_lift[actor].ours = 0;   /* the game wrote it again (the model was loaded again): its value is the game's */
+        if (pointer_lines < POINTER_LINES) {
+            pointer_lines++;
+            log_line("state %s actor %d: pointer_raise: the game wrote the pointer's height again (%d, was raised to %d): taken as its own",
+                     name, actor, (int)*word, (int)pointer_lift[actor].written);
+        }
+    }
+    if (!want) {
+        if (pointer_lift[actor].ours) {
+            *word = pointer_lift[actor].base;
+            pointer_lift[actor].ours = 0;
+            if (pointer_lines < POINTER_LINES) {
+                pointer_lines++;
+                log_line("state %s actor %d: pointer at the game's height again (%d): the actor does not stand in the state (statuses %08lx, pose %02x)",
+                         name, actor, (int)*word, state_actor_status(actor), (unsigned)*(const BYTE *)(ADDR_IDLE_BASE + (DWORD)actor * 0x68));
+            }
+        }
+        return;
+    }
+    if (!pointer_lift[actor].ours)
+        pointer_lift[actor].base = *word;
+    value = (long)pointer_lift[actor].base - want;
+    if (value < -32768)
+        value = -32768;
+    if (!pointer_lift[actor].ours && pointer_lines < POINTER_LINES) {
+        pointer_lines++;
+        log_line("state %s actor %d: pointer raised %d units (its height %d -> %ld)", name, actor, want, (int)pointer_lift[actor].base, value);
+    }
+    pointer_lift[actor].written = (short)value;
+    *word = (short)value;
+    pointer_lift[actor].ours = 1;
+}
+
+/* From state_end: the game's height back, if the word is still ours. */
+static void pointer_raise_end(int actor)
+{
+    short *word = (short *)(ADDR_MARK_HEIGHT + (DWORD)actor * 0x74);
+
+    if (!pointer_lift[actor].ours)
+        return;
+    pointer_lift[actor].ours = 0;
+    if (*word != pointer_lift[actor].written)
+        return;                         /* (written again by the game since: its own) */
+    *word = pointer_lift[actor].base;
+    if (pointer_lines < POINTER_LINES) {
+        pointer_lines++;
+        log_line("state %s actor %d: pointer at the game's height again (%d): the state ended", state_run[actor].state.name, actor, (int)*word);
+    }
+}
 
 /* STAGE FX BEGIN: (stage fx 1; FF7FF8Fusion/Notes/Stage_FX_Stage1.md) the stage lines' player, which the native test
    runs against game memory mapped at the game's addresses.
@@ -40626,6 +45435,7 @@ static void reload_characters(void)
         if (!was->defined)
             sxc2_adopt_kept(NEW_CHARACTER_FIRST_ID + i, c); /* (stage 2 of the save move) defined again: a record carried forward for it is its record */
     }
+    build_character_ai();       /* (main menu only: no battle is reading a block) */
     limits_defined = 0;
     test_full_gauge_mask = test_learn_all_mask = 0;
     test_first_limit_block = 0;
@@ -40640,12 +45450,178 @@ static void reload_characters(void)
     }
 }
 
+/* ---- Live tables: a directory of this DLL's tables for a reader outside the process ----------------
+   The config editor's "Live tables" page reads the game's memory through /proc/<pid>/mem (read only) and
+   finds this record through the DLL's export table (it is the one global that is not static on purpose:
+   GNU ld exports every non-static global of the mod build, so it needs no .def line and no dllexport; a
+   dllexport anywhere in this file would turn that off), or through the "live tables: directory at" line
+   of the log. The record says where each table is, how big a record is, how many there are, how many
+   are in use and where the live count lives. A heap table's address is the pointer's value at the last
+   refresh: live_tables_refresh runs at the end of every reading of the files, which is the only time a
+   heap table is made again, and live_tables_begin runs at the start of each, so the reader sees "being
+   rebuilt" in between. While a reading or a refresh is under way, `generation` is odd. Nothing here
+   changes what the DLL does: no hook, no site, no write to the game (the refresh reads five of the
+   kernel's section pointers and six instruction operands, each after IsBadReadPtr, to say whether the
+   game reads a table). */
+#define LIVE_MARKER             "SXLIVE01"
+#define LIVE_VERSION            1
+#define LIVE_ENTRIES            64
+#define LIVE_NAME               24
+#define LIVE_STATIC             1            /* kind: an array of the DLL's */
+#define LIVE_HEAP               2            /* a VirtualAlloc'd table: address 0 while it does not exist */
+#define LIVE_NONE               0xffffffffu  /* in_use or live: not applicable */
+
+struct live_entry {
+    char name[LIVE_NAME];               /* the variable's name, 0-ended: "spells", "spell_list0", "materia" */
+    DWORD kind;                         /* LIVE_STATIC or LIVE_HEAP */
+    DWORD address;                      /* where record 0 is; 0 for a heap table that does not exist */
+    DWORD record_size;                  /* sizeof one record */
+    DWORD count;                        /* records the memory holds (the capacity) */
+    DWORD in_use;                       /* records in use at the refresh, or LIVE_NONE */
+    DWORD in_use_at;                    /* address of the live counter the page reads instead, or 0 */
+    DWORD in_use_width;                 /* 1, 2 or 4: the counter's size in bytes; 0 with in_use_at 0 */
+    DWORD live;                         /* 1 the game reads this table, 0 it does not, LIVE_NONE n/a */
+    DWORD spare[2];                     /* 0 */
+};                                      /* 64 bytes */
+struct live_directory {
+    char marker[8];                     /* LIVE_MARKER, not 0-ended */
+    DWORD version;                      /* LIVE_VERSION */
+    DWORD size;                         /* sizeof *this: 4,428 */
+    DWORD entry_size;                   /* sizeof(struct live_entry): 64 */
+    DWORD entry_count;                  /* entries filled */
+    volatile LONG generation;           /* odd = a reading or a refresh is under way; even = complete */
+    DWORD refreshed;                    /* GetTickCount() of the last refresh */
+    DWORD exe_base, dll_base;           /* GetModuleHandleA(NULL), dll_module */
+    char config[MAX_PATH + 32];         /* config_dir, so the page can check it reads the same folder */
+    struct live_entry entry[LIVE_ENTRIES];
+};
+struct live_directory spellext_live_directory;     /* NOT static: see the comment above */
+static LONG live_said, live_overflow_said;
+
+/* Adds one entry. `in_use_at` is the counter's address (an int, short or BYTE of this DLL's) or NULL. */
+static void live_entry(const char *name, DWORD kind, const void *at, DWORD record_size, DWORD count,
+                       DWORD in_use, const void *in_use_at, DWORD in_use_width, DWORD live)
+{
+    struct live_directory *d = &spellext_live_directory;
+    struct live_entry *e;
+
+    if (d->entry_count >= LIVE_ENTRIES) {
+        if (!InterlockedExchange(&live_overflow_said, 1))
+            log_line("live tables: more than %d entries; `%s` and the rest are not listed", LIVE_ENTRIES, name);
+        return;
+    }
+    e = &d->entry[d->entry_count++];
+    lstrcpynA(e->name, name, LIVE_NAME);
+    e->kind = kind; e->address = (DWORD)at; e->record_size = record_size; e->count = count;
+    e->in_use = in_use; e->in_use_at = (DWORD)in_use_at; e->in_use_width = in_use_at ? in_use_width : 0;
+    e->live = live; e->spare[0] = e->spare[1] = 0;
+}
+
+/* Makes the generation odd if it is even: a reading of the files is starting, and heap tables will be
+   freed and made again before the refresh at its end. Harmless if called twice. */
+static void live_tables_begin(void)
+{
+    struct live_directory *d = &spellext_live_directory;
+
+    if (!(d->generation & 1))
+        InterlockedIncrement(&d->generation);
+}
+
+/* Fills the directory afresh and leaves the generation even. `why` is for the log, once. */
+static void live_tables_refresh(const char *why)
+{
+    struct live_directory *d = &spellext_live_directory;
+    /* the exe is read only where it is mapped: this also runs from DllMain */
+    BOOL kernel_readable = !IsBadReadPtr((const void *)ADDR_KERNEL_ITEM_POINTER, 0x14);
+    DWORD weapons_live = kernel_readable && *(DWORD *)ADDR_KERNEL_WEAPON_POINTER == (DWORD)weapon_table;
+    DWORD armour_live = kernel_readable && *(DWORD *)ADDR_KERNEL_ARMOUR_POINTER == (DWORD)armour_table;
+    DWORD accessories_live = kernel_readable && *(DWORD *)ADDR_KERNEL_ACCESSORY_POINTER == (DWORD)accessory_table;
+    /* moved = the operand names the DLL's table now (a refused repoint leaves the "attempted" flag at 1) */
+    DWORD limits_live = !IsBadReadPtr((const void *)0x00703522u, 4) && !IsBadReadPtr((const void *)0x007021b2u, 4)
+                        && *(DWORD *)0x00703522u == (DWORD)limit_table && *(DWORD *)0x007021b2u == (DWORD)limit_table;
+    DWORD prices_live = !IsBadReadPtr((const void *)ADDR_PRICE_OPERAND, 4) && *(DWORD *)ADDR_PRICE_OPERAND == (DWORD)price_table;
+    DWORD throw_live = !IsBadReadPtr((const void *)ADDR_THROW_OPERAND, 4) && *(DWORD *)ADDR_THROW_OPERAND == (DWORD)throw_effects;
+
+    live_tables_begin();                /* odd while this writes, whether or not begin ran before */
+    copy_bytes((BYTE *)d->marker, (const BYTE *)LIVE_MARKER, 8);
+    d->version = LIVE_VERSION; d->size = sizeof *d; d->entry_size = sizeof(struct live_entry);
+    d->exe_base = (DWORD)GetModuleHandleA(NULL); d->dll_base = (DWORD)dll_module;
+    lstrcpynA(d->config, config_dir, sizeof d->config);
+    d->entry_count = 0;
+    /* the heap tables: the pointers as they are now */
+    live_entry("spells", LIVE_HEAP, spells, sizeof(struct spell), spell_capacity, spell_count, &spell_count, sizeof spell_count, LIVE_NONE);
+    live_entry("spell_support", LIVE_HEAP, spell_support, sizeof(struct spell_support), spell_capacity, spell_count, &spell_count, sizeof spell_count, LIVE_NONE);
+    live_entry("spell_by_id", LIVE_HEAP, spell_by_id, 2, 65536, LIVE_NONE, NULL, 0, LIVE_NONE);
+    live_entry("spell_list0", LIVE_HEAP, spell_list[0], sizeof(struct list_entry), list_capacity, list_length[0], &list_length[0], sizeof list_length[0], LIVE_NONE);
+    live_entry("spell_list1", LIVE_HEAP, spell_list[1], sizeof(struct list_entry), list_capacity, list_length[1], &list_length[1], sizeof list_length[1], LIVE_NONE);
+    live_entry("spell_list2", LIVE_HEAP, spell_list[2], sizeof(struct list_entry), list_capacity, list_length[2], &list_length[2], sizeof list_length[2], LIVE_NONE);
+    live_entry("wide_items", LIVE_HEAP, wide_items, sizeof(struct wide_item), wide_item_room, wide_item_count, &wide_item_count, sizeof wide_item_count, LIVE_NONE);
+    live_entry("wide_gears", LIVE_HEAP, wide_gears, sizeof(struct wide_gear), wide_gear_room, wide_gear_count, &wide_gear_count, sizeof wide_gear_count, LIVE_NONE);
+    live_entry("fields_entries", LIVE_HEAP, fields_entries, sizeof(struct fields_entry), fields_entry_count, fields_entry_count, &fields_entry_count, sizeof fields_entry_count, LIVE_NONE);
+    live_entry("fields_infos", LIVE_HEAP, fields_infos, 0xd0, fields_table, LIVE_NONE, NULL, 0, fields_live != 0);
+    live_entry("fields_scales", LIVE_HEAP, fields_scales, 4, fields_table, LIVE_NONE, NULL, 0, fields_live != 0);
+    live_entry("loose_files", LIVE_HEAP, loose_files, sizeof(struct loose_file), loose_slots, loose_count, &loose_count, sizeof loose_count, LIVE_NONE);
+    /* the DLL's arrays */
+    live_entry("materia", LIVE_STATIC, materia_table, MATERIA_RECORD_SIZE, MATERIA_COUNT_EXTENDED, LIVE_NONE, NULL, 0,
+               kernel_readable && *(DWORD *)ADDR_KERNEL_MATERIA_POINTER == (DWORD)materia_table);
+    live_entry("materia_names", LIVE_STATIC, materia_names, sizeof materia_names[0], NEW_MATERIA_COUNT, LIVE_NONE, NULL, 0, LIVE_NONE);
+    live_entry("materia_descriptions", LIVE_STATIC, materia_descriptions, sizeof materia_descriptions[0], NEW_MATERIA_COUNT, LIVE_NONE, NULL, 0, LIVE_NONE);
+    live_entry("limits", LIVE_STATIC, limit_table, 28, sizeof limit_table / 28, LIVE_NONE, NULL, 0, limits_live);
+    live_entry("spell_renames", LIVE_STATIC, spell_renames, sizeof spell_renames[0], 256, spell_rename_count, &spell_rename_count, sizeof spell_rename_count, LIVE_NONE);
+    live_entry("weapons", LIVE_STATIC, weapon_table, WEAPON_RECORD_SIZE, WEAPON_COUNT_EXTENDED, LIVE_NONE, NULL, 0, weapons_live);
+    live_entry("weapon_mirror", LIVE_STATIC, weapon_storage, WEAPON_RECORD_SIZE, WEAPON_MIRROR, LIVE_NONE, NULL, 0, weapons_live);
+    live_entry("weapon_names", LIVE_STATIC, weapon_names, sizeof weapon_names[0], NEW_WEAPON_COUNT, LIVE_NONE, NULL, 0, LIVE_NONE);
+    live_entry("weapon_descriptions", LIVE_STATIC, weapon_descriptions, sizeof weapon_descriptions[0], NEW_WEAPON_COUNT, LIVE_NONE, NULL, 0, LIVE_NONE);
+    live_entry("armour", LIVE_STATIC, armour_table, ARMOUR_RECORD_SIZE, ARMOUR_COUNT_EXTENDED, LIVE_NONE, NULL, 0, armour_live);
+    live_entry("armour_mirror", LIVE_STATIC, armour_storage, ARMOUR_RECORD_SIZE, GEAR_MIRROR, LIVE_NONE, NULL, 0, armour_live);
+    live_entry("armour_names", LIVE_STATIC, armour_names, sizeof armour_names[0], NEW_ARMOUR_COUNT, LIVE_NONE, NULL, 0, LIVE_NONE);
+    live_entry("armour_descriptions", LIVE_STATIC, armour_descriptions, sizeof armour_descriptions[0], NEW_ARMOUR_COUNT, LIVE_NONE, NULL, 0, LIVE_NONE);
+    live_entry("accessories", LIVE_STATIC, accessory_table, ACCESSORY_RECORD_SIZE, ACCESSORY_COUNT_EXTENDED, LIVE_NONE, NULL, 0, accessories_live);
+    live_entry("accessory_mirror", LIVE_STATIC, accessory_storage, ACCESSORY_RECORD_SIZE, GEAR_MIRROR, LIVE_NONE, NULL, 0, accessories_live);
+    live_entry("accessory_names", LIVE_STATIC, accessory_names, sizeof accessory_names[0], NEW_ACCESSORY_COUNT, LIVE_NONE, NULL, 0, LIVE_NONE);
+    live_entry("accessory_descriptions", LIVE_STATIC, accessory_descriptions, sizeof accessory_descriptions[0], NEW_ACCESSORY_COUNT, LIVE_NONE, NULL, 0, LIVE_NONE);
+    live_entry("items", LIVE_STATIC, item_table, ITEM_RECORD_SIZE, ITEM_TABLE_RECORDS, LIVE_NONE, NULL, 0,
+               kernel_readable && *(DWORD *)ADDR_KERNEL_ITEM_POINTER == (DWORD)item_table);
+    live_entry("item_names", LIVE_STATIC, item_names, sizeof item_names[0], NEW_ITEM_COUNT, LIVE_NONE, NULL, 0, LIVE_NONE);
+    live_entry("item_descriptions", LIVE_STATIC, item_descriptions, sizeof item_descriptions[0], NEW_ITEM_COUNT, LIVE_NONE, NULL, 0, LIVE_NONE);
+    live_entry("prices", LIVE_STATIC, price_table, 4, PRICE_TABLE_ENTRIES, (DWORD)price_first_materia, &price_first_materia, sizeof price_first_materia, prices_live);
+    live_entry("throw_effects", LIVE_STATIC, throw_effects, sizeof throw_effects[0], WEAPON_COUNT_EXTENDED, LIVE_NONE, NULL, 0, throw_live);
+    live_entry("item_ranks", LIVE_STATIC, item_ranks, sizeof item_ranks[0], ITEM_RANK_TABLE, LIVE_NONE, NULL, 0, item_ranks_live != 0);
+    live_entry("wide_list", LIVE_STATIC, wide_list, sizeof wide_list[0], WIDE_ROWS_MAX + WIDE_GUARD_ROWS, wide_bound, &wide_bound, sizeof wide_bound, wide_live != 0);
+    live_entry("wide_battle", LIVE_STATIC, wide_battle, 6, WIDE_ROWS_MAX + WIDE_GUARD_ROWS, LIVE_NONE, NULL, 0, wide_battle_at == wide_battle);
+    live_entry("wide_carried", LIVE_STATIC, wide_carried, sizeof wide_carried[0], WIDE_ROWS_MAX, wide_carried_count, &wide_carried_count, sizeof wide_carried_count, LIVE_NONE);
+    live_entry("shops", LIVE_STATIC, shop_table, SHOP_SIZE, SHOP_COUNT, LIVE_NONE, NULL, 0, shop_table_live != 0);
+    /* the open shop: made up in the last record of shop_table, its entries running on into the room after it */
+    live_entry("shop_open", LIVE_STATIC, shop_table + SHOP_SHOWN_AS * SHOP_SIZE, 4 + SHOP_BIG * 8, 1, LIVE_NONE, NULL, 0, shop_open_hooked != 0);
+    /* the game's shops as the exe had them (vanilla), kept before the first add; live = the copy is filled */
+    live_entry("shops_original", LIVE_STATIC, shops_original, SHOP_SIZE, SHOP_COUNT, LIVE_NONE, NULL, 0, shops_kept != 0);
+    live_entry("shop_adds", LIVE_STATIC, shop_adds, sizeof shop_adds[0], SHOP_ADD_MAX, shop_add_count, &shop_add_count, sizeof shop_add_count, LIVE_NONE);
+    live_entry("growth_curves", LIVE_STATIC, growth_curves, CURVE_SIZE, CURVES_EXTENDED, LIVE_NONE, NULL, 0, growth_curve_base == growth_curves);
+    live_entry("characters", LIVE_STATIC, new_characters, sizeof(struct new_character), ROSTER_MAX, seat_count, &seat_count, sizeof seat_count, new_characters_live != 0);
+    live_entry("seats", LIVE_STATIC, seat_roster, sizeof seat_roster[0], SEAT_MAX, seat_count, &seat_count, sizeof seat_count, LIVE_NONE);
+    live_entry("char_ai", LIVE_STATIC, char_ai, sizeof char_ai[0], ROSTER_MAX, LIVE_NONE, NULL, 0, LIVE_NONE);
+    live_entry("effects", LIVE_STATIC, effect_copies, sizeof(struct effect_copy), EFFECT_COPY_MAX, effect_copy_count, &effect_copy_count, sizeof effect_copy_count, LIVE_NONE);
+    live_entry("effect_bases", LIVE_STATIC, effect_bases, sizeof(struct effect_base), EFFECT_BASE_COUNT, LIVE_NONE, NULL, 0, LIVE_NONE);
+    live_entry("nfx_scripts", LIVE_STATIC, nfx_scripts, sizeof(struct nfx_script), EFFECT_COPY_MAX, LIVE_NONE, NULL, 0, LIVE_NONE);
+    live_entry("nfx_pool", LIVE_STATIC, nfx_pool, sizeof(struct nfx_item), NFX_POOL_ITEMS, nfx_pool_used, &nfx_pool_used, sizeof nfx_pool_used, LIVE_NONE);
+    live_entry("sounds", LIVE_STATIC, sound_handles, sizeof(struct sound_handle), SOUND_HANDLE_MAX, sound_handle_count, &sound_handle_count, sizeof sound_handle_count, LIVE_NONE);
+    live_entry("cameras", LIVE_STATIC, own_cameras, sizeof(struct own_camera), MAX_OWN_CAMERAS, own_camera_count, &own_camera_count, sizeof own_camera_count, LIVE_NONE);
+    live_entry("camera_pool", LIVE_STATIC, camera_pool, 1, CAMERA_POOL_BYTES, camera_pool_used, &camera_pool_used, sizeof camera_pool_used, LIVE_NONE);
+    live_entry("camera_ff8", LIVE_STATIC, camera_ff8_pool, sizeof(struct camera_ff8_segment), CAMERA_FF8_SEGMENTS, camera_ff8_used, &camera_ff8_used, sizeof camera_ff8_used, LIVE_NONE);
+    live_entry("kernel_kept", LIVE_STATIC, kernel_kept, 1, sizeof kernel_kept, LIVE_NONE, NULL, 0, kernel_kept_ready != 0);
+    d->refreshed = GetTickCount();
+    InterlockedExchange(&d->generation, (d->generation | 1) + 1);     /* even: complete */
+    if (!InterlockedExchange(&live_said, 1))
+        log_line("live tables: directory at %08lx (version %d, %lu entries; %s)", (DWORD)d, LIVE_VERSION, d->entry_count, why);
+}
+
 static void reload_config(void)
 {
     if (!restore_kernel_tables()) {
         log_line("config reload: the kernel's tables were not kept at start-up; nothing reloaded");
         return;
     }
+    live_tables_begin();        /* (live tables) heap tables are made again below: "being rebuilt" until the refresh at the end */
     /* (the limit items are in the characters' sheets: made afresh by load_limits, read last) */
     character_names_scanned = 0;                        /* the character file's names, for `equip` lists */
     load_spell_names();
@@ -40669,6 +45645,7 @@ static void reload_config(void)
     seat_equipment();
     refresh_growth_curves();
     forget_own_cameras();
+    live_tables_refresh("the files read again");
 }
 
 /* ---- The SpellExt screen of the main menu ------------------------------------
@@ -41883,14 +46860,17 @@ static void draw_character_view(void)
     else
         screen_line(left, top + 3 * CHARACTER_LINE, 7, "Battle: the base's model%s%s", c->battle_prefix[0] ? ", files " : "",
                   c->battle_prefix);
-    screen_line(left, top + 4 * CHARACTER_LINE, 7, "Equips like: %s", nine_names[c->equip_like >= 0 && c->equip_like < 9 ? c->equip_like : c->base]);
+    screen_line(left, top + 4 * CHARACTER_LINE, 7, "Equips like: %s", c->equip_like == EQUIP_LIKE_NONE ? "none" : nine_names[c->equip_like >= 0 && c->equip_like < 9 ? c->equip_like : c->base]);
     if (c->party_slot)
         screen_line(right + 0x30, top, 7, "Party slot: %d", c->party_slot);
     else
         screen_line(right + 0x30, top, 7, "Party slot: none");
     screen_line(right + 0x30, top + CHARACTER_LINE, 7, "Joins: %s", c->join_on_load ? "on load" : "by field script");
     screen_line(right + 0x30, top + 2 * CHARACTER_LINE, 7, "Remake on load: %s", c->remake_on_load > 0 ? "yes" : "no");
-    screen_line(right + 0x30, top + 3 * CHARACTER_LINE, 7, "Portrait: %s", c->portrait[0] ? c->portrait : "the base's");
+    if (c->portrait_number >= 0)
+        screen_line(right + 0x30, top + 3 * CHARACTER_LINE, 7, "Portrait: %s (the game's %d)", c->portrait, c->portrait_number);
+    else
+        screen_line(right + 0x30, top + 3 * CHARACTER_LINE, 7, "Portrait: %s", c->portrait[0] ? c->portrait : "the base's");
     if (c->own_limits)
         screen_line(right + 0x30, top + 4 * CHARACTER_LINE, 7, "Limits: own, set %s", c->limit_set[0] ? c->limit_set : "default");
     else if (c->limits_like >= 0)
@@ -42141,6 +47121,7 @@ static const char *seats_toggle_phs(struct new_character *c)
             build_character_record(c, c->record, UNUSED_RECORD_ID);
             c->has_record = 1;
             learn_limits(c, c->record);
+            character_wide_wear(c, "switched on");     /* (a sheet's wide piece) */
         }
         c->hidden = 0;
     }
@@ -43821,29 +48802,39 @@ static const char *wide_hook_missing(BOOL new_game_too)
    the copy ARE moved); the bounds inside the three routines of the list (006cbe9c, 006cbf94,
    006cc031, 006cc0b5: never run on the list; the routine FFNx put behind 006cbe5f is fed on the
    game's 320 words, which stay 320); the battle list's length byte 009ac110 (rows / 2: 255 at
-   most, the reason for 510). */
-enum { WIDE3_BOUND, WIDE3_BATTLE };
+   most, the reason for 510).
+
+   (STAGE 4, tools/work/limits/wide/stage4_design/PLAN.md) `wide_rows = N`, N an even number from 512
+   to WIDE_ROWS_MAX: the 26 bounds take N (N0 N0 N0 N0 = N as a dword; W0 W0 = N as a word, the
+   Item menu's two scroll totals; H0 H0 = N / 2 as a word, the sell list's rows of two cells; with
+   N = 510 these are exactly the bytes stage 3 wrote) and 8 MORE sites (wide4_sites) move the
+   battle list's length to the DLL's dword wide_battle_pairs (L0 L0 L0 L0 = its address): 10 whole
+   instructions, each the same length as the game's. The 52 are compared first, as for 510 (a
+   refusal: 320 rows); then the 8: a refusal there, or 10 c1 9a 00 anywhere else in the code, and
+   the list has 510 rows in this run ("N ROWS REFUSED", the 52 valued for 510), the switch on. A
+   read-back fault of any of the 60 puts every one of them back: 320 rows. */
+enum { WIDE3_BOUND, WIDE3_BATTLE, WIDE3_LENGTH };
 static const struct wide3_site {
     DWORD address;
     const char *old_bytes, *new_bytes;
     BYTE kind;
 } wide3_sites[] = {
     /* battle end write-back, in 00430dd0 (state 5) */
-    { 0x00431420u, "81 7d fc 40 01 00 00", "81 7d fc fe 01 00 00", WIDE3_BOUND },
+    { 0x00431420u, "81 7d fc 40 01 00 00", "81 7d fc N0 N0 N0 N0", WIDE3_BOUND },
     { 0x0043142fu, "05 54 c3 9a 00", "05 Z0 Z0 Z0 Z0", WIDE3_BATTLE },
     /* mid-battle gain 004331ac */
-    { 0x00433212u, "81 7d f8 40 01 00 00", "81 7d f8 fe 01 00 00", WIDE3_BOUND },
+    { 0x00433212u, "81 7d f8 40 01 00 00", "81 7d f8 N0 N0 N0 N0", WIDE3_BOUND },
     { 0x00433221u, "05 54 c3 9a 00", "05 Z0 Z0 Z0 Z0", WIDE3_BATTLE },
-    { 0x00433275u, "81 7d f8 40 01 00 00", "81 7d f8 fe 01 00 00", WIDE3_BOUND },
+    { 0x00433275u, "81 7d f8 40 01 00 00", "81 7d f8 N0 N0 N0 N0", WIDE3_BOUND },
     { 0x00433292u, "05 54 c3 9a 00", "05 Z0 Z0 Z0 Z0", WIDE3_BATTLE },
     /* random Throw 004333c4 (its bound stays 320) */
     { 0x0043340fu, "66 8b 91 54 c3 9a 00", "66 8b 91 Z0 Z0 Z0 Z0", WIDE3_BATTLE },
     { 0x00433427u, "8a 88 58 c3 9a 00", "8a 88 Z4 Z4 Z4 Z4", WIDE3_BATTLE },
     /* lose a random item 00434969 */
-    { 0x0043498eu, "81 7d f8 40 01 00 00", "81 7d f8 fe 01 00 00", WIDE3_BOUND },
+    { 0x0043498eu, "81 7d f8 40 01 00 00", "81 7d f8 N0 N0 N0 N0", WIDE3_BOUND },
     { 0x0043499fu, "66 8b 91 54 c3 9a 00", "66 8b 91 Z0 Z0 Z0 Z0", WIDE3_BATTLE },
     { 0x004349b6u, "8a 88 58 c3 9a 00", "8a 88 Z4 Z4 Z4 Z4", WIDE3_BATTLE },
-    { 0x004349f9u, "81 7d f8 40 01 00 00", "81 7d f8 fe 01 00 00", WIDE3_BOUND },
+    { 0x004349f9u, "81 7d f8 40 01 00 00", "81 7d f8 N0 N0 N0 N0", WIDE3_BOUND },
     { 0x00434a0au, "66 8b 91 54 c3 9a 00", "66 8b 91 Z0 Z0 Z0 Z0", WIDE3_BATTLE },
     { 0x00434a21u, "8a 88 58 c3 9a 00", "8a 88 Z4 Z4 Z4 Z4", WIDE3_BATTLE },
     /* take one from a battle row 00434a80 */
@@ -43855,14 +48846,14 @@ static const struct wide3_site {
     { 0x00434adfu, "66 c7 80 54 c3 9a 00 ff ff", "66 c7 80 Z0 Z0 Z0 Z0 ff ff", WIDE3_BATTLE },
     { 0x00434aeeu, "c6 81 58 c3 9a 00 0a", "c6 81 Z4 Z4 Z4 Z4 0a", WIDE3_BATTLE },
     /* use one up by number 00434c2a */
-    { 0x00434c40u, "81 7d fc 40 01 00 00", "81 7d fc fe 01 00 00", WIDE3_BOUND },
+    { 0x00434c40u, "81 7d fc 40 01 00 00", "81 7d fc N0 N0 N0 N0", WIDE3_BOUND },
     { 0x00434c51u, "66 8b 91 54 c3 9a 00", "66 8b 91 Z0 Z0 Z0 Z0", WIDE3_BATTLE },
     { 0x00434c65u, "8a 88 58 c3 9a 00", "8a 88 Z4 Z4 Z4 Z4", WIDE3_BATTLE },
     /* spoils 005c84ed */
-    { 0x005c857du, "81 7d f0 40 01 00 00", "81 7d f0 fe 01 00 00", WIDE3_BOUND },
-    { 0x005c8605u, "81 7d f0 40 01 00 00", "81 7d f0 fe 01 00 00", WIDE3_BOUND },
+    { 0x005c857du, "81 7d f0 40 01 00 00", "81 7d f0 N0 N0 N0 N0", WIDE3_BOUND },
+    { 0x005c8605u, "81 7d f0 40 01 00 00", "81 7d f0 N0 N0 N0 N0", WIDE3_BOUND },
     /* battle start build 005d1520 */
-    { 0x005d153fu, "81 7d f8 40 01 00 00", "81 7d f8 fe 01 00 00", WIDE3_BOUND },
+    { 0x005d153fu, "81 7d f8 40 01 00 00", "81 7d f8 N0 N0 N0 N0", WIDE3_BOUND },
     { 0x005d1552u, "81 c1 54 c3 9a 00", "81 c1 Z0 Z0 Z0 Z0", WIDE3_BATTLE },
     /* win screen 006c6b30 (kept in a local, never used) */
     { 0x006c6b36u, "c7 45 d4 54 c3 9a 00", "c7 45 d4 Z0 Z0 Z0 Z0", WIDE3_BATTLE },
@@ -43879,28 +48870,28 @@ static const struct wide3_site {
     /* battle Item list draw, half size 006df007 */
     { 0x006df00du, "c7 45 e8 54 c3 9a 00", "c7 45 e8 Z0 Z0 Z0 Z0", WIDE3_BATTLE },
     /* Equip list builder 007083ed */
-    { 0x00708430u, "81 7d f8 40 01 00 00", "81 7d f8 fe 01 00 00", WIDE3_BOUND },
-    { 0x007084eau, "81 7d f8 40 01 00 00", "81 7d f8 fe 01 00 00", WIDE3_BOUND },
-    { 0x007085a0u, "81 7d f8 40 01 00 00", "81 7d f8 fe 01 00 00", WIDE3_BOUND },
+    { 0x00708430u, "81 7d f8 40 01 00 00", "81 7d f8 N0 N0 N0 N0", WIDE3_BOUND },
+    { 0x007084eau, "81 7d f8 40 01 00 00", "81 7d f8 N0 N0 N0 N0", WIDE3_BOUND },
+    { 0x007085a0u, "81 7d f8 40 01 00 00", "81 7d f8 N0 N0 N0 N0", WIDE3_BOUND },
     /* Arrange 00714640 */
-    { 0x0071466du, "68 40 01 00 00", "68 fe 01 00 00", WIDE3_BOUND },
-    { 0x0071468eu, "68 40 01 00 00", "68 fe 01 00 00", WIDE3_BOUND },
-    { 0x007146afu, "68 40 01 00 00", "68 fe 01 00 00", WIDE3_BOUND },
-    { 0x007146cdu, "68 40 01 00 00", "68 fe 01 00 00", WIDE3_BOUND },
-    { 0x007146ebu, "68 40 01 00 00", "68 fe 01 00 00", WIDE3_BOUND },
-    { 0x00714709u, "68 40 01 00 00", "68 fe 01 00 00", WIDE3_BOUND },
-    { 0x00714727u, "68 40 01 00 00", "68 fe 01 00 00", WIDE3_BOUND },
+    { 0x0071466du, "68 40 01 00 00", "68 N0 N0 N0 N0", WIDE3_BOUND },
+    { 0x0071468eu, "68 40 01 00 00", "68 N0 N0 N0 N0", WIDE3_BOUND },
+    { 0x007146afu, "68 40 01 00 00", "68 N0 N0 N0 N0", WIDE3_BOUND },
+    { 0x007146cdu, "68 40 01 00 00", "68 N0 N0 N0 N0", WIDE3_BOUND },
+    { 0x007146ebu, "68 40 01 00 00", "68 N0 N0 N0 N0", WIDE3_BOUND },
+    { 0x00714709u, "68 40 01 00 00", "68 N0 N0 N0 N0", WIDE3_BOUND },
+    { 0x00714727u, "68 40 01 00 00", "68 N0 N0 N0 N0", WIDE3_BOUND },
     /* Item menu set-up 00714ef2 */
-    { 0x00714f34u, "68 40 01 00 00", "68 fe 01 00 00", WIDE3_BOUND },
+    { 0x00714f34u, "68 40 01 00 00", "68 N0 N0 N0 N0", WIDE3_BOUND },
     /* Item menu handler 00715105 */
-    { 0x00715717u, "66 c7 05 f2 17 dd 00 40 01", "66 c7 05 f2 17 dd 00 fe 01", WIDE3_BOUND },
-    { 0x007160d4u, "66 c7 05 f2 17 dd 00 40 01", "66 c7 05 f2 17 dd 00 fe 01", WIDE3_BOUND },
-    { 0x00717404u, "68 40 01 00 00", "68 fe 01 00 00", WIDE3_BOUND },
+    { 0x00715717u, "66 c7 05 f2 17 dd 00 40 01", "66 c7 05 f2 17 dd 00 W0 W0", WIDE3_BOUND },
+    { 0x007160d4u, "66 c7 05 f2 17 dd 00 40 01", "66 c7 05 f2 17 dd 00 W0 W0", WIDE3_BOUND },
+    { 0x00717404u, "68 40 01 00 00", "68 N0 N0 N0 N0", WIDE3_BOUND },
     /* shop set-up 0071a6e6 */
-    { 0x0071a728u, "68 a0 00 00 00", "68 ff 00 00 00", WIDE3_BOUND },
+    { 0x0071a728u, "68 a0 00 00 00", "68 H0 H0 00 00", WIDE3_BOUND },
     /* shop loop 0071aaa3 */
-    { 0x0071bf20u, "66 c7 05 02 47 dd 00 a0 00", "66 c7 05 02 47 dd 00 ff 00", WIDE3_BOUND },
-    { 0x0071d5efu, "66 c7 05 02 47 dd 00 a0 00", "66 c7 05 02 47 dd 00 ff 00", WIDE3_BOUND },
+    { 0x0071bf20u, "66 c7 05 02 47 dd 00 a0 00", "66 c7 05 02 47 dd 00 H0 H0", WIDE3_BOUND },
+    { 0x0071d5efu, "66 c7 05 02 47 dd 00 a0 00", "66 c7 05 02 47 dd 00 H0 H0", WIDE3_BOUND },
 };
 #define WIDE3_SITE_COUNT        ((int)(sizeof wide3_sites / sizeof wide3_sites[0]))
 #define WIDE3_BATTLE_OPERANDS   26              /* dwords of the game's code in 009ac354-009acad3: every one on a row of the table */
@@ -43911,12 +48902,42 @@ static BYTE wide3_new[sizeof wide3_sites / sizeof wide3_sites[0]][WIDE_SITE_BYTE
 static BYTE wide3_length[sizeof wide3_sites / sizeof wide3_sites[0]];
 static DWORD wide3_protect[sizeof wide3_sites / sizeof wide3_sites[0]];
 static int wide3_go;                    /* 1 while the 52 sites are meant to be written with the switch (asked for and not refused so far) */
+static int wide3_rows = WIDE_V2_ROWS;   /* (stage 4) the rows the 52 sites are valued for: N; 510 after a refusal of the 8 below */
 
-/* One string of the table as bytes. Z0 / Z2 / Z4 (four of a kind): the address of the DLL's battle copy + 0 / 2 / 4. */
+/* (Stage 4) THE BATTLE LIST'S LENGTH: the 8 operands of its byte 009ac110 in the game's code (a raw search of the exe: 8, all
+   in .text), each moved to the DLL's dword wide_battle_pairs by the same instruction one size wider (the two writers' loads
+   too: their locals are whole dwords). The `xor r32,r32` before each reader stays (the dword load fills the register). */
+static const struct wide3_site wide4_sites[] = {
+    /* battle start build 005d1520: the length = max(3, (last row + 2) / 2), written */
+    { 0x005d16bbu, "8a 45 f4 a2 10 c1 9a 00", "8b 45 f4 a3 L0 L0 L0 L0", WIDE3_LENGTH },
+    /* mid-battle gain 004331ac: read, compared with (new row + 1) / 2, raised */
+    { 0x00433399u, "a0 10 c1 9a 00", "a1 L0 L0 L0 L0", WIDE3_LENGTH },
+    { 0x004333a3u, "8a 4d f0 88 0d 10 c1 9a 00", "8b 4d f0 89 0d L0 L0 L0 L0", WIDE3_LENGTH },
+    /* battle Item list set-up 006d982c: the grid's total rows = length x 2 */
+    { 0x006d9895u, "8a 15 10 c1 9a 00", "8b 15 L0 L0 L0 L0", WIDE3_LENGTH },
+    /* battle Item list draw 006debfe: the scroll bar when length > 3; its total = length x 2 (a word) */
+    { 0x006dec22u, "8a 0d 10 c1 9a 00", "8b 0d L0 L0 L0 L0", WIDE3_LENGTH },
+    { 0x006dec35u, "8a 15 10 c1 9a 00", "8b 15 L0 L0 L0 L0", WIDE3_LENGTH },
+    /* battle Item list draw, half size 006df007: the same */
+    { 0x006df02bu, "8a 0d 10 c1 9a 00", "8b 0d L0 L0 L0 L0", WIDE3_LENGTH },
+    { 0x006df03eu, "8a 15 10 c1 9a 00", "8b 15 L0 L0 L0 L0", WIDE3_LENGTH },
+};
+#define WIDE4_SITE_COUNT        ((int)(sizeof wide4_sites / sizeof wide4_sites[0]))
+#define WIDE4_LENGTH_OPERANDS   8               /* dwords 009ac110 in the game's code: every one on a row of wide4_sites */
+static BYTE wide4_old[sizeof wide4_sites / sizeof wide4_sites[0]][WIDE_SITE_BYTES];
+static BYTE wide4_new[sizeof wide4_sites / sizeof wide4_sites[0]][WIDE_SITE_BYTES];
+static BYTE wide4_length[sizeof wide4_sites / sizeof wide4_sites[0]];
+static DWORD wide4_protect[sizeof wide4_sites / sizeof wide4_sites[0]];
+static int wide4_go;                    /* (stage 4) 1 while the 8 sites are meant to be written with the switch */
+
+/* One string of the table as bytes. Z0 / Z2 / Z4 (four of a kind): the address of the DLL's battle copy + 0 / 2 / 4.
+   (Stage 4) N0 (four of a kind): wide3_rows as a dword; W0 (two): wide3_rows as a word; H0 (two): wide3_rows / 2, rounded up,
+   as a word (the sell list's rows of two cells); L0 (four): the address of the DLL's dword wide_battle_pairs. */
 static int wide3_parse(const char *text, BYTE *bytes)
 {
-    int n = 0, group = 0;
-    char delta = 0;
+    int n = 0, group = 0, size = 4;
+    char kind = 0, delta = 0;
+    DWORD of = 0;
 
     while (*text) {
         int value;
@@ -43927,12 +48948,21 @@ static int wide3_parse(const char *text, BYTE *bytes)
         }
         if (n == WIDE_SITE_BYTES || !text[1])
             return -1;
-        if (text[0] == 'Z') {
-            if ((text[1] != '0' && text[1] != '2' && text[1] != '4') || (group && delta != text[1]))
+        if (text[0] == 'Z' || text[0] == 'N' || text[0] == 'W' || text[0] == 'H' || text[0] == 'L') {
+            if (group && (kind != text[0] || delta != text[1]))
                 return -1;
-            delta = text[1];
-            value = (int)(((DWORD)wide_battle + (DWORD)(delta - '0')) >> (8 * group) & 0xff);
-            group = (group + 1) & 3;
+            if (!group) {
+                kind = text[0], delta = text[1];
+                if (kind == 'Z' ? delta != '0' && delta != '2' && delta != '4' : delta != '0')
+                    return -1;
+                size = kind == 'W' || kind == 'H' ? 2 : 4;
+                of = kind == 'Z' ? (DWORD)wide_battle + (DWORD)(delta - '0') : kind == 'L' ? (DWORD)&wide_battle_pairs
+                   : kind == 'H' ? (DWORD)(wide3_rows + 1) / 2 : (DWORD)wide3_rows;
+                if (size == 2 && of > 0xffffu)
+                    return -1;
+            }
+            value = (int)(of >> (8 * group) & 0xff);
+            group = (group + 1) % size;
         } else {
             int high = hex_digit(text[0]), low = hex_digit(text[1]);
 
@@ -43949,7 +48979,7 @@ static int wide3_parse(const char *text, BYTE *bytes)
 static void wide3_refused(const char *why, DWORD address, const BYTE *found, const BYTE *expected, int count)
 {
     char bytes[2][WIDE_SITE_BYTES * 3 + 4];
-    int i, k;
+    int i, k, rows = wide_rows_wanted > WIDE_V2_ROWS ? wide_rows_wanted : WIDE_V2_ROWS, sites = WIDE3_SITE_COUNT + (rows > WIDE_V2_ROWS ? WIDE4_SITE_COUNT : 0);
 
     for (k = 0; k < 2; k++) {
         const BYTE *b = k ? expected : found;
@@ -43959,16 +48989,44 @@ static void wide3_refused(const char *why, DWORD address, const BYTE *found, con
             wsprintfA(bytes[k] + i * 3, "%02x ", b[i]);
     }
     wide3_go = 0;
+    wide4_go = 0;                       /* (stage 4) the 8 go with the 52 */
     wide_rows_refused = 1;
     if (address)
-        log_line("*** wide item list: 510 ROWS REFUSED at %08lx: %s%s%s%s%s: NONE of the %d sites of the 510-row list is written and THE ITEM LIST HAS 320 ROWS in this run, as with wide_rows = 320. The switch itself is not affected (see the lines below) ***",
-                 address, why, found ? "; found " : "", bytes[0], expected ? "expected " : "", bytes[1], WIDE3_SITE_COUNT);
+        log_line("*** wide item list: %d ROWS REFUSED at %08lx: %s%s%s%s%s: NONE of the %d sites of the %d-row list is written and THE ITEM LIST HAS 320 ROWS in this run, as with wide_rows = 320. The switch itself is not affected (see the lines below) ***",
+                 rows, address, why, found ? "; found " : "", bytes[0], expected ? "expected " : "", bytes[1], sites, rows);
     else
-        log_line("*** wide item list: 510 ROWS REFUSED: %s: NONE of the %d sites of the 510-row list is written and THE ITEM LIST HAS 320 ROWS in this run, as with wide_rows = 320. The switch itself is not affected (see the lines below) ***",
-                 why, WIDE3_SITE_COUNT);
+        log_line("*** wide item list: %d ROWS REFUSED: %s: NONE of the %d sites of the %d-row list is written and THE ITEM LIST HAS 320 ROWS in this run, as with wide_rows = 320. The switch itself is not affected (see the lines below) ***",
+                 rows, why, sites, rows);
 }
 
-/* Is the byte at `address` on a row of the stage's table? */
+/* (Stage 4) One of the 8 sites of the battle list's length refused, before anything was written: the list has 510 rows in this
+   run (the 52 are valued for 510 again: their strings were read once already, so they read again). */
+static void wide4_refuse(const char *why, DWORD address, const BYTE *found, const BYTE *expected, int count)
+{
+    char bytes[2][WIDE_SITE_BYTES * 3 + 4];
+    int i, k;
+
+    for (k = 0; k < 2; k++) {
+        const BYTE *b = k ? expected : found;
+
+        bytes[k][0] = 0;
+        for (i = 0; b && i < count; i++)
+            wsprintfA(bytes[k] + i * 3, "%02x ", b[i]);
+    }
+    wide4_go = 0;
+    wide4_refused = 1;
+    wide3_rows = WIDE_V2_ROWS;
+    for (i = 0; i < WIDE3_SITE_COUNT; i++)
+        wide3_parse(wide3_sites[i].new_bytes, wide3_new[i]);
+    if (address)
+        log_line("*** wide item list: %d ROWS REFUSED at %08lx: %s%s%s%s%s: NONE of the %d sites that name the battle list's length (009ac110) is written and THE ITEM LIST HAS 510 ROWS in this run, as with wide_rows = 510 (the 52 sites of the 510-row list are written for 510 rows). The switch itself is not affected (see the lines below) ***",
+                 wide_rows_wanted, address, why, found ? "; found " : "", bytes[0], expected ? "expected " : "", bytes[1], WIDE4_SITE_COUNT);
+    else
+        log_line("*** wide item list: %d ROWS REFUSED: %s: NONE of the %d sites that name the battle list's length (009ac110) is written and THE ITEM LIST HAS 510 ROWS in this run, as with wide_rows = 510 (the 52 sites of the 510-row list are written for 510 rows). The switch itself is not affected (see the lines below) ***",
+                 wide_rows_wanted, why, WIDE4_SITE_COUNT);
+}
+
+/* Is the byte at `address` on a row of the stage's table? (Stage 4: or of the 8 of the battle list's length.) */
 static BOOL wide3_on_a_site(DWORD address)
 {
     int s;
@@ -43977,6 +49035,37 @@ static BOOL wide3_on_a_site(DWORD address)
         if (address >= wide3_sites[s].address && address < wide3_sites[s].address + wide3_length[s])
             return TRUE;
     return FALSE;
+}
+
+static BOOL wide4_on_a_site(DWORD address)
+{
+    int s;
+
+    for (s = 0; s < WIDE4_SITE_COUNT; s++)
+        if (address >= wide4_sites[s].address && address < wide4_sites[s].address + wide4_length[s])
+            return TRUE;
+    return FALSE;
+}
+
+/* (Stage 4) The game's code read through for the battle list's length byte 009ac110 as an operand (10 c1 9a 00). *stray: the
+   first that is not on a row of wide4_sites. Returns the count of all. */
+static int wide4_scan_length(DWORD *stray)
+{
+    const BYTE *text = (const BYTE *)WIDE_TEXT_START;
+    DWORD i;
+    int all = 0;
+
+    *stray = 0;
+    for (i = 0; i + 4 <= WIDE_TEXT_BYTES; i++) {
+        DWORD at = WIDE_TEXT_START + i;
+
+        if (text[i] != 0x10 || text[i + 1] != 0xc1 || text[i + 2] != 0x9a || text[i + 3] != 0x00)
+            continue;
+        all++;
+        if ((!wide4_on_a_site(at) || !wide4_on_a_site(at + 3)) && !*stray)
+            *stray = at;
+    }
+    return all;
 }
 
 /* The game's code read through for an address inside the game's own battle copy (009ac354 to
@@ -44007,14 +49096,16 @@ static int wide3_scan_battle(DWORD *stray)
    wide_switch_install, once every site of the switch itself was found in order. Leaves wide3_go
    at 1 only if all 52 may be written. */
 static BOOL equip_hook_in(void);
+static void wide4_look(void);
 static void wide3_look(void)
 {
     DWORD stray = 0;
     int s, t, all;
 
-    wide3_go = 0;
-    if (wide_rows_wanted != WIDE_ROWS)
+    wide3_go = wide4_go = 0;
+    if (wide_rows_wanted < WIDE_V2_ROWS)
         return;
+    wide3_rows = wide_rows_wanted;      /* (stage 4) the 52 valued for N */
     wide3_go = 1;
     for (s = 0; s < WIDE3_SITE_COUNT; s++) {
         int a = wide3_parse(wide3_sites[s].old_bytes, wide3_old[s]), b = wide3_parse(wide3_sites[s].new_bytes, wide3_new[s]);
@@ -44059,26 +49150,202 @@ static void wide3_look(void)
                       stray, NULL, NULL, 0);
         return;
     }
-    if (!equip_hook_in())
+    if (!equip_hook_in()) {
         wide3_refused("the DLL's hook on the builder of the Equip menu's list (0070718d) is not in: with 510 rows that list's room must be guarded there", 0, NULL, NULL, 0);
+        return;
+    }
+    if (wide_rows_wanted > WIDE_V2_ROWS)
+        wide4_look();       /* (stage 4) the 8 of the battle list's length: a refusal there leaves 510 rows */
 }
 
-/* At every save and load, with 510 rows: are the 52 sites still as written? */
+/* (Stage 4) Steps 1 and 2 for the 8 sites of the battle list's length, after the 52 were found in order. Leaves wide4_go at 1
+   only if all 8 may be written; else wide4_refuse (510 rows). */
+static void wide4_look(void)
+{
+    DWORD stray = 0;
+    int s, t, all;
+
+    for (s = 0; s < WIDE4_SITE_COUNT; s++) {
+        int a = wide3_parse(wide4_sites[s].old_bytes, wide4_old[s]), b = wide3_parse(wide4_sites[s].new_bytes, wide4_new[s]);
+
+        if (a < 1 || a != b) {
+            wide4_refuse("the DLL's own table of the battle list's length cannot be read at this row (a fault of this build)", wide4_sites[s].address, NULL, NULL, 0);
+            return;
+        }
+        wide4_length[s] = (BYTE)a;
+    }
+    for (s = 0; s < WIDE4_SITE_COUNT; s++) {
+        for (t = 0; t < s; t++)
+            if (wide4_sites[s].address < wide4_sites[t].address + wide4_length[t] && wide4_sites[t].address < wide4_sites[s].address + wide4_length[s]) {
+                wide4_refuse("two rows of the DLL's own table of the battle list's length share a byte (a fault of this build)", wide4_sites[s].address, NULL, NULL, 0);
+                return;
+            }
+        for (t = 0; t < WIDE3_SITE_COUNT; t++)
+            if (wide4_sites[s].address < wide3_sites[t].address + wide3_length[t] && wide3_sites[t].address < wide4_sites[s].address + wide4_length[s]) {
+                wide4_refuse("a row of the DLL's table of the battle list's length shares a byte with a site of the 510-row list (a fault of this build)", wide4_sites[s].address, NULL, NULL, 0);
+                return;
+            }
+        for (t = 0; t < WIDE_SITE_COUNT; t++)
+            if (wide4_sites[s].address < wide_sites[t].address + wide_site_length[t] && wide_sites[t].address < wide4_sites[s].address + wide4_length[s]) {
+                wide4_refuse("a row of the DLL's table of the battle list's length shares a byte with a site of the switch (a fault of this build)", wide4_sites[s].address, NULL, NULL, 0);
+                return;
+            }
+    }
+    for (s = 0; s < WIDE4_SITE_COUNT; s++) {
+        DWORD at = wide4_sites[s].address;
+
+        if (IsBadReadPtr((const void *)at, wide4_length[s])) {
+            wide4_refuse("the site cannot be read", at, NULL, NULL, 0);
+            return;
+        }
+        if (!bytes_are(at, wide4_old[s], wide4_length[s])) {
+            wide4_refuse("the bytes of this instruction that names the battle list's length are not the game's (another mod wrote here, or the exe is another build)",
+                         at, (const BYTE *)at, wide4_old[s], wide4_length[s]);
+            return;
+        }
+    }
+    all = wide4_scan_length(&stray);
+    if (stray || all != WIDE4_LENGTH_OPERANDS) {
+        log_line("wide item list: the game's code names the battle list's length (009ac110) in %d places (%d expected)", all, WIDE4_LENGTH_OPERANDS);
+        wide4_refuse(stray ? "the game's code names the battle list's length here, where the table has no site: a reader or writer that would stay on the byte (another mod's code?)"
+                           : "the game's code does not name the battle list's length as often as the game's does",
+                     stray, NULL, NULL, 0);
+        return;
+    }
+    wide4_go = 1;
+}
+
+/* (STAGE 4b, tools/work/limits/wide/stage4_design/PLAN.md 5.4) ARRANGE OVER THE ROWS IN USE. Arrange (00714640) hands the
+   game's sort 0071475d (cdecl: list, count, comparer, swap) the whole list: with N rows its work grows with N x N, every empty
+   row being equal to every other (about 5.6 million comparisons at 3350 rows, in one frame). With more than 510 rows its 7 calls
+   (one for each order: by use in the field, in battle, to throw; by number, by name, most, fewest) go to wide_sort_used: it moves
+   every EMPTY row to the end (the rows in use keep their order: Arrange orders them anyway) and has the game's own sort order
+   the rows in use only; then every one of the 7 orders leaves the empty rows at the end, as the game's sort does, and its cost
+   follows the kinds held, not N. Things of the same rank (the same use, number, name or quantity) may end in another order
+   among themselves than the game's sort would leave them in (it is not a stable sort): the owner's default, said in the readme.
+   Any other caller, or a list or count that is not the run's, is passed to the game's sort as it is. The 7 calls are compared
+   first (each an e8 to 0071475d; no byte of FFNx or Enhanced Stock UI lies on them), written all or none, read back; a refusal
+   leaves them as the game's (Arrange sorts all N rows, as in stage 4a) with one line. Nothing with 510 rows or fewer. */
+#define WIDE_FN_SORT            0x0071475du
+static const DWORD wide_sort_calls[7] = { 0x00714677u, 0x00714698u, 0x007146b9u, 0x007146d7u, 0x007146f5u, 0x00714713u, 0x00714731u };
+#define WIDE_SORT_CALLS         ((int)(sizeof wide_sort_calls / sizeof wide_sort_calls[0]))
+static int wide_sort_live;              /* 1: the 7 calls go to wide_sort_used (from the switch on, for the run) */
+static BYTE wide_sort_old[WIDE_SORT_CALLS][5];
+
+static int __cdecl wide_sort_used(DWORD list, DWORD count, DWORD comparer, DWORD swap)
+{
+    if (wide_sort_live && wide_live && list == (DWORD)wide_list && count == (DWORD)wide_bound && count <= WIDE_ROWS_MAX) {
+        DWORD i, used = 0;
+
+        for (i = 0; i < count; i++)
+            if (wide_list[i] != WIDE_EMPTY)
+                wide_list[used++] = wide_list[i];
+        for (i = used; i < count; i++)
+            wide_list[i] = WIDE_EMPTY;
+        count = used;
+    }
+    return ((int (__cdecl *)(DWORD, DWORD, DWORD, DWORD))WIDE_FN_SORT)(list, count, comparer, swap);
+}
+
+/* From wide_switch_install once the list has more than 510 rows: the 7 calls re-pointed, or none (a line either way). */
+static void wide_sort_install(void)
+{
+    DWORD protect[WIDE_SORT_CALLS], old_protect, at = 0;
+    const char *why = NULL;
+    int s, t, back = -1;
+
+    if (wide_sort_live || !wide_live || wide_bound <= WIDE_V2_ROWS)
+        return;
+    for (s = 0; s < WIDE_SORT_CALLS && !why; s++) {
+        at = wide_sort_calls[s];
+        if (IsBadReadPtr((const void *)at, 5))
+            why = "the site cannot be read";
+        else if (!wide_call_goes_to(at, (void *)WIDE_FN_SORT))
+            why = "is not the game's call of its sort (e8 to 0071475d): another mod holds it, or the exe is another build";
+        else if (wide_on_a_site(at) || wide_on_a_site(at + 4) || wide3_on_a_site(at) || wide3_on_a_site(at + 4) || wide4_on_a_site(at) || wide4_on_a_site(at + 4))
+            why = "shares a byte with a site of the switch or of the long list (a fault of this build)";
+        else
+            copy_bytes(wide_sort_old[s], (const BYTE *)at, 5);
+    }
+    for (s = 0; !why && s < WIDE_SORT_CALLS; s++)
+        if (!VirtualProtect((void *)wide_sort_calls[s], 5, PAGE_EXECUTE_READWRITE, &protect[s])) {
+            log_line("wide item list: VirtualProtect error %lu", GetLastError());
+            for (t = s - 1; t >= 0; t--)
+                VirtualProtect((void *)wide_sort_calls[t], 5, protect[t], &old_protect);
+            at = wide_sort_calls[s];
+            why = "its page could not be made writable; no byte of the 7 was written";
+        }
+    if (why) {
+        log_line("*** wide item list: Arrange (stage 4b): the call at %08lx %s: NONE of the 7 calls of the game's sort is re-pointed and Arrange sorts all %d rows with the game's own sort, as in stage 4a (a hitch is possible with a long list). Nothing else is affected ***",
+                 at, why, wide_bound);
+        return;
+    }
+    for (s = 0; s < WIDE_SORT_CALLS; s++) {
+        BYTE call[5];
+        DWORD rel = (DWORD)wide_sort_used - (wide_sort_calls[s] + 5);
+
+        call[0] = 0xe8, call[1] = (BYTE)rel, call[2] = (BYTE)(rel >> 8), call[3] = (BYTE)(rel >> 16), call[4] = (BYTE)(rel >> 24);
+        copy_bytes((BYTE *)wide_sort_calls[s], call, 5);
+    }
+    for (s = 0; s < WIDE_SORT_CALLS && back < 0; s++)
+        if (!wide_call_goes_to(wide_sort_calls[s], (void *)wide_sort_used))
+            back = s;
+    if (back >= 0)
+        for (s = 0; s < WIDE_SORT_CALLS; s++)
+            copy_bytes((BYTE *)wide_sort_calls[s], wide_sort_old[s], 5);
+    for (s = WIDE_SORT_CALLS - 1; s >= 0; s--) {
+        VirtualProtect((void *)wide_sort_calls[s], 5, protect[s], &old_protect);
+        FlushInstructionCache(GetCurrentProcess(), (void *)wide_sort_calls[s], 5);
+    }
+    if (back >= 0) {
+        for (s = 0, t = 0; s < WIDE_SORT_CALLS; s++)
+            t += bytes_are(wide_sort_calls[s], wide_sort_old[s], 5);
+        log_line("*** wide item list: Arrange (stage 4b): the call at %08lx did not read back as written: %s; Arrange sorts all %d rows with the game's own sort, as in stage 4a. Nothing else is affected ***",
+                 wide_sort_calls[back], t == WIDE_SORT_CALLS ? "every one of the 7 was put back and reads back as the game's" : "NOT every one of the 7 reads back as the game's after putting them back (a fault of the system): STOP, keep this log, and start the game with wide_rows = 510", wide_bound);
+        return;
+    }
+    wide_sort_live = 1;
+    log_line("wide item list: Arrange (stage 4b): the 7 calls of the game's sort (0071475d) in Arrange (00714640) go to the DLL's routine at %08lx, every one compared first and read back: it moves the empty rows to the end (the rows in use keep their order) and the game's own sort orders only the rows in use, so Arrange's work follows the kinds held, not the list's %d rows. Things of the same rank (the same use, number, name or quantity) may end in another order among themselves than the game's sort would leave them in",
+             (DWORD)wide_sort_used, wide_bound);
+}
+
+/* At every save and load, with 510 rows: are the 52 sites still as written? (Stage 4: with more than 510, the 8 too, and no
+   operand 009ac110 left in the code.) */
 static void wide3_hold(const char *moment)
 {
     DWORD stray = 0;
     int s;
 
-    if (wide_bound != WIDE_ROWS)
+    if (wide_bound <= WIDE_GAME_ROWS)
         return;
     for (s = 0; s < WIDE3_SITE_COUNT; s++)
         if (!bytes_are(wide3_sites[s].address, wide3_new[s], wide3_length[s])) {
             if (wide_may_say(WIDE_SAY_SITES))
-                log_line("*** wide list: at \"%s\" the site at %08lx of the 510-row list no longer holds what the switch wrote there (it starts %02x %02x %02x now): something patched the game's code AFTER the switch. The game may walk the item list with two lengths, or the battle with two copies: STOP, keep this log, and start the game with wide_rows = 320 ***",
-                         moment, wide3_sites[s].address, *(const BYTE *)wide3_sites[s].address, *(const BYTE *)(wide3_sites[s].address + 1),
+                log_line("*** wide list: at \"%s\" the site at %08lx of the %d-row list no longer holds what the switch wrote there (it starts %02x %02x %02x now): something patched the game's code AFTER the switch. The game may walk the item list with two lengths, or the battle with two copies: STOP, keep this log, and start the game with wide_rows = 320 ***",
+                         moment, wide3_sites[s].address, wide_bound, *(const BYTE *)wide3_sites[s].address, *(const BYTE *)(wide3_sites[s].address + 1),
                          *(const BYTE *)(wide3_sites[s].address + 2));
             return;
         }
+    for (s = 0; wide4_live && s < WIDE4_SITE_COUNT; s++)
+        if (!bytes_are(wide4_sites[s].address, wide4_new[s], wide4_length[s])) {
+            if (wide_may_say(WIDE_SAY_SITES))
+                log_line("*** wide list: at \"%s\" the site at %08lx of the battle list's length (the %d-row list) no longer holds what the switch wrote there (it starts %02x %02x %02x now): something patched the game's code AFTER the switch. The battle may read its list's length from two places: STOP, keep this log, and start the game with wide_rows = 510 ***",
+                         moment, wide4_sites[s].address, wide_bound, *(const BYTE *)wide4_sites[s].address, *(const BYTE *)(wide4_sites[s].address + 1),
+                         *(const BYTE *)(wide4_sites[s].address + 2));
+            return;
+        }
+    for (s = 0; wide_sort_live && s < WIDE_SORT_CALLS; s++)
+        if (!wide_call_goes_to(wide_sort_calls[s], (void *)wide_sort_used)) {
+            if (wide_may_say(WIDE_SAY_SITES))
+                log_line("*** wide list: at \"%s\" the call of Arrange's sort at %08lx (the %d-row list) no longer goes to the DLL's routine (it starts %02x %02x %02x now): something patched the game's code AFTER the switch. Arrange may sort with another routine: STOP, keep this log, and start the game with wide_rows = 510 ***",
+                         moment, wide_sort_calls[s], wide_bound, *(const BYTE *)wide_sort_calls[s], *(const BYTE *)(wide_sort_calls[s] + 1),
+                         *(const BYTE *)(wide_sort_calls[s] + 2));
+            break;
+        }
+    if (wide4_live && wide4_scan_length(&stray) && wide_may_say(WIDE_SAY_SITES))
+        log_line("*** wide list: at \"%s\" the game's code names the battle list's OLD length byte 009ac110 again (the first place: %08lx): something patched the game's code AFTER the switch: STOP, keep this log, and start the game with wide_rows = 510 ***",
+                 moment, stray);
+    stray = 0;
     if (wide3_scan_battle(&stray) && wide_may_say(WIDE_SAY_SITES))
         log_line("*** wide list: at \"%s\" the game's code names the battle's OLD copy of the item list again (the first place: %08lx): something patched the game's code AFTER the switch: STOP, keep this log, and start the game with wide_rows = 320 ***",
                  moment, stray);
@@ -44357,7 +49624,7 @@ static void gear_wide_gate(void)
         return;
     }
     gear_wide_live = 1;
-    log_line("box: wide gear: %d of 36 sites written (the name and description calls of the PHS, Status, Equip and Materia screens, each compared first: 24 of 006c6b1b, 12 of 0041963c); wide gear: FFNx tables ours (006c51a4 -> %08lx, 006c51cc -> %08lx%s); %d wide piece(s) defined. A wide piece lives in the BOX or on a character (never in the item list; a wide weapon cannot be thrown); worn, it holds a lent slot: weapons 128-191, armour 32-127, accessories 32-127. A save holds a stand-in in its place and the companion file's WORN section holds the piece",
+    log_line("box: wide gear: %d of 36 sites written (the name and description calls of the PHS, Status, Equip and Materia screens, each compared first: 24 of 006c6b1b, 12 of 0041963c); wide gear: FFNx tables ours (006c51a4 -> %08lx, 006c51cc -> %08lx%s); %d wide piece(s) defined. A wide piece lives in the ITEM LIST (a row of number and quantity, like a wide item: greyed in the Item menu, dimmed in a battle, never thrown or sold), in the box (box = on; box = auto when the item list has no row for it) or on a character; worn, it holds a lent slot: weapons 128-191, armour 32-127, accessories 32-127. A save holds a stand-in in its place and the companion file's WORN section holds the piece",
              written, *(const DWORD *)ADDR_WEAPON_POWER_OPERAND, *(const DWORD *)ADDR_ARMOUR_DEFENCE_OPERAND, (driver_reads_files_itself() || GetModuleHandleA("FFNx.dll")) ? "; written before the driver started" : "; no FFNx in this process", wide_gear_count);
     gear_window_gate();             /* (the box, stage B6) the window's one site: only here, once wide gear is at work */
 }
@@ -44481,8 +49748,8 @@ static void wide_switch_install(void)
     static LONG tried;
     DWORD stray = 0, old_protect;
     const char *missing;
-    int s, t, t3 = -1, inside = 0, all, written = 0, later_differs = 0, entry, entry_other = 0;
-    DWORD stray3 = 0;
+    int s, t, t3 = -1, t4 = -1, inside = 0, all, written = 0, later_differs = 0, entry, entry_other = 0;
+    DWORD stray3 = 0, stray4 = 0;
     BOOL new_game_put = FALSE, entry_moved, only3 = FALSE;
 
     if (wide_items_mode != WIDE_ON || InterlockedExchange(&tried, 1))
@@ -44604,6 +49871,16 @@ static void wide_switch_install(void)
             log_line("wide item list: VirtualProtect error %lu", error);
             wide3_refused("the site's page could not be made writable; no byte of the 510-row list was written", wide3_sites[s].address, NULL, NULL, 0);
         }
+    /* (stage 4) the pages of the 8 sites of the battle list's length; if one cannot be made writable the list has 510 rows */
+    for (s = 0; wide3_go && wide4_go && s < WIDE4_SITE_COUNT; s++)
+        if (!VirtualProtect((void *)wide4_sites[s].address, wide4_length[s], PAGE_EXECUTE_READWRITE, &wide4_protect[s])) {
+            DWORD error = GetLastError();
+
+            for (t = s - 1; t >= 0; t--)
+                VirtualProtect((void *)wide4_sites[t].address, wide4_length[t], wide4_protect[t], &old_protect);
+            log_line("wide item list: VirtualProtect error %lu", error);
+            wide4_refuse("the site's page could not be made writable; no byte of the 8 sites was written", wide4_sites[s].address, NULL, NULL, 0);
+        }
     for (s = 0; s < WIDE_SITE_COUNT; s++)
         if (wide_site_written(s)) {
             copy_bytes((BYTE *)wide_sites[s].address, wide_site_new[s], wide_site_length[s]);
@@ -44611,6 +49888,8 @@ static void wide_switch_install(void)
         }
     for (s = 0; wide3_go && s < WIDE3_SITE_COUNT; s++)
         copy_bytes((BYTE *)wide3_sites[s].address, wide3_new[s], wide3_length[s]);
+    for (s = 0; wide3_go && wide4_go && s < WIDE4_SITE_COUNT; s++)
+        copy_bytes((BYTE *)wide4_sites[s].address, wide4_new[s], wide4_length[s]);
     for (s = 0, t = -1; s < WIDE_SITE_COUNT && t < 0; s++)
         if (wide_site_written(s) && !bytes_are(wide_sites[s].address, wide_site_new[s], wide_site_length[s]))
             t = s;
@@ -44619,6 +49898,13 @@ static void wide_switch_install(void)
             t3 = s;
     if (wide3_go && t3 < 0 && wide3_scan_battle(&stray3))
         t3 = WIDE3_SITE_COUNT;      /* the code still names the battle's old copy */
+    for (s = 0, t4 = -1; wide3_go && wide4_go && s < WIDE4_SITE_COUNT && t4 < 0; s++)
+        if (!bytes_are(wide4_sites[s].address, wide4_new[s], wide4_length[s]))
+            t4 = s;
+    if (wide3_go && wide4_go && t4 < 0 && wide4_scan_length(&stray4))
+        t4 = WIDE4_SITE_COUNT;      /* (stage 4) the code still names the length byte */
+    if (t3 < 0 && t4 >= 0)
+        t3 = WIDE3_SITE_COUNT + 1;  /* (stage 4) a fault of the 8 is a fault of the stage: all 60 go back (said below) */
     all = wide_scan_operands(TRUE, &inside, &stray);
     entry_moved = wide_fed && !bytes_are(WIDE_FN_REMOVE, wide_entry_seen, 5);     /* (the fed form) the jump at the entry must still be the one looked at */
     if (t >= 0 || t3 >= 0 || stray || inside != WIDE_ROUTINE_OPERANDS || all != WIDE_ROUTINE_OPERANDS || entry_moved) {
@@ -44628,12 +49914,21 @@ static void wide_switch_install(void)
         only3 = t3 >= 0 && t < 0 && !stray && inside == WIDE_ROUTINE_OPERANDS && all == WIDE_ROUTINE_OPERANDS && !entry_moved;
         for (s = 0; wide3_go && s < WIDE3_SITE_COUNT; s++)
             copy_bytes((BYTE *)wide3_sites[s].address, wide3_old[s], wide3_length[s]);
+        for (s = 0; wide3_go && wide4_go && s < WIDE4_SITE_COUNT; s++)
+            copy_bytes((BYTE *)wide4_sites[s].address, wide4_old[s], wide4_length[s]);       /* (stage 4) the 8 with the 52 */
         for (s = 0; only3 && s < WIDE3_SITE_COUNT; s++)
             if (!bytes_are(wide3_sites[s].address, wide3_old[s], wide3_length[s]))
+                only3 = FALSE;
+        for (s = 0; only3 && wide4_go && s < WIDE4_SITE_COUNT; s++)
+            if (!bytes_are(wide4_sites[s].address, wide4_old[s], wide4_length[s]))
                 only3 = FALSE;
         for (s = 0; !only3 && s < WIDE_SITE_COUNT; s++)
             if (wide_site_written(s))
                 copy_bytes((BYTE *)wide_sites[s].address, wide_site_old[s], wide_site_length[s]);
+    }
+    for (s = WIDE4_SITE_COUNT - 1; wide3_go && wide4_go && s >= 0; s--) {
+        VirtualProtect((void *)wide4_sites[s].address, wide4_length[s], wide4_protect[s], &old_protect);
+        FlushInstructionCache(GetCurrentProcess(), (void *)wide4_sites[s].address, wide4_length[s]);
     }
     for (s = WIDE3_SITE_COUNT - 1; wide3_go && s >= 0; s--) {
         VirtualProtect((void *)wide3_sites[s].address, wide3_length[s], wide3_protect[s], &old_protect);
@@ -44644,7 +49939,11 @@ static void wide_switch_install(void)
             VirtualProtect((void *)wide_sites[s].address, wide_site_length[s], wide_site_protect[s], &old_protect);
             FlushInstructionCache(GetCurrentProcess(), (void *)wide_sites[s].address, wide_site_length[s]);
         }
-    if (only3)
+    if (only3 && t4 >= 0)
+        wide3_refused(t4 < WIDE4_SITE_COUNT ? "the bytes written at this site of the battle list's length did not read back as written; every one of the 60 sites of the long list was put back as it was and read back as the game's"
+                                            : "after the writing the game's code still names the battle list's length byte 009ac110 here; every one of the 60 sites of the long list was put back as it was and read back as the game's",
+                      t4 < WIDE4_SITE_COUNT ? wide4_sites[t4].address : stray4, NULL, NULL, 0);
+    else if (only3)
         wide3_refused(t3 < WIDE3_SITE_COUNT ? "the bytes written at this site of the 510-row list did not read back as written; every one of the 52 sites of the 510-row list was put back as it was and read back as the game's"
                                             : "after the writing the game's code still names the battle's old copy of the item list here; every one of the 52 sites of the 510-row list was put back as it was and read back as the game's",
                       t3 < WIDE3_SITE_COUNT ? wide3_sites[t3].address : stray3, NULL, NULL, 0);
@@ -44654,39 +49953,51 @@ static void wide_switch_install(void)
         wide_new_game_out(new_game_put);
         wide_switch_refused(t >= 0 ? "the bytes written here did not read back as written; EVERY site was put back as it was"
                             : t3 >= 0 && t3 < WIDE3_SITE_COUNT ? "the bytes written at this site of the 510-row list did not read back as written; EVERY site, of the switch and of the 510-row list, was put back as it was"
+                            : t4 >= 0 ? "the bytes written at a site of the battle list's length did not read back as written, or the code still names 009ac110; EVERY site, of the switch and of the long list, was put back as it was"
                             : t3 >= 0 ? "after the writing the game's code still names the battle's old copy of the item list; EVERY site, of the switch and of the 510-row list, was put back as it was"
                             : entry_moved ? "the jump at the entry of the remove routine changed while the sites were written; EVERY site was put back as it was"
                                    : "after the writing the game's code still names the old item list outside the three routines; EVERY site was put back as it was",
-                            t >= 0 ? wide_sites[t].address : t3 >= 0 && t3 < WIDE3_SITE_COUNT ? wide3_sites[t3].address : t3 >= 0 ? stray3 : entry_moved ? WIDE_FN_REMOVE : stray, NULL, NULL, 0);
+                            t >= 0 ? wide_sites[t].address : t3 >= 0 && t3 < WIDE3_SITE_COUNT ? wide3_sites[t3].address : t4 >= 0 && t4 < WIDE4_SITE_COUNT ? wide4_sites[t4].address
+                            : t4 >= 0 ? stray4 : t3 >= 0 ? stray3 : entry_moved ? WIDE_FN_REMOVE : stray, NULL, NULL, 0);
         return;
     }
     /* 6. the switch is on */
     if (wide3_go) {
-        /* (stage 3) the list has 510 rows from here on; the battle's copy is the DLL's, every entry empty as the game's build leaves an empty row */
+        /* (stage 3) the list has 510 rows from here on; the battle's copy is the DLL's, every entry empty as the game's build leaves an empty row.
+           (Stage 4) N rows, with the 8 sites of the length (else 510); every entry of the array */
         BYTE *entry = wide_battle;
 
-        for (s = 0; s < WIDE_ROWS + WIDE_GUARD_ROWS; s++, entry += 6)
+        for (s = 0; s < WIDE_ROWS_MAX + WIDE_GUARD_ROWS; s++, entry += 6)
             entry[0] = entry[1] = 0xff, entry[2] = entry[3] = 0, entry[4] = 0x0b, entry[5] = 0;
         wide_battle_at = wide_battle;
-        wide_bound = WIDE_ROWS;
+        wide_bound = wide3_rows;
+        if (wide4_go) {
+            wide4_live = 1;
+            wide_battle_pairs = *(const BYTE *)ADDR_BATTLE_ITEM_ROWS;   /* (what the byte held: the start build writes it at every battle) */
+        }
     }
     wide_live = 1;
     if (wide_fed) {
         log_line("wide item list: THE SWITCH IS ON (stage 1): %d sites of the game's code written, every one compared first and read back; the item list is the DLL's array at %08lx (%d rows of one dword, %d in use by the game's code); add and find are the DLL's (%08lx, %08lx); every call of remove comes to the DLL's (%08lx), THE FED FORM: see the next line",
-                 written, (DWORD)wide_list, WIDE_ROWS, wide_bound, (DWORD)wide_game_add, (DWORD)wide_game_find, (DWORD)wide_game_remove);
+                 written, (DWORD)wide_list, WIDE_ROWS_MAX, wide_bound, (DWORD)wide_game_add, (DWORD)wide_game_find, (DWORD)wide_game_remove);
         log_line("wide item list: the remove routine at 006cbe5f is NOT the game's: its entry is a jump (%02x %02x %02x %02x %02x) to %08lx in %s. FFNx puts one there for its Steam achievements, which it forces ON for the Steam edition whatever FFNx.toml says. The entry is LEFT AS IT IS and the routine behind it is FED: for every removal of an item the game's 320 words hold, the DLL calls 006cbe5f itself, once, on those words, with the word the game would pass; then it removes from its own list and paints the words from it",
                  wide_entry_seen[0], wide_entry_seen[1], wide_entry_seen[2], wide_entry_seen[3], wide_entry_seen[4], wide_entry_target, entry_module);
         if (entry_other)
             log_line("wide item list: NOTE: the jump at 006cbe5f does not lead into the driver (FFNx) but into %s: that routine is fed as FFNx's would be; if it is not meant to take items out, expect lines with three stars", entry_module);
     } else {
         log_line("wide item list: THE SWITCH IS ON (stage 1): %d sites of the game's code written, every one compared first and read back; the item list is the DLL's array at %08lx (%d rows of one dword, %d in use by the game's code); add, remove and find are the DLL's (%08lx, %08lx, %08lx)",
-                 written, (DWORD)wide_list, WIDE_ROWS, wide_bound, (DWORD)wide_game_add, (DWORD)wide_game_remove, (DWORD)wide_game_find);
+                 written, (DWORD)wide_list, WIDE_ROWS_MAX, wide_bound, (DWORD)wide_game_add, (DWORD)wide_game_remove, (DWORD)wide_game_find);
     }
     log_line("wide item list: a number above 511 can be in the list only as a WIDE ITEM of the items file ([1024] to [9999]) and only once wide items are ADMITTED (the \"wide items:\" lines); without one, saves are today's saves; the game's 320 words at 00dc0234 are kept as a picture of the list. Enhanced Stock UI's call at 0071b8f3: %s",
              *(const BYTE *)0x0071b8f3u == 0xe8 ? "there (its bytes are on no site)" : "not there");
-    if (wide_bound == WIDE_ROWS)
+    if (wide_bound == WIDE_V2_ROWS)
         log_line("wide item list: THE LIST HAS 510 ROWS (stage 3, wide_rows = 510): %d more sites of the game's code written, every one compared first and read back: 26 bounds of 320 on the item list raised to 510 (the sell list: 160 rows of 2 to 255 rows of 2) and the 26 places that name the battle's copy of the list, which is now the DLL's array at %08lx (510 entries of 6 bytes). Random Throw goes on looking at rows 0 to 319 only (its bound is left as it is: its candidates fill an array of 320 on its own stack). The game's 320 words at 00dc0234 stay the picture of the list: row for row while no row past 319 is in use; after that every game kind and what else fits, in list order, and the companion file holds the whole list",
                  WIDE3_SITE_COUNT, (DWORD)wide_battle);
+    else if (wide_bound > WIDE_V2_ROWS)
+        log_line("wide item list: THE LIST HAS %d ROWS (stage 4, wide_rows = %d): %d more sites of the game's code written, every one compared first and read back: 26 bounds of 320 on the item list raised to %d (the sell list: 160 rows of 2 to %d rows of 2), the 26 places that name the battle's copy of the list, which is now the DLL's array at %08lx (%d entries of 6 bytes), and the 8 that name the battle list's length: it is the DLL's dword at %08lx now (pairs of rows; 255 was the game's byte's most). Random Throw goes on looking at rows 0 to 319 only. The game's 320 words at 00dc0234 stay the picture of the list: row for row while no row past 319 is in use; after that every game kind and what else fits, in list order, and the companion file holds the whole list (version 3 once it does not fit 510 rows). Arrange: the next line",
+                 wide_bound, wide_bound, WIDE3_SITE_COUNT + WIDE4_SITE_COUNT, wide_bound, (wide_bound + 1) / 2, (DWORD)wide_battle, wide_bound, (DWORD)&wide_battle_pairs);
+    if (wide_bound > WIDE_V2_ROWS)
+        wide_sort_install();        /* (stage 4b) Arrange over the rows in use; a refusal leaves the game's sort over all N rows */
     if (later_differs)
         log_line("wide item list: the text bounds word at 007b7492 is not the game's ffff (%04x): the switch writes nothing there; wide items (stage 2) write it when they are admitted, and will be REFUSED while it is not ffff",
                  *(const WORD *)0x007b7492u);
@@ -44906,6 +50217,7 @@ static int __cdecl kernel_loader_hook(void)
     wide_watch("before a kernel load", FALSE);      /* (the wide list, shadow; nothing at the first call: the key is not read yet) reads only */
     result = ((int (__cdecl *)(void))kernel_loader_next)();
     call = InterlockedIncrement(&loader_calls);
+    live_tables_begin();            /* (live tables) heap tables are made again below: "being rebuilt" until the refresh at the end */
     keep_kernel_tables();
 
     log_line("kernel loader call #%ld returned %d; driver patch sites start %02x, %02x (e9 = patched)",
@@ -44979,6 +50291,7 @@ static int __cdecl kernel_loader_hook(void)
     box_script_sites();             /* (the box, stage B2) are the field's three item calls the game's? one line; nothing unless the box is at work */
     box_routing_sites();            /* (the box, stage B3) are the calls the routing knows the game's, are the battle hooks in? one line; nothing unless the box is at work */
     box_equip_sites();              /* (the box, stage B4) are the Equip menu's six calls and the builder's hook the DLL's? one line; nothing unless the box is at work */
+    live_tables_refresh("a kernel load");   /* (live tables) the directory as the tables are now */
     return result;
 }
 
@@ -45173,6 +50486,7 @@ BOOL WINAPI DllMain(HINSTANCE self, DWORD reason, LPVOID reserved)
             }
         }
 #endif
+        live_tables_refresh("start-up");    /* (live tables) the arrays are known; the heap tables do not exist yet */
     } else if (reason == DLL_PROCESS_DETACH) {
         log_line("unloading; kernel loader was called %ld time(s)", loader_calls);
         if (log_file != INVALID_HANDLE_VALUE)

@@ -8,3 +8,4 @@ EXPORTS
   dotemuRegQueryValueExA = AF3DN_orig.dotemuRegQueryValueExA
   dotemuRegSetValueExA = AF3DN_orig.dotemuRegSetValueExA
   new_dll_graphics_driver
+  spellext_live_directory DATA

@@ -123,8 +123,9 @@ What they are
     A wide item is an item of FF7_SpellExt_Items.ini whose section is a number from 1024 to 9999 (8,976 numbers). It takes
     exactly the keys of a [448] section and behaves as one: its base's use in battle with the changed fields, menu_hp /
     menu_mp in the Item menu, a price, sell, give_on_load. See FF7_SpellExt_Items_README.txt.
-    Numbers 512-1023 are never given to anything. 10000-27999 are kept for weapons, armour and accessories of a later build:
-    a section there is REFUSED with a line. Today's [105]-[127] and [448]-[511] are unchanged.
+    Numbers 512-1023 are never given to anything. 10000-27999 are wide weapons, armour and accessories: sections of the gear
+    files, not of the items file (a section there is REFUSED with a line); a wide piece also lives in a row of the item list
+    like a wide item (see FF7_SpellExt_Box_README.txt, "WIDE GEAR"). Today's [105]-[127] and [448]-[511] are unchanged.
 
 What they need
     wide_items = on in FF7_SpellExt_Game.ini AND the line "THE SWITCH IS ON" at start-up. Then, the first time the items file
@@ -199,7 +200,8 @@ What does not, yet
     - rows: still 320. A wide item uses a row like any item; the longer list is a later stage.
     - quantity: 99, as for every item.
     - Throw: a wide item is never throwable.
-    - weapons, armour, accessories, materia with wide numbers: later stages.
+    - materia with wide numbers: a later stage. (Weapons, armour and accessories with wide numbers: the gear files and
+      FF7_SpellExt_Box_README.txt, "WIDE GEAR".)
     - "use on all", reviving, curing, sources, tents from the Item menu: not for a new item (as for [448]).
     - an enemy script that asks "which item was used last" sees one byte of the number: a wide item N also answers for
       N - 256, N - 512 ... (the game already cuts there above 255).
@@ -228,7 +230,12 @@ Loud lines (a line with *** is a stop sign unless listed as expected in the test
                                                                     the save was made at the second attempt: the wide items are in this run
                                                                     only (and in earlier saves' companions): free the folder and save again
     load: *** wide items: if that item list held wide items ..., they are LOST FOR THIS LOAD ...
-    save: *** wide items: N row(s) found NO free row in the item list ...
+    save: *** wide items: N row(s) found NO free row in the item list ...   (a list full to its last row) a row carried from the
+                                                                    loaded save's companion is still in that file; a row of numbers 0-511
+                                                                    from the loaded save's own words is held by that save alone: do not
+                                                                    save over it; send the log. (Stage 4b: with wide_rows below 3350
+                                                                    such a row is written past the list's own rows; only a list of
+                                                                    3350 rows, the most, has no row past its own)
     *** wide items: at "..." the two places written when wide items were admitted no longer hold what was written ...
 Plain lines worth knowing
     wide items: at "...": N row(s) of the item list hold a wide item that the items file does NOT define now ...
@@ -251,7 +258,7 @@ Going back to an older build
     unless --force: the wide items of that save are then in no file the older build writes. Keep the backup.
 
 ================================================================================================================================
-THE 510-ROW LIST (stage 3)                                                        key: wide_rows = 510 (default) | 320   (FF7_SpellExt_Game.ini)
+THE LONG LIST (stages 3 and 4)           key: wide_rows = 510 (default) | 320 | an even number from 512 to 3350   (FF7_SpellExt_Game.ini)
 ================================================================================================================================
     wide_rows = 320     the item list has the game's 320 rows. Nothing below applies.
     wide_rows = 510     (the default from 2026-10-14, when the line is absent) the item list has 510 rows: the Item menu, Arrange, Customize, the shop's sell list, the Equip menu's
@@ -292,10 +299,65 @@ THE 510-ROW LIST (stage 3)                                                      
         NOTHING is added); the same holds in the unmodified game.
 
     What stays as it was: the quantity (99); random Throw (the "Throw" a confused character or an enemy skill makes) picks only
-    among the first 320 rows; more than 510 rows; the Equip menu offers at most 320 pieces of one kind (it can only matter if
+    among the first 320 rows; more than 3350 rows; the Equip menu offers at most 320 pieces of one kind (it can only matter if
     one piece lies in hundreds of rows).
 
-    A TESTING AID:   test_fill_rows = N     (FF7_SpellExt_Game.ini; 1 to 510; take the line out after the test)
+    MORE THAN 510 ROWS (stage 4)   wide_rows = 1020 (any EVEN number from 512 to 3350; 321-509 and odd numbers are refused
+    with one line, "wide_rows must be 320 or an even number from 510 to 3350: 510 is used", and the list has 510 rows).
+    3350 is the most because the companion file must keep the box's whole 12,000 kinds beside the longest list (stage 4b;
+    stage 4a's most was 2040)
+        Everything above holds, with your number in place of 510: the Item menu, Arrange, Customize, the shop's sell list (half
+        as many rows of two), the Equip menu's source and the battle's Item / W-Item / Throw list all reach the last row.
+        The battle keeps the length of its item list in ONE BYTE (255 pairs of rows: that is why 510 was the most); with more
+        than 510 rows the 8 places of the game's code that read or write that byte read and write a number of the DLL's own
+        instead (60 places in all, every one compared first). At start-up the log says one of:
+            wide item list: THE LIST HAS 1020 ROWS (stage 4, wide_rows = 1020): 60 more sites of the game's code written ...
+            *** wide item list: 1020 ROWS REFUSED at <address>: ... THE ITEM LIST HAS 510 ROWS in this run, as with wide_rows = 510 ***
+            *** wide item list: 1020 ROWS REFUSED at <address>: ... THE ITEM LIST HAS 320 ROWS in this run ... ***
+        The first REFUSED line is about the 8 places of the battle list's length (another mod wrote there): you get 510
+        rows. The second is about the 52 places of the 510-row list: you get 320, as before. Send the line either way.
+        ARRANGE (stage 4b): with more than 510 rows Arrange moves the empty rows to the end first and has the game's own sort
+        order only the rows in use, so its work follows the kinds you hold, not the list's length (the game's sort over all
+        rows grows with the square of the rows, empty ones included). The order is the game's, by every one of its seven
+        choices; only things of the SAME RANK (the same name, number, quantity or use) may end in another order among
+        themselves than the game's own sort would leave them in. At start-up the log says one of:
+            wide item list: Arrange (stage 4b): the 7 calls of the game's sort (0071475d) in Arrange (00714640) go to the DLL's routine ...
+            *** wide item list: Arrange (stage 4b): the call at <address> ...: NONE of the 7 calls of the game's sort is re-pointed ... ***
+        The second (another mod holds one of those calls) is not dangerous: Arrange then sorts the whole list with the game's
+        own sort, as stage 4a did (a hitch is possible with a long list; read from the code, not timed in the game). With 510
+        rows or fewer nothing of this is done: Arrange is the game's own, exactly.
+        A new thing stolen or morphed in a battle whose row falls just past the rows the battle's list shows is in that list
+        only after the battle (the game's own rule, at every length): it is not lost.
+      THE SAVE with more than 510 rows: while no row past the 510th is in use, saves and companion files are exactly as
+        with 510 rows (and the stage-3 build can play them); from the moment one is, the companion file holds the whole list
+        as a list of VERSION 3 (the log at the save: "holds THE WHOLE LIST in its order (version 3: ..."). The save file
+        itself is as with 510 rows: every thing of the game's own kinds, then what fits.
+      A LONG LIST IN A SHORTER RUN (you go back to wide_rows = 510, or a smaller number): at the load, a row past the run's
+        last row is MOVED into a free row (the thing stays in the bag; its place in the list changes; a wide item too), and
+        only when no row is free (or it is a wide number that run cannot show) is it CARRIED: not in the bag in that run,
+        kept in the companion file of every save, back at a load with enough rows. A carried thing follows the save as every
+        other does: one used up or changed in a run without this DLL is gone or changed at the next load too. The log says how many were moved, and a *** line names what is not in the bag:
+            load: item list: N row(s) of the item list of <key>.sxc lie past this run's 510 rows ...: M moved to free rows ...
+            load: *** item list: K thing(s) of the item list of <key>.sxc are NOT IN THE BAG in this run ... ***
+      THE STAGE-4A BUILD (the one before stage 4b, 2040 rows at most) reads every version-3 list, but one longer than 2040
+        rows only by the rule above for a long list in a shorter run: its rows past 2039 are moved into free rows, or carried.
+        While no more than 2040 rows are IN USE nothing is lost, only the places change. With MORE than 2040 rows in use it
+        cannot keep them all: the rows it cannot place are LEFT OUT of its next save (its *** lines "found NO free row" and
+        "NO ROOM to carry"). Do not play such a save on the stage-4a build: keep this build for it. To give a save with no
+        more than 2040 rows in use to the stage-4a build, game closed, on a COPY first:
+            python3 -I sxc2.py --fold FF7_SpellExt_Saves\<key>.sxc out.sxc 2040     then put out.sxc in its place under the same name
+        (refused, with the reason, when more than 2040 rows are in use or the save's words would lose a number); sxc2.py
+        --check-folder names every save whose list is longer than 2040 rows.
+      AN OLDER BUILD (the stage-3 build, the one before stage 4) does not know version 3: it carries such a list whole, shows
+        the bag as the save's 320 words, and if you play on it a newly gained thing can push one of the mod's own things out
+        of those words, which the next load with this build then takes as used up. So: A SAVE WHOSE COMPANION HOLDS A
+        VERSION-3 LIST MUST NOT BE PLAYED ON THE STAGE-3 BUILD. To go back, game closed, on a COPY first:
+            python3 -I sxc2.py --fold FF7_SpellExt_Saves\<key>.sxc out.sxc     then put out.sxc in its place under the same name
+        --fold makes the list version 2 (510 rows) when the rows in use fit in 510 and the save's words keep the same
+        numbers; it refuses otherwise and says why (then play that save with this build). sxc2.py --check-folder names every
+        save whose companion holds a version-3 list.
+
+    A TESTING AID:   test_fill_rows = N     (FF7_SpellExt_Game.ini; 1 to 3350, at most the rows the list has; take the line out after the test)
         at every load one of each thing the list does not hold is added until N rows are in use: the game's kinds first, then
         the mod's defined things, then the defined wide items. The log says how many were added and whether N was reached.
         USE IT ON A SPARE SLOT ONLY: it fills the bag with about 300 things.

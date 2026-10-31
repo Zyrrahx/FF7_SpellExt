@@ -107,15 +107,55 @@ base            Optional. One of the original nine, by number:
 
 Looks
 -----
-portrait        File name, without extension, of the character's portrait.
-                Put <name>.png anywhere under SpellExtConfig\files. Any size:
-                it is scaled to fill the portrait frame (7 : 8, slightly
-                taller than wide; a square picture loses a little from each
-                side). <name>_l.png, a smaller version, is optional.
-                Game-format <name>.tex and <name>_l.tex work too and are used
-                as they are. Default: the base's portrait.
+portrait        The character's portrait: a picture file of your own, or one
+                of the game's own portraits. Three forms (NAME is 1 to 12
+                letters, digits or _, without extension):
+                  portrait = NAME       a picture file NAME if there is one
+                                        (below); else, if NAME is one of the
+                                        game's portraits, that portrait;
+                                        else the base's portrait is shown
+                  portrait = game:NAME  the game's portrait, even if a file
+                                        of that name exists
+                  portrait = file:NAME  the picture file only, never the
+                                        game's portrait
+                The game's portraits, by the name battle_like takes, by the
+                menu archive's own file name, or by number:
+                  cloud      cloud   0     red        red     4
+                  barret     barre   1     yuffie     yufi    5
+                  tifa       tifa    2     caitsith   ketc    6
+                  aeris      earith  3     vincent    bins    7
+                  (aerith)                 cid        cido    8
+                  youngcloud pcloud  9     sephiroth  pcefi  10
+                             choco  11 (the chocobo)
+                A game portrait needs no file: the DLL reads it from the menu
+                archive (menu_us.lgp) exactly as the game reads it, so a mod
+                that replaces that portrait (Enhanced Stock UI's avatars,
+                Ninostyle ...) shows its picture for this character too.
+                Example, a character built on Cloud with Sephiroth's face:
+                  base = 0
+                  portrait = game:sephiroth
+                (plain "portrait = sephiroth" works too, unless a file
+                named sephiroth is under SpellExtConfig\files: then the file wins)
+                A picture file: put <name>.png anywhere under
+                SpellExtConfig\files. Any size: it is scaled to fill the
+                portrait frame (7 : 8, slightly taller than wide; a square
+                picture loses a little from each side). <name>_l.png, a
+                smaller version, is optional. Game-format <name>.tex and
+                <name>_l.tex work too and are used as they are.
+                Enhanced Stock UI's battle window shows a small avatar: a
+                file <name>_b.tex if there is one; else, for a picture file,
+                one made from its PNG, and for a game portrait the same
+                picture as the menu, drawn small (a few columns at its right
+                edge are cut, as on the PHS).
+                FF7_SpellExt.log says, for each character, where its portrait
+                comes from, e.g. "character 14: portrait sephiroth = the
+                game's own portrait 10 (pcefi.tex or ...)" or "... = the file
+                ...\sephiroth.tex (a file of that name takes precedence ...)".
+                Files are found when the game starts: restart after adding
+                one. Default: the base's portrait.
 portrait_fit    yes (default) or no. no = the PNG is already laid out as the
                 game's texture and must not be scaled (see files\README.txt).
+                Not used for a game portrait.
 battle_like     Whose place the character takes in battle, by character name
                   cloud barret tifa aeris red yuffie caitsith vincent cid
                   youngcloud sephiroth
@@ -145,15 +185,27 @@ battle_files    Two letters: the prefix of the character's own battle model
                 other mod you use has battle files of that prefix. Two mods
                 with the same prefix show one model for both.
                 The parts follow the model named in `battle_like`: aa is
-                the skeleton, ac ad ... the textures, am onward the body
-                parts, ck-cz the weapon models, da the animations (for
-                Vincent's model: sfaa -> snaa, sfac -> snac, and so on).
-                Any part you do not supply is taken from the `battle_like`
-                model, so you can start with just the textures.
+                the skeleton, ab the scripts, ac ad ... the textures,
+                am onward the body parts, ck-cz the weapon models, da the
+                animations (for Vincent's model: sfaa -> snaa, sfac -> snac,
+                and so on).
+                A part you do not supply is taken from the `battle_like` model
+                only for the skeleton (aa), the scripts (ab) and the animations
+                (da). FFNx reads the body parts, textures and weapon models
+                itself, so a missing one is not drawn (the character is
+                invisible; FFNx.log shows "failed to find file"): supply the
+                full set, every part renamed to your prefix.
                 The character then has its own model, separate from the
                 original character's, who keeps theirs.
 equip_like      One of the nine (name or 0-8): the character may equip
-                whatever they can. Default: the base, or the battle_like
+                whatever they can. Or none: the character may equip only
+                what all nine can (armour and accessories every one of the
+                nine may wear; no original character's own weapons), and
+                whatever an `equip` list of the weapon, armour or accessory
+                file names it for (equip = 12, or its name). A piece only
+                some of the nine may wear (in the game: Escort Guard, the
+                men's; Minerva Band, the women's) is not for it unless a
+                list names it. Default: the base, or the battle_like
                 character.
 
 
@@ -169,8 +221,97 @@ limits          none (default), or one of the nine (name or 0-8). The
                 same character as `battle_like`, or expect odd-looking
                 results. Vincent's limits are transformations into other
                 models and have not been tried with a new character; Cloud's
-                are the simplest to start with.
+                are the simplest to start with. A transformed character acts
+                by itself, so it needs a battle AI (`ai_like = vincent`,
+                below), or it will stand idle.
                 Limit breaks of the character's own are not possible yet.
+
+
+Battle AI
+---------
+The original characters have small battle scripts in the kernel ("character
+AI"): Sephiroth's makes him fight by himself, Vincent's picks the beast
+forms' attacks, Cloud's and Aeris's keep the date scores. A new character
+has none unless given one of these keys (one or the other, not both):
+
+ai_like         One of cloud barret tifa aeris red yuffie caitsith vincent
+                cid youngcloud sephiroth, or a kernel entry 0-11, or none
+                (default). The character gets its OWN COPY of the kernel's
+                whole character-AI block, as the game loaded it (so under a
+                kernel mod such as New Threat, that mod's scripts), and runs
+                that character's entry. Its scripts never touch the original
+                character's: a script that switches to another entry ("link")
+                switches inside the copy.
+ai              A file name, without extension, of 1 to 31 letters, digits,
+                _ or -: the character's block is SpellExtConfig\ai\NAME.ai,
+                in the kernel's own layout (a table of entry offsets, each
+                entry 16 section offsets, then the scripts; 65535 bytes at
+                most). Entry 0 is the character; further entries are what
+                its scripts may link to. The project's tool tools\ai_tool.py
+                writes such files from text and checks them. A new file in
+                the ai folder is seen only after the game restarts (like any
+                new file of a mod).
+                Or none (default).
+
+Both keys in one section: the second is ignored, with a line in the log.
+With copy_of, the copy has the keys of the one it copies (and a block of its
+own); one line of its own replaces them.
+
+Every block is checked before it is used: every script must stay inside the
+block, use only the interpreter's instructions, end with "end" (73), and jump
+only onto an instruction of its own script. A block that fails is refused
+with one log line (file, entry, section, offset, why) and the character has
+no AI, as without the key. The log also says, for each character with an AI,
+which of its sections it has.
+
+What runs when (as for the original characters):
+  init          at the start of each battle
+  main          on the character's turn, but ONLY while the game treats it
+                as AI-controlled: after a transformation (Vincent's limits),
+                or when its own script sets the bit 4024 (Sephiroth's init
+                does). Otherwise the turn opens the menu as usual.
+  counter       after every action, for each of its targets
+  death         when the character dies
+  physical, magical  when hit by that kind of attack
+  battle_end    at the end of the battle
+  pre_action    before every action in the battle (anyone's): each
+                actor's own script runs, with the battle's last command
+                and attack being the coming action's
+  custom1-8     when an action with command 0x22 runs that section on it
+So `ai_like = sephiroth` makes the character take every turn by itself, with
+Sephiroth's choices of attack (and his immunities, which his init sets).
+
+Links ("link" in a script) last until the end of the battle: each battle
+starts again from the character's own entry. (The original characters keep a
+link for as long as the game runs; Barret's, Tifa's and Yuffie's first battle
+sends them to Aeris's entry.)
+
+The date scores: Cloud's and Aeris's scripts (and Barret's, Tifa's and
+Yuffie's, which link to Aeris's) change the save's affection values for the
+date at the Gold Saucer. A character with ai_like = cloud, aeris, barret, tifa
+or yuffie therefore changes those values too, as the original would.
+
+Berserk, Confusion and Manipulate do not use these scripts and are unchanged.
+
+Dexterity changed by a script and the time gauge: a party member's gauge
+speed is worked out from its dexterity (AI variable 40a0) only at battle
+start, a KO or revive, Haste/Slow/Stop and the like, and copystats. A script
+that changes dexterity in battle (for example a pre_action script that does
+store 40a0) changes hit rate and evasion at once, but the gauge only at the
+next of those. With
+
+    atb_follows_dexterity = yes
+
+in FF7_SpellExt_Game.ini the DLL compares the three party slots' dexterity
+at the set-up of every action (and when an action starts to play) and, on a
+change, has the game work that member's gauge speed out again with its own
+routine. The gauge's fill is kept; only its speed changes. Default no (the
+game's behaviour). Read again with the rest of the game file. The log says
+"atb_follows_dexterity: party slot N: dexterity A -> B ..." (eight lines a
+battle at most). Enemies are not followed. The key works only when the
+character file defines at least one new character (SpellExt's battle-start
+step is then in); otherwise the log says "NOT at work: it needs the
+battle-start hook" once, and the gauge behaves as the game's.
 
 
 Growth
@@ -223,10 +364,22 @@ strength vitality magic spirit dexterity luck
 hp, mp          ONE value: starting current and maximum.
 exp             Total experience.
 weapon          The weapon's item ID: 128-255 for a kernel weapon, 320-383
-                for one from the weapon file. Default without a base: the
-                equip_like character's first weapon.
-armour          Armour item ID, 256-287.
-accessory       Accessory item ID, 288-319, or none.
+                for a new one from the weapon file, 10000-15999 for a WIDE
+                weapon (see "A piece of wide gear on a sheet" below).
+                Default without a base: the equip_like character's first
+                weapon. With equip_like = none: the first weapon it may
+                equip (the game's weapons first, then the weapon file's
+                320-383); if there is none, its base's first, which it may
+                not equip (a line in the log says so). With a base: the
+                base's weapon; with equip_like = none a line in the log says
+                so when the character may not equip it.
+armour          Armour item ID: 256-287, 384-415 for a new one from the
+                armour file, 16000-21999 for a WIDE armour.
+accessory       Accessory item ID: 288-319, 416-447 for a new one from the
+                accessory file, 22000-27999 for a WIDE accessory, or none.
+                A new piece (320-447) that no gear file defines when the
+                character is created is replaced by the stand-in below, with
+                a line in the log.
 weapon_materia  The materia in the weapon's slots when the character is created,
 armour_materia  and in the armour's: one entry per slot, in slot order, separated
                 by commas. An entry is
@@ -250,6 +403,40 @@ remake_on_load  yes = TESTING AID: the character is rebuilt from this sheet at
 
 (A stat key appears with nine values for growth OR one value for a starting
 value. To give both, write the key twice.)
+
+A piece of wide gear on a sheet
+- It needs box = on or auto and wide_items = on in the game file, and the
+  piece defined in its gear file (FF7_SpellExt_Weapons.ini and the others).
+  A wide number of the wrong kind (armour = 10000) is refused.
+- The piece is MADE when the character is created (it is not taken from
+  the item list or the box, except by a character with remake_on_load: see
+  below). It is worn as any wide piece is: through a lent slot; a save holds
+  a stand-in in its place and the companion file's WORN section holds the
+  piece. A sleeping box (box = auto) does NOT wake for it.
+- When it cannot be worn the character is created wearing the STAND-IN (the
+  first of the game's weapons its equip_like character can wear, or with
+  equip_like = none the first weapon it may equip, as for `weapon` above;
+  armour 256; no accessory) and the log says why in one line: wide gear
+  not at work in this run (box = off, wide_items off, nothing defined at
+  start-up, refused) or the number not defined (nothing is made then). If
+  the character may not equip it (its equip list names neither the
+  character nor the one it equips like; with equip_like = none: its list
+  does not name the character and it is not for all nine) or every lent
+  slot of the kind is in use, the piece is made and goes into the ITEM LIST
+  instead (box = on: the box; the box also when the list has no row for it)
+  (with remake_on_load it is NOT made, since it would be made again at
+  every load; one already in the item list or the box stays there).
+- remake_on_load: the character is made anew at every load and never adds
+  a piece. It wears again the piece the save holds (also when it is
+  created later than the load, by a field script or the PHS), or takes one
+  of that number from the item list or the box when one holds it (say after
+  you swapped it off in the Equip menu: the row it was in goes); one is made
+  only when there is none of it in the item list, the box or on the
+  character. Change the number on the sheet and the old piece goes to the
+  item list (or the box), the new one is made (or taken back). If the
+  piece's equip list stops naming the character, the piece it wore goes to
+  the item list or the box (a *** line) and stays there.
+- give_on_load of the same piece then gives none: the save owns one.
 
 
 Joining
@@ -288,3 +475,5 @@ Known limits
   file to load correctly.
 - Field scripts must not use variables 192-255 of banks 11 and 12: the
   character's record is stored there.
+- weapon_materia fills eight slots whatever the piece has, wide or new
+  pieces included (see weapon_materia above).

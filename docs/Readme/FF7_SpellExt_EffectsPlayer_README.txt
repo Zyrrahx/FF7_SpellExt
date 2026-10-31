@@ -2,7 +2,9 @@ FF7 SpellExt - the native effect player: effect scripts
 ========================================================
 
 A native effect is an effect number the DLL plays itself, from a script, with no effect routine of the
-game's. It is named in FF7_SpellExt_Effects.ini and played by a spell like any effect copy.
+game's. It is named in FF7_SpellExt_Effects.ini and played by a spell like any effect copy, or by a
+limit (`spell_effects = effect 0x201:0 all` in FF7_SpellExt_Limits.ini: see "A limit made of spell
+effects" in FF7_SpellExt_Limits_README.txt).
 
     ; FF7_SpellExt_Effects.ini
     [effect 0x201]
@@ -42,7 +44,7 @@ case does not matter. A script has a head (`key = value` lines) and a timeline.
 Head:
 
   file N = TEXTURE.TIM [SHEET.SPT] [blend=KIND] [tex=A,B,...]
-      The effect's files, numbered 0, 1, 2 ... in order (16 at most: 0 to 15). The game asks for NAME.TIM as
+      The effect's files, numbered 0, 1, 2 ... in order (32 at most: 0 to 31). The game asks for NAME.TIM as
       NAME.TEX and for NAME.SPT as NAME.S. A file with a sheet (.SPT) can be drawn by `sprite`; a file
       with only a texture is there for a sheet's second (third, fourth) texture page.
       blend:  add (the default; fire and light), average (half and half), subtract, quarter (a quarter
@@ -77,7 +79,7 @@ Head:
       log; its spells play their base effect). A name the archive holds once is found from any folder.
 
   length = FRAMES
-      How long the effect is, 1 to 480 frames. The battle runs 15 frames a second (30 = 2 s). The
+      How long the effect is, 1 to 600 frames. The battle runs 15 frames a second (30 = 2 s). The
       effect ENDS at its length whatever else is pending. Without `length`, the last frame any line
       names, plus one.
 
@@ -116,7 +118,7 @@ Timeline: one command a line, `FRAME` or `FIRST-LAST` first (0 to length - 1):
                         at a target are not either. For a picture fixed in the arena: FF8's Meteor drops
                         its rocks round the arena, not round the target. No bone=, depth= or each=
                         (refused).
-        bone=N          the bone place it sits at, 0 to 54 (default 1; 0 is the model's root, inside its
+        bone=N          the bone place it sits at, 0 to 49 (default 1; 0 is the model's root, inside its
                         body, not its feet; past a model's last bone: its last). bone=random: a bone
                         chosen once for each target (as Fire's bursts; not with at=centre). bone=ground:
                         on the floor under the actor (see `model`); x, y and depth still apply on top
@@ -175,7 +177,7 @@ Timeline: one command a line, `FRAME` or `FIRST-LAST` first (0 to length - 1):
                         target (never turned with the caster: see the sprite's at=arena). face=camera
                         works as at a target (its axes the screen's, at that place). No bone= or each=
                         (refused).
-        bone=N          the bone place it sits at, 0 to 54 (default 1, as a sprite; 0 is the model's
+        bone=N          the bone place it sits at, 0 to 49 (default 1, as a sprite; 0 is the model's
                         root, inside its body (about the hips), NOT its feet; past a model's last bone:
                         its last). bone=random as a sprite (not with at=centre)
         bone=ground     on the floor under the actor: the actor's place now (it follows the actor when
@@ -436,11 +438,11 @@ a script from another game's frames would make) is simply one line per sprite pe
 2. Limits
 ---------
 
-    files per effect         16         texture pages per sheet   4
-    frames (length)          480 (32 s) timeline lines per script 2048 (65536 for all scripts together)
+    files per effect         32         texture pages per sheet   4
+    frames (length)          600 (40 s) timeline lines per script 2048 (256000 for all scripts together)
     lines in a script file   12000      script file size          512 KB
     sprites drawn per frame  128 (the rest of that frame is not drawn; the log says so once)
-    models drawn per frame   64 (the same; counted apart from the sprites)
+    models drawn per frame   256 (the same; counted apart from the sprites)
     turn                     -36000 to 36000 degrees about each axis
     fade                     0-255      uv                        0-255 each (256ths of the texture)
     sound ids                1-751      each=                     0-60 frames
@@ -453,14 +455,15 @@ a script from another game's frames would make) is simply one line per sprite pe
     stage dark               0-4096     stage colour              0-255 each
     fill / flash colour      0-255 each fill alpha                0-255
     fill and flash lines     16 drawn a frame (the rest of that frame is not drawn; the log says so once)
-    flash in=, out=          0-479, together no more than the line's frames
+    flash in=, out=          0-599, together no more than the line's frames
     shake x, y, z            0-1024     shake period              2-60, even
     actors fade, amount      0-4096     actors tint               0-255 each
     actors move x, y, z      -8192 to 8192 battle units from the actor's own place
     actors turn              -36000 to 36000 degrees about each axis
     backdrop (layer=back)    one a frame (the last line on)
 
-One native effect plays at a time (a cast's script waits for its effect before the next action). An
+One native effect plays at a time (a cast's script waits for its effect before the next action; a limit's
+second `effect` step ends the first one, whose hits are shown then). An
 effect also always ends: at its length, as soon as its files are freed by another effect, or after a
 watchdog (450 updates, or four per frame and 60 more for a long one) if the battle's pause flag never
 clears.
