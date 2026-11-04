@@ -82,16 +82,17 @@ The folders
 -----------
     SpellExtConfig\enemies\<folder>\generated.ini      the converter's enemy (do not edit)
     SpellExtConfig\enemies\<folder>\enemy.ini          YOUR enemy: a key here wins
-    SpellExtConfig\enemies\<folder>\ai.ai.txt          the AI as text (tools/ai_tool.py)
-    SpellExtConfig\enemies\<folder>\ai.ai              the AI assembled (tools/ai_tool.py asm)
+    SpellExtConfig\enemies\<folder>\ai.ai.txt          the AI as text (see "The AI")
+    SpellExtConfig\enemies\<folder>\ai.ai              the AI assembled (see "The AI")
     SpellExtConfig\enemies\<folder>\model\aa, ab, ...  the enemy's model files
     SpellExtConfig\scenes\generated\<scene>.ini        the converter's scene (do not edit)
     SpellExtConfig\scenes\<scene>.ini                  YOUR scene: a key here wins
 
-The keys are those of the text formats (content\README.md of the converter's
-work): the DLL reads exactly what tools/scene_compile.py reads, and refuses what
-it refuses, with the same words, naming the file and the line. A folder or scene
-file name is 1 to 31 letters, digits, _ and -.
+"The converter" is the project's FF8 enemy converter, which writes the
+generated files; it is not published here. You need no generated file: an
+enemy.ini or a scene file of your own alone is enough. The keys of both are in
+"The keys" below. A mistake refuses the scene with one line naming the file
+and the line. A folder or scene file name is 1 to 31 letters, digits, _ and -.
 
 The overlay rule: the generated file first; every key your file gives wins; a
 [section] only in your file is added after the generated ones. To take a
@@ -101,6 +102,107 @@ Your edits take effect at the next battle of yours: every file of a scene is
 read again when its battle is handed over (no restart, no re-init). A new
 scene file is seen at the next battle too (the folders are looked at again when
 they were written since).
+
+
+The keys
+--------
+Text after ; is a comment. Numbers are decimal or 0x hex. A list may be
+separated by spaces or commas. `none`, written in small letters, means an
+empty list or no value.
+An unknown key in [enemy], [attack ...], [scene] or [formation N] refuses the
+scene, and the line lists the keys that section takes.
+
+enemy.ini (and generated.ini): [enemy]
+
+    name             REQUIRED. The name shown in battle, at most 31 characters.
+    model            REQUIRED. In a scene of yours its value is not used: enemy
+                     slot 0, 1, 2 is drawn as model 365, 366, 367 from the
+                     folder's model\ files (see "The models"). Write `pool`.
+    level            REQUIRED. 1 to 99.
+    hp               REQUIRED. 1 to 4294967295.
+    mp, ap           0 to 65535 (0 when left out).
+    exp, gil         0 to 4294967295 (0 when left out).
+    str def mag mdef spd eva luck
+                     0 to 255 each (0 when left out).
+    elements         Up to 8 element:rate pairs, or none.
+                     Elements: fire ice bolt earth poison gravity water wind
+                     holy restorative cut hit punch shoot shout hidden.
+                     Rates: weak (or double), half, immune (or nullify),
+                     absorb, death, fullcure.
+    immune           Status names (below), or none.
+    drops, steals    item:rate pairs; the rate is in 64ths, 0 to 63 (8 when
+                     left out). Drops and steals together hold 4 items.
+    manipulate       Up to 3 names of its own [attack NAME] sections.
+    back_multiplier  0 to 255 (16 when left out, as the game's field enemies).
+    morph            An item, or none (the default).
+    ai               REQUIRED. See "The AI".
+
+An item is a number (0 to 319) or the name of item 0 to 127 as the active game
+shows it, in any case, a space written _: potion, hi-potion, phoenix_down.
+
+Status names: death near_death sleep poison sadness fury confusion silence
+haste slow stop frog small slow_numb petrify regen barrier mbarrier reflect
+dual shield death_sentence manipulate berserk peerless paralysis darkness
+dual_drain death_force resist lucky_girl imprisoned.
+
+[attack NAME]: one section per attack, NAME at most 31 characters. Their order
+is the enemy's action order, 16 at most. Every attack:
+
+    id               REQUIRED. 00-7f: a kernel attack; 0100-7fff: a scene
+                     attack of this scene.
+    script           The model script the action plays, 3 to 0x3f (3 when left
+                     out). 3 is the attack, 4 the cast (it has the effect step);
+                     0 and 1 (idle loops) and 2 (the death) are refused.
+    camera           default (the game's own; the default) or a camera number.
+    effect, effect_all, camera_multi
+                     SpellExt's effects and cameras: see "Enemy attacks with
+                     SpellExt's effects and cameras".
+
+A kernel attack (id below 0x100) keeps the kernel's own record: it takes only
+id, script, camera, effect, effect_all and camera_multi. A scene attack also
+takes:
+
+    base             REQUIRED. A scene attack ID (0x100 and up) of the game's
+                     own scene.bin; its 28-byte record is copied first.
+    name             REQUIRED. The name shown, at most 31 characters.
+    power, accuracy, target
+                     0 to 255: change the copied record.
+    mp               0 to 999.
+    element          Element names, or none.
+    status           Status names, or none.
+    status_chance    0 to 63 (63 when status is given without it).
+    formula          physical, magical, or the raw byte 0 to 255.
+    impact           0 to 255, or none.
+    effect           0 to 255 (the game's effect byte), none, or 0x100 and up
+                     (a SpellExt effect).
+    sound            0 to 0xfffe, or none.
+
+A scene file (scenes\<scene>.ini):
+
+    [scene]
+    number = 300                     ; REQUIRED. 256 to 4095
+    enemies = my_enemy other_enemy   ; REQUIRED. 1 to 3 enemy folder names: slots 0, 1, 2
+
+    [formation 0]                    ; REQUIRED
+    stage = 12                       ; REQUIRED. The battle location, 0 to 89
+    camera = 79:2                    ; REQUIRED. scene:formation of the game's scene.bin
+    rows = my_enemy:-800,0,-1120:1 other_enemy:80,0,-2080:2
+    kind = normal                    ; normal, preemptive, back, side, pincer
+    escape_counter = 1               ; 0 to 65535 (1 when left out)
+    flags = 0xfffd                   ; the raw word, 0 to 0xffff (0xfffd when left out)
+    next = none                      ; a chained battle, or none (the default)
+
+    [formation 1]                    ; optional: formation 0 changed by these keys
+    kind = back
+
+- rows (REQUIRED): 1 to 6 entries separated by spaces, each
+  folder:x,y,z[:row[:cover]]. folder is one of the scene's `enemies`; x, y, z
+  are in the game's arena units (-32768 to 32767); row (1 when left out) and
+  cover (0 when left out) are 0 to 65535.
+- camera also gives the STAND-IN battle (see "Where it all happens").
+- Formations 1 to 3 are copies of formation 0; a [formation N] section of
+  their own changes only the keys it gives.
+- Other sections of a scene file (the converter's [origin]) are not read.
 
 
 Limits both the DLL and the compiler keep
@@ -118,13 +220,45 @@ Limits both the DLL and the compiler keep
 
 The AI
 ------
-`ai = ai.ai.txt` in enemy.ini means the ASSEMBLED block beside it, ai.ai: the
-DLL has no assembler. Assemble it with
-    python3 -I tools/ai_tool.py asm ai.ai.txt -o ai.ai
-after each change of the text. When ai.ai is older than ai.ai.txt the log says
-so at the battle (the block is used as it is). Missing ai.ai: the scene is
-refused. `ai = none` gives the enemy a plain AI: it attacks a random party
-member with its first attack (it needs at least one attack).
+`ai` in enemy.ini names a file beside enemy.ini (no folder in the name):
+- `ai = NAME.ai`: that assembled AI block is used.
+- `ai = ai.ai.txt` (any name ending in .txt): the ASSEMBLED block beside it
+  with the .txt taken off, here ai.ai. The DLL has no assembler. When ai.ai is
+  older than ai.ai.txt the log says so at the battle (the block is used as it
+  is). Missing ai.ai: the scene is refused.
+- `ai = none`: a plain AI. The enemy attacks a random party member with its
+  first attack (it needs at least one attack).
+
+The block is one AI entry (table 1, entry 0), in the game's battle AI layout,
+and it must pass the same check as a character's AI file. An AI may only use
+attack IDs its enemy has (see "Limits both the DLL and the compiler keep").
+
+To write one: the AI page of SpellExt Config (External Tools\SpellExt Config)
+assembles and checks the text, and Save writes SpellExtConfig\ai\NAME.txt and
+SpellExtConfig\ai\NAME.ai. Copy NAME.ai into the enemy's folder and give
+`ai = NAME.ai` (or copy it as ai.ai beside ai.ai.txt). The page writes only to
+the ai folder, not to an enemy folder. Its assembler is the same as the one
+the log's words name ("tools/ai_tool.py asm": the project's own tool, not
+published here), and it gives the same bytes. The smallest AI, the same as `ai = none` for an enemy
+whose first attack is 0110:
+
+    table 1
+
+    entry 0
+
+    script main
+            addr.word  target_mask        ; the target: a random one of the party
+            load.word  enemies_mask
+            randbit
+            store
+            push.b     20                 ; command 20: an enemy attack
+            push.w     0110               ; the attack: an [attack NAME] id of this enemy
+            attack
+            end
+
+An entry's scripts are named init, main, counter, death, physical, magical,
+battle_end, pre_action and custom1 to custom8; each is optional. Numbers in the
+AI text are hex.
 
 
 The models
