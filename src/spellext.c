@@ -1338,6 +1338,8 @@ static struct { BYTE set, single, all; } cast_animation[10];
 /* Effect copies (`animation = 0x100` and up; see "Effect copies", after the spell file code): the copy
    each actor's action wants, noted at its set-up, and the effect step that loads it */
 static void effect_copy_note(int *action, int spell);
+/* Stage 6a: an enemy's attack with SpellExt extras (an effect, cameras), noted after the game's set-up ("enemies") */
+static void enemies_attack_note(int *action);
 
 static void prop_effect_step(int actor);   /* a limit's `prop` (see "A prop", with the limits further down) */
 static void state_effect_step(int actor);   /* a limit's `state` (see "A state", after the prop) */
@@ -1457,6 +1459,7 @@ static void __cdecl action_setup_hook(void)
         ((void (__cdecl *)(void))FN_ACTION_SETUP)();
         note_limit_action(action[ACT_ACTOR], action[ACT_COMMAND_TYPE], id);
         return_scratch_slot(action[ACT_ACTOR]);
+        enemies_attack_note(action);    /* an enemy's attack with extras of the enemies files (nothing with enemies off) */
         return;
     }
     if (index) {
@@ -9484,6 +9487,293 @@ static const char *direct_mode_name(const char *full)
     return direct && *last ? last : NULL;
 }
 
+/* ==== ENEMIES (models) BEGIN ====
+   `enemies = on` in the game file (read at start-up only; off by default). A battle model's files have
+   four-letter names in the battle archive: the first two letters name the model, (model number) / 26 and
+   % 26 as 'a'..'z' (FUN_005e2460: ENEMY365.DAT -> OB..), the last two the part (aa skeleton, ab, ac..
+   textures, da animations, the rest the parts). The models 365-369 (letters ob-of) are a POOL: a pool
+   number assigned to a folder has its files served from
+       SpellExtConfig\enemies\<folder>\model\<the last two letters>
+   whoever asks for them: the driver (FFNx reads a battle model's files itself, by fopen, through its own
+   imports of CreateFileA/W: it tries <game>\direct\battle\<name> first, then the archive) or the game
+   (FUN_006820d2, under the stock driver: open_file_hook). An unassigned pool number, a file the folder
+   lacks and every other name go on as before. The assignment, for now, is the [models] section of
+   SpellExtConfig\FF7_SpellExt_Enemies.ini (`365 = <folder>`), read once at start-up: a static testing
+   assignment. A battle's own assignment (a later stage) replaces it through enemies_model_assign and
+   enemies_model_clear, the only writers of the table. With enemies off nothing here runs: no file is
+   read, no call or import is taken. */
+#define ENEMIES_FILE_NAME       "FF7_SpellExt_Enemies.ini"
+#define ENEMIES_FOLDER_NAME     "enemies"
+#define ENEMIES_POOL_FIRST      365         /* ENEMY365.DAT: letters ob */
+#define ENEMIES_POOL_COUNT      5           /* 365-369: ob, oc, od, oe, of (below the game's 376-entry model tables) */
+#define ENEMIES_NAME_MAX        31          /* a folder name: letters, digits, _ and - */
+#define ENEMIES_SERVED_LOG_MAX  200
+#define ENEMIES_MISSING_LOG_MAX 100
+#define ENEMIES_FAILED_LOG_MAX  100
+#define ENEMIES_SUFFIXES        (26 * 26)
+
+/* ENEMIES MODEL PURE BEGIN  (no Win32 call inside: tested natively, the enemies stage 2a test) */
+static int enemies_letter(char c)
+{
+    if (c >= 'A' && c <= 'Z')
+        c = (char)(c + 0x20);
+    return c >= 'a' && c <= 'z' ? c - 'a' : -1;
+}
+
+/* The two letters of a battle model number (FUN_005e2460's rule, lower case), as a string. */
+static void enemies_model_letters(int model, char *out)
+{
+    out[0] = (char)('a' + model / 26 % 26);
+    out[1] = (char)('a' + model % 26);
+    out[2] = 0;
+}
+
+/* If `bare` is exactly four letters (any case) whose first two are those of a model in
+   [first, first + count): the model's index in that range, and its last two letters in `suffix`
+   (lower case); else -1. */
+static int enemies_model_index(const char *bare, int first, int count, char *suffix)
+{
+    int i, letters[4], model;
+
+    for (i = 0; i < 4; i++)
+        if ((letters[i] = enemies_letter(bare[i])) < 0)
+            return -1;
+    if (bare[4])
+        return -1;
+    model = letters[0] * 26 + letters[1];
+    if (model < first || model >= first + count)
+        return -1;
+    suffix[0] = (char)('a' + letters[2]);
+    suffix[1] = (char)('a' + letters[3]);
+    suffix[2] = 0;
+    return model - first;
+}
+
+/* Whether the path part [start, end) is `word`, ignoring case (word in lower case). */
+static BOOL enemies_part_is(const char *start, const char *end, const char *word)
+{
+    for (; start < end && *word; start++, word++)
+        if ((*start >= 'A' && *start <= 'Z' ? *start + 0x20 : *start) != *word)
+            return FALSE;
+    return start == end && !*word;
+}
+
+/* If `full` (a path the driver opens) is a file in, or one folder below, a folder `battle` or
+   `battle.lgp` that is itself in a folder `direct` (FFNx's direct-mode paths for the battle archive:
+   direct\battle\NAME, direct\battle.lgp\NAME, direct\battle\<its current folder>\NAME), returns its
+   last part; else NULL. */
+static const char *enemies_driver_bare(const char *full)
+{
+    const char *c, *part = full;
+    BOOL direct_last = FALSE;
+    int folders_after = -1;         /* folders seen after the battle folder; -1: none seen */
+
+    for (c = full; *c; c++)
+        if (*c == '\\' || *c == '/') {
+            if (folders_after >= 0)
+                folders_after++;
+            if (direct_last && (enemies_part_is(part, c, "battle") || enemies_part_is(part, c, "battle.lgp")))
+                folders_after = 0;
+            direct_last = enemies_part_is(part, c, "direct");
+            part = c + 1;
+        }
+    return (folders_after == 0 || folders_after == 1) && *part ? part : NULL;
+}
+
+/* Whether [start, end) can be an enemy folder's name: 1 to ENEMIES_NAME_MAX letters, digits, _ or -. */
+static BOOL enemies_folder_name_ok(const char *start, const char *end)
+{
+    const char *c;
+
+    if (end <= start || end - start > ENEMIES_NAME_MAX)
+        return FALSE;
+    for (c = start; c < end; c++)
+        if (!((*c >= 'a' && *c <= 'z') || (*c >= 'A' && *c <= 'Z') || (*c >= '0' && *c <= '9') || *c == '_' || *c == '-'))
+            return FALSE;
+    return TRUE;
+}
+
+/* Appends `text` to out (of `capacity` bytes, `*length` used); FALSE when it does not fit. */
+static BOOL enemies_append(char *out, int capacity, int *length, const char *text)
+{
+    for (; *text; text++) {
+        if (*length + 1 >= capacity)
+            return FALSE;
+        out[(*length)++] = *text;
+    }
+    out[*length] = 0;
+    return TRUE;
+}
+
+/* `config` (ending with a separator) + enemies\<folder>\model\<suffix>; FALSE (out empty) when it would
+   not fit `capacity`. With config "" it gives the path relative to the config folder, for the log. */
+static BOOL enemies_model_path(const char *config, const char *folder, const char *suffix, char *out, int capacity)
+{
+    int length = 0;
+
+    if (capacity < 1)
+        return FALSE;
+    out[0] = 0;
+    if (enemies_append(out, capacity, &length, config) && enemies_append(out, capacity, &length, ENEMIES_FOLDER_NAME "\\") &&
+        enemies_append(out, capacity, &length, folder) && enemies_append(out, capacity, &length, "\\model\\") &&
+        enemies_append(out, capacity, &length, suffix))
+        return TRUE;
+    out[0] = 0;
+    return FALSE;
+}
+
+/* One line of [models]: KEY = VALUE, KEY a pool number (decimal or 0x), VALUE a folder name or `none`.
+   1: read (*index the pool index, folder the name, "" for none); -1: a mistake (*fault says what). */
+static int enemies_models_entry(const char *key, const char *key_end, const char *value, const char *stop,
+                                int *index, char *folder, const char **fault)
+{
+    const char *c = key;
+    DWORD number = 0;
+    int digits = 0, i;
+
+    if (key_end - c > 2 && c[0] == '0' && (c[1] | 0x20) == 'x') {
+        for (c += 2; c < key_end && digits < 8; c++, digits++) {
+            int d = (*c >= '0' && *c <= '9') ? *c - '0' : ((*c | 0x20) >= 'a' && (*c | 0x20) <= 'f') ? (*c | 0x20) - 'a' + 10 : -1;
+
+            if (d < 0)
+                break;
+            number = number * 16 + (DWORD)d;
+        }
+    } else {
+        for (; c < key_end && *c >= '0' && *c <= '9' && digits < 9; c++, digits++)
+            number = number * 10 + (DWORD)(*c - '0');
+    }
+    if (!digits || c != key_end || number < ENEMIES_POOL_FIRST || number >= ENEMIES_POOL_FIRST + ENEMIES_POOL_COUNT) {
+        *fault = "the key must be a model number of the pool, 365 to 369";
+        return -1;
+    }
+    if (enemies_part_is(value, stop, "none") || enemies_part_is(value, stop, "off")) {
+        *index = (int)number - ENEMIES_POOL_FIRST;
+        folder[0] = 0;
+        return 1;
+    }
+    if (!enemies_folder_name_ok(value, stop)) {
+        *fault = "the value must be a folder name of SpellExtConfig\\enemies (1 to 31 letters, digits, _ or -), or none";
+        return -1;
+    }
+    for (i = 0; value + i < stop; i++)
+        folder[i] = value[i];
+    folder[i] = 0;
+    *index = (int)number - ENEMIES_POOL_FIRST;
+    return 1;
+}
+/* ENEMIES MODEL PURE END */
+
+static LONG enemies_asked, enemies_given, enemies_settled;  /* the game file's key at this reading; taken at the first */
+static LONG enemies_on;             /* for the run: the start-up reading said on */
+static LONG enemies_live;           /* serving: on and set up by enemies_start */
+static char enemies_models[ENEMIES_POOL_COUNT][ENEMIES_NAME_MAX + 1];      /* "" = unassigned */
+static LONG enemies_served_bits[(ENEMIES_POOL_COUNT * ENEMIES_SUFFIXES + 31) / 32];
+static LONG enemies_missing_bits[(ENEMIES_POOL_COUNT * ENEMIES_SUFFIXES + 31) / 32];
+static LONG enemies_failed_bits[(ENEMIES_POOL_COUNT * ENEMIES_SUFFIXES + 31) / 32];
+static LONG enemies_served_logged, enemies_missing_logged, enemies_failed_logged;
+
+/* Sets (set TRUE) or clears bit `n` of `bits` from any thread; returns whether it was set before. */
+static BOOL enemies_bit(LONG *bits, int n, BOOL set)
+{
+    LONG *word = bits + n / 32, mask = (LONG)(1u << (n % 32)), seen;
+
+    do
+        seen = *word;
+    while (InterlockedCompareExchange(word, set ? seen | mask : seen & ~mask, seen) != seen);
+    return (seen & mask) != 0;
+}
+
+/* The only writer of the table. A folder of "" unassigns. The pool number's first-time log bits are
+   cleared, so a new assignment says again what it serves. */
+static void enemies_model_assign(int index, const char *folder)
+{
+    int i;
+
+    if (index < 0 || index >= ENEMIES_POOL_COUNT || lstrlenA(folder) > ENEMIES_NAME_MAX)
+        return;
+    enemies_models[index][0] = 0;
+    for (i = index * ENEMIES_SUFFIXES; i < (index + 1) * ENEMIES_SUFFIXES; i++) {
+        enemies_bit(enemies_served_bits, i, FALSE);
+        enemies_bit(enemies_missing_bits, i, FALSE);
+        enemies_bit(enemies_failed_bits, i, FALSE);
+    }
+    lstrcpyA(enemies_models[index], folder);
+}
+
+static void enemies_model_clear(void)
+{
+    int i;
+
+    for (i = 0; i < ENEMIES_POOL_COUNT; i++)
+        enemies_model_assign(i, "");
+}
+
+/* Whether a file request names an assigned pool model's file that its folder holds: copies the file's
+   full path into `path` (MAX_PATH + 200 bytes) and returns TRUE. `bare` is the request's last part,
+   `who` says who asked (for the log). A file the folder lacks: one line (the first time), and FALSE.
+   The caller opens `path` and says how it went: enemies_model_opened. */
+static BOOL enemies_model_file(const char *bare, const char *who, char *path)
+{
+    char suffix[3], relative[MAX_PATH], folder[ENEMIES_NAME_MAX + 1];
+    int index = enemies_model_index(bare, ENEMIES_POOL_FIRST, ENEMIES_POOL_COUNT, suffix), bit;
+    DWORD attributes;
+
+    if (index < 0)
+        return FALSE;
+    lstrcpynA(folder, enemies_models[index], sizeof folder);
+    if (!folder[0])
+        return FALSE;
+    bit = index * ENEMIES_SUFFIXES + (suffix[0] - 'a') * 26 + (suffix[1] - 'a');
+    if (!enemies_model_path(config_dir, folder, suffix, path, MAX_PATH + 200) ||
+        !enemies_model_path("", folder, suffix, relative, sizeof relative))
+        return FALSE;
+    attributes = GetFileAttributesA(path);
+    if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY)) {
+        if (!enemies_bit(enemies_missing_bits, bit, TRUE) && InterlockedIncrement(&enemies_missing_logged) <= ENEMIES_MISSING_LOG_MAX)
+            log_line("enemies: model file %s: %s is MISSING (model %d is served from enemies\\%s\\model\\); %s looks for %s itself",
+                     bare, relative, ENEMIES_POOL_FIRST + index, folder, who, bare);
+        return FALSE;
+    }
+    return TRUE;
+}
+
+/* After the open of the `path` enemies_model_file gave for `bare`: one line the first time the file is
+   served, or the first time it could not be opened (each with its own budget). */
+static void enemies_model_opened(const char *bare, const char *who, const char *path, BOOL opened, DWORD error)
+{
+    char suffix[3];
+    int index = enemies_model_index(bare, ENEMIES_POOL_FIRST, ENEMIES_POOL_COUNT, suffix), bit;
+    const char *relative = path + lstrlenA(config_dir);
+
+    if (index < 0)
+        return;
+    if (lstrlenA(path) < lstrlenA(config_dir))
+        relative = path;
+    bit = index * ENEMIES_SUFFIXES + (suffix[0] - 'a') * 26 + (suffix[1] - 'a');
+    if (opened) {
+        if (!enemies_bit(enemies_served_bits, bit, TRUE) && InterlockedIncrement(&enemies_served_logged) <= ENEMIES_SERVED_LOG_MAX)
+            log_line("enemies: model file %s -> %s (asked by %s)", bare, relative, who);
+    } else if (!enemies_bit(enemies_failed_bits, bit, TRUE) && InterlockedIncrement(&enemies_failed_logged) <= ENEMIES_FAILED_LOG_MAX) {
+        log_line("enemies: model file %s: %s could not be opened (error %lu); %s looks for %s itself", bare, relative, error, who, bare);
+    }
+}
+
+/* The driver's open of `full`: a read-only open of an existing file below direct\battle whose name is
+   an assigned pool model's. */
+static BOOL enemies_driver_answers(const char *full, DWORD access, DWORD disposition, char *path)
+{
+    const char *bare;
+
+    if (!enemies_live || (access & (GENERIC_WRITE | GENERIC_ALL)) || disposition != OPEN_EXISTING)
+        return FALSE;
+    bare = enemies_driver_bare(full);
+    return bare && enemies_model_file(bare, "the driver", path);
+}
+static void enemies_start(int *ok, int *total);        /* with the game file's keys */
+static void enemies_battle_watch(void);                 /* (enemies, scenes) a battle's pool models: given back when it is over */
+/* ==== ENEMIES (models) END ==== */
+
 static BOOL effect_swap_answers(const char *full, DWORD access, DWORD disposition, char *path)
 {
     const char *bare;
@@ -9504,6 +9794,15 @@ static HANDLE WINAPI driver_create_file_a(LPCSTR name, DWORD access, DWORD share
         driver_open_before[0] ? (void *)driver_open_before[0] : (void *)CreateFileA;
     char path[MAX_PATH + 200];
 
+    if (enemies_live)
+        enemies_battle_watch();
+    if (enemies_live && name && !IsBadStringPtrA(name, 1024) && enemies_driver_answers(name, access, disposition, path)) {
+        HANDLE file = before(path, access, share, security, disposition, flags, template_file);
+
+        enemies_model_opened(enemies_driver_bare(name), "the driver", path, file != INVALID_HANDLE_VALUE, GetLastError());
+        if (file != INVALID_HANDLE_VALUE)
+            return file;
+    }
     if (name && !IsBadStringPtrA(name, 1024) && effect_swap_answers(name, access, disposition, path)) {
         effect_swap_off();              /* handed over: nothing more to answer for */
         return before(path, access, share, security, disposition, flags, template_file);
@@ -9519,10 +9818,24 @@ static HANDLE WINAPI driver_create_file_w(LPCWSTR name, DWORD access, DWORD shar
     char narrow[1024], path[MAX_PATH + 200];
     int i;
 
+    if (enemies_live)
+        enemies_battle_watch();
     if (name && !IsBadStringPtrW(name, 1024)) {
         for (i = 0; i < (int)sizeof narrow - 1 && name[i] && name[i] < 0x80; i++)
             narrow[i] = (char)name[i];
         narrow[i] = 0;
+        if (enemies_live && !name[i] && enemies_driver_answers(narrow, access, disposition, path)) {
+            WCHAR wide[MAX_PATH + 200];
+            HANDLE file = INVALID_HANDLE_VALUE;
+
+            /* the file's path in the config folder, handed on to what the slot held (the path is in the
+               ANSI code page, as GetModuleFileNameA gave the config folder) */
+            if (MultiByteToWideChar(CP_ACP, 0, path, -1, wide, MAX_PATH + 200) > 0)
+                file = before(wide, access, share, security, disposition, flags, template_file);
+            enemies_model_opened(enemies_driver_bare(narrow), "the driver", path, file != INVALID_HANDLE_VALUE, GetLastError());
+            if (file != INVALID_HANDLE_VALUE)
+                return file;
+        }
         if (!name[i] && effect_swap_answers(narrow, access, disposition, path)) {
             effect_swap_off();
             return CreateFileA(path, access, share, security, disposition, flags, template_file);
@@ -9565,6 +9878,43 @@ static void set_import_slot(DWORD *slot, DWORD value)
     }
 }
 
+/* The driver's two import slots hold this DLL's functions while one of three reasons wants them: the
+   effect swap (driver_opens_taken, from a limit's set-up until its file is handed over), a battle of a
+   DLL scene with pool models of its own (enemies_battle_holds, from the overwrite of its scene in
+   load_scene_hook until the battle is over: enemies_battle_watch), and the testing aid [models] of
+   FF7_SpellExt_Enemies.ini (enemies_holds_opens, for the run while it assigns a pool model). When none
+   does they hold what they held before, so the slots are taken when the first reason comes and given
+   back when the last one goes, never by one under another. With enemies off this does exactly what
+   effect_swap_on and effect_swap_off did themselves: take on the swap's set-up, give back at its end. */
+static LONG driver_opens_lock, driver_opens_in, enemies_holds_opens, enemies_battle_holds;
+
+static void driver_opens_settle(void)
+{
+    BOOL wanted;
+
+    while (InterlockedExchange(&driver_opens_lock, 1))
+        Sleep(0);
+    wanted = driver_opens_taken || enemies_holds_opens || enemies_battle_holds;
+    if (wanted && !driver_opens_in) {
+        if (driver_open_slot[0]) {
+            driver_open_before[0] = *driver_open_slot[0];
+            set_import_slot(driver_open_slot[0], (DWORD)driver_create_file_a);
+        }
+        if (driver_open_slot[1]) {
+            driver_open_before[1] = *driver_open_slot[1];
+            set_import_slot(driver_open_slot[1], (DWORD)driver_create_file_w);
+        }
+        driver_opens_in = 1;
+    } else if (!wanted && driver_opens_in) {
+        if (driver_open_slot[0] && *driver_open_slot[0] == (DWORD)driver_create_file_a)
+            set_import_slot(driver_open_slot[0], driver_open_before[0]);
+        if (driver_open_slot[1] && *driver_open_slot[1] == (DWORD)driver_create_file_w)
+            set_import_slot(driver_open_slot[1], driver_open_before[1]);
+        driver_opens_in = 0;
+    }
+    InterlockedExchange(&driver_opens_lock, 0);
+}
+
 /* A limit with an effect_file starts: note the swap and, if the driver reads files itself, take
    its two file-open imports until effect_swap_off. */
 static void effect_swap_on(const char *from, const char *to)
@@ -9582,33 +9932,76 @@ static void effect_swap_on(const char *from, const char *to)
         driver_open_slot[1] = module_import_slot(driver, "KERNEL32.dll", "CreateFileW");
     }
     if (!InterlockedExchange(&driver_opens_taken, 1)) {
-        if (driver_open_slot[0]) {
-            driver_open_before[0] = *driver_open_slot[0];
-            set_import_slot(driver_open_slot[0], (DWORD)driver_create_file_a);
-        }
-        if (driver_open_slot[1]) {
-            driver_open_before[1] = *driver_open_slot[1];
-            set_import_slot(driver_open_slot[1], (DWORD)driver_create_file_w);
-        }
+        driver_opens_settle();
         log_line("effect file %s -> %s: the driver's file opens pass through this DLL until the file is handed over (imports found: %d)",
                  from, to, (driver_open_slot[0] != NULL) + (driver_open_slot[1] != NULL));
     }
 }
 
-/* The swap ends; the driver's imports are put back as they were. */
+/* The swap ends; the driver's imports are put back as they were (unless enemies holds them). */
 static void effect_swap_off(void)
 {
     effect_swap_from[0] = 0;
-    if (InterlockedExchange(&driver_opens_taken, 0)) {
-        if (driver_open_slot[0] && *driver_open_slot[0] == (DWORD)driver_create_file_a)
-            set_import_slot(driver_open_slot[0], driver_open_before[0]);
-        if (driver_open_slot[1] && *driver_open_slot[1] == (DWORD)driver_create_file_w)
-            set_import_slot(driver_open_slot[1], driver_open_before[1]);
+    if (InterlockedExchange(&driver_opens_taken, 0))
+        driver_opens_settle();
+}
+
+/* enemies on, at start-up: finds the driver's two file-open import slots when the driver reads files
+   itself (FFNx). Nothing is taken here: a battle with pool models takes them while it lasts, [models]
+   for the run (driver_opens_settle). Says how the model files are served, for the start-up line. */
+static LONG enemies_driver_found;       /* 1: the driver reads files itself and its slots were found */
+
+static const char *enemies_find_driver_opens(void)
+{
+    HMODULE driver = GetModuleHandleA("AF3DN.P");
+    HMODULE kernel = GetModuleHandleA("KERNEL32.dll");
+
+    if (!driver)
+        return "through the game's own file opens (no driver AF3DN.P is loaded at this point: the driver's own opens are NOT seen)";
+    if (driver == dll_module || GetModuleHandleA("AF3DN_orig.dll"))
+        return "through the game's own file opens (the stock driver)";
+    if (!driver_open_slot[0] && !driver_open_slot[1]) {
+        driver_open_slot[0] = module_import_slot(driver, "KERNEL32.dll", "CreateFileA");
+        driver_open_slot[1] = module_import_slot(driver, "KERNEL32.dll", "CreateFileW");
     }
+    if (!driver_open_slot[0] && !driver_open_slot[1])
+        return "NOT through the driver: its imports of CreateFileA and CreateFileW were not found (only the game's own file opens are seen)";
+    log_line("enemies: the driver's (AF3DN.P at %08lx) import slots: CreateFileA %08lx holds %08lx, CreateFileW %08lx holds %08lx (KERNEL32's: %08lx, %08lx)",
+             (DWORD)driver, (DWORD)driver_open_slot[0], driver_open_slot[0] ? *driver_open_slot[0] : 0,
+             (DWORD)driver_open_slot[1], driver_open_slot[1] ? *driver_open_slot[1] : 0,
+             kernel ? (DWORD)GetProcAddress(kernel, "CreateFileA") : 0, kernel ? (DWORD)GetProcAddress(kernel, "CreateFileW") : 0);
+    enemies_driver_found = 1;
+    return "through this DLL: the driver's imports of CreateFileA/W pass through it while a battle with pool models of a DLL scene lasts (and for the run while [models] assigns one), and the game's own file opens";
 }
 
 static void *__cdecl open_file_hook(int *source, const char *name)
 {
+    /* enemies on: a battle archive file (archive 2) of an assigned pool model, from its folder */
+    if (enemies_live && source && name && source[0] == 0 && source[1] != 0 && source[2] == 2) {
+        char translated[512], *path;
+        const char *final = name, *c;
+
+        if (source[3]) {
+            translated[0] = 0;
+            ((void (__cdecl *)(const char *, char *))source[3])(name, translated);
+            final = translated;
+        }
+        for (c = final; *c; c++)
+            if (*c == '\\' || *c == '/')
+                final = c + 1;
+        path = override_paths[InterlockedIncrement(&override_next) & 15];
+        if (enemies_model_file(final, "the game", path)) {
+            int plain_source[4];
+            void *file;
+
+            plain_source[0] = source[0];
+            plain_source[1] = plain_source[2] = plain_source[3] = 0;   /* not from an archive, no name callback */
+            file = ((void *(__cdecl *)(int *, const char *))FN_OPEN_FILE)(plain_source, path);
+            enemies_model_opened(final, "the game", path, file != NULL, 0);
+            if (file)
+                return file;
+        }
+    }
     if (override_on && source && name && source[0] == 0 && source[1] != 0) {
         char translated[512];
         const char *final = name, *c;
@@ -9671,8 +10064,9 @@ static void *__cdecl open_file_hook(int *source, const char *name)
         }
     }
     /* A part of a new character's own model that was not supplied: use the
-       same part of the model it stands on. */
-    if (source && name && source[1] != 0) {
+       same part of the model it stands on. (override_on: as when this hook was installed only with it;
+       enemies = on installs the hook without it, and must not start this.) */
+    if (override_on && source && name && source[1] != 0) {
         char *fallback = override_paths[InterlockedIncrement(&override_next) & 15];
 
         if (base_model_part_name(name, fallback)) {
@@ -9838,10 +10232,14 @@ static void game_text(char *out, const BYTE *in, int max)
         lstrcpyA(out, "(no name)");
 }
 
+static BOOL enemies_describe(LONG battle, char *scene, int slot, char *folder);   /* (enemies, scenes) */
+static void enemies_load_scene(DWORD number, void *callback);                       /* (enemies, scenes) */
+static void enemies_game_scene(void);                                               /* (enemies, scenes) */
+
 static void describe_battle(const char *prefix)
 {
     const WORD *ids = (const WORD *)ADDR_SCENE_ENEMY_IDS;
-    char names[3][34], rows[64];
+    char names[3][34], rows[64], scene[64], folders[3][40];
     int i, n = 0;
 
     if (last_battle < 0 || IsBadReadPtr(ids, 8) || IsBadReadPtr((const void *)ADDR_SCENE_ENEMIES, 3 * 0xb8))
@@ -9854,6 +10252,14 @@ static void describe_battle(const char *prefix)
     rows[0] = 0;
     for (i = 0; i < 6; i++)
         n += wsprintfA(rows + n, " %d", (int)*(const short *)(ADDR_SCENE_FORMATION + i * 0x10));
+    if (enemies_live && last_battle >= 1024 && enemies_describe(last_battle, scene, 0, folders[0]) &&
+        enemies_describe(last_battle, NULL, 1, folders[1]) && enemies_describe(last_battle, NULL, 2, folders[2])) {
+        /* (enemies) a DLL scene's battle: its scene's name and each enemy's folder */
+        log_line("%sbattle %ld (%s, formation %ld): enemies %u '%s'%s, %u '%s'%s, %u '%s'%s; rows hold%s; party %d %d %d",
+                 prefix, last_battle, scene, last_battle & 3, ids[0], names[0], folders[0], ids[1], names[1], folders[1],
+                 ids[2], names[2], folders[2], rows, ((const BYTE *)ADDR_PARTY)[0], ((const BYTE *)ADDR_PARTY)[1], ((const BYTE *)ADDR_PARTY)[2]);
+        return;
+    }
     log_line("%sbattle %ld (scene %ld, formation %ld): enemies %u '%s', %u '%s', %u '%s'; rows hold%s; party %d %d %d",
              prefix, last_battle, last_battle >> 2, last_battle & 3, ids[0], names[0], ids[1], names[1], ids[2], names[2],
              rows, ((const BYTE *)ADDR_PARTY)[0], ((const BYTE *)ADDR_PARTY)[1], ((const BYTE *)ADDR_PARTY)[2]);
@@ -9864,7 +10270,19 @@ static void follow_esui_battle_avatars(void);
 static void __cdecl load_scene_hook(DWORD number, void *callback)
 {
     follow_esui_battle_avatars();       /* a mod's patches may arrive after the kernel was loaded */
-    ((void (__cdecl *)(DWORD, void *))FN_LOAD_SCENE)(number, callback);
+    if (enemies_live && number >= 1024 && number <= 16383)
+        enemies_load_scene(number, callback);   /* (enemies) a DLL scene: its stand-in loaded, then written over */
+    else if (enemies_live && number >= 1020) {
+        /* (enemies) scene 255 or past 4095: FUN_005d14a9 would read past scene.bin's table */
+        if (!*(const DWORD *)0x00c069bcu && InterlockedIncrement(&battles_logged) <= 400)
+            log_line("enemies: battle %lu (scene %lu) is no battle the game or a DLL scene has: battle 0 (scene 0:0) plays in its place", number, number >> 2);
+        enemies_game_scene();
+        ((void (__cdecl *)(DWORD, void *))FN_LOAD_SCENE)(0, callback);
+    } else {
+        if (enemies_live)
+            enemies_game_scene();               /* (enemies) a scene of the game's: no pool model of a DLL scene is served for it */
+        ((void (__cdecl *)(DWORD, void *))FN_LOAD_SCENE)(number, callback);
+    }
     last_battle = (LONG)number;
     if (InterlockedIncrement(&battles_logged) <= 400)
         describe_battle("");
@@ -10256,6 +10674,8 @@ static void install_hooks(void)
         log_line("loose files on: %lu file(s) indexed under %s; each replaces the archive file of the same name",
                  loose_count, override_dir);
     }
+    if (enemies_on)
+        enemies_start(&ok, &total);     /* (enemies) the pool models' files; nothing at all when off */
     log_line("hooks installed: %d of %d", ok, total);
     /* the one switch of the save work (save_work_on), said at every start */
     log_line("save work: hooks in: prepare %ld, load slot %ld, load accepted %ld, save write %ld: %s", save_prepare_live, load_slot_live,
@@ -10494,7 +10914,8 @@ static void apply_flag_changes(const struct spell_draft *draft, BYTE *record)
 #define EFFECT_BASE_COUNT       0x36         /* magic effects 0x00-0x35: the ones a copy may be of */
 #define EFFECT_COPY_FIRST       0x100        /* the DLL's own effect numbers start here */
 #define EFFECT_COPY_LAST        0xffff
-#define EFFECT_COPY_MAX         256          /* [effect N] sections, copies and native effects together (64 before stage 3a) */
+#define EFFECT_COPY_MAX         1024         /* [effect N] sections, copies and native effects together (64 before stage 3a, 256
+                                                before stage 6b; the refusal text says 1024) */
 #define EFFECT_FILES_MAX        16           /* entries of a base's file list (the game's most is 12) */
 #define EFFECT_RENAMES_MAX      16           /* `file` lines of one copy */
 #define EFFECT_NAME_MAX         32           /* a file name and its 0 */
@@ -10774,7 +11195,7 @@ static int effect_file_parse(char *text, DWORD size, struct effect_copy *copies,
                 continue;
             }
             if (count == capacity) {
-                problem(line_number, "too many effect sections, copies and native effects together (256 at most): the section is skipped");
+                problem(line_number, "too many effect sections, copies and native effects together (1024 at most): the section is skipped");
                 continue;
             }
             c = &copies[count++];
@@ -11020,7 +11441,12 @@ static int native_clock_step(struct native_clock *k, int paused, int group_ok, i
                                                 bound of its own: FUN_00689978 allocates count x 0xc and every routine
                                                 of the group walks *group entries */
 #define NFX_ITEMS_MAX           2048         /* timeline lines of one script (512 before the limits stage) */
-#define NFX_POOL_ITEMS          256000       /* timeline lines of all scripts together (a static pool, int indices; 4096 before stage 3a, 65536 before 2026-10-23) */
+#define NFX_POOL_ITEMS          1048576      /* timeline lines of all scripts together, at most (int indices; 4096 before stage 3a,
+                                                65536 before 2026-10-23, 256000 before stage 6b, a static array then). The pool
+                                                is on the heap and sized to need (nfx_pool_size_for, native_pool_room): the
+                                                refusal text names the size it has */
+#define NFX_POOL_LEAST          256000       /* (stage 6b) the smallest pool made (the size the static pool had) */
+#define NFX_POOL_STEP           65536        /* (stage 6b) a pool's size is a multiple of this past NFX_POOL_LEAST */
 #define NFX_LINES_MAX           12000        /* lines of one script file (4000 before the limits stage) */
 #define NFX_TEXT_MAX            0x80000      /* bytes of one script file: 512 KB (128 KB before the limits stage) */
 #define NFX_LENGTH_MAX          600          /* frames: 40 s at the battle's 15 updates a second (240 before the limits stage, 480
@@ -11141,6 +11567,22 @@ static int native_clock_step(struct native_clock *k, int paused, int group_ok, i
 #define NFX_MODEL_FLAGS         0x00b0u      /* a model entry's flags but the blend: Blizzaga's BRIZAG_1 entry 00b1 (008af438) & ~7:
                                                 0x80 light data, 0x20 the matrix handed over is finished, 0x10 instances a frame */
 #define NFX_MODEL_SCALE         1            /* a model entry's second word (vertices x 1 at load; the size is the line's matrix) */
+/* (fx morph f1; tools/work/fx_morph/build_f1/SPEC_model_morph.md) a model's vertex sets: `file N = NAME.RSD morph=NAME.MRF`
+   names a file of SpellExtConfig\effects (read by this DLL, never by the game) holding S sets of the .P's V vertex
+   positions; a model line's shape=A>B picks the set it draws (in page, as a sprite's page=A>B), tween=smooth blends
+   neighbouring sets. One set a frame for each file: the file is one polygon set in the engine (native_morph_write) */
+#define NFX_MORPH_FILES_MAX     256          /* different .MRF names in one reading, all scripts together */
+#define NFX_MORPH_SETS_MAX      600          /* vertex sets in one .MRF (one a frame over the longest effect) */
+#define NFX_MORPH_VERTS_MAX     32768        /* vertices in one .MRF (it must be the .P's count) */
+#define NFX_MORPH_FILE_BYTES    0x1000000    /* one .MRF, its header included: 16 MiB */
+#define NFX_MORPH_TOTAL_BYTES   0x4000000    /* all the .MRF files of one reading together: 64 MiB */
+#define NFX_MORPH_HEADER        32           /* "SXMORPH1", u32 32, u32 V, u32 S, u32 flags 0, u32 0, u32 0; then S x V x 3 floats */
+#define NFX_MORPH_EACH_TURNS    9            /* an each=K line of a morph file is taken as on to LAST + 9 K (the tenth actor's) */
+#define NFX_SHAPE_GIVEN         0x01         /* an item's `shape`: shape= given (the sets in page.a, page.b) */
+#define NFX_SHAPE_SMOOTH        0x02         /* tween=smooth: blended between neighbouring sets, in 256ths of a step */
+#define NFX_SHAPE_TWEEN         0x04         /* tween= given (refused without shape=) */
+#define NFX_FACE_YAW            0x01         /* an item's `face`: face=yaw, the model's axes the camera's yaw only (nfx_yaw_frame) */
+#define NFX_YAW_LEVEL_LEAST     1024         /* face=yaw: the level part of a camera row (4096 = 1) it is taken from, at least */
 
 /* refusal 1: the script is not used; 0: a note (a reserved key or command, ignored) */
 typedef void (*nfx_say_fn)(int line, int refusal, const char *what);
@@ -11155,6 +11597,8 @@ struct nfx_item {
     WORD sound;
     struct nfx_range page, x, y, depth, sx, sy, rot, r, g, b, pal;
     struct nfx_range z, sz;             /* a model: its third offset and third scale (x, y, sx, sy are its first two) */
+    BYTE shape, face;                   /* (fx morph) a model: NFX_SHAPE_* (shape= in page), NFX_FACE_YAW; 0 for every other
+                                           line. They take the two bytes of padding before turn: the item stays 108 bytes */
     struct nfx_wide turn[3];            /* a model: degrees about X, then Y, then Z */
     struct nfx_range fade, u, v;        /* a model (stage 3b): its fade (255 none), its texture offset (256ths); r, g, b and
                                            pal as a sprite's, read only with NFX_F_COLOUR / NFX_F_PALETTE */
@@ -11165,6 +11609,7 @@ struct nfx_file {
     int model;                          /* NAME.RSD: a model entry (NFX_MODEL_FLAGS), drawn by `model` lines */
     int tex_default;                    /* tex was not given: the list is the default, this file then the next ones */
     BYTE tex[NFX_TEX_MAX];              /* the files whose textures the sheet's texture pages are, in order */
+    int morph;                          /* (fx morph) a model's morph= file: its index in nfx_morphs; -1 none */
 };
 struct nfx_script {
     char folder[EFFECT_NAME_MAX];
@@ -11190,6 +11635,49 @@ typedef char nfx_files_max_check[NFX_FILES_MAX == 32 && NFX_FILES_MAX <= 32 && s
 typedef char nfx_limits_check[NFX_ITEMS_MAX == 2048 && NFX_LENGTH_MAX == 600 && NFX_LINES_MAX == 12000 &&
                               NFX_TEXT_MAX == 0x80000 && NFX_LINES_MAX <= 32767 && NFX_LENGTH_MAX <= 32767 &&
                               72000LL * NFX_LENGTH_MAX <= 0x7fffffffLL ? 1 : -1];
+/* (fx morph) the item keeps its size (shape and face sit in the padding before turn), and the numbers the refusal texts
+   spell out (256 files, 600 sets, 32768 vertices, 16 and 64 MiB) are the defines'; a set's bytes and a smooth step's
+   (B - A) x 256 x (f - FIRST) stay within the types they are computed in */
+typedef char nfx_morph_check[sizeof(struct nfx_item) == 108 && NFX_MORPH_FILES_MAX == 256 && NFX_MORPH_SETS_MAX == 600 &&
+                             NFX_MORPH_VERTS_MAX == 32768 && NFX_MORPH_FILE_BYTES == 16 * 1024 * 1024 &&
+                             NFX_MORPH_TOTAL_BYTES == 64 * 1024 * 1024 && NFX_MORPH_SETS_MAX <= NFX_LENGTH_MAX &&
+                             (long long)NFX_MORPH_SETS_MAX * NFX_MORPH_VERTS_MAX * 12 + NFX_MORPH_HEADER <= 0xffffffffLL &&
+                             (long long)NFX_MORPH_SETS_MAX * 256 * NFX_LENGTH_MAX <= 0x7fffffffLL ? 1 : -1];
+
+/* (fx morph) The morph files the scripts of this reading name, each once (nfx_morph_index; the reader of a file line
+   enters a name, the runtime reads the file: native_script_morphs). Emptied before each reading (native_morphs_forget). */
+struct nfx_morph {
+    char name[EFFECT_NAME_MAX];
+    int state;                          /* 0 not read yet, 1 read and sound, -1 refused (why) */
+    int verts, sets;
+    DWORD bytes;                        /* the file's size, its header included */
+    const BYTE *data;                   /* the whole file (the runtime's block): its sets from data + NFX_MORPH_HEADER */
+    const char *why;                    /* state -1: the refusal */
+};
+static struct nfx_morph nfx_morphs[NFX_MORPH_FILES_MAX];
+static int nfx_morph_count;
+
+/* The index of the morph file `name` (any case), entered if new; -1 when NFX_MORPH_FILES_MAX names are in already. */
+static int nfx_morph_index(const char *name)
+{
+    struct nfx_morph *m;
+    int i;
+
+    for (i = 0; i < nfx_morph_count; i++)
+        if (effect_same_name(nfx_morphs[i].name, name))
+            return i;
+    if (nfx_morph_count == NFX_MORPH_FILES_MAX)
+        return -1;
+    m = &nfx_morphs[nfx_morph_count];
+    for (i = 0; name[i] && i < EFFECT_NAME_MAX - 1; i++)
+        m->name[i] = name[i];
+    m->name[i] = 0;
+    m->state = m->verts = m->sets = 0;
+    m->bytes = 0;
+    m->data = NULL;
+    m->why = NULL;
+    return nfx_morph_count++;
+}
 
 /* [p, end) is a whole signed number (decimal or 0x). */
 static int nfx_int(const char *p, const char *end, int *out)
@@ -11322,7 +11810,7 @@ static int nfx_take_folder(char *out, const char *start, const char *end)
    [blend=..]`, a model: its textures are the ones its RSD names. NULL, or why not. */
 static const char *nfx_file_line(struct nfx_file *f, char *p, char *end)
 {
-    char *word_end;
+    char *word_end, morph[EFFECT_NAME_MAX];
     int words = 0;
 
     f->second[0] = 0;
@@ -11330,6 +11818,8 @@ static const char *nfx_file_line(struct nfx_file *f, char *p, char *end)
     f->tex_count = 0;
     f->tex_default = 0;
     f->model = 0;
+    f->morph = -1;                      /* (fx morph) */
+    morph[0] = 0;
     for (;;) {
         while (p < end && is_space(*p))
             p++;
@@ -11361,6 +11851,10 @@ static const char *nfx_file_line(struct nfx_file *f, char *p, char *end)
                 f->tex[i] = (BYTE)list[i];
             }
             f->tex_count = n;
+        } else if (word_end - p > 6 && word_is(p, p + 6, "morph=")) {
+            /* (fx morph) the model's vertex sets, a file of SpellExtConfig\effects (SPEC section 2); a model only (below) */
+            if (!effect_take_name(morph, p + 6, word_end) || !effect_same_name(effect_extension(morph), ".MRF"))
+                return "morph names the model's vertex sets, NAME.MRF in SpellExtConfig\\effects: 1 to 31 characters, letters, digits, _ and - and the dot of .MRF";
         } else if (words == 0) {
             if (!effect_take_name(f->name, p, word_end))
                 return "a file is NAME.TIM: 1 to 31 characters, letters, digits, _ and - and the dot of the extension";
@@ -11372,7 +11866,7 @@ static const char *nfx_file_line(struct nfx_file *f, char *p, char *end)
                 return "the first name of a file line is its texture, NAME.TIM (the game asks for NAME.TEX; a PNG may stand in for it), or a model, NAME.RSD";
             words++;
         } else if (words == 1 && f->model) {
-            return "a model's file line names its .RSD alone (its textures are the ones the RSD names), then optionally blend=";
+            return "a model's file line names its .RSD alone (its textures are the ones the RSD names), then optionally blend= and morph=";
         } else if (words == 1) {
             if (!effect_take_name(f->second, p, word_end) || !effect_same_name(effect_extension(f->second), ".SPT"))
                 return "the second name of a file line is its sprite sheet, NAME.SPT (the game asks for NAME.S)";
@@ -11389,6 +11883,10 @@ static const char *nfx_file_line(struct nfx_file *f, char *p, char *end)
         return "tex= is for a file with a sprite sheet (.SPT)";
     if (f->blend == NFX_BLEND_SOLID && !f->model)
         return "blend=solid is for a model (.RSD): a sprite is add, average, subtract or quarter";
+    if (morph[0] && !f->model)
+        return "morph= is for a model (file N = NAME.RSD morph=NAME.MRF): a sprite sheet has no vertex sets";
+    if (morph[0] && (f->morph = nfx_morph_index(morph)) < 0)
+        return "more than 256 different morph files (.MRF) in the scripts together";
     return NULL;
 }
 
@@ -11408,7 +11906,8 @@ static const char *nfx_file_line(struct nfx_file *f, char *p, char *end)
        channel = 4            optional, 1-4 (default 4): the channel it plays on (and cuts)
        volume = 100           reserved for stage 3: a note, ignored
    Scripts say `sound 56780` or `sound my_sound_0`; the game's own sounds 1-751 are played as before. */
-#define SOUND_HANDLE_MAX        256          /* [sound N] sections (64 before stage 3a) */
+#define SOUND_HANDLE_MAX        1024         /* [sound N] sections (64 before stage 3a, 256 before stage 6b; the refusal text says
+                                                1024) */
 #define SOUND_NAME_MAX          24           /* a name and its 0 */
 #define SOUND_GAME_LAST         751          /* the game's own sounds (= NFX_SOUND_MAX): never a handle */
 #define SOUND_POOL_FIRST        53848        /* the numbers whose loop dword lies in the exe's .rsrc */
@@ -11421,6 +11920,15 @@ static const char *nfx_file_line(struct nfx_file *f, char *p, char *end)
 #define SOUND_RUNS_SAID         6            /* the usable runs a refusal names */
 #define SOUND_SCN_READ          0x40000000u  /* IMAGE_SCN_MEM_READ */
 #define SOUND_SCN_WRITE         0x80000000u  /* IMAGE_SCN_MEM_WRITE */
+/* (stage 6b) the refusal texts spell out two of these (1024 effect sections, 1024 sound handles; the pool's names its
+   size: nfx_pool_full_text); a handle is a number of its own in the pool of numbers, so there are never more of them
+   than numbers; the pool's sizes are whole steps up to its most, a step holds a whole script, a line is whole DWORDs (the
+   pool grows by copying DWORDs), and a pool index (an int: used + count, a script's first) and the pool's size in bytes
+   stay within an int */
+typedef char effect_counts_check[EFFECT_COPY_MAX == 1024 && SOUND_HANDLE_MAX == 1024 && NFX_POOL_ITEMS == 1048576 &&
+                                 SOUND_HANDLE_MAX <= SOUND_POOL_LAST - SOUND_POOL_FIRST + 1 && NFX_POOL_LEAST <= NFX_POOL_ITEMS &&
+                                 NFX_POOL_ITEMS % NFX_POOL_STEP == 0 && NFX_POOL_STEP >= NFX_ITEMS_MAX && sizeof(struct nfx_item) % 4 == 0 &&
+                                 (long long)NFX_POOL_ITEMS * sizeof(struct nfx_item) <= 0x7fffffffLL ? 1 : -1];
 
 struct sound_handle {
     WORD id;                            /* SOUND_POOL_FIRST..SOUND_POOL_LAST */
@@ -11647,7 +12155,7 @@ static int sound_file_parse(char *text, DWORD size, struct sound_handle *h, int 
                 continue;
             }
             if (count == capacity) {
-                say(line_number, 1, "too many sound handles (256 at most): the section is skipped");
+                say(line_number, 1, "too many sound handles (1024 at most): the section is skipped");
                 continue;
             }
             c = &h[count++];
@@ -12001,18 +12509,39 @@ static const char *nfx_item_key(struct nfx_item *it, char *key, char *key_end, c
             it->pal = nfx_pair(a[0], b[0]);
             it->flags |= NFX_F_PALETTE;
         } else if (word_is(key, key_end, "face")) {
-            if (word_is(value, end, "camera"))
+            /* the last face= of the line counts; (fx morph) yaw: the screen's axes made level (nfx_yaw_frame) */
+            if (word_is(value, end, "camera")) {
                 it->flags |= NFX_F_FACE;
-            else if (word_is(value, end, "world")) {
+                it->face &= ~NFX_FACE_YAW;
+            } else if (word_is(value, end, "yaw")) {
                 it->flags &= ~NFX_F_FACE;
+                it->face |= NFX_FACE_YAW;
+            } else if (word_is(value, end, "world")) {
+                it->flags &= ~NFX_F_FACE;
+                it->face &= ~NFX_FACE_YAW;
                 it->given |= NFX_G_WORLD;
             } else
-                return "face is camera (the model's axes are the screen's: x right, y down, z away; turn= about those) or world (the default; not with at=screen)";
+                return "face is camera (the model's axes are the screen's: x right, y down, z away; turn= about those), yaw (upright in the world, turned about the vertical to face the camera; turn= about those axes) or world (the default; not with at=screen)";
+        } else if (word_is(key, key_end, "shape")) {
+            /* (fx morph) a vertex set of the file's morph= file, or FIRST>LAST in whole sets as a sprite's page=A>B; below the
+               file's set count (checked when the .MRF is read: nfx_morph_shape_bad) */
+            if (nfx_values(value, end, 1, a, b) != 1 || !nfx_within(a, b, 1, 0, NFX_MORPH_SETS_MAX - 1))
+                return "shape is a vertex set of the model's morph file (0 to 599, below its set count), or FIRST>LAST stepping over the line's frames (shape=0>59)";
+            it->page = nfx_pair(a[0], b[0]);
+            it->shape |= NFX_SHAPE_GIVEN;
+        } else if (word_is(key, key_end, "tween")) {
+            if (word_is(value, end, "smooth"))
+                it->shape |= NFX_SHAPE_SMOOTH;
+            else if (word_is(value, end, "step"))
+                it->shape &= ~NFX_SHAPE_SMOOTH;
+            else
+                return "tween is step (whole vertex sets, as a sprite's page=A>B: the default) or smooth (blended between neighbouring sets)";
+            it->shape |= NFX_SHAPE_TWEEN;
         } else if (word_is(key, key_end, "zoom")) {
             if (!nfx_zoom_key(it, value, end))
                 return nfx_zoom_text;
         } else
-            return "a model line takes at= bone= x= y= z= turn= scale= fade= colour= uv= palette= face= each= (and zoom= with at=screen)";
+            return "a model line takes at= bone= x= y= z= turn= scale= fade= colour= uv= palette= face= shape= tween= each= (and zoom= with at=screen)";
         return NULL;
     }
     /* a sprite */
@@ -12145,6 +12674,7 @@ static const char *nfx_timeline_line(struct nfx_item *it, char *p, char *end, nf
         it->flags = NFX_F_NOFRAME;
     it->each = 0;
     it->given = 0;
+    it->shape = it->face = 0;           /* (fx morph) */
     it->entry = 0;
     it->at = NFX_AT_TARGET;
     it->bone = 1;
@@ -12315,6 +12845,8 @@ static const char *nfx_timeline_line(struct nfx_item *it, char *p, char *end, nf
             return "depth= is not used with at=screen: z= is the sprite's distance from the camera";
         if (it->given & NFX_G_WORLD)
             return "face=world is not with at=screen: a screen model's axes are the screen's (x right, y down, z away), as face=camera";
+        if (it->face & NFX_FACE_YAW)
+            return "face=yaw turns a model in the world by the camera's yaw: an at=screen model's axes are the screen's already (face=camera)";
         if (!(it->given & NFX_G_Z) || (it->kind == NFX_MODEL ? it->z.a < 1 || it->z.b < 1 : it->depth.a < 1 || it->depth.b < 1))
             return nfx_screen_z_text;       /* (a sprite holds its z in depth) */
     }
@@ -12365,6 +12897,11 @@ static const char *nfx_timeline_line(struct nfx_item *it, char *p, char *end, nf
     }
     if (it->kind == NFX_SHAKE && !(it->given & NFX_G_AXIS))
         return "a shake line says how far the picture jolts: x=, y= or z= (0 to 1024 battle units, along the screen's axes)";
+    if (it->kind == NFX_MODEL && (it->shape & NFX_SHAPE_TWEEN) && !(it->shape & NFX_SHAPE_GIVEN))
+        return "tween= says how a line goes through its vertex sets: give shape=A>B with it";
+    if (it->kind == NFX_MODEL && (it->shape & NFX_SHAPE_GIVEN) && it->each && it->page.a != it->page.b)
+        /* (fx morph) a file is one polygon set: one vertex set a frame for all its copies (nfx_morph_conflict) */
+        return "each= staggers the targets, but a morph file shows one vertex set a frame for all its copies: with shape=A>B give no each=, or draw each staggered copy from a file line of its own (the same RSD and morph=)";
     return NULL;
 }
 
@@ -12378,6 +12915,125 @@ static int nfx_hide_names_targets(int who)
 
 /* Reads a script. Its items go into pool[used..]; returns the new count used (the old one if the script is
    refused: s->usable is then 0). Every problem goes to `say` with its line. */
+/* (stage 6b) The pool's size for `need` lines: NFX_POOL_LEAST at least, else need rounded up to a whole NFX_POOL_STEP, and
+   never past NFX_POOL_ITEMS. */
+static int nfx_pool_size_for(int need)
+{
+    int size = need <= NFX_POOL_LEAST ? NFX_POOL_LEAST : (need + NFX_POOL_STEP - 1) / NFX_POOL_STEP * NFX_POOL_STEP;
+
+    return size > NFX_POOL_ITEMS ? NFX_POOL_ITEMS : size;
+}
+
+/* (stage 6b) The pool-full refusal, naming the pool's size (`capacity`: 1048576 at the most; less only when it could not
+   grow, which the log says). One text at a time: it is said before the next is made. */
+static const char *nfx_pool_full_text(int capacity)
+{
+    static char text[96];
+    const char *head = "the scripts together have more timeline lines than the pool holds (";
+    char digits[12];
+    unsigned v = capacity > 0 ? (unsigned)capacity : 0u;
+    int n = 0, at = 0;
+
+    do
+        digits[n++] = (char)('0' + v % 10);
+    while ((v /= 10) != 0);
+    while (*head)
+        text[at++] = *head++;
+    while (n)
+        text[at++] = digits[--n];
+    text[at++] = ')';
+    text[at] = 0;
+    return text;
+}
+
+/* (fx morph) A number's digits put at text[*at] (no sprintf in the pure block). */
+static void nfx_text_number(char *text, int *at, unsigned v)
+{
+    char digits[12];
+    int n = 0;
+
+    do
+        digits[n++] = (char)('0' + v % 10);
+    while ((v /= 10) != 0);
+    while (n)
+        text[(*at)++] = digits[--n];
+}
+
+/* (fx morph) A text and the numbers its '#' marks stand for, in order, into a buffer of its own (one text at a time:
+   said before the next is made, as nfx_pool_full_text). */
+static const char *nfx_text_with(const char *form, unsigned a, unsigned b, unsigned c)
+{
+    static char text[480];
+    unsigned v[3];
+    int at = 0, n = 0;
+
+    v[0] = a, v[1] = b, v[2] = c;
+    for (; *form && at < (int)sizeof text - 12; form++)
+        if (*form == '#' && n < 3)
+            nfx_text_number(text, &at, v[n++]);
+        else
+            text[at++] = *form;
+    text[at] = 0;
+    return text;
+}
+
+/* (fx morph) Where a model line is among its file's vertex sets at its own frame `own` (from..to): 256 x the set, plus
+   with tween=smooth the 256ths of the way to the next. shape=A>B steps as a sprite's page=A>B (nfx_lerp: whole sets, the
+   quotient truncated toward zero); smooth: A x 256 + (B - A) x 256 x (own - from) / (to - from), truncated the same way.
+   Without shape=: set 0. (|B - A| <= 599, so the product stays below 600 x 256 x 600 within an int.) */
+static int nfx_shape_value(const struct nfx_item *it, int own)
+{
+    int from = it->from, to = it->to, a = it->page.a, b = it->page.b;
+
+    if (!(it->shape & NFX_SHAPE_GIVEN))
+        return 0;
+    if (to <= from || a == b)
+        return a * 256;
+    if (it->shape & NFX_SHAPE_SMOOTH)
+        return a * 256 + (b - a) * 256 * (own - from) / (to - from);
+    return (a + (b - a) * (own - from) / (to - from)) * 256;
+}
+
+/* (fx morph) One vertex set a frame for each morph file (SPEC 3.2): 1 if two model lines of one of the script's morph
+   files ask for different (set, 256ths) at a frame both are on (*first the earlier line's index, *second the later's,
+   *frame the first such frame), else 0. A line with each=K is taken as on to LAST + 9 K, the tenth actor's frames (its
+   shape is one set then: a changing shape with each= is refused by the line's reader). */
+static int nfx_morph_conflict(const struct nfx_item *items, int count, const struct nfx_script *s, int *first, int *second, int *frame)
+{
+    static int value[NFX_LENGTH_MAX];
+    static short owner[NFX_LENGTH_MAX];
+    int k, i, f;
+
+    for (k = 0; k < s->file_count; k++) {
+        if (!s->file[k].model || s->file[k].morph < 0)
+            continue;
+        for (f = 0; f < NFX_LENGTH_MAX; f++)
+            owner[f] = -1;
+        for (i = 0; i < count; i++) {
+            const struct nfx_item *it = &items[i];
+            int last;
+
+            if (it->kind != NFX_MODEL || it->entry != k || it->from < 0)
+                continue;
+            last = it->to + (it->each ? NFX_MORPH_EACH_TURNS * it->each : 0);
+            if (last >= NFX_LENGTH_MAX)
+                last = NFX_LENGTH_MAX - 1;
+            for (f = it->from; f <= last; f++) {
+                int v = nfx_shape_value(it, f <= it->to ? f : it->to);
+
+                if (owner[f] < 0) {
+                    owner[f] = (short)i;
+                    value[f] = v;
+                } else if (value[f] != v) {
+                    *first = owner[f], *second = i, *frame = f;
+                    return 1;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
 static int nfx_parse(char *text, DWORD size, struct nfx_script *s, struct nfx_item *pool, int used, int capacity, nfx_say_fn say)
 {
     char *line, *end, *file_end = text + size;
@@ -12478,7 +13134,7 @@ static int nfx_parse(char *text, DWORD size, struct nfx_script *s, struct nfx_it
                 continue;
             if (s->count == NFX_ITEMS_MAX || used + s->count >= capacity) {
                 NFX_REFUSE(line_number, s->count == NFX_ITEMS_MAX ? "more than 2048 timeline lines in one script"
-                                                                  : "the scripts together have more timeline lines than the pool holds (256000)");
+                                                                  : nfx_pool_full_text(capacity));
                 continue;
             }
             pool[used + s->count++] = it;
@@ -12535,8 +13191,12 @@ static int nfx_parse(char *text, DWORD size, struct nfx_script *s, struct nfx_it
             if (it->kind == NFX_MODEL) {
                 if (it->entry >= s->file_count || !s->file[it->entry].model)
                     NFX_REFUSE(it->line, "model names a file that is not given, or is not a model (file N = NAME.RSD)");
-                else
+                else {
                     s->model_files |= 1u << it->entry;
+                    if ((it->shape & NFX_SHAPE_GIVEN) && s->file[it->entry].morph < 0)
+                        /* (fx morph) */
+                        NFX_REFUSE(it->line, "shape= picks a vertex set of the model's morph file: give its file line one (file N = NAME.RSD morph=NAME.MRF)");
+                }
             }
             hits += it->kind == NFX_HIT;
             s->centre += it->at == NFX_AT_CENTRE && (it->kind == NFX_SPRITE || it->kind == NFX_MODEL);
@@ -12588,6 +13248,15 @@ static int nfx_parse(char *text, DWORD size, struct nfx_script *s, struct nfx_it
                        and its death run from there */
                     NFX_REFUSE(it->line, "move and turn who=targets (or opponents, others, all) must end before the script's first hit frame (the first hit line's, or a third of the length without one): a target is back on its own place when it is struck and when it dies; for the rest of the effect move who=caster, allies (never a target among them) or bystanders");
             }
+        }
+        if (s->usable) {
+            /* (fx morph) one vertex set a frame for each morph file, whatever lines and copies draw it (SPEC 3.2) */
+            int first, second, frame;
+
+            if (nfx_morph_conflict(pool + used, s->count, s, &first, &second, &frame))
+                NFX_REFUSE(pool[used + second].line,
+                           nfx_text_with("this line and line # draw file # with different vertex sets on frame #: a morph file shows one vertex set a frame for all its lines and copies (give them the same shape= over the frames they share, or draw one from a file line of its own naming the same RSD and morph=)",
+                                         (unsigned)pool[used + first].line, pool[used + first].entry, (unsigned)frame));
         }
     }
 #undef NFX_REFUSE
@@ -13045,6 +13714,70 @@ static void nfx_model_matrix(short *m, const int *turn, const int *scale)
     }
 }
 
+/* (fx morph) The whole square root of v (rounded down). */
+static int nfx_isqrt(unsigned v)
+{
+    unsigned r = 0, bit = 1u << 30;
+
+    while (bit > v)
+        bit >>= 2;
+    while (bit) {
+        if (v >= r + bit) {
+            v -= r + bit;
+            r = (r >> 1) + bit;
+        } else
+            r >>= 1;
+        bit >>= 2;
+    }
+    return (int)r;
+}
+
+/* (fx morph) face=yaw: the yaw frame W (9 ints, m[3 * row + column], 4096 = 1.0; its columns are the model's x, y and z in
+   the battle's world) from the camera's rotation `cam` (00bfcb30's 9 shorts: world to view, p' = m p, so its rows are the
+   screen's right, down and line of sight in the world). z is the line of sight made level, (e, 0, g) normalised; y the
+   world's vertical (0, 1, 0), down as everywhere in the battle; x = y x z = (g, 0, -e). A line of sight within about
+   14.5 degrees of the vertical (its level part below 1/4) gives x from the screen's right made level instead, and
+   z = x x y; neither (a camera rolled 90 degrees and looking straight down): the world's own axes. With a level camera
+   W x the model is face=camera's turn; looking down by P, the model is seen tilted by P only (it stays upright). */
+static void nfx_yaw_frame(const short *cam, int *w)
+{
+    int e = cam[6], g = cam[8], n = nfx_isqrt((unsigned)(e * e + g * g)), xa, xc, za, zc;
+
+    if (n >= NFX_YAW_LEVEL_LEAST) {
+        za = e * 4096 / n, zc = g * 4096 / n;           /* z = (za, 0, zc) */
+        xa = zc, xc = -za;                              /* x = y x z */
+    } else {
+        e = cam[0], g = cam[2];
+        n = nfx_isqrt((unsigned)(e * e + g * g));
+        if (n >= NFX_YAW_LEVEL_LEAST) {
+            xa = e * 4096 / n, xc = g * 4096 / n;       /* x = the screen's right made level */
+            za = -xc, zc = xa;                          /* z = x x y */
+        } else
+            xa = 4096, xc = 0, za = 0, zc = 4096;
+    }
+    w[0] = xa, w[1] = 0, w[2] = za;
+    w[3] = 0, w[4] = 4096, w[5] = 0;
+    w[6] = xc, w[7] = 0, w[8] = zc;
+}
+
+/* (fx morph) face=yaw: the model-to-world rotation W x R (R the line's turn and scale, nfx_model_matrix's 9 shorts, so a
+   turn= is about the yaw frame's axes, Y its vertical) into out, and the line's offset (x, y, z) in the yaw frame turned
+   into the world's axes, W x off, into moved. The place is the caller's (the bone's, the floor's, the centre's or the
+   arena's). |W| <= 4096 and |R| <= 4096 x 7: every sum stays within an int; a short past its range is held there. */
+static void nfx_yaw_local(const short *cam, const short *r, const int *off, short *out, int *moved)
+{
+    int w[9], rr[9], o[9], i;
+
+    nfx_yaw_frame(cam, w);
+    for (i = 0; i < 9; i++)
+        rr[i] = r[i];
+    nfx_mat3(w, rr, o);
+    for (i = 0; i < 9; i++)
+        out[i] = (short)(o[i] > 32767 ? 32767 : o[i] < -32768 ? -32768 : o[i]);
+    for (i = 0; i < 3; i++)
+        moved[i] = nfx_round_4096(w[3 * i] * off[0] + w[3 * i + 1] * off[1] + w[3 * i + 2] * off[2]);
+}
+
 /* What a model line draws at its own frame `own`. Stage 3b: fade (255 none), colour (r, g, b; read with NFX_F_COLOUR),
    the texture offset u, v (256ths) and the palette row (-1: none given). */
 struct nfx_model_draw { int x, y, z, turn[3], scale[3], fade, r, g, b, u, v, palette; };
@@ -13117,6 +13850,92 @@ static int nfx_model_palette_bad(const struct nfx_item *items, int count, int en
             (items[i].pal.a >= palettes || items[i].pal.b >= palettes))
             return 1 + i;
     return 0;
+}
+
+/* ---- (fx morph) A model's vertex sets: the .MRF file (SPEC_model_morph.md section 2) ----
+   "SXMORPH1", u32 header size 32, u32 V (1..32768), u32 S (1..600), u32 flags 0, u32 0, u32 0; then S sets of V
+   vertices, each three float32 (x, y, z) in the .P's own units and axes, in the .P's vertex order. Exactly
+   32 + S x V x 12 bytes, at most 16 MiB. NULL and the counts, or why not. */
+static const char *nfx_morph_header(const BYTE *d, DWORD size, int *verts, int *sets)
+{
+    static const BYTE magic[8] = { 'S', 'X', 'M', 'O', 'R', 'P', 'H', '1' };
+    DWORD v, s, need;
+    int k;
+
+    if (size < NFX_MORPH_HEADER)
+        return "the morph file is shorter than its 32-byte header";
+    for (k = 0; k < 8; k++)
+        if (d[k] != magic[k])
+            return "the morph file does not start with SXMORPH1: it is not a morph file";
+    if (effect_dword(d + 8) != NFX_MORPH_HEADER)
+        return "the morph file's header size (its bytes 8-11) is not 32";
+    v = effect_dword(d + 12);
+    s = effect_dword(d + 16);
+    if (v < 1 || v > NFX_MORPH_VERTS_MAX)
+        return "the morph file's vertex count (its bytes 12-15) is 1 to 32768";
+    if (s < 1 || s > NFX_MORPH_SETS_MAX)
+        return "the morph file's set count (its bytes 16-19) is 1 to 600";
+    if (effect_dword(d + 20) || effect_dword(d + 24) || effect_dword(d + 28))
+        return "the morph file's flags and reserved words (its bytes 20-31) must be 0";
+    need = s * v * 12 + NFX_MORPH_HEADER;
+    if (need > NFX_MORPH_FILE_BYTES)
+        return "the morph file's sets need more than 16 MiB (sets x vertices x 12 bytes): fewer sets or vertices";
+    if (size != need)
+        return "the morph file's size is not 32 + sets x vertices x 12 bytes (cut short, or more after its sets)";
+    *verts = (int)v;
+    *sets = (int)s;
+    return NULL;
+}
+
+/* (fx morph) 0 if each of the `floats` float32 at p is finite with |v| < 2^21 (its exponent field below 148); else 1 + the
+   index of the first that is not (a NaN, an infinity, or too far out for a battle). Read as bits: no floating point. */
+static DWORD nfx_morph_values_bad(const BYTE *p, DWORD floats)
+{
+    DWORD i;
+
+    for (i = 0; i < floats; i++)
+        if ((effect_dword(p + 4 * i) >> 23 & 0xff) >= 148)
+            return i + 1;
+    return 0;
+}
+
+/* (fx morph) 0 if every model line of file `entry` with shape= asks only for sets below `sets`; else 1 + its index. */
+static int nfx_morph_shape_bad(const struct nfx_item *items, int count, int entry, int sets)
+{
+    int i;
+
+    for (i = 0; i < count; i++)
+        if (items[i].kind == NFX_MODEL && items[i].entry == entry && (items[i].shape & NFX_SHAPE_GIVEN) &&
+            (items[i].page.a >= sets || items[i].page.b >= sets))
+            return 1 + i;
+    return 0;
+}
+
+/* (fx morph) `count` vertex positions written at dst, `stride` bytes apart (x, y, z float32 at +0, +4, +8: the engine's
+   vertex, 0x20 bytes, whose colour and texture coordinates after them are left alone), from vertex `first` of the sets
+   (S sets of `verts` vertices, 12 bytes each) at position `value` (nfx_shape_value): set value / 256, blended
+   value % 256 / 256 of the way to the next (none past the last set). */
+static void nfx_morph_fill(const BYTE *sets, int verts, int nsets, int value, int first, int count, BYTE *dst, int stride)
+{
+    int k = value >> 8, w = value & 255, i, c;
+    const float *a, *b;
+    float t;
+
+    if (k < 0)
+        k = 0, w = 0;
+    if (k >= nsets)
+        k = nsets - 1, w = 0;
+    if (k + 1 >= nsets)
+        w = 0;
+    a = (const float *)(sets + ((DWORD)k * (DWORD)verts + (DWORD)first) * 12u);
+    b = a + (DWORD)verts * 3u;
+    t = (float)w * (1.0f / 256.0f);
+    for (i = 0; i < count; i++, dst += stride) {
+        float *o = (float *)dst;
+
+        for (c = 0; c < 3; c++)
+            o[c] = w ? a[3 * i + c] + (b[3 * i + c] - a[3 * i + c]) * t : a[3 * i + c];
+    }
 }
 
 /* Stage 3b (the review's fix 1): a model's states (p_hundred, 100 bytes each, `groups` of them): the texture set of the
@@ -14026,6 +14845,10 @@ static int effect_natives_usable;       /* usable native effects (`play =`): not
 static LONG effect_preload_live, effect_logs;
 static DWORD effect_preload_next = FN_EFFECT_PRELOAD;
 static struct { short single, several, now; } effect_copy_cast[10];    /* copy indexes per actor, -1 none */
+/* Stage 6a: an enemy's attack noted at its set-up for a native effect (enemies_attack_note), with the command type and
+   the record's effect byte the note left; native_effect_step plays it at that type and byte only. Cleared at every
+   set-up (effect_copy_note) and battle start. */
+static struct { BYTE on, type, number; } enemy_native[10];
 static int effect_pending_base = -1, effect_pending_set;  /* a preload still running in the game's thread with a copy's names */
 static int effect_swapped_base = -1;    /* the base whose list holds a copy's names now */
 
@@ -14339,6 +15162,7 @@ static BOOL native_effect_step(int actor_arg);  /* ("Native effects", below) */
 static void native_script_read(int i);         /* (the same) */
 static void native_scripts_forget(void);
 static void native_scripts_check_files(void);
+static void native_pool_report(void);           /* (stage 6b) */
 
 /* The effect step, FUN_00427c22, from summon_effect_hook and summon_intro_task. */
 static void start_effect_copy(int actor_arg)
@@ -14380,6 +15204,7 @@ static void effect_copy_note(int *action, int spell)
     if (actor < 0 || actor >= 10)
         return;
     effect_copy_cast[actor].single = effect_copy_cast[actor].several = effect_copy_cast[actor].now = -1;
+    enemy_native[actor].on = 0;
     if (spell < 0)
         return;
     if (spells[spell].animation_copy)
@@ -14407,8 +15232,10 @@ static void effect_copies_battle_start(void)
     effect_pending_base = -1;
     for (i = 0; i < EFFECT_BASE_COUNT; i++)
         effect_bases[i].loaded_value = 0;
-    for (i = 0; i < 10; i++)
+    for (i = 0; i < 10; i++) {
         effect_copy_cast[i].single = effect_copy_cast[i].several = effect_copy_cast[i].now = -1;
+        enemy_native[i].on = 0;
+    }
 }
 
 /* ---- Sound handles (stage 1): the runtime (the reader and checks are "Sound handles" in the pure part) ----
@@ -14656,6 +15483,7 @@ static void load_effect_copies(void)
     }
     log_line("effects file: %d effect copies, %d usable, %d native effect(s) usable, %d sound handle(s) usable, %d line(s) with problems",
              effect_copy_count, effect_copies_usable, effect_natives_usable, sound_handles_usable, effect_file_problems);
+    native_pool_report();               /* (stage 6b) */
 }
 
 static BOOL driver_reads_files_itself(void);    /* (with the new characters' model code) */
@@ -14889,12 +15717,35 @@ static void effect_copies_install(void)
 #define NATIVE_SET_GROUPS       0x10         /* a polygon set's group count (FFNx ff7_polygon_set numgroups) */
 #define NATIVE_SET_HUNDREDS     0x34         /* its p_hundred array, 100 bytes each (hundred_data; FUN_005d1aaa walks it) */
 #define NATIVE_SPRITE_SCALE     0x19         /* Fire's entries' second word */
+/* (fx morph) a morph file's set is written into the model's live vertices through the game's own lock, as the game's
+   fades do (FUN_0068f0f8: lock, the vertices 0x20 apart, unlock). FUN_00670196 under FFNx (d3d2_flag, game object
+   +0x984, set to 1 in ff7_opengl.cpp) takes the driver's vertex array, indexed_primitives[group]->vertices (set +0x50,
+   its +0x10); under the stock driver it locks the group's execute buffer (set +0x4c, COM +0x10). FFNx copies the
+   positions into its vertex buffer at every draw call (Renderer::bindVertexBuffer), and FUN_0068d2b8 (each copy's fade,
+   colour, uv, palette) rewrites only colours and texture coordinates: the set written shows for every copy that frame. */
+#define FN_NATIVE_VERTS_LOCK    0x00670196u  /* FUN_00670196(group, set, game object), cdecl: its polygon_group record (set +0x5c +
+                                                group x 0x24) with the live vertices put at +8, or 0 */
+#define FN_NATIVE_VERTS_UNLOCK  0x00670144u  /* FUN_00670144(group, set, game object), cdecl: unlocks (nothing when +0x984 is set) */
+#define ADDR_NATIVE_GAME_OBJECT 0x00db2bb8u  /* what FUN_00676578 returns (a1 b8 2b db 00): the game object */
+#define NATIVE_SET_PDATA        0x30         /* a polygon set's polygon data (the .P: FFNx polygon_data), or 0 */
+#define NATIVE_SET_PGROUPS      0x5c         /* its polygon_group records, 0x24 bytes each: +4 the vertices, +8 the live ones */
+#define NATIVE_PGROUP_SIZE      0x24
+#define NATIVE_PDATA_VTYPE      0x08         /* the .P's vertex type: 2 = pre-lit screen vertices (TLVERTEX), refused */
+#define NATIVE_PDATA_VERTS      0x0c         /* its vertices, all groups */
+#define NATIVE_PDATA_GROUPS     0x34         /* its groups */
+#define NATIVE_PDATA_GROUPDATA  0x6c         /* its p_group records, 0x38 bytes: +0xc the group's first vertex, +0x10 its vertices */
+#define NATIVE_PGROUP_DATA_SIZE 0x38
+#define NATIVE_VERTEX_STRIDE    0x20         /* the live vertex: x, y, z, w, colour, specular, u, v (FFNx nvertex; D3DLVERTEX) */
+#define NATIVE_P_HEAD           64           /* a .P's header: 16 dwords, the vertex count the fourth (+0xc) */
 #define NATIVE_MAGIC_LGP        "data\\battle\\magic.lgp"
 
 struct native_entry { WORD flags, scale; char *name, *second; DWORD more[2]; };     /* 0x14 bytes, as the game's */
 typedef char native_entry_size_check[sizeof(struct native_entry) == 0x14 ? 1 : -1];
-static struct nfx_item nfx_pool[NFX_POOL_ITEMS];
-static int nfx_pool_used;
+/* (stage 6b) the timeline pool: nfx_pool_capacity lines, sized to need by native_pool_room (NFX_POOL_LEAST to NFX_POOL_ITEMS);
+   NULL until the first script read. Its block may be replaced at a reading (nothing keeps a pointer into it between two
+   calls: every reader takes nfx_pool + first anew), never between readings */
+static struct nfx_item *nfx_pool;
+static int nfx_pool_used, nfx_pool_capacity;
 static struct nfx_script nfx_scripts[EFFECT_COPY_MAX];             /* by the effect's index in effect_copies */
 static struct native_entry native_lists[EFFECT_COPY_MAX][NFX_FILES_MAX];
 static DWORD native_handles[EFFECT_COPY_MAX];   /* the groups; the engine writes 0 in one when it frees its group */
@@ -14915,9 +15766,12 @@ static BYTE native_model_out[0x20];
 static BYTE native_orphaned[EFFECT_COPY_MAX];   /* a group of an older reading may still read this effect's list */
 static DWORD native_list_models[EFFECT_COPY_MAX];       /* the list's entries written as models, a bit each (files 0-31) */
 static int native_list_count[EFFECT_COPY_MAX];  /* its entries written since the battle started (the most) */
+static int native_morph_state;          /* (fx morph) the lock routines: 0 not looked at, 1 as expected, -1 not */
+static DWORD native_morph_total;        /* (fx morph) the bytes of this reading's .MRF files (NFX_MORPH_TOTAL_BYTES at most) */
 static struct {
     BYTE running, draw_said, limit_said, model_said, model_limit_said, centre_said, screen_said, zoom_said;
     BYTE arena_said;                    /* (arena anchor) the first at=arena draw logged */
+    BYTE morph_said, morph_bad_said;    /* (fx morph) the first set written logged; a set not written logged */
     WORD serial;                        /* which task this is: an older one ends itself */
     int actor, mask, drawn, undrawn, effect, generation, length, watchdog;
     int limit_hit;                      /* a limit's step: its hit (NATIVE_HIT_ALL for `all`); NATIVE_HIT_NONE a magic cast */
@@ -15031,6 +15885,138 @@ static BOOL native_centre_routine_ok(DWORD number)
             break;
         }
     return native_centre_state > 0;
+}
+
+/* (fx morph) The game's vertex lock and unlock, as ff7_en.exe has them (objdump of the exe, 2026-11-04): their first
+   bytes, and in the lock the d3d2 test (+0x984), the driver's array (set +0x50, its +0x10 put at the record's +8) and the
+   record (set +0x5c + group x 0x24) the writes rely on; in the unlock the same test. FFNx neither replaces nor patches
+   either (its source names neither; it calls FUN_0068d2b8, which calls them). Asked only by an effect whose script has a
+   morph file; another effect is not touched by the answer. */
+static BOOL native_morph_routines_ok(DWORD number)
+{
+    static const struct { DWORD at; BYTE n, bytes[18]; } sites[] = {
+        { FN_NATIVE_VERTS_LOCK,   17, { 0x55, 0x8b, 0xec, 0x83, 0xec, 0x20, 0xc7, 0x45, 0xfc, 0x00, 0x00, 0x00, 0x00, 0x83, 0x7d, 0x0c, 0x00 } },
+        { 0x006701ccu,             7, { 0x83, 0xb8, 0x84, 0x09, 0x00, 0x00, 0x00 } },       /* cmp [eax+0x984], 0 */
+        { 0x006701e1u,             3, { 0x8b, 0x42, 0x50 } },                               /* mov eax, [edx+0x50] */
+        { 0x006701f6u,             3, { 0x6b, 0xc0, 0x24 } },                               /* imul eax, eax, 0x24 */
+        { 0x006701fcu,             3, { 0x8b, 0x51, 0x5c } },                               /* mov edx, [ecx+0x5c] */
+        { 0x0067020au,             6, { 0x8b, 0x51, 0x10, 0x89, 0x50, 0x08 } },             /* mov edx, [ecx+0x10]; mov [eax+8], edx */
+        { FN_NATIVE_VERTS_UNLOCK, 18, { 0x55, 0x8b, 0xec, 0x83, 0x7d, 0x0c, 0x00, 0x74, 0x47, 0x8b, 0x45, 0x0c, 0x8b, 0x4d, 0x08, 0x3b, 0x48, 0x10 } },
+        { 0x0067015bu,            11, { 0x83, 0xba, 0x84, 0x09, 0x00, 0x00, 0x00, 0x74, 0x02, 0xeb, 0x2e } },
+        { 0x0067657bu,             5, { 0xa1, 0xb8, 0x2b, 0xdb, 0x00 } },                   /* FUN_00676578: mov eax, [00db2bb8] */
+    };
+    int i, k;
+
+    if (native_morph_state)
+        return native_morph_state > 0;
+    native_morph_state = 1;
+    for (i = 0; i < (int)(sizeof sites / sizeof sites[0]) && native_morph_state > 0; i++)
+        for (k = 0; k < sites[i].n; k++)
+            if (((const BYTE *)sites[i].at)[k] != sites[i].bytes[k]) {
+                log_line("native effects: morph files OFF: %08lx is not as expected (byte %d is %02x, not %02x); an effect with a morph file plays its base effect (first: %04lx)",
+                         sites[i].at, k, ((const BYTE *)sites[i].at)[k], sites[i].bytes[k], number);
+                native_morph_state = -1;
+                break;
+            }
+    if (native_morph_state > 0)
+        log_line("native effects: morph files on (00670196, 00670144 as expected; %s): a model's vertex sets are written through the game's own vertex lock",
+                 *(const DWORD *)ADDR_NATIVE_GAME_OBJECT && !IsBadReadPtr((const void *)(*(const DWORD *)ADDR_NATIVE_GAME_OBJECT + 0x984), 4)
+                 ? (*(const DWORD *)(*(const DWORD *)ADDR_NATIVE_GAME_OBJECT + 0x984) ? "the driver's vertex arrays (d3d2_flag 1: FFNx)"
+                                                                                   : "the stock driver's execute buffers")
+                 : "no game object yet");
+    return native_morph_state > 0;
+}
+
+/* (fx morph) Whether file k's loaded polygon set can take morph file m's sets: its polygon data there and of m's vertex
+   count, as many groups in the set as in the data, no pre-lit screen vertices, every group's vertices within the count
+   and as many as its record says, and the game's lock giving each group its vertices. NULL, or why not (*a, *b: the two
+   numbers that disagree). Locks and unlocks each group once (under FFNx: reads only). */
+static const char *native_morph_layout(DWORD set, const struct nfx_morph *m, int *a, int *b)
+{
+    DWORD pdata, groupdata, pgroups, game = *(const DWORD *)ADDR_NATIVE_GAME_OBJECT;
+    int groups, g;
+
+    *a = *b = 0;
+    if (!game || IsBadReadPtr((const void *)set, NATIVE_SET_PGROUPS + 4))
+        return "no game object, or its polygon set cannot be read";
+    groups = *(const int *)(set + NATIVE_SET_GROUPS);
+    pdata = *(const DWORD *)(set + NATIVE_SET_PDATA);
+    pgroups = *(const DWORD *)(set + NATIVE_SET_PGROUPS);
+    if (!pdata || IsBadReadPtr((const void *)pdata, NATIVE_PDATA_GROUPDATA + 4))
+        return "its polygon set has no polygon data (the .P) to check the morph file against";
+    *a = groups, *b = *(const int *)(pdata + NATIVE_PDATA_GROUPS);
+    if (groups < 1 || groups > 4096 || groups != *b)
+        return "its polygon set and its .P have different group counts";
+    if (*(const DWORD *)(pdata + NATIVE_PDATA_VTYPE) == 2)
+        return "its .P has pre-lit screen vertices (vertex type 2): a morph needs the model's own";
+    *a = *(const int *)(pdata + NATIVE_PDATA_VERTS), *b = m->verts;
+    if (*a != *b)
+        return "its .P's vertex count is not the morph file's";
+    groupdata = *(const DWORD *)(pdata + NATIVE_PDATA_GROUPDATA);
+    if (!groupdata || IsBadReadPtr((const void *)groupdata, (UINT_PTR)groups * NATIVE_PGROUP_DATA_SIZE) || !pgroups ||
+        IsBadReadPtr((const void *)pgroups, (UINT_PTR)groups * NATIVE_PGROUP_SIZE))
+        return "its group records cannot be read";
+    for (g = 0; g < groups; g++) {
+        const DWORD *gd = (const DWORD *)(groupdata + (DWORD)g * NATIVE_PGROUP_DATA_SIZE);
+        DWORD rec, live;
+
+        *a = g, *b = (int)gd[4];
+        if (gd[3] > (DWORD)m->verts || gd[4] > (DWORD)m->verts - gd[3] ||
+            gd[4] != *(const DWORD *)(pgroups + (DWORD)g * NATIVE_PGROUP_SIZE + 4))
+            return "a group's vertices (group, count) lie outside the morph file's, or disagree with its record";
+        if (!gd[4])
+            continue;
+        rec = ((DWORD (__cdecl *)(int, DWORD, DWORD))FN_NATIVE_VERTS_LOCK)(g, set, game);
+        live = rec ? *(const DWORD *)(rec + 8) : 0;
+        if (rec)                        /* (unlocked only after a lock that gave a record, as FUN_0068f0f8 does) */
+            ((void (__cdecl *)(int, DWORD, DWORD))FN_NATIVE_VERTS_UNLOCK)(g, set, game);
+        if (!rec || !live || IsBadWritePtr((void *)live, gd[4] * NATIVE_VERTEX_STRIDE))
+            return "the game's vertex lock (00670196) gives a group (group, count) no writable vertices";
+    }
+    return NULL;
+}
+
+/* (fx morph) File k's polygon set (from its model record, asked this update) shows morph file m's position `value`
+   (nfx_shape_value): every group locked, its vertices' positions written, unlocked. FALSE if the set no longer matches
+   what native_load checked (nothing written then). A few thousand floats an update. */
+static BOOL native_morph_write(DWORD record, const struct nfx_morph *m, int value)
+{
+    DWORD set = record && !IsBadReadPtr((const void *)record, 8) ? *(const DWORD *)(record + 4) : 0, pdata, groupdata, pgroups;
+    DWORD game = *(const DWORD *)ADDR_NATIVE_GAME_OBJECT;
+    int groups, g;
+
+    if (!set || !game || m->state <= 0 || IsBadReadPtr((const void *)set, NATIVE_SET_PGROUPS + 4))
+        return FALSE;
+    groups = *(const int *)(set + NATIVE_SET_GROUPS);
+    pdata = *(const DWORD *)(set + NATIVE_SET_PDATA);
+    pgroups = *(const DWORD *)(set + NATIVE_SET_PGROUPS);
+    if (!pdata || IsBadReadPtr((const void *)pdata, NATIVE_PDATA_GROUPDATA + 4) || groups < 1 || groups > 4096 ||
+        groups != *(const int *)(pdata + NATIVE_PDATA_GROUPS) || *(const int *)(pdata + NATIVE_PDATA_VERTS) != m->verts ||
+        !(groupdata = *(const DWORD *)(pdata + NATIVE_PDATA_GROUPDATA)) || !pgroups ||
+        IsBadReadPtr((const void *)groupdata, (UINT_PTR)groups * NATIVE_PGROUP_DATA_SIZE) ||
+        IsBadReadPtr((const void *)pgroups, (UINT_PTR)groups * NATIVE_PGROUP_SIZE))
+        return FALSE;
+    for (g = 0; g < groups; g++) {
+        const DWORD *gd = (const DWORD *)(groupdata + (DWORD)g * NATIVE_PGROUP_DATA_SIZE);
+        DWORD rec, live;
+
+        if (gd[3] > (DWORD)m->verts || gd[4] > (DWORD)m->verts - gd[3] ||
+            gd[4] != *(const DWORD *)(pgroups + (DWORD)g * NATIVE_PGROUP_SIZE + 4))
+            return FALSE;
+        if (!gd[4])
+            continue;
+        rec = ((DWORD (__cdecl *)(int, DWORD, DWORD))FN_NATIVE_VERTS_LOCK)(g, set, game);
+        live = rec ? *(const DWORD *)(rec + 8) : 0;
+        if (!rec)
+            return FALSE;
+        if (live)
+            nfx_morph_fill(m->data + NFX_MORPH_HEADER, m->verts, m->sets, value, (int)gd[3], (int)gd[4], (BYTE *)live,
+                           NATIVE_VERTEX_STRIDE);
+        ((void (__cdecl *)(int, DWORD, DWORD))FN_NATIVE_VERTS_UNLOCK)(g, set, game);
+        if (!live)
+            return FALSE;
+    }
+    return TRUE;
 }
 
 /* The battle's group manager now, 0 if none. */
@@ -15186,6 +16172,22 @@ static BOOL native_load(int e, int actor)
                          !m || IsBadReadPtr((const void *)m, 8) ? "the .P or a texture the RSD names was not found or not readable"
                                                                 : "the RSD was not found or not readable, or no polygon set was made");
             return FALSE;
+        }
+        if (s->file[k].morph >= 0 && s->file[k].morph < nfx_morph_count) {
+            /* (fx morph) the loaded model must be the one the morph file's sets are of, and the game's lock must give its
+               vertices (native_morph_layout), before any set is written into it */
+            const struct nfx_morph *mf = &nfx_morphs[s->file[k].morph];
+            const char *why = NULL;
+            int a = 0, b = 0;
+
+            if (!native_morph_routines_ok(effect_copies[e].number))
+                return FALSE;           /* (said once) */
+            if (mf->state <= 0 || (why = native_morph_layout(*(const DWORD *)(m + 4), mf, &a, &b)) != NULL) {
+                if (native_say())
+                    log_line("native effect %04lx: file %d (%s): morph file %s: %s (%d, %d): not played", effect_copies[e].number, k,
+                             s->file[k].name, mf->name, why ? why : "not read", a, b);
+                return FALSE;
+            }
         }
         if (nfx_model_palette_bad(nfx_pool + s->first, s->count, k, 0)) {
             /* stage 3b: a line of this model gives palette= (any row: against a count of 0 every row is "bad"). Its
@@ -15449,7 +16451,7 @@ static int native_draw_models(DWORD group, int f, int *last, int *at, struct nfx
     const struct nfx_item *items = nfx_pool + s->first;
     DWORD records[NFX_FILES_MAX];
     int i, k, t, models = 0, coloured = 0, full = 0;
-    DWORD pinned = 0;
+    DWORD pinned = 0, written = 0, unwritten = 0;   /* (fx morph) the morph files whose set this update wrote, or could not */
     short place[4] = { 0, 0, 0, 0 };
 
     for (i = 0; i < s->count; i++)
@@ -15474,6 +16476,7 @@ static int native_draw_models(DWORD group, int f, int *last, int *at, struct nfx
             DWORD base = (DWORD)t * ACTOR_EFFECT_STRIDE;
             struct nfx_model_draw d;
             int own, bones = 0, turn = nfx_pass_turn(it, t, native_play.mask, native_play.actor), height = 0;
+            int moved[3] = { 0, 0, 0 };         /* (fx morph) face=yaw: the offsets turned into the world */
 
             if (turn < 0 || (own = nfx_item_frame(it, f, turn)) < 0)
                 continue;
@@ -15481,6 +16484,8 @@ static int native_draw_models(DWORD group, int f, int *last, int *at, struct nfx
                 : t == NFX_CENTRE_PASS ? !native_centre_place(it, place, &height)
                                        : (!*(const DWORD *)(ADDR_NATIVE_MODEL + base) || (bones = *(const short *)(ADDR_NATIVE_BONES + base)) < 1))
                 continue;
+            if (unwritten >> it->entry & 1)
+                continue;                       /* (fx morph) its set could not be written this update: not drawn */
             if (models == NFX_MODEL_DRAWS_MAX) {
                 if (!native_play.model_limit_said && native_say())
                     log_line("native effect %04lx: frame %d asks for more than %d models: the rest are not drawn (said once)",
@@ -15504,6 +16509,19 @@ static int native_draw_models(DWORD group, int f, int *last, int *at, struct nfx
                 nfx_screen_model(native_model_out, &d);
                 native_screen_zoom(f, it, native_model_out);
                 native_screen_said(f, it, d.x, d.y, d.z, d.scale[0], d.scale[1], d.scale[2]);
+            } else if (it->face & NFX_FACE_YAW) {
+                /* (fx morph) face=yaw: the line's turn and scale in the yaw frame (the camera's line of sight made level,
+                   the world's vertical, nfx_yaw_frame), its offsets in that frame, at the place; then camera x that, as a
+                   world-placed line: the camera read is the matrix FUN_00661e85 multiplies by here */
+                int off[3];
+
+                off[0] = d.x, off[1] = d.y, off[2] = d.z;
+                nfx_yaw_local((const short *)ADDR_NATIVE_CAMERA, (const short *)native_model_out, off, (short *)native_model_local, moved);
+                *(int *)(native_model_local + 0x12) = place[0] + moved[0];
+                *(int *)(native_model_local + 0x16) = place[1] + moved[1];
+                *(int *)(native_model_local + 0x1a) = place[2] + moved[2];
+                ((BYTE *(__cdecl *)(const BYTE *, const BYTE *, BYTE *))FN_NATIVE_CAMERA_TIMES)((const BYTE *)ADDR_NATIVE_CAMERA,
+                                                                                                 native_model_local, native_model_out);
             } else if (it->flags & NFX_F_FACE) {
                 /* stage 3b, face=camera: the billboard's place (camera x place, moved z along the line of sight),
                    the model's own turn and scale in the screen's axes, x and y on the screen's plane: the sprites'
@@ -15531,6 +16549,33 @@ static int native_draw_models(DWORD group, int f, int *last, int *at, struct nfx
                 coloured = 1;
             } else
                 ((void (__cdecl *)(int, int, int))FN_NATIVE_COLOUR)(0, 0, 0);
+            if (s->file[it->entry].morph >= 0 && s->file[it->entry].morph < nfx_morph_count && !(written >> it->entry & 1)) {
+                /* (fx morph) the file's vertex set for this update, written before its first copy is added (the reader
+                   makes every line of a morph file agree at each frame: nfx_morph_conflict); the copies are drawn later
+                   this frame, all with it */
+                const struct nfx_morph *mf = &nfx_morphs[s->file[it->entry].morph];
+                int value = nfx_shape_value(it, own);
+
+                if (!native_morph_write(records[it->entry], mf, value)) {
+                    unwritten |= 1u << it->entry;
+                    if (!native_play.morph_bad_said && native_say())
+                        log_line("native effect %04lx: frame %d: file %d (%s): the morph file's set could not be written (its polygon set is no longer the one checked at the cast): that file is not drawn (said once)",
+                                 native_play.number, f, it->entry, s->file[it->entry].name);
+                    native_play.morph_bad_said = 1;
+                    continue;
+                }
+                written |= 1u << it->entry;
+                if (!native_play.morph_said && native_say()) {
+                    if (value & 255)
+                        log_line("native effect %04lx: first morph set at frame %d: line %d, file %d (%s, %s): set %d and %d/256 of the way to set %d, %d vertices",
+                                 native_play.number, f, it->line, it->entry, s->file[it->entry].name, mf->name, value >> 8, value & 255,
+                                 (value >> 8) + 1, mf->verts);
+                    else
+                        log_line("native effect %04lx: first morph set at frame %d: line %d, file %d (%s, %s): set %d, %d vertices",
+                                 native_play.number, f, it->line, it->entry, s->file[it->entry].name, mf->name, value >> 8, mf->verts);
+                }
+                native_play.morph_said = 1;
+            }
             /* {record, 0x80, 0, 0x20} with none of stage 3b's keys (stage 3a's call to the bit) */
             nfx_model_context(&d, (it->flags & NFX_F_COLOUR) != 0, (int)(pinned >> it->entry & 1), records[it->entry], native_model_ctx);
             ((DWORD (__cdecl *)(DWORD *, DWORD, DWORD, DWORD))FN_NATIVE_ADD_INSTANCE)(native_model_ctx, 0, 0xc, 0);
@@ -15540,6 +16585,8 @@ static int native_draw_models(DWORD group, int f, int *last, int *at, struct nfx
                 at[0] = d.x, at[1] = d.y, at[2] = d.z;
             else if (it->flags & NFX_F_FACE)
                 at[0] = place[0], at[1] = place[1], at[2] = place[2];
+            else if (it->face & NFX_FACE_YAW)
+                at[0] = place[0] + moved[0], at[1] = place[1] + moved[1], at[2] = place[2] + moved[2];
             else
                 at[0] = place[0] + d.x, at[1] = place[1] + d.y, at[2] = place[2] + d.z;
             *shown = d;
@@ -15663,13 +16710,14 @@ static void native_draw(DWORD group, int f)
         const struct nfx_item *mi = &items[model_last];
 
         native_play.model_said = 1;
-        if ((mi->flags & (NFX_F_COLOUR | NFX_F_FACE | NFX_F_PALETTE)) || mi->bone == NFX_BONE_GROUND || mi->fade.a != NFX_FADE_MAX ||
+        if ((mi->flags & (NFX_F_COLOUR | NFX_F_FACE | NFX_F_PALETTE)) || mi->face || mi->bone == NFX_BONE_GROUND || mi->fade.a != NFX_FADE_MAX ||
             mi->fade.b != NFX_FADE_MAX || mi->u.a || mi->u.b || mi->v.a || mi->v.b) {
             /* stage 3b's keys: the same line and what they gave (a line with none of them is logged as before) */
             if (native_say())
                 log_line("native effect %04lx: first model draw at frame %d: %d sprite(s), %d model(s), the last model of line %d at (%d, %d, %d)%s%s, turn (%d, %d, %d), scale (%d, %d, %d), fade %d colour %s%02x%02x%02x uv %d,%d row %d (context %08lx %08lx %08lx)",
                          native_play.number, f, drawn, models, mi->line, model_at[0], model_at[1], model_at[2],
-                         mi->bone == NFX_BONE_GROUND ? " on the ground" : "", (mi->flags & NFX_F_FACE) ? " facing the camera" : "",
+                         mi->bone == NFX_BONE_GROUND ? " on the ground" : "",
+                         (mi->flags & NFX_F_FACE) ? " facing the camera" : (mi->face & NFX_FACE_YAW) ? " turned to the camera's yaw" : "",
                          shown.turn[0], shown.turn[1], shown.turn[2], shown.scale[0], shown.scale[1], shown.scale[2], shown.fade,
                          (mi->flags & NFX_F_COLOUR) ? "" : "none ", (mi->flags & NFX_F_COLOUR) ? shown.r : 0,
                          (mi->flags & NFX_F_COLOUR) ? shown.g : 0, (mi->flags & NFX_F_COLOUR) ? shown.b : 0, shown.u, shown.v, shown.palette,
@@ -15846,6 +16894,7 @@ static BOOL native_start(int actor, int c, unsigned shown, int number, int limit
     native_play.draw_said = native_play.limit_said = native_play.model_said = native_play.model_limit_said = 0;
     native_play.centre_said = native_play.screen_said = native_play.zoom_said = 0;
     native_play.arena_said = 0;
+    native_play.morph_said = native_play.morph_bad_said = 0;    /* (fx morph) */
     native_play.clock.frame = native_play.clock.calls = native_play.clock.page = native_play.clock.hit_done = 0;
     for (i = 0; i < nfx_scripts[c].count && i < NFX_ITEMS_MAX; i++)
         for (t = 0; t < 10; t++)
@@ -15871,14 +16920,36 @@ static BOOL native_start(int actor, int c, unsigned shown, int number, int limit
     return TRUE;
 }
 
-/* The effect step of a magic cast (start_effect_copy): TRUE if the actor's action plays a native effect and its
-   task was started; FALSE and the game's routine runs (nothing native noted, or a refusal: logged). */
+/* The effect step of a magic cast (start_effect_copy), or of an enemy's attack noted by enemies_attack_note: TRUE if
+   the actor's action plays a native effect and its task was started; FALSE and the game's routine runs (nothing
+   native noted, or a refusal: logged). */
 static BOOL native_effect_step(int actor_arg)
 {
     int actor = (BYTE)actor_arg, c, number;
     unsigned shown;
 
-    if (!effect_natives_usable || actor >= 10 || *(const BYTE *)(ADDR_ACTOR_COMMAND_TYPE + actor * ACTOR_EFFECT_STRIDE) != 2)
+    if (!effect_natives_usable || actor >= 10)
+        return FALSE;
+    if (enemy_native[actor].on) {
+        /* an enemy's attack: magic (type 02) or a scene attack (type 20) whose record's effect byte the note set to a
+           file-less base; played at that type and byte only, the effect for one target or several from the record's
+           results, as for a party member's cast */
+        int type = *(const BYTE *)(ADDR_ACTOR_COMMAND_TYPE + actor * ACTOR_EFFECT_STRIDE);
+
+        number = *(const BYTE *)(ADDR_ACTOR_NUMBER + actor * ACTOR_EFFECT_STRIDE);
+        if (type != enemy_native[actor].type || number != enemy_native[actor].number) {
+            if (native_say())
+                log_line("enemies: actor %d's effect step has type %02x, effect %02x; its note was type %02x, effect %02x: the game's effect plays",
+                         actor, type, number, enemy_native[actor].type, enemy_native[actor].number);
+            return FALSE;
+        }
+        shown = *(const WORD *)ADDR_EFFECT_TARGETS;
+        c = (shown & (shown - 1)) ? effect_copy_cast[actor].several : effect_copy_cast[actor].single;
+        if (c < 0 || c >= effect_copy_count || !effect_copies[c].usable || !effect_copies[c].play || !nfx_scripts[c].usable)
+            return FALSE;
+        return native_start(actor, c, shown, number, NATIVE_HIT_NONE);
+    }
+    if (*(const BYTE *)(ADDR_ACTOR_COMMAND_TYPE + actor * ACTOR_EFFECT_STRIDE) != 2)
         return FALSE;
     shown = *(const WORD *)ADDR_EFFECT_TARGETS;
     number = *(const BYTE *)(ADDR_ACTOR_NUMBER + actor * ACTOR_EFFECT_STRIDE);
@@ -15954,6 +17025,184 @@ static void native_script_say(int line, int refusal, const char *what)
         log_line("effect script effects\\%s.txt: %s%s", native_script_name, refusal ? "" : "(note) ", what);
 }
 
+static int native_pool_failed;          /* (stage 6b) native_pool_room could not have a block in this reading (it asks once a reading) */
+
+/* (stage 6b) Room in the timeline pool for `need` lines, before a script is read (native_script_read: what is read so far
+   and the most one script adds). The pool is made at the first script read of a run (a run with no native effect never
+   makes it) as small as nfx_pool_size_for allows, and grown at any later read, of this reading or of a Re-init, that could
+   not fit: a new block of the size for `need`, committed whole (108 bytes a line), the lines read so far copied into it
+   (their places, the scripts' `first`, stay as they were), the old block freed. Nothing keeps a pointer into the pool
+   between two calls (every reader takes nfx_pool + first anew; the game's groups hold native_lists and the scripts' file
+   names, not the pool; native_scripts_forget has ended every play by the generation before the scripts are read), so
+   the block may be replaced at a reading. It never shrinks: a Re-init that needs less reads into the block it has. If the
+   memory is not to be had: with no block, no script is read (each native effect is not used); with one, it stays as it
+   is and a script that does not fit it is refused (the text names its size). Either is said once a reading, and the next
+   reading asks again. */
+static void native_pool_room(int need)
+{
+    int size = nfx_pool_size_for(need), was = nfx_pool_capacity;
+    struct nfx_item *block;
+
+    if ((nfx_pool && size <= nfx_pool_capacity) || native_pool_failed)
+        return;
+    block = VirtualAlloc(NULL, (SIZE_T)size * sizeof(struct nfx_item), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!block) {
+        native_pool_failed = 1;
+        if (!nfx_pool)
+            log_line("native effects: the timeline pool (%d lines, %lu KiB) could not be allocated (error %lu): no script is read, no native effect is used",
+                     size, (DWORD)((SIZE_T)size * sizeof(struct nfx_item) / 1024), GetLastError());
+        else
+            log_line("native effects: the timeline pool could not grow from %d to %d lines (%lu KiB; error %lu): it stays at %d, and a script past them is refused",
+                     was, size, (DWORD)((SIZE_T)size * sizeof(struct nfx_item) / 1024), GetLastError(), was);
+        return;
+    }
+    if (nfx_pool) {
+        const DWORD *from = (const DWORD *)nfx_pool;
+        DWORD *to = (DWORD *)block, n = (DWORD)nfx_pool_used * (sizeof(struct nfx_item) / 4);
+
+        while (n--)                     /* (a DWORD at a time: a line is 108 bytes, 27 DWORDs) */
+            *to++ = *from++;
+        VirtualFree(nfx_pool, 0, MEM_RELEASE);
+        log_line("native effects: the timeline pool grown from %d to %d lines (%lu KiB at %08lx; %d line(s) read so far kept)", was, size,
+                 (DWORD)((SIZE_T)size * sizeof(struct nfx_item) / 1024), (DWORD)block, nfx_pool_used);
+    } else
+        log_line("native effects: the timeline pool holds %d lines (%lu KiB at %08lx); it grows to need, up to %d", size,
+                 (DWORD)((SIZE_T)size * sizeof(struct nfx_item) / 1024), (DWORD)block, NFX_POOL_ITEMS);
+    nfx_pool = block;
+    nfx_pool_capacity = size;
+}
+
+/* (stage 6b) After a reading's scripts (load_effect_copies): the lines read and the pool's size, if there is a pool. */
+static void native_pool_report(void)
+{
+    if (nfx_pool)
+        log_line("native effects: %d timeline line(s) read into a pool of %d (%lu KiB)", nfx_pool_used, nfx_pool_capacity,
+                 (DWORD)((SIZE_T)nfx_pool_capacity * sizeof(struct nfx_item) / 1024));
+    if (nfx_morph_count) {
+        /* (fx morph) only when a script names a morph file: a reading without one logs as before */
+        int i, read = 0;
+
+        for (i = 0; i < nfx_morph_count; i++)
+            read += nfx_morphs[i].state > 0;
+        log_line("native effects: %d morph file(s) named, %d read (%lu KiB of vertex sets; 64 MiB at most)", nfx_morph_count, read,
+                 native_morph_total / 1024);
+    }
+}
+
+static int native_rsd_text(const char *rsd, char *buf, int cap);   /* (below) */
+static void native_model_p_file(const char *rsd, char *out);
+
+/* (fx morph) The morph files of the last reading forgotten, their blocks freed (native_scripts_forget: no task of that
+   reading draws again, and nothing keeps a pointer into a block between two calls). */
+static void native_morphs_forget(void)
+{
+    int i;
+
+    for (i = 0; i < nfx_morph_count; i++)
+        if (nfx_morphs[i].data)
+            VirtualFree((void *)nfx_morphs[i].data, 0, MEM_RELEASE);
+    nfx_morph_count = 0;
+    native_morph_total = 0;
+}
+
+/* (fx morph) Morph file m read from SpellExtConfig\effects (once a reading, by the first script naming it): its header and
+   every value checked (nfx_morph_header, nfx_morph_values_bad), within 16 MiB and the reading's 64 MiB. m->state 1 and its
+   block kept, or -1 and m->why (a refusal of every script naming it; the details logged here, once). */
+static void native_morph_load(struct nfx_morph *m)
+{
+    char path[MAX_PATH + 96];
+    HANDLE file;
+    DWORD size = 0, got = 0, bad = 0;
+    BYTE *data = NULL;
+    int verts = 0, sets = 0;
+    const char *why = NULL;
+
+    m->state = -1;
+    lstrcpyA(path, config_dir);
+    lstrcatA(path, "effects\\");
+    lstrcatA(path, m->name);
+    file = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) {
+        m->why = "the morph file (morph=) is not found in SpellExtConfig\\effects";
+        log_line("native effects: morph file %s: not found", path);
+        return;
+    }
+    size = GetFileSize(file, NULL);
+    if (size == INVALID_FILE_SIZE)
+        why = "the morph file (morph=) cannot be read";
+    else if (size > NFX_MORPH_FILE_BYTES)
+        why = "the morph file (morph=) is larger than 16 MiB";
+    else if (size > NFX_MORPH_TOTAL_BYTES - native_morph_total)
+        why = "the morph files the scripts name are more than 64 MiB together: this one is not read";
+    else if (!(data = VirtualAlloc(NULL, size ? size : 1, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)))
+        why = "there is no memory for the morph file (morph=)";
+    else if (!ReadFile(file, data, size, &got, NULL) || got != size)
+        why = "the morph file (morph=) cannot be read";
+    else if ((why = nfx_morph_header(data, size, &verts, &sets)) == NULL &&
+             (bad = nfx_morph_values_bad(data + NFX_MORPH_HEADER, (DWORD)sets * (DWORD)verts * 3u)) != 0)
+        why = "the morph file holds a value that is not a finite number below 2097152 (the log line before names its set and vertex)";
+    CloseHandle(file);
+    if (why) {
+        m->why = why;
+        if (bad)
+            log_line("native effects: morph file effects\\%s: set %lu, vertex %lu, value %lu (0 x, 1 y, 2 z) is %08lx: not a finite number below 2097152",
+                     m->name, (bad - 1) / 3u / (DWORD)verts, (bad - 1) / 3u % (DWORD)verts, (bad - 1) % 3u,
+                     effect_dword(data + NFX_MORPH_HEADER + 4 * (bad - 1)));
+        else
+            log_line("native effects: morph file effects\\%s (%lu bytes): %s", m->name, size, why);
+        if (data)
+            VirtualFree(data, 0, MEM_RELEASE);
+        return;
+    }
+    m->state = 1;
+    m->data = data;
+    m->bytes = size;
+    m->verts = verts;
+    m->sets = sets;
+    native_morph_total += size;
+    log_line("native effects: morph file effects\\%s: %d vertex set(s) of %d vertices (%lu KiB)", m->name, sets, verts, size / 1024);
+}
+
+/* (fx morph) After script s is read: the morph files it names read (native_morph_load), every shape= below its file's
+   set count (nfx_morph_shape_bad), and its .P's vertex count the morph file's where the .P can be read now (native_rsd_text,
+   from where the game will read it; the cast checks the loaded model again: native_morph_layout). A problem refuses the
+   script, on the file line's (or the shape line's) number, as any refused line. */
+static void native_script_morphs(struct nfx_script *s)
+{
+    const struct nfx_item *items = nfx_pool + s->first;
+    int k, bad;
+
+    for (k = 0; k < s->file_count; k++) {
+        struct nfx_file *f = &s->file[k];
+        struct nfx_morph *m;
+        char p_name[EFFECT_NAME_MAX], asked[EFFECT_NAME_MAX + 4];
+        BYTE head[NATIVE_P_HEAD];
+
+        if (!f->model || f->morph < 0 || f->morph >= nfx_morph_count)
+            continue;
+        m = &nfx_morphs[f->morph];
+        if (!m->state)
+            native_morph_load(m);
+        if (m->state < 0) {
+            native_script_say(f->line, 1, m->why);
+            s->problems++, s->usable = 0;
+            continue;
+        }
+        if ((bad = nfx_morph_shape_bad(items, s->count, k, m->sets)) != 0) {
+            native_script_say(items[bad - 1].line, 1, nfx_text_with("shape= asks for a vertex set past the morph file's: file # has # set(s), 0 to #",
+                                                                    (unsigned)k, (unsigned)m->sets, (unsigned)(m->sets - 1)));
+            s->problems++, s->usable = 0;
+        }
+        native_model_p_file(f->name, p_name);
+        effect_asked_name(p_name, asked);
+        if (native_rsd_text(asked, (char *)head, NATIVE_P_HEAD) == NATIVE_P_HEAD && effect_dword(head + 0xc) != (DWORD)m->verts) {
+            native_script_say(f->line, 1, nfx_text_with("the morph file has # vertices in a set, but the model's .P has #: a set holds every vertex of the .P, in the .P's order (file #)",
+                                                        (unsigned)m->verts, effect_dword(head + 0xc), (unsigned)k));
+            s->problems++, s->usable = 0;
+        }
+    }
+}
+
 /* Before the effects file is read again: no task or group of the last reading is used any more. */
 static void native_scripts_forget(void)
 {
@@ -15971,6 +17220,8 @@ static void native_scripts_forget(void)
     if (held)
         log_line("native effects: %d group handle(s) held as the scripts are read again: dropped (the game frees those groups)", held);
     nfx_pool_used = 0;
+    native_pool_failed = 0;             /* (stage 6b) */
+    native_morphs_forget();             /* (fx morph) */
 }
 
 /* Reads native effect i's script (load_effect_copies). Not usable if it is not there or any line is refused. */
@@ -15990,13 +17241,20 @@ static void native_script_read(int i)
     native_script_said = 0;
     s->usable = 0;
     s->count = 0;
+    native_pool_room(nfx_pool_used + NFX_ITEMS_MAX);    /* (stage 6b) made, or grown, for the most one script adds */
+    if (!nfx_pool) {                    /* (native_pool_room said why) */
+        log_line("native effect %04lx: effects\\%s.txt is not read: there is no timeline pool (see above): not used (its spells play effect %02x)",
+                 c->number, c->play_name, c->play_base);
+        c->usable = 0;
+        return;
+    }
     text = read_whole_file(file, &size);
     if (text) {
-        nfx_pool_used = nfx_parse(text, size, s, nfx_pool, nfx_pool_used, NFX_POOL_ITEMS, native_script_say);
+        nfx_pool_used = nfx_parse(text, size, s, nfx_pool, nfx_pool_used, nfx_pool_capacity, native_script_say);
         VirtualFree(text, 0, MEM_RELEASE);
     } else if (effect_same_name(c->play_name, "stage0_test")) {
         /* stage 0's timeline, built in (nfx_parse only reads the text) */
-        nfx_pool_used = nfx_parse((char *)nfx_stage0_text, sizeof nfx_stage0_text - 1, s, nfx_pool, nfx_pool_used, NFX_POOL_ITEMS,
+        nfx_pool_used = nfx_parse((char *)nfx_stage0_text, sizeof nfx_stage0_text - 1, s, nfx_pool, nfx_pool_used, nfx_pool_capacity,
                                   native_script_say);
         built_in = TRUE;
     } else {
@@ -16004,6 +17262,14 @@ static void native_script_read(int i)
                  c->number, c->play_base);
         c->usable = 0;
         return;
+    }
+    if (s->usable && s->file_count) {
+        /* (fx morph) its morph files read and checked against its lines and its .P (a script without one: nothing) */
+        native_script_morphs(s);
+        if (!s->usable) {
+            nfx_pool_used = s->first;   /* (as nfx_parse leaves a refused script: none of its lines kept) */
+            s->count = 0;
+        }
     }
     if (native_script_said > NFX_PROBLEMS_SAID)
         log_line("effect script effects\\%s.txt: %d more problem(s) or note(s) not listed", c->play_name, native_script_said - NFX_PROBLEMS_SAID);
@@ -16649,6 +17915,10 @@ struct new_character {
     struct limit_state state[STATE_MAX];
     char limit_state_name[12][STATE_NAME_MAX + 1];  /* as the limit's section gave it, lower case; "" = none */
     BYTE limit_state[12];               /* which of state[] it is, + 1; 0 = none (worked out when the whole file is read) */
+    /* `form = NAME` of a limit (a [form NAME] section of the limits file: FORM PURE, with the model code) */
+    char limit_form_name[12][16];       /* as the limit's section gave it, lower case (FORM_NAME_MAX + 1); "" = none */
+    BYTE limit_form[12];                /* which of forms[] it transforms into, + 1; 0 = none (worked out when the whole file is read) */
+    WORD limit_form_line[12];           /* the line of the limit's section, for the log */
     int full_gauge;                     /* testing aid: starts every battle with a full gauge, refilled by any damage */
     BYTE own_curve[9][16];              /* growth curves of its own: 8 level bands x (gradient, base) */
     BYTE own_curve_set[9];
@@ -16665,6 +17935,7 @@ struct new_character {
     int keep_seat;                      /* `keep_seat = yes`: always seated, and its seat is never given to another */
     char field_model[8];                /* `field_model = YUAA`: its field skeleton YUAA.HRC (four characters, upper case); "" = none */
     signed char field_model_found;      /* 0 not looked for yet, 1 the skeleton file can be found, -1 it can not */
+    BYTE body_blend;                    /* `body_blend = yes`: the body parts of its own battle model keep each group's blend mode (load_character_model_hook) */
     int ai_like;                        /* `ai_like`: the kernel's character-AI entry it has a private copy of, + 1; 0 = none */
     char ai_file[AI_NAME_MAX + 1];      /* `ai = NAME`: its block is SpellExtConfig\ai\NAME.ai; "" = none */
     BYTE ai_keys_here;                  /* of the section being read: 1 ai_like given, 2 ai given (the second of the two is refused) */
@@ -17250,6 +18521,360 @@ static void __cdecl growth_pointer_hook(BYTE *work)
     }
 }
 
+/* ---- Transformations: forms (the limits file's [form NAME] sections) ----
+
+   The game turns a party member into another battle model with two commands of the model script (read
+   from the code, FUN_0041fba4): `ac NN` stores a form number in 009aded8 (10: 4, 5 or 6 by the weapon's
+   animation set, the way back), and `a2 SS` frees the actor's model and loads the one named by the
+   7-entry table 007c1098[009aded8] (calls of FUN_0042a330 at 00424090 and 004240b1), then plays its
+   script SS. The attack record's additional effect 3 (FUN_005df95a) makes the actor AI-controlled.
+   A FORM here is a model a new character's limit turns it into: numbered from FORM_FIRST in the file's
+   order, loaded under a made-up name of its own (FORM00.DAT ...) whose files the archive name hook names
+   after the game model given (model_enemy: ENEMYnnn; model_like: one of the game's own names from the
+   table at 008ff2f0). Those files are the model's OWN (its skeleton, animations, parts, textures, as the
+   game, the loose-file index and the mod folders serve them for that model), except its script file,
+   which a party slot needs in the party layout (74 slots): `model_script = XY` (or XYAB) names it. Or
+   `model_files = XY` gives a full set of the form's own (XYAA, XYAB, XYDA, parts, textures). */
+/* FORM PURE BEGIN  (no Win32 call: tested natively by the transformation stage's test/unit) */
+#define FORM_FIRST              0x20    /* 0-6 are the game's (007c1098), 10 is `ac 0a`; 7-9 and 11-31 left clear */
+#define FORM_MAX                16
+#define FORM_NAME_MAX           15
+#define FORM_ENEMY_MODELS       370     /* the ENEMY pattern of 008ff2f0 counts 0x172 enemy models: 0-369 */
+#define FORM_OPCODE_STORE       0xac    /* ac NN: store the form number */
+#define FORM_STEM               "FORM"
+#define FORM_SCRIPT_SLOTS       0x4a    /* the a2 case and FUN_0042ae73 relocate 74 script offsets (loop to 0x4a) */
+#define FORM_SCRIPT_TABLE       0x68    /* the script file's header: the offsets follow it, relative to the file */
+#define FORM_MODEL_ANIMATIONS   0x2c    /* a script byte below it is one of the model's animations (0x2c-0x33: a limit pack's) */
+#define FORM_SCRIPT_WALK_MAX    0x400   /* bytes walked in one script before it counts as having no end */
+#define FORM_HRC_SIZE           0x34    /* read_battle_hrc throws away a shorter skeleton file */
+
+struct form_def {
+    char name[FORM_NAME_MAX + 1];   /* lower case; "" = no form */
+    char files[3];                  /* model_files, upper case; "" = not given */
+    char scripts[3];                /* model_script: the first two letters of its script file (XYAB), upper case; "" = not given */
+    char stem[12];                  /* the game's name its parts are named after: ENEMY331, GALL ...; "" = not given */
+    char model_name[12];            /* FORM00.DAT: the data file name the game is given */
+    int weapon;                     /* weapon = yes: the loader is told the model has weapon models (0042a330's flag 0) */
+    int line;                       /* its section's line */
+    int bad;                        /* a key was refused or a needed one is missing: no limit transforms into it */
+};
+
+/* Operand bytes after each command byte 0x8e-0xff of a battle model script: each case of FUN_0041fba4's
+   switch, counted from its reads of the script (a word, FUN_00424f5f, being two). The switch's default and
+   bytes below 0x8e are an animation, one byte. b3, c1, ca, ce jump forward and 9e, eb, ec, f1, f3 wait: no
+   operand of their own. */
+static const BYTE form_operands[0x72] = {
+    /* 8e */ 0, 0, 3, 1, 0, 0, 5, 0, 2, 2, 1, 6, 4, 0, 0, 1, 0, 0,
+    /* a0 */ 1, 2, 1, 1, 0, 0, 0, 1, 2, 2, 0, 4, 1, 5, 0, 1,
+    /* b0 */ 0, 0, 0, 0, 0, 11, 1, 0, 0, 1, 2, 0, 1, 4, 1, 2,
+    /* c0 */ 0, 0, 1, 0, 3, 0, 1, 3, 5, 0, 0, 8, 1, 0, 0, 8,
+    /* d0 */ 3, 5, 0, 0, 3, 8, 1, 2, 3, 0, 1, 4, 3, 2, 2, 0,
+    /* e0 */ 0, 0, 0, 0, 0, 0, 0, 1, 0, 3, 0, 0, 0, 0, 0, 0,
+    /* f0 */ 0, 0, 0, 0, 1, 1, 0, 1, 1, 0, 0, 4, 0, 6, 0, 0
+};
+
+/* Where the operand of the script's first `ac` is, walking it command by command (an operand byte equal to
+   ac is not taken for one): its offset, -1 if the script has no ac, -2 if a command's operands run past the
+   end before one is met. */
+static int form_ac_operand(const BYTE *script, int length)
+{
+    int at = 0;
+
+    while (at < length) {
+        BYTE op = script[at];
+        int operands = op >= 0x8e ? form_operands[op - 0x8e] : 0;
+
+        if (at + 1 + operands > length)
+            return -2;
+        if (op == FORM_OPCODE_STORE)
+            return at + 1;
+        at += 1 + operands;
+    }
+    return -1;
+}
+
+/* A form's name, 1 to 15 letters, digits or _, lower case into `out`; FALSE otherwise (and for "none"). */
+static BOOL form_name(char *out, const char *start, const char *end)
+{
+    int k, length = (int)(end - start);
+
+    out[0] = 0;
+    if (length < 1 || length > FORM_NAME_MAX || word_is(start, end, "none"))
+        return FALSE;
+    for (k = 0; k < length; k++) {
+        char ch = start[k];
+
+        if (ch >= 'A' && ch <= 'Z')
+            ch = (char)(ch + 0x20);
+        if (!((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '_')) {
+            out[0] = 0;
+            return FALSE;
+        }
+        out[k] = ch;
+    }
+    out[length] = 0;
+    return TRUE;
+}
+
+/* Whether [start, end) is `name`, ignoring case (the game's names are upper case). */
+static BOOL form_same_name(const char *start, const char *end, const char *name)
+{
+    for (; start < end && *name; start++, name++)
+        if ((*start >= 'a' && *start <= 'z' ? *start - 0x20 : *start) != (*name >= 'a' && *name <= 'z' ? *name - 0x20 : *name))
+            return FALSE;
+    return start == end && !*name;
+}
+
+/* One key of a [form NAME] section; NULL, or the problem. `like` holds the game's own model names model_like
+   may name (like_count of them; 0: the game's table was not as expected). */
+static const char *form_key(struct form_def *f, char *key, char *key_end, char *value, char *stop, const char *const *like,
+                            int like_count)
+{
+    char *p = value;
+    DWORD n;
+    int k;
+
+    if (word_is(key, key_end, "model_files") || word_is(key, key_end, "model_script")) {
+        char *two = word_is(key, key_end, "model_script") ? f->scripts : f->files;
+        /* model_script also takes the file's whole archive name, XYAB */
+        BOOL whole = two == f->scripts && stop - value == 4 && (value[2] | 0x20) == 'a' && (value[3] | 0x20) == 'b';
+
+        if ((stop - value != 2 && !whole) || !((value[0] | 0x20) >= 'a' && (value[0] | 0x20) <= 'z') ||
+            !((value[1] | 0x20) >= 'a' && (value[1] | 0x20) <= 'z'))
+            return two == f->scripts
+                   ? "model_script is the form's script file in the battle archive's naming, its two letters or its name (zo or ZOAB: 74 slots in the party layout)"
+                   : "model_files is two letters: the form's own files in the battle archive's naming (xy: XYAA, XYAB, XYDA and its parts)";
+        two[0] = (char)(value[0] & ~0x20);
+        two[1] = (char)(value[1] & ~0x20);
+        two[2] = 0;
+        return NULL;
+    }
+    if (word_is(key, key_end, "model_enemy") || word_is(key, key_end, "model_like")) {
+        if (f->stem[0])
+            return "a form's parts are named after one model: model_enemy or model_like, once";
+        if (word_is(key, key_end, "model_enemy")) {
+            if (!parse_number(&p, stop, &n) || p != stop || n >= FORM_ENEMY_MODELS)
+                return "model_enemy is the number of an enemy model, 0 to 369 (the battle archive's two letters: 331 = mt..)";
+            for (k = 0; k < 5; k++)
+                f->stem[k] = "ENEMY"[k];
+            f->stem[5] = (char)('0' + n / 100);
+            f->stem[6] = (char)('0' + n / 10 % 10);
+            f->stem[7] = (char)('0' + n % 10);
+            f->stem[8] = 0;
+            return NULL;
+        }
+        if (!like_count)
+            return "model_like: the game's table of battle model names (008ff2f0) is not as expected; use model_enemy";
+        for (k = 0; k < like_count; k++)
+            if (like[k] && form_same_name(value, stop, like[k])) {
+                int i;
+
+                for (i = 0; i < (int)sizeof f->stem - 1 && like[k][i]; i++)
+                    f->stem[i] = like[k][i];
+                f->stem[i] = 0;
+                return NULL;
+            }
+        return "model_like is one of the game's own party-slot battle model names (the log lists them)";
+    }
+    if (word_is(key, key_end, "weapon")) {
+        if (word_is(value, stop, "yes"))
+            f->weapon = 1;
+        else if (word_is(value, stop, "no"))
+            f->weapon = 0;
+        else
+            return "weapon is yes (the equipped weapon's model is loaded with the form) or no (the default: none, as the game's beasts)";
+        return NULL;
+    }
+    return "a form's section takes: model_enemy or model_like, model_script, model_files, weapon";
+}
+
+/* When the file has been read: the form's data file name (FORM00.DAT for index 0), or the problem. */
+static const char *form_finish(struct form_def *f, int index)
+{
+    const char *made = FORM_STEM "00.DAT";
+    int k;
+
+    for (k = 0; made[k]; k++)
+        f->model_name[k] = made[k];
+    f->model_name[k] = 0;
+    f->model_name[4] = (char)('0' + index / 10 % 10);
+    f->model_name[5] = (char)('0' + index % 10);
+    if (!f->stem[0])
+        return "the form has neither model_enemy nor model_like (the model whose files it loads): no limit transforms into it";
+    if (!f->files[0] && !f->scripts[0])
+        return "the form has neither model_script (its script file in the party layout) nor model_files (a full set of its own): the model's own script file is not in the party layout, so no limit transforms into it";
+    return NULL;
+}
+
+/* The first two of a file's four archive letters, once the game's rule has named it after the model the
+   form loads (the last two are the part's): the script file, asked for as FORM00.B, from `model_script` if
+   given; every file from `model_files` if given; otherwise the model's own, left as they are.
+   `extension` is what follows the asked name's dot. */
+static void form_part_letters(const struct form_def *f, const char *extension, char *letters)
+{
+    const char *two = f->files[0] ? f->files : NULL;
+
+    if (f->scripts[0] && (extension[0] == 'B' || extension[0] == 'b') && !extension[1])
+        two = f->scripts;
+    if (two) {
+        letters[0] = two[0];
+        letters[1] = two[1];
+    }
+}
+
+static DWORD form_dword(const BYTE *at)
+{
+    return (DWORD)at[0] | (DWORD)at[1] << 8 | (DWORD)at[2] << 16 | (DWORD)at[3] << 24;
+}
+
+/* Slots 0x2e-0x32 and 0x34-0x3b are taken from the exe for every model: the file's are never played. */
+static BOOL form_slot_from_exe(int slot)
+{
+    return (slot >= 0x2e && slot <= 0x32) || (slot >= 0x34 && slot <= 0x3b);
+}
+
+/* A script file served for a form (as it was read: `size` bytes): NULL if it is in the party layout and
+   every script it may play ends, with *max_animation the highest of the model's own animations any of
+   them plays (-1: none); otherwise the problem, with *bad_slot the script it was found in (-1: the file).
+   Each script is walked command by command (form_operands) to an end: ee, ff, f1 or fe c0. A slot whose
+   offset points into the header or the offset table is not walked (party files have such unused slots),
+   except slots 0-3, which every party model plays. */
+static const char *form_check_scripts(const BYTE *file, DWORD size, int *max_animation, int *bad_slot)
+{
+    int slot;
+
+    *max_animation = -1;
+    *bad_slot = -1;
+    if (!file || size < FORM_SCRIPT_TABLE + FORM_SCRIPT_SLOTS * 4)
+        return "it is shorter than a party model's script file (a 0x68-byte header and 74 script offsets: 0x190 bytes)";
+    for (slot = 0; slot < FORM_SCRIPT_SLOTS; slot++) {
+        DWORD at = form_dword(file + FORM_SCRIPT_TABLE + slot * 4), walked = 0;
+
+        if (form_slot_from_exe(slot))
+            continue;
+        *bad_slot = slot;
+        if (at >= size)
+            return "a script's offset points past the end of the file (an enemy model's own script file, 32 slots, does that)";
+        if (at < FORM_SCRIPT_TABLE + FORM_SCRIPT_SLOTS * 4) {
+            if (slot < 4)
+                return "one of scripts 0-3 (idle, weak idle, KO pose, the way back) points into the file's header";
+            continue;
+        }
+        for (;;) {
+            BYTE op;
+
+            if (at >= size || walked >= FORM_SCRIPT_WALK_MAX)
+                return "a script runs to the end of the file (or 1024 bytes) without an end (ee, ff, f1 or fe c0), or a command's operands run past it";
+            op = file[at];
+            if (op == 0xee || op == 0xff || op == 0xf1 || (op == 0xfe && at + 1 < size && file[at + 1] == 0xc0))
+                break;
+            if (op < 0x8e) {
+                if (op >= FORM_MODEL_ANIMATIONS)
+                    return "a script plays an animation numbered 0x2c or more (a limit pack's: a form has none loaded)";
+                if (op > *max_animation)
+                    *max_animation = op;
+                at++;
+                walked++;
+                continue;
+            }
+            at += 1 + form_operands[op - 0x8e];
+            walked += 1 + form_operands[op - 0x8e];
+        }
+    }
+    *bad_slot = -1;
+    return NULL;
+}
+
+/* A skeleton file (aa) as read: NULL and its bone and animation counts (dwords 3 and 7 + 10: what the
+   loader makes the model's animation table of, FUN_005e02e9), or the problem. */
+static const char *form_check_skeleton(const BYTE *file, DWORD size, int *bones, int *animations)
+{
+    DWORD first, second;
+
+    *bones = *animations = 0;
+    if (!file || size < FORM_HRC_SIZE)
+        return "it is shorter than a battle skeleton file's header (0x34 bytes)";
+    first = form_dword(file + 0x1c);
+    second = form_dword(file + 0x28);
+    *bones = (int)form_dword(file + 0x0c);
+    if (first > 0x1000 || second > 0x1000)
+        return "its animation counts (dwords 7 and 10) are not a battle model's";
+    *animations = (int)(first + second);
+    return NULL;
+}
+
+/* Whether the scripts fit the model: the highest animation they play is below what the skeleton file
+   says (the model's table) and below what the animation file holds; and the animation file holds no
+   more than the table (FUN_005e82de stores one pointer per animation it holds into that table). */
+static const char *form_check_fit(int max_animation, int skeleton_animations, int file_animations)
+{
+    if (file_animations > skeleton_animations)
+        return "its animation file holds more animations than its skeleton file makes room for";
+    if (max_animation >= skeleton_animations || max_animation >= file_animations)
+        return "its scripts play an animation the model does not have (a model mod that changed its animations?)";
+    return NULL;
+}
+
+/* The form index a made-up file name belongs to (FORM00.xxx -> 0), or -1; *stem_length = the length of FORMnn. */
+static int form_index_of_name(const char *name, int *stem_length)
+{
+    int i, index;
+
+    for (i = 0; i < 4; i++)
+        if (name[i] != FORM_STEM[i])
+            return -1;
+    if (name[4] < '0' || name[4] > '9' || name[5] < '0' || name[5] > '9' || (name[6] && name[6] != '.'))
+        return -1;
+    index = (name[4] - '0') * 10 + name[5] - '0';
+    *stem_length = 6;
+    return index < FORM_MAX ? index : -1;
+}
+/* What a form takes from where, for the log: ", its script file from ZOAB (the rest as ...)", ", every file from
+   its own set XY??". Bounded: at most out_size - 1 characters and the NUL (a longer text is cut, never written
+   past). FORM_SAID_SIZE holds every text it makes: the three pieces together, each %s being two letters. */
+#define FORM_SAID_FILES         ", every file from its own set "
+#define FORM_SAID_SCRIPT        ", its script file from "
+#define FORM_SAID_REST          " (the rest as the game, the loose-file index and the mod folders serve that model's)"
+#define FORM_SAID_SIZE          160
+_Static_assert(FORM_SAID_SIZE >= sizeof FORM_SAID_FILES + 4 + sizeof FORM_SAID_SCRIPT + 4 + sizeof FORM_SAID_REST,
+               "FORM_SAID_SIZE must hold the longest text form_files_said makes");
+
+static void form_say(char *out, int out_size, int *n, const char *text)
+{
+    while (*n < out_size - 1 && *text)
+        out[(*n)++] = *text++;
+    out[*n] = 0;
+}
+
+static void form_files_said(const struct form_def *f, char *out, int out_size)
+{
+    int n = 0;
+
+    if (out_size <= 0)
+        return;
+    out[0] = 0;
+    if (f->files[0]) {
+        form_say(out, out_size, &n, FORM_SAID_FILES);
+        form_say(out, out_size, &n, f->files);
+        form_say(out, out_size, &n, "??");
+    }
+    if (f->scripts[0]) {
+        form_say(out, out_size, &n, FORM_SAID_SCRIPT);
+        form_say(out, out_size, &n, f->scripts);
+        form_say(out, out_size, &n, "AB");
+    }
+    if (!f->files[0])
+        form_say(out, out_size, &n, FORM_SAID_REST);
+}
+/* FORM PURE END */
+
+static struct form_def forms[FORM_MAX];
+static int form_count;                  /* sections read, bad ones included (their numbers stay taken) */
+static int form_hooks_state;            /* 0 not tried, 1 both a2 calls hooked, -1 refused (form keys off) */
+static const struct form_def *form_in_slot[3];  /* the form each party slot's model is, or NULL (its own) */
+static char slot_own_model[3][16];      /* the data file name each party slot's model was loaded under at battle start */
+static const struct form_def *form_of_name(const char *name, int *stem_length);    /* with the a2 hook, below */
+
 /* ---- A battle model of a new character's own ---- */
 
 /* The battle asks for a party member's model by a data file name from a
@@ -17307,10 +18932,42 @@ static int __cdecl load_party_model_hook(int zero, int slot, const char *name)
         int i;
 
         for (i = 0; i < 15 && name && name[i]; i++)
-            party_model_file[slot][i] = name[i];
-        party_model_file[slot][i] = 0;
+            party_model_file[slot][i] = slot_own_model[slot][i] = name[i];
+        party_model_file[slot][i] = slot_own_model[slot][i] = 0;
+        form_in_slot[slot] = NULL;      /* (forms) the slot holds its own model again */
     }
     return ((int (__cdecl *)(int, int, const char *))FN_LOAD_PARTY_MODEL)(zero, slot, name);
+}
+
+/* `body_blend = yes`. The game loads a party model's body with the load context's blend mode at 4 (set by
+   FUN_0067455e in FUN_0042a330), and FUN_00694c80 then makes every group of every part solid, whatever its
+   hundred says; only the weapon gets mode 6 (FUN_005e149a), which keeps each hundred's own blend. For this
+   character the body gets 6 as well: the groups marked blend 4 stay solid, by the same branch of FUN_00694c80 as
+   before; those marked 0-3 blend. The call chained is FUN_0042a330's only call of the model loader, on the context
+   it made for this one model, so nothing else sees the mode.
+
+   The character is known by the model's NAME, not by its slot: load_party_model_hook gave a character with
+   `battle_files` the made-up name of its own section, and no other model has one, so a seat changing hands, the
+   frog (slot 6) and a model a script loads in the middle of a battle cannot be taken for it. */
+#define SITE_LOAD_CHARACTER_MODEL 0x0042a41cu   /* in FUN_0042a330: e8 b1 76 1b 00 */
+#define FN_LOAD_CHARACTER_MODEL 0x005e1ad2u     /* FUN_005e1ad2(0, slot, source, context, data file name) */
+#define FN_CONTEXT_SET_BLEND    0x00674659u     /* FUN_00674659(mode, context): stores it at context + 0x20 */
+#define MODEL_BLEND_AS_FILE     6               /* FUN_00694c80: each hundred's own (its +0x44) */
+#define BODY_BLEND_LOG_MAX      16
+
+static int __cdecl load_character_model_hook(int zero, int slot, void *source, void *context, const char *name)
+{
+    static LONG logged;
+    int stem;
+    const struct new_character *c = name ? model_name_owner(name, &stem) : NULL;
+
+    if (c && c->body_blend && c->battle_prefix[0]) {
+        ((void (__cdecl *)(int, void *))FN_CONTEXT_SET_BLEND)(MODEL_BLEND_AS_FILE, context);
+        if (InterlockedIncrement(&logged) <= BODY_BLEND_LOG_MAX)
+            log_line("character %d: body_blend: its model %s in slot %d keeps each group's blend mode",
+                     character_file_id(c), name, slot);
+    }
+    return ((int (__cdecl *)(int, int, void *, void *, const char *))FN_LOAD_CHARACTER_MODEL)(zero, slot, source, context, name);
 }
 
 /* Builds, in `out`, the game's own name for the same part of the model a new
@@ -17321,6 +18978,8 @@ static BOOL base_model_part_name(const char *name, char *out)
     int stem;
     struct new_character *c = model_name_owner(name, &stem);
 
+    /* (forms: not here. A form's file that is missing must never be replaced by the model's own: its own
+       script file is not in the party layout. form_model_load_hook reads every file it needs first.) */
     if (!c || !c->model_base_stem[0] || lstrlenA(name + stem) > 40)
         return FALSE;
     lstrcpyA(out, c->model_base_stem);
@@ -17340,7 +18999,333 @@ static void __cdecl archive_name_hook(int patterns, void *table, const char *nam
         out[1] = c->battle_prefix[1];
         return;
     }
+    if (!c) {
+        /* (forms) FORM00.xxx: named as the same file of the model the form loads (ENEMY331.xxx, or the
+           model_like name's), then given the form's two letters where it has them (form_part_letters):
+           FORM00.B -> ENEMY331.B -> MTAB -> ZOAB with model_script = ZOAB; FORM00.D -> MTAA, the model's own */
+        const struct form_def *f = form_of_name(name, &stem);
+
+        if (f && lstrlenA(name + stem) <= 40) {
+            lstrcpyA(base_name, f->stem);
+            lstrcatA(base_name, name + stem);
+            ((void (__cdecl *)(int, void *, const char *, char *))FN_ARCHIVE_NAME)(patterns, table, base_name, out);
+            form_part_letters(f, name[stem] == '.' ? name + stem + 1 : "", out);
+            return;
+        }
+    }
     ((void (__cdecl *)(int, void *, const char *, char *))FN_ARCHIVE_NAME)(patterns, table, name, out);
+}
+
+/* ---- Transformations: the a2 command's model load ----
+
+   The two calls of FUN_0042a330 in the a2 case of FUN_0041fba4 (00424090 for 009aded8 >= 4, 004240b1 below)
+   go through form_model_load_hook. The game's table read just before each call (mov eax,[edx*4+007c1098]) is
+   left alone: its value, the `name` argument, is not used when the hook substitutes. Neither site nor
+   0042a330, 009aded8 or 007c1098 is touched by FFNx 1.24.3 (it only reads offsets of 0041fba4 as a base for
+   get_relative_call; the a2 calls are at +0x44ec and +0x450d, none of them), New Threat's or ESUI's hext.
+   The load is synchronous (0042a330 frees the slot's model and loads the new one before it returns), and
+   the a2 case dereferences the slot's model pointer right after it: so the hook always loads SOMETHING
+   (the character's own model if a form's does not load or its number is unknown).
+   Before a form is loaded, the three files it cannot do without are read the way the loader reads them
+   (alloc_get_file with the party loader's file context, between the loader's own chdir pair; read from the
+   code, FUN_005e1ad2 -> FUN_005e149a / FUN_005e82de / read_battle_hrc): the script file, the skeleton
+   file and the animation file. A missing skeleton file must never reach the loader: under FFNx its
+   read_battle_hrc reads a size the game's reader leaves unset when the file is missing, and may then
+   write through a null header. A missing or enemy-layout script file must not either: the a2 case
+   relocates 74 offsets and plays them. If any is missing, or the scripts play an animation the model does
+   not have (a model mod with other animations), the slot's own model is loaded instead, with one line.
+   The loaded model is looked at again before the hook returns (its script file and the animations the
+   scripts play are there). */
+#define ADDR_FORM_CASE          0x00424070u  /* the a2 case from its test of 009aded8 to its second call: 0x46 bytes */
+#define SITE_FORM_LOAD_FROM_4   0x00424090u  /* e8 9b 62 00 00: 0042a330(0, 0, actor, 007c1098[n]) when n >= 4 */
+#define SITE_FORM_LOAD_BELOW_4  0x004240b1u  /* e8 7a 62 00 00: 0042a330(0, 1, actor, 007c1098[n]) when n < 4 */
+#define FN_LOAD_MODEL_SLOT      0x0042a330u  /* FUN_0042a330(a, no weapon models, slot, data file name), cdecl */
+#define ADDR_FORM_NUMBER        0x009aded8u  /* the number `ac NN` stored (int) */
+#define ADDR_FORM_NAME_TABLE    0x007c1098u  /* the game's 7 data file names (its four beasts, then 4-6), and a 0 */
+#define FORM_GAME_NAMES         7
+#define FORM_GAME_OWN_FIRST     4            /* 4-6: the game's own character model by weapon set (what `ac 0a` resolves to) */
+#define FORM_LOG_MAX            24
+#define FN_FORM_GET_FILE        0x006829feu  /* alloc_get_file(file context, &size, name): the whole file in the game's memory, or 0 (cdecl) */
+#define FN_FORM_CHDIR           0x005dfe08u  /* battle_regular_chdir(0xcc-byte buffer): the loader's, before its reads (cdecl) */
+#define FN_FORM_OLDDIR          0x005dfe51u  /* battle_regular_olddir(that buffer), after them (cdecl) */
+#define FN_FORM_FREE            0x0065fb40u  /* the game's free (FN_GAME_FREE, defined further down) */
+#define ADDR_FORM_LOAD_KIND     0x007c1ff0u  /* FUN_00429a12's row for kind 2 (the party loader): 0, 1, archive yes, archive 2, name callback */
+#define FN_FORM_NAME_CALLBACK   0x005e2908u  /* the battle archive's name callback that row holds (it reaches 005e292f) */
+#define FORM_LETTERS_SIZE       200          /* open_file_006820d2 gives the callback a 200-byte buffer */
+
+/* The form a made-up file name belongs to (FORM00.xxx), if it is one of the file's usable forms; else NULL. */
+static const struct form_def *form_of_name(const char *name, int *stem_length)
+{
+    int index = name ? form_index_of_name(name, stem_length) : -1;
+
+    return index >= 0 && index < form_count && forms[index].name[0] && !forms[index].bad ? &forms[index] : NULL;
+}
+
+static int load_model_slot(int zero, int flag, int slot, const char *name)
+{
+    return ((int (__cdecl *)(int, int, int, const char *))FN_LOAD_MODEL_SLOT)(zero, flag, slot, name);
+}
+
+static void form_note_slot(int slot, const struct form_def *f, const char *name)
+{
+    int i;
+
+    form_in_slot[slot] = f;
+    for (i = 0; i < 15 && name[i]; i++)
+        party_model_file[slot][i] = name[i];
+    party_model_file[slot][i] = 0;
+}
+
+/* One file of a form, read as the party loader reads it: `ext` after the form's stem (FORM00.B), through
+   the game's alloc_get_file with the loader's file context (archive 2 and its name callback, which this
+   DLL's archive_name_hook answers), between the loader's own chdir pair. So the loose-file index, the
+   mod folders (the driver's direct folder) and the archive are asked exactly as they are for the load.
+   The four letters asked for go into `letters` (FORM_LETTERS_SIZE bytes, the size of the buffer the game's
+   open_file gives the callback; cut to 15 characters). Returns the file (the game's memory) or NULL. */
+static BYTE *form_read_file(const struct form_def *f, const char *ext, DWORD *size, char *letters)
+{
+    DWORD context[4];
+    BYTE olddir[0x100];
+    char name[24];
+    BYTE *data;
+    int i;
+
+    for (i = 0; i < 6; i++)
+        name[i] = f->model_name[i];             /* FORM00 */
+    name[6] = '.';
+    lstrcpyA(name + 7, ext);
+    for (i = 0; i < FORM_LETTERS_SIZE; i++)
+        letters[i] = 0;
+    ((void (__cdecl *)(const char *, char *))FN_FORM_NAME_CALLBACK)(name, letters);
+    letters[15] = 0;
+    context[0] = 0;                             /* read */
+    context[1] = 1;                             /* from an archive */
+    context[2] = 2;                             /* battle */
+    context[3] = FN_FORM_NAME_CALLBACK;
+    *size = 0;
+    ((void (__cdecl *)(void *))FN_FORM_CHDIR)(olddir);
+    data = ((BYTE *(__cdecl *)(void *, DWORD *, const char *))FN_FORM_GET_FILE)(context, size, name);
+    ((void (__cdecl *)(void *))FN_FORM_OLDDIR)(olddir);
+    if (!data)
+        *size = 0;
+    return data;
+}
+
+static void form_free_file(BYTE *data)
+{
+    if (data)
+        ((void (__cdecl *)(void *, const char *, int))FN_FORM_FREE)(data, "spellext form check", 0);
+}
+
+/* Before a form is loaded: its script file, skeleton file and animation file are there and fit each other.
+   TRUE, with *max_animation (the highest model animation its scripts play) and the counts for the log;
+   or FALSE, with the problem said in `why`. */
+static BOOL form_files_ready(const struct form_def *f, int *max_animation, int *bones, int *animations, char *why, int why_size)
+{
+    static const char *const ext[3] = { "B", "D", "A00" };     /* the script file, the skeleton, the animations (FUN_005e826a: A + 00) */
+    static const char *const what[3] = { "script file", "skeleton file", "animation file" };
+    BYTE *file[3];
+    DWORD size[3];
+    char letters[3][FORM_LETTERS_SIZE];
+    const char *problem = NULL;
+    int k, bad_slot = -1, held = 0, at = -1, fit = 0;
+
+    *max_animation = -1;
+    *bones = *animations = 0;
+    for (k = 0; k < 3; k++)
+        file[k] = form_read_file(f, ext[k], &size[k], letters[k]);
+    for (k = 0; k < 3 && !problem; k++)
+        if (!file[k] || !size[k]) {
+            problem = "not found (the loose-file index, the mod folders and the battle archive were asked as the loader asks them)";
+            at = k;
+        }
+    if (!problem && (problem = form_check_scripts(file[0], size[0], max_animation, &bad_slot)) != NULL)
+        at = 0;
+    if (!problem && (problem = form_check_skeleton(file[1], size[1], bones, animations)) != NULL)
+        at = 1;
+    if (!problem) {
+        held = size[2] >= 4 ? (int)form_dword(file[2]) : -1;
+        if (held < 0 || held > 0x1000) {
+            problem = "it does not start with an animation count";
+            at = 2;
+        } else if ((problem = form_check_fit(*max_animation, *animations, held)) != NULL) {
+            at = 0;
+            fit = 1;
+        }
+    }
+    for (k = 0; k < 3; k++)
+        form_free_file(file[k]);
+    if (!problem)
+        return TRUE;
+    if (at == 0 && bad_slot >= 0)
+        wsprintfA(why, "its %s %s (script %d): %s", what[at], letters[at], bad_slot, problem);
+    else if (fit)
+        wsprintfA(why, "its %s %s plays animation %d; its skeleton file %s gives %d, its animation file %s holds %d: %s", what[0], letters[0],
+                  *max_animation, letters[1], *animations, letters[2], held, problem);
+    else
+        wsprintfA(why, "its %s %s: %s", what[at], letters[at], problem);
+    why[why_size - 1] = 0;
+    return FALSE;
+}
+
+/* After the load: the model 0042a330 returned has its script file and every animation its scripts play
+   (the record of FUN_005e02e9: +0 the script file, +8 the animation count, +0xc the animations). */
+static const char *form_loaded_ready(int model, int max_animation)
+{
+    const DWORD *record = (const DWORD *)model;
+    const DWORD *animation;
+    int k;
+
+    if (!model || IsBadReadPtr(record, 0x10))
+        return "the loader returned no model";
+    if (!record[0])
+        return "the model has no script file";
+    if ((int)record[2] <= max_animation)
+        return "the model has fewer animations than its scripts play";
+    animation = (const DWORD *)record[3];
+    if (max_animation >= 0 && (!animation || IsBadReadPtr(animation, (max_animation + 1) * 4)))
+        return "the model's animation table is missing";
+    for (k = 0; k <= max_animation; k++)
+        if (!animation[k])
+            return "an animation its scripts play did not load";
+    return NULL;
+}
+
+static int __cdecl form_model_load_hook(int zero, int flag, int slot, const char *name)
+{
+    static LONG logged;
+    int n = *(const int *)ADDR_FORM_NUMBER, r;
+    BOOL party = slot >= 0 && slot < 3;
+    struct new_character *c = party ? new_character(((const BYTE *)ADDR_PARTY)[slot]) : NULL;
+    const char *own = !party ? NULL : slot_own_model[slot][0] ? slot_own_model[slot] : c && c->battle_prefix[0] ? c->model_name : NULL;
+
+    if (party && (n < 0 || n >= FORM_GAME_NAMES)) {
+        /* a SpellExt form, or a number past the game's table: never read that table for it */
+        const struct form_def *f = n >= FORM_FIRST && n < FORM_FIRST + form_count && forms[n - FORM_FIRST].name[0] &&
+                                   !forms[n - FORM_FIRST].bad ? &forms[n - FORM_FIRST] : NULL;
+        const char *back = own ? own : ((const char *const *)ADDR_FORM_NAME_TABLE)[FORM_GAME_OWN_FIRST];
+
+        if (f) {
+            char why[320];
+            int max_animation, bones, animations;
+
+            if (form_files_ready(f, &max_animation, &bones, &animations, why, sizeof why)) {
+                const char *after;
+
+                r = load_model_slot(0, f->weapon ? 0 : 1, slot, f->model_name);
+                after = form_loaded_ready(r, max_animation);
+                if (!after) {
+                    char said[FORM_SAID_SIZE];
+
+                    form_note_slot(slot, f, f->model_name);
+                    form_files_said(f, said, sizeof said);
+                    if (InterlockedIncrement(&logged) <= FORM_LOG_MAX)
+                        log_line("form %s loaded into slot %d (%s: the files of %s%s; %d bones, %d animations, its scripts play up to %d; %s)",
+                                 f->name, slot, f->model_name, f->stem, said, bones, animations, max_animation,
+                                 f->weapon ? "with the weapon's model" : "no weapon model");
+                    return r;
+                }
+                if (InterlockedIncrement(&logged) <= FORM_LOG_MAX)
+                    log_line("form %s: loaded into slot %d, but %s: the slot's own model %s is loaded instead", f->name, slot,
+                             after, back);
+            } else if (InterlockedIncrement(&logged) <= FORM_LOG_MAX) {
+                log_line("form %s is NOT loaded into slot %d: %s. The slot's own model %s is loaded instead", f->name, slot, why, back);
+            }
+        } else if (InterlockedIncrement(&logged) <= FORM_LOG_MAX) {
+            log_line("form number 0x%02x (009aded8) in slot %d is no form of the limits file: the slot's own model %s is loaded", n,
+                     slot, back);
+        }
+        r = load_model_slot(0, 0, slot, back);
+        form_note_slot(slot, NULL, back);
+        return r;
+    }
+    if (party && (c || form_in_slot[slot]) && own && n >= FORM_GAME_OWN_FIRST) {
+        /* the way back (`ac 0a`, or 4-6) on a slot a new character holds, or one in a form of this DLL's
+           (whoever it is: the game's table is right only for its own character): the slot's own model */
+        r = load_model_slot(zero, flag, slot, own);
+        if (InterlockedIncrement(&logged) <= FORM_LOG_MAX)
+            log_line("revert: slot %d loads %s (character %d's own model; the game's table says %s)%s", slot, own,
+                     c ? character_file_id(c) : (int)((const BYTE *)ADDR_PARTY)[slot], name ? name : "(none)",
+                     r ? "" : ": it did NOT load");
+        form_note_slot(slot, NULL, own);
+        return r;
+    }
+    r = load_model_slot(zero, flag, slot, name);
+    if (party && name)
+        form_note_slot(slot, NULL, name);
+    return r;
+}
+
+/* Whether the code at `at` begins with `bytes` (or is another module's jump there, which still does the
+   routine's work when called). */
+static BOOL form_routine_is(DWORD at, const BYTE *bytes, int count)
+{
+    int i;
+
+    if (*(const BYTE *)at == 0xe9)
+        return TRUE;
+    for (i = 0; i < count; i++)
+        if (((const BYTE *)at)[i] != bytes[i])
+            return FALSE;
+    return TRUE;
+}
+
+/* Hooks the two calls, once, if the whole stretch of the a2 case they are in is as the exe has it, the
+   archive name call (005e292f) is this DLL's (archive_hooked: patched just before; a form's files are
+   named there), and the routines and the loader's file context the file check uses are the game's. */
+static void install_form_hooks(BOOL archive_hooked)
+{
+    static const BYTE get_file[13] = { 0x55, 0x8b, 0xec, 0x8b, 0x45, 0x10, 0x50, 0x8b, 0x4d, 0x0c, 0x51, 0x6a, 0x00 };
+    static const BYTE chdir_entry[13] = { 0x55, 0x8b, 0xec, 0x51, 0x8b, 0x45, 0x08, 0x50, 0x68, 0xcc, 0x00, 0x00, 0x00 };
+    static const BYTE olddir_entry[9] = { 0x55, 0x8b, 0xec, 0x8b, 0x45, 0x08, 0x83, 0x38, 0x00 };
+    static const BYTE callback[9] = { 0x55, 0x8b, 0xec, 0x8b, 0x45, 0x0c, 0x50, 0x8b, 0x4d };
+    static const DWORD kind[5] = { 0, 1, 1, 2, FN_FORM_NAME_CALLBACK };
+    static const BYTE expected[0x46] = {
+        0x83, 0x3d, 0xd8, 0xde, 0x9a, 0x00, 0x04,       /* 00424070 cmp dword [009aded8], 4 */
+        0x7c, 0x21,                                     /* 00424077 jl 0042409a */
+        0x8b, 0x15, 0xd8, 0xde, 0x9a, 0x00,             /* 00424079 mov edx, [009aded8] */
+        0x8b, 0x04, 0x95, 0x98, 0x10, 0x7c, 0x00,       /* 0042407f mov eax, [edx*4 + 007c1098] */
+        0x50, 0x0f, 0xbf, 0x4d, 0x08, 0x51, 0x6a, 0x00, 0x6a, 0x00,     /* push name, actor, 0, 0 */
+        0xe8, 0x9b, 0x62, 0x00, 0x00,                   /* 00424090 call 0042a330 */
+        0x83, 0xc4, 0x10, 0xeb, 0x1f,                   /* add esp, 0x10; jmp 004240b9 */
+        0x8b, 0x15, 0xd8, 0xde, 0x9a, 0x00,             /* 0042409a mov edx, [009aded8] */
+        0x8b, 0x04, 0x95, 0x98, 0x10, 0x7c, 0x00,       /* 004240a0 mov eax, [edx*4 + 007c1098] */
+        0x50, 0x0f, 0xbf, 0x4d, 0x08, 0x51, 0x6a, 0x01, 0x6a, 0x00,     /* push name, actor, 1, 0 */
+        0xe8, 0x7a, 0x62, 0x00, 0x00                    /* 004240b1 call 0042a330 */
+    };
+    const char *off = NULL;
+    int i, done;
+
+    if (form_hooks_state)
+        return;
+    for (i = 0; i < 5 && ((const DWORD *)ADDR_FORM_LOAD_KIND)[i] == kind[i]; i++)
+        ;
+    if (!archive_hooked)
+        off = "the battle archive's name call (005e292f) is not this DLL's: a form's files could not be named";
+    else if (i < 5)
+        off = "the party loader's file context (007c1ff0) is not the game's";
+    else if (!form_routine_is(FN_FORM_GET_FILE, get_file, sizeof get_file) || !form_routine_is(FN_FORM_CHDIR, chdir_entry, sizeof chdir_entry) ||
+             !form_routine_is(FN_FORM_OLDDIR, olddir_entry, sizeof olddir_entry) || !form_routine_is(FN_FORM_NAME_CALLBACK, callback, sizeof callback))
+        off = "one of the game's routines a form's files are read with (006829fe, 005dfe08, 005dfe51, 005e2908) does not start as expected";
+    if (off) {
+        form_hooks_state = -1;
+        log_line("form hooks: 0 of 2: %s: no form = key is honoured, a revert loads what the game says", off);
+        return;
+    }
+    for (i = 0; i < (int)sizeof expected && ((const BYTE *)ADDR_FORM_CASE)[i] == expected[i]; i++)
+        ;
+    if (i < (int)sizeof expected) {
+        form_hooks_state = -1;
+        log_line("form hooks: 0 of 2: the a2 command's code at %08lx is not the game's (byte %08lx is %02x, expected %02x; another DLL or patch?): no form = key is honoured, a revert loads what the game says",
+                 ADDR_FORM_CASE, ADDR_FORM_CASE + (DWORD)i, ((const BYTE *)ADDR_FORM_CASE)[i], expected[i]);
+        return;
+    }
+    done = patch_call(SITE_FORM_LOAD_FROM_4, FN_LOAD_MODEL_SLOT, form_model_load_hook);
+    done += patch_call(SITE_FORM_LOAD_BELOW_4, FN_LOAD_MODEL_SLOT, form_model_load_hook);
+    form_hooks_state = done == 2 ? 1 : -1;
+    log_line("form hooks: %d of 2 (the a2 command's calls of 0042a330 at 00424090, 004240b1)%s", done,
+             done == 2 ? ": transformations into forms, and a new character's own model on the way back"
+                       : ": no form = key is honoured");
 }
 
 /* ---- New characters in the PHS ---- */
@@ -18033,6 +20018,14 @@ static const char *apply_character_key(struct new_character *c, char *key, char 
         c->battle_prefix[2] = 0;
         return NULL;
     }
+    if (word_is(key, key_end, "body_blend")) {
+        int yes;
+
+        if (!parse_yes_no(value, end, &yes))
+            return "expected yes or no";
+        c->body_blend = (BYTE)yes;
+        return NULL;
+    }
     if (word_is(key, key_end, "battle_like") || word_is(key, key_end, "battle_model")) {     /* battle_model: the old name */
         for (i = 0; models[i].name && !word_is(value, end, models[i].name); i++)
             ;
@@ -18333,6 +20326,7 @@ static int load_characters(void)
                 current->model_base_stem[0] = 0;
                 current->field_model[0] = 0;
                 current->field_model_found = 0;
+                current->body_blend = 0;
                 current->ai_like = 0;
                 current->ai_file[0] = 0;
                 current->ai_keys_here = 0;
@@ -21194,11 +23188,16 @@ static void field_add_seats(const char *name)
     }
 }
 
+static LONG battle_menu_owed;           /* (battle menu) a test battle's party or loss flag is still to be put back */
+static void battle_menu_field_read(void);       /* (battle menu) the field is read: back from the test battle? */
+
 static int __cdecl field_read_hook(const char *name)
 {
     BOOL resumed = *(const DWORD *)ADDR_FIELD_RESUMING != 0;    /* before the call, as the reader sees it */
     int result;
 
+    if (battle_menu_owed)
+        battle_menu_field_read();   /* (battle menu, stage 3) back from a test battle: its party put back before the field runs */
     if (!resumed && fields_before_read(name))       /* (field capacity) an id nobody registered: not read */
         return 0;
     result = ((int (__cdecl *)(const char *))field_read_next)(name);
@@ -22171,6 +24170,7 @@ static void enable_new_characters(void)
     const int loops = sizeof record_loop_starts / sizeof record_loop_starts[0];
     DWORD old_protect;
     int i, ok = 0, count;
+    BOOL archive_name_hooked;
 
     if (new_characters_live || !weapon_table_live)
         return;
@@ -22244,12 +24244,20 @@ static void enable_new_characters(void)
              patch_call(0x006ff79cu, 0x00720aeeu, preview_hook_b) + patch_call(0x00721ab8u, 0x00720aeeu, preview_hook_b));
     for (i = 0; i < (int)(sizeof load_nine_sites / sizeof load_nine_sites[0]); i++)
         ok += patch_call(load_nine_sites[i], FN_LOAD_NINE_PORTRAITS, load_nine_portraits_hook);
+    archive_name_hooked = patch_call(SITE_ARCHIVE_NAME, FN_ARCHIVE_NAME, archive_name_hook);  /* (before the form hooks, which need it) */
+    ok += archive_name_hooked;
+    install_form_hooks(archive_name_hooked);    /* (before the limits file: its form keys are honoured only with them) */
     load_limits();
     install_limit_item();
     ok += install_limit_hooks();
     for (i = 0; i < (int)(sizeof load_party_model_sites / sizeof load_party_model_sites[0]); i++)
         ok += patch_call(load_party_model_sites[i], FN_LOAD_PARTY_MODEL, load_party_model_hook);
-    ok += patch_call(SITE_ARCHIVE_NAME, FN_ARCHIVE_NAME, archive_name_hook);
+    if (!patch_call(SITE_LOAD_CHARACTER_MODEL, FN_LOAD_CHARACTER_MODEL, load_character_model_hook))
+        log_line("body_blend: NOT on (the party model load call is not the game's): a character's body stays solid");
+    for (i = 0; i < ROSTER_MAX; i++)
+        if (new_characters[i].defined && new_characters[i].body_blend && !new_characters[i].battle_prefix[0])
+            log_line("character %d: body_blend does nothing without battle_files (only its own model files can say which groups blend)",
+                     NEW_CHARACTER_FIRST_ID + i);
     for (i = 0; i < 2; i++)
         ok += patch_call(render_ninth_sites[i], FN_RENDER_TEXTURE, render_ninth_portrait_hook);
     ok += patch_call(SITE_PHS_SWAP, FN_PHS_SWAP, phs_swap_hook);
@@ -25893,6 +27901,7 @@ static void __cdecl battle_start_party_hook(void)
     native_battle_start();          /* native effects: no group handle or task is carried over */
     prop_battle_start();        /* props: no group handle, armed prop or task is carried over */
     state_battle_start();       /* states: nobody is in one when a battle starts */
+    form_in_slot[0] = form_in_slot[1] = form_in_slot[2] = NULL;    /* forms: every slot holds its own model */
     pause_battle_start();
     char_ai_battle_start();     /* character AI: no seat is linked (before the party's init scripts run) */
     for (slot = 0; slot < 3; slot++) {
@@ -25947,7 +27956,7 @@ static unsigned __cdecl limit_learning_hook(BYTE *record, int kills, int uses)
     struct new_character *c = new_character(record[0]);
     BYTE id = record[0], saved[16];
     BYTE *thresholds = NULL;
-    unsigned learned;
+    unsigned learned, was = *(const WORD *)(record + 0x22);
 
     if (c && (c->limits_like >= 0 || c->own_limits)) {
         int vessel = c->limits_like >= 0 ? c->limits_like : 0;
@@ -25966,6 +27975,18 @@ static unsigned __cdecl limit_learning_hook(BYTE *record, int kills, int uses)
     record[0] = id;
     if (thresholds)
         copy_bytes(thresholds, saved, sizeof saved);
+    if (c && c->own_limits) {
+        /* a kill or use count teaches a slot, defined or not: only a defined limit is learned. Bits the
+           record already had stay, as a save may hold a limit the config no longer defines. */
+        unsigned all = 0;
+        int i;
+
+        for (i = 0; i < 12; i++)
+            if (c->limit_command[i] != 0xff)
+                all |= 1u << i;
+        *(WORD *)(record + 0x22) &= (WORD)(all | was);
+        learned &= all;
+    }
     return learned;
 }
 
@@ -26188,8 +28209,8 @@ static void follow_chain_step(int actor, int id)
     int position = follow_chain[actor].position, turn, chain, strength, k;
     int *action = current_action();
 
-    if (!c || id != c->limit_record[position][0x13])
-        return;
+    if (!c || id != c->limit_record[position][0x13] || c->limit_form[position])
+        return;                                 /* (a form's limit: byte 0x13 is its form number, not a follow-up) */
     turn = follow_chain[actor].done++;          /* 0 = the first follow-up */
     chain = c->limit_follow_chain[position];
     strength = c->limit_follow_strength[position][turn < FOLLOW_CHAIN_MAX ? turn : FOLLOW_CHAIN_MAX - 1];
@@ -26540,6 +28561,7 @@ static int limit_effect;        /* effect: -1 the base's, -2 none, else a game l
 
 /* ---- A state: the limits file ---- */
 static char limit_state_draft[STATE_NAME_MAX + 1];      /* state: the name, lower case; "" = none */
+static char limit_form_draft[FORM_NAME_MAX + 1];        /* form: the name, lower case; "" = none */
 
 /* A state's name: 1 to 15 letters, digits or _, kept in lower case. `none` is not a name. */
 static BOOL state_name(char *out, const char *start, const char *end)
@@ -27217,6 +29239,9 @@ static void finish_limit(struct spell_draft *draft, struct new_character *c, int
         log_line("character %d limit %d-%d: effect file %s is taken from the loose file %s", NEW_CHARACTER_FIRST_ID + (int)(c - new_characters),
                  level, position, limit_swap_draft[0], limit_swap_draft[1]);
     lstrcpyA(c->limit_state_name[index], limit_state_draft);
+    lstrcpyA(c->limit_form_name[index], limit_form_draft);
+    c->limit_form[index] = 0;           /* finish_forms, when the whole file is read */
+    c->limit_form_line[index] = (WORD)line;
     c->limit_state[index] = 0;          /* finish_states, when the whole file is read */
     lstrcpyA(c->limit_prop[index], limit_prop_draft);
     c->limit_prop_bone[index] = (BYTE)limit_prop_bone_draft;
@@ -27278,6 +29303,172 @@ static void finish_limit(struct spell_draft *draft, struct new_character *c, int
     limits_defined++;
 }
 
+/* ---- Transformations: the limits file's side ---- */
+
+/* The game's own battle model names model_like may name: entries 2-22 of the table FUN_005e2460 is given
+   (008ff2f0, 0x17 entries of 6 dwords, the first a name), read once from the exe's memory. Entries 0 and 1
+   (ENEMY, STAGE) are patterns with a number, not a model, and must be what they are for the rest to be trusted. */
+static const char *form_like[ARCHIVE_PATTERNS];
+static int form_like_count = -1;
+
+static void form_read_like_names(void)
+{
+    const DWORD *table = (const DWORD *)ADDR_ARCHIVE_PATTERNS;
+    int i;
+
+    if (form_like_count >= 0)
+        return;
+    form_like_count = 0;
+    for (i = 0; i < ARCHIVE_PATTERNS; i++)
+        if (table[i * 6] < 0x00400000u || table[i * 6] >= 0x01000000u || IsBadReadPtr((const void *)table[i * 6], 12))
+            return;
+    if (lstrcmpA((const char *)table[0], "ENEMY") || lstrcmpA((const char *)table[6], "STAGE"))
+        return;
+    for (i = 2; i < ARCHIVE_PATTERNS; i++)
+        form_like[form_like_count++] = (const char *)table[i * 6];
+}
+
+/* [form NAME]: the section's form, or the problem (then *out is NULL and its lines are passed over). */
+static const char *form_section_start(char *name, char *stop, int line, struct form_def **out)
+{
+    char *name_end = stop - 1;
+    char lower[FORM_NAME_MAX + 1];
+    int k;
+
+    *out = NULL;
+    trim(&name, &name_end);
+    if (stop[-1] != ']' || !form_name(lower, name, name_end))
+        return "a form's section looks like [form NAME]: the word form, a name of 1 to 15 letters, digits or _";
+    for (k = 0; k < form_count; k++)
+        if (!lstrcmpA(forms[k].name, lower))
+            return "this form is already defined above: this section is passed over";
+    if (form_count == FORM_MAX)
+        return "too many forms (16 at most): this section is passed over";
+    for (k = 0; k < (int)sizeof forms[0]; k++)
+        ((BYTE *)&forms[form_count])[k] = 0;
+    lstrcpyA(forms[form_count].name, lower);
+    forms[form_count].line = line;
+    *out = &forms[form_count++];
+    return NULL;
+}
+
+/* When the whole file has been read: each form's number and name, and each limit's `form`: the number
+   written into its record's additional modifier (byte 0x13, which FUN_005df95a saves for the AI) and into
+   the operand of its script's first `ac`. Returns the problems found (each said with its line). */
+static int finish_forms(void)
+{
+    int n, i, k, problems = 0, named = 0;
+
+    for (k = 0; k < form_count; k++) {
+        struct form_def *f = &forms[k];
+        const char *why = form_finish(f, k);
+
+        if (why && !f->bad) {
+            log_line("limits file line %d: form %s: %s", f->line, f->name, why);
+            problems++;
+        }
+        for (n = 0; !why && !f->bad && n < ROSTER_MAX; n++) {
+            const char *prefix = new_characters[n].battle_prefix;
+            const char *two = !new_characters[n].defined || !prefix[0] ? NULL
+                            : f->files[0] == prefix[0] && f->files[1] == prefix[1] ? f->files
+                            : f->scripts[0] == prefix[0] && f->scripts[1] == prefix[1] ? f->scripts : NULL;
+
+            if (two) {
+                log_line("limits file line %d: form %s: %s %s is also character %d's battle_files: the form would load that character's files; give the form two letters of its own",
+                         f->line, f->name, two == f->files ? "model_files" : "model_script", two, NEW_CHARACTER_FIRST_ID + n);
+                problems++;
+                f->bad = 1;
+            }
+        }
+        if (why || f->bad) {
+            f->bad = 1;
+            log_line("form %s (line %d) is number 0x%02x but is NOT usable (a problem above): no limit transforms into it", f->name,
+                     f->line, FORM_FIRST + k);
+        } else {
+            char said[FORM_SAID_SIZE];
+
+            form_files_said(f, said, sizeof said);
+            log_line("form %s is number 0x%02x (line %d): loaded as %s with the files of %s%s, %s", f->name, FORM_FIRST + k, f->line,
+                     f->model_name, f->stem, said, f->weapon ? "with the equipped weapon's model" : "no weapon model");
+        }
+    }
+    for (n = 0; n < ROSTER_MAX; n++) {
+        struct new_character *c = &new_characters[n];
+        int id = NEW_CHARACTER_FIRST_ID + n;
+
+        if (!c->defined || !c->own_limits)
+            continue;
+        for (i = 0; i < 12; i++) {
+            BYTE *record = c->limit_record[i];
+            const char *name = c->limit_form_name[i];
+            int line = c->limit_form_line[i], level = i / 3 + 1, position = i % 3 + 1, at = -3, s;
+            char why[200];
+
+            c->limit_form[i] = 0;
+            if (c->limit_command[i] == 0xff || !name[0])
+                continue;
+            named++;
+            for (k = 0; k < form_count && lstrcmpA(forms[k].name, name); k++)
+                ;
+            for (s = 0; s < STATE_MAX && !c->state[s].name[0]; s++)
+                ;
+            why[0] = 0;
+            if (form_hooks_state != 1)
+                lstrcpyA(why, "transformations are off (form hooks: see the start of the log)");
+            else if (k == form_count)
+                wsprintfA(why, "there is no section [form %s] in this file", name);
+            else if (forms[k].bad)
+                wsprintfA(why, "that form is not usable (its section, line %d, had a problem)", forms[k].line);
+            else if (c->limit_state_name[i][0])
+                wsprintfA(why, "it has state = %s too: a transforming limit cannot leave a state", c->limit_state_name[i]);
+            else if (s < STATE_MAX)
+                /* a state lends its idle and attack scripts into the actor's CURRENT model table and lends them
+                   again when the table changes (state_stay_task): into a form's, with the character's own
+                   animation numbers. Refused here rather than ending the state at the a2 load, which would
+                   run the state's ends inside a model script step, with its task and lent slots in flight. */
+                wsprintfA(why, "character %d has a state ([%d state %s], line %d): a form and a state are not held together", id, id,
+                          c->state[s].name, (int)c->state[s].line);
+            else if (record[REC_ADDITIONAL_EFFECT] != 3)
+                wsprintfA(why, "it needs additional_effect 3 (the game's transformation: a base such as 173, or the key); this limit's is %d",
+                          (int)record[REC_ADDITIONAL_EFFECT]);
+            else if (!c->limit_script_length[i])
+                lstrcpyA(why, "it needs a script of the limit's own with an ac command (ac 00 ... a2 11); it has none");
+            else if ((at = form_ac_operand(c->limit_script[i], c->limit_script_length[i])) < 0)
+                lstrcpyA(why, at == -1 ? "its script has no ac command (ac 00 stores the form's number before a2 loads its model)"
+                                       : "a command of its script runs past the script's end before any ac");
+            if (why[0]) {
+                /* left out, as if its section were not there: as written it would turn its user into the game's
+                   own beast of its ac number (Galian Beast for ac 00), which nobody asked for */
+                problems++;
+                c->limit_command[i] = 0xff;
+                c->limit_start &= (WORD)~(1 << i);
+                log_line("limits file line %d: [%d %d-%d] form = %s: %s: the limit is LEFT OUT (not learned, not in the menu)", line, id,
+                         level, position, name, why);
+                continue;
+            }
+            record[REC_ADDITIONAL_MODIFIER] = (BYTE)(FORM_FIRST + k);
+            c->limit_script[i][at] = (BYTE)(FORM_FIRST + k);
+            c->limit_form[i] = (BYTE)(k + 1);
+            log_line("limit [%d %d-%d] transforms into form %s: number 0x%02x written to its record's additional_modifier and to its script's ac (byte %d)",
+                     id, level, position, name, FORM_FIRST + k, at);
+        }
+    }
+    if (form_count && form_like_count <= 0)
+        log_line("forms: the game's table of battle model names (008ff2f0) is not as expected: model_like is refused, model_enemy works");
+    if (form_count && form_like_count > 0) {
+        char list[ARCHIVE_PATTERNS * 12];
+
+        list[0] = 0;
+        for (k = 0; k < form_like_count; k++)
+            if (lstrlenA(form_like[k]) < 11)
+                wsprintfA(list + lstrlenA(list), "%s%s", k ? " " : "", form_like[k]);
+        log_line("forms: model_like may name the game's own: %s", list);
+    }
+    if (form_count || named)
+        log_line("forms: %d section(s), %d limit(s) name one, %d problem(s)", form_count, named, problems);
+    return problems;
+}
+
 /* Reads the limits file: each new character's own limit breaks. Run once,
    after the character file. */
 /* New limits share the numbers of the game limits whose effects they use, so
@@ -27329,6 +29520,7 @@ static void load_limits(void)
     static struct spell_draft draft;
     struct new_character *c = NULL, *owner = NULL;
     struct limit_state *state_section = NULL;   /* the lines being read are a state's: [12 state NAME] */
+    struct form_def *form_section = NULL;       /* the lines being read are a form's: [form NAME] */
     char *text, *line, *end, *file_end;
     DWORD size = 0;
     int line_number = 0, errors = 0, level = 0, position = 0, learned = -1, start_line = 0, i;
@@ -27348,6 +29540,11 @@ static void load_limits(void)
         encode_text(each->limit_item_line[2], "This isn't meant for me.");
     }
     index_limit_items(0);
+    /* (forms) none until the file gives them; numbered again at every reading */
+    for (i = 0; i < (int)sizeof forms; i++)
+        ((BYTE *)forms)[i] = 0;
+    form_count = 0;
+    form_read_like_names();
     text = read_whole_file(LIMITS_FILE_NAME, &size);
     if (!text)
         return;
@@ -27418,9 +29615,13 @@ static void load_limits(void)
             owner = NULL;
             c = NULL;
             state_section = NULL;
+            form_section = NULL;
             in_test = stop - start == 6 && word_is(start + 1, stop - 1, "test") && stop[-1] == ']';
             if (in_test) {
                 ;
+            } else if (stop - start > 6 && word_is(start + 1, start + 5, "form") && is_space(start[5])) {
+                /* [form NAME]: a model a limit may turn its user into; no character's */
+                problem = form_section_start(start + 5, stop, line_number, &form_section);
             } else if (!parse_number(&p, stop, &n) || !roster_character((int)n)) {
                 problem = "a section starts with the ID of a character defined in the character file: [12] or [12 1-1]";
             } else {
@@ -27482,6 +29683,7 @@ static void load_limits(void)
                         limit_follow_chain_draft = 0;
                         limit_swap_draft[0][0] = limit_swap_draft[1][0] = 0;
                         limit_state_draft[0] = 0;
+                        limit_form_draft[0] = 0;
                         limit_prop_draft[0] = 0;
                         limit_prop_bone_draft = PROP_BONE_WEAPON_HAND;
                         limit_prop_offset_draft[0] = limit_prop_offset_draft[1] = limit_prop_offset_draft[2] = 0;
@@ -27537,6 +29739,22 @@ static void load_limits(void)
                 else
                     problem = "the [test] section takes: full_gauge, learn_all_on_load = game character IDs";
             }
+        } else if (form_section) {
+            char *key_end, *value;
+
+            for (equals = start; equals < stop && *equals != '='; equals++)
+                ;
+            key_end = equals;
+            value = equals + 1;
+            if (equals == stop) {
+                problem = "expected key = value";
+            } else {
+                trim(&start, &key_end);
+                trim(&value, &stop);
+                problem = form_key(form_section, start, key_end, value, stop, form_like, form_like_count > 0 ? form_like_count : 0);
+            }
+            if (problem)
+                form_section->bad = 1;
         } else if (!c) {
             continue;
         } else {
@@ -27783,6 +30001,12 @@ static void load_limits(void)
                         limit_state_draft[0] = 0;
                     else if (!state_name(limit_state_draft, value, stop))
                         problem = "state is the name of one of the character's states, 1 to 15 letters, digits or _ (its section: [12 state NAME]), or none";
+                } else if (word_is(start, key_end, "form")) {
+                    /* NAME: the [form NAME] its user turns into (its section may come after the limit's) */
+                    if (word_is(value, stop, "none"))
+                        limit_form_draft[0] = 0;
+                    else if (!form_name(limit_form_draft, value, stop))
+                        problem = "form is the name of a [form NAME] section of this file, 1 to 15 letters, digits or _, or none";
                 } else if (word_is(start, key_end, "prop")) {
                     /* NAME: the model NAME.RSD (and the .P its PLY line names), looked for as an effect's model is */
                     problem = prop_name_value(limit_prop_draft, value, stop);
@@ -27879,6 +30103,7 @@ static void load_limits(void)
         finish_limit(&draft, owner, level, position, learned, kills, uses, start_line);
     VirtualFree(text, 0, MEM_RELEASE);
     finish_states();
+    errors += finish_forms();   /* (before the copies below: a copy_of character gets the numbers written) */
     {
         /* A character made with copy_of that the limits file says nothing about has the limits of
            the one it was copied from; repeated until nothing more is copied (a copy of a copy). Each
@@ -39567,6 +41792,802 @@ static int bl_actor_of(const BYTE *model)
     return (int)(offset / BL_ACTOR_STRIDE);
 }
 
+static void __cdecl bl_draw_body_hook(int pack, int animation, int frame, BYTE *model);
+
+/* ==== VERTEX BONES BEGIN ====
+   model_skinning = on (the game file; needs breaking_limits = on and wide_skeletons on or all, whose call at 0042fab2 it shares):
+   a model drawn in battle may name, in SpellExtConfig\skins\<first two letters of its part files>.skin, single vertices that
+   follow another bone than the part they are in. The game has one rigid part per bone, and a polygon that crosses two bones
+   has to live in one of them. The DLL rewrites the x y z of those vertices each time the model is drawn.
+   Where (read from the code, seen in the exe's bytes): 0042f3e8 clears skeleton+4 (0042f7e2) before its call at 0042fab2, and the
+   walk 006840da draws a part only when skeleton+4 is not 0 (00684995). So in battle the walk draws nothing: it sets every
+   matrix and fills the bone table the model's +0x90 names, entry bone + 1 = bone x root x camera; 0042f3e8 draws the parts
+   afterwards through 00684cc6 (00430212, 00430237, 00430258). When the game's 005e0d3c returns, every bone matrix of this frame
+   is final and nothing of this model has been drawn: this block runs there, in bl_draw_body_hook.
+   A vertex drawn by part P on bone p must land where bone t would put it: v x T_p = r x T_t, so v = r x T_t x inverse(T_p),
+   r its place in t's frame. Root, placement, scale and camera cancel. T carries scale, so the inverse is the general one; a
+   determinant near 0 skips the actor for that frame (the vertices keep the last frame's places).
+   Under FFNx the vertices drawn are the indexed primitive's (polygon set +0x50, [group], +0x10 vertices, 32 bytes each, x y z
+   first; +0x14 their count), copied once from the .p at load and sent again at every draw, normals worked out from them
+   (read from FFNx 1.24.3, and in 1.25.1's own code: load 1038a520, draw 10389c10, lit 10407450, unlit 10407610, normals 10404e30).
+   A file is taken whole or not at all, one log line saying why: any index out of range, a vertex that is not at the place the
+   file says (rx ry rz), a vertex listed twice, a part with no vertex arrays, code that is not the game's. A refused file writes
+   nothing. Nothing here waits, nothing is on a task list, and only this block's own vertices are written. No file: the model is
+   left alone, and one line says so with what was seen (bs_no_skin).
+   A part's name: the battle loads a part by the name the game asks for, "CLOUD.P11" (005e11cc: "%s.%c%02d" of the model's data
+   file, P and the bone), and the archive's four letters are made only inside the file open, by the source's callback. FFNx's
+   make_pc_name is given the asked name, so polygon_data +0x60 holds "battle/CLOUD_P11" (the dot made _; read from FFNx 1.24.3
+   and in 1.25.1's own code, load_p_file at 103934f0 and make_pc_name at 1044b790). bs_archive_stem turns it into "rtax" by the
+   same call the game's callback makes, so a file names parts as the archive does, whatever the model's data file is called.
+   A battle is not a scene load. A chained battle (0041c0bb, stage above 1) calls 005d1050 again through 004381d5, once a tick
+   while the last action displays, and keeps the party's models with their vertices moved; 0042a17d reloads only the enemies,
+   and 0042a330 can replace a party model in a battle, perhaps at the same addresses. So a record forgets nothing at a scene:
+   a new battle is a changed scene count at stage 1 or less. A READY record lives on across one such turn, marked suspect, and
+   every draw first checks it against the live model from the model's own pointers, bound by bound (bs_intact): bones, part
+   sets, groups, vertices, and that each vertex is where this block last left it. Any difference: the file is read again, at most
+   BS_RELOADS_MOST times a battle. */
+#define BS_FOLDER               "skins\\"
+#define BS_FILE_END             ".skin"
+#define BS_SITE_CLEAR           0x0042f7e2u  /* c7 40 04 00 00 00 00: movl $0,4(%eax): 0042f3e8 clears skeleton+4 */
+#define BS_SITE_WALK_TEST       0x00684995u  /* 83 79 04 00 74 22: the walk's cmpl $0,4(%ecx) / je, before its draw */
+#define BS_FN_WALK              0x006840dau  /* 55 8b ec 81 ec 34 02 00 00: the walk; FFNx puts an e9 here with external meshes on */
+#define BS_ADDR_MODEL_MODE      0x0090f964u  /* the renderer's mode; bit 0x8000: the walk stores the bone table */
+#define BS_ADDR_STAGE           0x009a8af8u  /* a dword: the battle's stage; 0 at start and end (0041b5b3, 0041b8e6), +1 at each scene (0041c105) */
+#define BS_MODE_TABLE           0x8000u
+#define BS_FLAG_TABLE           0x4000u      /* skeleton+0xc: the walk stores this skeleton's bone table */
+#define BS_MODELS               16           /* models with a skin record in one battle */
+#define BS_PARTS_MOST           512          /* parts looked at in one model */
+#define BS_ENTRIES_MOST         8192         /* lines of one file */
+#define BS_FILE_MOST            0x400000u    /* bytes of one file */
+#define BS_STEM_ROOM            16
+#define BS_RELOADS_MOST         4            /* a model whose parts change under it: read again this often in one battle */
+#define BS_LOG_MOST             64
+#define BS_PLACE_MOST           1000000.0    /* the largest number a file may hold, and the largest place written */
+#define BS_PLACE_CLOSE          0.01f        /* how near a vertex must be to rx ry rz */
+#define BS_DET_SMALL            1e-6         /* |det| below this part of the rows' lengths multiplied: near 0 */
+#define BS_ALL_KEYS             0x3ffu
+#define BS_TL_VERTICES          3u           /* indexed primitive +0xc, FFNx's TLVERTEX: the only kind not in model space. It is 1, 2 or 3 for
+                                                the .p's 0, 1, 2 (ff7gl_load_group; 1.25.1: 1038a5e5-1038a608), and only 3 is told apart when drawn */
+
+enum { BS_EMPTY = 0, BS_NONE, BS_REFUSED, BS_READY };
+
+struct bs_host {                    /* one part with rewritten vertices */
+    short bone, rsd;
+    const BYTE *set;                /* its polygon set, as loaded */
+    const BYTE *arrays;             /* the set's +0x50 */
+    double inverse[12];             /* this draw's inverse(T_p), rows of three */
+};
+
+struct bs_entry {
+    WORD host, group, vertex, bone;
+    float place[3];                 /* r, in the true bone's frame */
+    float rest[3];                  /* the vertex in the part's file */
+    float last[3];                  /* where this block last left it (rest until the first write) */
+};
+
+struct bs_skin {
+    BYTE *model;
+    const BYTE *skeleton;
+    int state, reloads, host_count, entry_count, top_bone, bones;
+    int suspect;                    /* kept across a battle's turn: not yet seen again in this battle */
+    int counted;                    /* in this battle's count of files in use: a file read again is not a second file */
+    int noted;                      /* its line saying why it has no skin was written in this battle */
+    char name[8];
+    struct bs_host *hosts;
+    struct bs_entry *entries;
+};
+
+struct bs_line {
+    char part[BS_STEM_ROOM];
+    double group, vertex, bone, place[3], rest[3];
+    unsigned seen;
+};
+
+static LONG bs_on, bs_asked, bs_settled, bs_logged;
+static LONG bs_battle = -1;
+static int bs_said, bs_seen, bs_used;
+static DWORD bs_draws, bs_vertices, bs_skipped;
+static double bs_largest;
+static struct bs_skin bs_skins[BS_MODELS];
+static struct { char stem[BS_STEM_ROOM]; short bone, rsd; } bs_parts[BS_PARTS_MOST];
+
+static BOOL bs_may_log(void)
+{
+    return InterlockedIncrement(&bs_logged) <= BS_LOG_MOST;
+}
+
+static double bs_abs(double v)
+{
+    return v < 0.0 ? -v : v;
+}
+
+/* The last component of a path, without its extension, in small letters. Its length; 0 when it does not fit. */
+static int bs_stem(const char *start, const char *end, char *out)
+{
+    const char *p, *from = start;
+    int n = 0;
+
+    for (p = start; p < end && *p; p++)
+        if (*p == '/' || *p == '\\')
+            from = p + 1;
+    for (p = from; p < end && *p && *p != '.'; p++) {
+        if (n >= BS_STEM_ROOM - 1)
+            return 0;
+        out[n++] = *p >= 'A' && *p <= 'Z' ? (char)(*p + 32) : *p;
+    }
+    out[n] = 0;
+    return n;
+}
+
+/* FN_ARCHIVE_NAME is what it was when this was built (or another module's jump, as state_weapon_prop_name allows). Looked at once. */
+static BOOL bs_archive_ok(void)
+{
+    static const BYTE first[6] = { 0x55, 0x8b, 0xec, 0x81, 0xec, 0x04 };
+    static int state;                   /* 0 not looked at, 1 as expected, -1 not */
+
+    if (!state) {
+        state = *(const BYTE *)FN_ARCHIVE_NAME == 0xe9 || bytes_are(FN_ARCHIVE_NAME, first, sizeof first) ? 1 : -1;
+        if (state < 0 && bs_may_log())
+            log_line("model_skinning: %08lx does not start as expected: part names stay as the driver gave them", FN_ARCHIVE_NAME);
+    }
+    return state > 0;
+}
+
+/* A stem as FFNx's name gives it, "cloud_p11", becomes the archive's four letters, "rtax", by the game's own call. Any other
+   stem, or a name the game's table does not know, is left as it is. Only the shape the game's call takes is passed to it (an
+   extension it does not know would show an error): a capital P and two digits, so a bone from 100 up keeps its stem. */
+static void bs_archive_stem(char *stem)
+{
+    char name[BS_STEM_ROOM], letters[16];
+    int n = lstrlenA(stem), k;
+
+    if (n < 5 || stem[n - 4] != '_' || stem[n - 3] != 'p' || stem[n - 2] < '0' || stem[n - 2] > '9' || stem[n - 1] < '0' || stem[n - 1] > '9')
+        return;
+    if (!bs_archive_ok())
+        return;
+    for (k = 0; k <= n; k++)
+        name[k] = stem[k] >= 'a' && stem[k] <= 'z' ? (char)(stem[k] - 32) : stem[k];
+    name[n - 4] = '.';
+    for (k = 0; k < (int)sizeof letters; k++)
+        letters[k] = 0;
+    archive_name_hook(ARCHIVE_PATTERNS, (void *)ADDR_ARCHIVE_PATTERNS, name, letters);
+    for (k = 0; k < 4; k++)
+        if (letters[k] < 'A' || letters[k] > 'Z')
+            return;                     /* the game's table has no such model: nothing was written */
+    if (letters[4])
+        return;
+    for (k = 0; k < 4; k++)
+        stem[k] = (char)(letters[k] + 32);
+    stem[4] = 0;
+}
+
+/* The polygon set of a bone's part `rsd`, as 00684cc6 reaches it, or NULL. */
+static const BYTE *bs_polygon_set(const BYTE *skeleton, int bone, int rsd)
+{
+    const BYTE *node = *(BYTE *const *)(skeleton + 0x14) + bone * 0x1c;
+    const BYTE *list = *(BYTE *const *)(node + 0x18), *data;
+
+    if (rsd >= *(const int *)(node + 0x10) || !list)
+        return NULL;
+    data = *(BYTE *const *)(list + rsd * 8 + 4);
+    return data ? *(BYTE *const *)(data + 4) : NULL;
+}
+
+/* A number of a file. The text after it, or NULL. */
+static const char *bs_number(const char *p, const char *end, double *out)
+{
+    double value = 0.0, scale = 1.0;
+    int negative = 0, digits = 0;
+
+    if (p < end && (*p == '-' || *p == '+'))
+        negative = *p++ == '-';
+    for (; p < end && *p >= '0' && *p <= '9'; p++, digits++)
+        value = value * 10.0 + (*p - '0');
+    if (p < end && *p == '.')
+        for (p++; p < end && *p >= '0' && *p <= '9'; p++, digits++) {
+            scale /= 10.0;
+            value += (*p - '0') * scale;
+        }
+    if (!digits || value > BS_PLACE_MOST)
+        return NULL;
+    *out = negative ? -value : value;
+    return p;
+}
+
+/* One line of a file: part=rtam group=0 vertex=17 bone=7 x=.. y=.. z=.. rx=.. ry=.. rz=.. ; comment
+   What is wrong with it, or NULL. No keys at all (a comment or an empty line): out->seen stays 0. */
+static const char *bs_read_line(const char *p, const char *stop, struct bs_line *out)
+{
+    static const char *const names[] = { "group", "vertex", "bone", "x", "y", "z", "rx", "ry", "rz" };
+    double *const slots[] = { &out->group, &out->vertex, &out->bone, &out->place[0], &out->place[1], &out->place[2],
+                              &out->rest[0], &out->rest[1], &out->rest[2] };
+    int k;
+
+    out->seen = 0;
+    for (;;) {
+        const char *key, *key_end, *value;
+
+        while (p < stop && (*p == ' ' || *p == '\t' || *p == '\r'))
+            p++;
+        if (p >= stop || *p == ';' || *p == '#')
+            break;
+        key = p;
+        while (p < stop && *p != '=' && *p != ' ' && *p != '\t' && *p != '\r')
+            p++;
+        key_end = p;
+        if (p >= stop || *p != '=')
+            return "a word that is not key=value";
+        value = ++p;
+        while (p < stop && *p != ' ' && *p != '\t' && *p != '\r' && *p != ';' && *p != '#')
+            p++;
+        if (word_is(key, key_end, "part")) {
+            if (out->seen & 1)
+                return "a key given twice";
+            out->seen |= 1;
+            if (!bs_stem(value, p, out->part))
+                return "a part name that does not fit";
+            continue;
+        }
+        for (k = 0; k < 9 && !word_is(key, key_end, names[k]); k++)
+            ;
+        if (k == 9)
+            return "a key it does not know";
+        if (out->seen & (2u << k))
+            return "a key given twice";
+        out->seen |= 2u << k;
+        if (bs_number(value, p, slots[k]) != p)
+            return "a value that is not a plain number";
+    }
+    if (out->seen && out->seen != BS_ALL_KEYS)
+        return "a line without all ten keys (part group vertex bone x y z rx ry rz)";
+    if (out->seen && (out->group != (int)out->group || out->vertex != (int)out->vertex || out->bone != (int)out->bone))
+        return "a group, vertex or bone that is not a whole number";
+    return NULL;
+}
+
+/* The code this block leans on, as the game has it. What is not, or NULL. */
+static const char *bs_code_problem(void)
+{
+    static const BYTE clear[] = { 0xc7, 0x40, 0x04, 0x00, 0x00, 0x00, 0x00 };
+    static const BYTE walk_test[] = { 0x83, 0x79, 0x04, 0x00, 0x74, 0x22 };
+    static const BYTE walk[] = { 0x55, 0x8b, 0xec, 0x81, 0xec, 0x34, 0x02, 0x00, 0x00 };
+    const BYTE *site = (const BYTE *)BL_SITE_DRAW_BODY;
+
+    if (site[0] != 0xe8 || BL_SITE_DRAW_BODY + 5 + *(const DWORD *)(site + 1) != (DWORD)bl_draw_body_hook)
+        return "the call at 0042fab2 is not this DLL's";
+    if (!bytes_are(BS_SITE_CLEAR, clear, sizeof clear))
+        return "the code at 0042f7e2 is not the game's (it clears skeleton+4)";
+    if (!bytes_are(BS_SITE_WALK_TEST, walk_test, sizeof walk_test))
+        return "the code at 00684995 is not the game's (the walk's test of skeleton+4)";
+    if (!bytes_are(BS_FN_WALK, walk, sizeof walk))
+        return "the first bytes of the walk 006840da are not the game's (FFNx's external meshes?)";
+    return NULL;
+}
+
+/* The bones the walk visits, marked in `visited` (entries bone, 0 or 1). */
+static void bs_walk_bones(const BYTE *skeleton, int bones, BYTE *visited)
+{
+    const BYTE *list = *(BYTE *const *)(skeleton + 0x1c);
+    const BYTE *node = list ? *(BYTE *const *)(list + 0xc) : NULL;
+    int guard;
+
+    for (guard = 0; node && guard < 4096; guard++) {
+        int bone = *(const short *)(node + 6);
+
+        if (*(const short *)(node + 4) == 1 && bone >= 0 && bone < bones)
+            visited[bone] = 1;
+        node = *(BYTE *const *)node;
+    }
+}
+
+/* One line of a file checked against the loaded model and put in the record. What is wrong, or NULL. */
+static const char *bs_take_line(struct bs_skin *skin, const BYTE *skeleton, int bones, int parts, const BYTE *visited, const struct bs_line *line)
+{
+    const BYTE *set = NULL, *arrays, *primitive, *vertex;
+    const float *place;
+    struct bs_entry *entry = &skin->entries[skin->entry_count];
+    int k, found = -1, host;
+
+    for (k = 0; k < parts; k++)
+        if (!lstrcmpA(bs_parts[k].stem, line->part)) {
+            if (found >= 0)
+                return "a part that two bones of the model hold";
+            found = k;
+        }
+    if (found < 0)
+        return "a part the model does not have";
+    if (line->bone < 0 || line->bone >= bones)
+        return "a bone out of range";
+    if ((int)line->bone == bs_parts[found].bone)
+        return "a vertex given the bone of its own part";
+    if (!visited[(int)line->bone] || !visited[bs_parts[found].bone])
+        return "a bone the skeleton's walk does not visit";
+    set = bs_polygon_set(skeleton, bs_parts[found].bone, bs_parts[found].rsd);
+    if (!set || IsBadReadPtr(set, 0x54))
+        return "a part with no polygon set";
+    arrays = *(BYTE *const *)(set + 0x50);
+    if (!arrays)
+        return "a part with no vertex arrays (polygon set +0x50 is empty: not FFNx?)";
+    if (line->group < 0 || line->group >= *(const int *)(set + 0x10))
+        return "a group out of range";
+    if (IsBadReadPtr(arrays, (line->group + 1) * 4))
+        return "a part whose vertex arrays cannot be read";
+    primitive = *(BYTE *const *)(arrays + (int)line->group * 4);
+    if (!primitive || IsBadReadPtr(primitive, 0x28))
+        return "a group with no vertex array";
+    if (*(const DWORD *)(primitive + 4) != 32 || *(const DWORD *)(primitive + 0xc) == BS_TL_VERTICES)
+        return "a group whose vertices are not the 32-byte model-space ones";
+    vertex = *(BYTE *const *)(primitive + 0x10);
+    if (line->vertex < 0 || line->vertex >= *(const int *)(primitive + 0x14))
+        return "a vertex out of range";
+    if (!vertex || IsBadWritePtr((void *)vertex, *(const DWORD *)(primitive + 0x14) * 32))
+        return "a group whose vertices cannot be written";
+    place = (const float *)(vertex + (int)line->vertex * 32);
+    for (k = 0; k < 3; k++)
+        if (bs_abs(place[k] - line->rest[k]) > BS_PLACE_CLOSE)
+            return "a vertex that is not at rx ry rz (a file for another build of the part?)";
+    for (host = 0; host < skin->host_count; host++)
+        if (skin->hosts[host].bone == bs_parts[found].bone && skin->hosts[host].rsd == bs_parts[found].rsd)
+            break;
+    for (k = 0; k < skin->entry_count; k++)
+        if (skin->entries[k].host == host && skin->entries[k].group == (int)line->group && skin->entries[k].vertex == (int)line->vertex)
+            return "a vertex listed twice";
+    if (host == skin->host_count) {
+        skin->hosts[host].bone = bs_parts[found].bone;
+        skin->hosts[host].rsd = bs_parts[found].rsd;
+        skin->hosts[host].set = set;
+        skin->hosts[host].arrays = arrays;
+        skin->host_count++;
+    }
+    entry->host = (WORD)host;
+    entry->group = (WORD)line->group;
+    entry->vertex = (WORD)line->vertex;
+    entry->bone = (WORD)line->bone;
+    for (k = 0; k < 3; k++) {
+        entry->place[k] = (float)line->place[k];
+        entry->rest[k] = place[k];
+        entry->last[k] = place[k];
+    }
+    if ((int)line->bone > skin->top_bone)
+        skin->top_bone = (int)line->bone;
+    if (bs_parts[found].bone > skin->top_bone)
+        skin->top_bone = bs_parts[found].bone;
+    skin->entry_count++;
+    return NULL;
+}
+
+/* The battle line's count: one for a record, however often its file was read. */
+static void bs_count_used(struct bs_skin *skin)
+{
+    if (!skin->counted) {
+        skin->counted = 1;
+        bs_used++;
+    }
+}
+
+static void bs_free(struct bs_skin *skin)
+{
+    if (skin->hosts)
+        VirtualFree(skin->hosts, 0, MEM_RELEASE);
+    skin->hosts = NULL;
+    skin->entries = NULL;
+    skin->host_count = skin->entry_count = 0;
+    skin->top_bone = -1;
+}
+
+/* Every line of a file taken into `skin`. What is wrong (*at_line its number), or NULL. */
+static const char *bs_read_file(struct bs_skin *skin, const BYTE *skeleton, int bones, int parts, const char *text, DWORD size, int *at_line)
+{
+    static BYTE visited[BL_WIDE_ENTRIES];
+    const char *p = text, *end = text + size;
+    const char *problem;
+    struct bs_line line;
+    int count = 0, k;
+
+    for (k = 0; k < BL_WIDE_ENTRIES; k++)
+        visited[k] = 0;
+    bs_walk_bones(skeleton, bones, visited);
+    *at_line = 0;
+    while (p < end) {                   /* the first look: the size of the record, and every line's form */
+        const char *stop = p;
+
+        while (stop < end && *stop != '\n')
+            stop++;
+        ++*at_line;
+        if ((problem = bs_read_line(p, stop, &line)) != NULL)
+            return problem;
+        if (line.seen && ++count > BS_ENTRIES_MOST)
+            return "more lines than one file may hold";
+        p = stop + 1;
+    }
+    *at_line = 0;
+    if (!count)
+        return "no lines";
+    skin->hosts = VirtualAlloc(NULL, count * (sizeof(struct bs_host) + sizeof(struct bs_entry)), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!skin->hosts)
+        return "no memory";
+    skin->entries = (struct bs_entry *)(skin->hosts + count);
+    for (p = text; p < end; ) {
+        const char *stop = p;
+
+        while (stop < end && *stop != '\n')
+            stop++;
+        ++*at_line;
+        bs_read_line(p, stop, &line);
+        if (line.seen && (problem = bs_take_line(skin, skeleton, bones, parts, visited, &line)) != NULL)
+            return problem;
+        p = stop + 1;
+    }
+    return NULL;
+}
+
+/* What bs_load saw of a model's part sets, for the line that says why it has no skin. */
+struct bs_seen_parts {
+    int bones, looked, no_set, no_data, no_name;
+    const char *first_name;             /* polygon_data +0x60 of the first part with one, as the driver wrote it */
+    const char *first_stem;
+};
+
+/* One line, once per model per battle, under bs_may_log's limit: a model with no skin, and why. `file` may be empty. */
+static void bs_no_skin(struct bs_skin *skin, const struct bs_seen_parts *seen, const char *why, const char *file)
+{
+    if (skin->noted)
+        return;
+    skin->noted = 1;
+    if (bs_may_log())
+        log_line("model_skinning: a model of %d bones has no skin: %s; part sets looked at %d, without a set %d, without data %d, without a name %d; first name '%.47s', first stem '%s'; file '%s' %s",
+                 seen->bones, why, seen->looked, seen->no_set, seen->no_data, seen->no_name, seen->first_name ? seen->first_name : "",
+                 seen->first_stem ? seen->first_stem : "", file, file[0] ? "did not open" : "not tried");
+}
+
+/* A model's first draw of a battle: its file is looked for, and taken or refused whole. */
+static void bs_load(struct bs_skin *skin, const BYTE *skeleton)
+{
+    const char *problem = NULL;
+    char file[64], *text;
+    DWORD size = 0;
+    int bones = *(const int *)(skeleton + 0x10), bone, rsd, parts = 0, at_line = 0;
+    struct bs_seen_parts seen;
+
+    skin->skeleton = skeleton;
+    skin->state = BS_NONE;
+    skin->suspect = 0;
+    skin->name[0] = 0;
+    bs_free(skin);
+    seen.bones = bones;
+    seen.looked = seen.no_set = seen.no_data = seen.no_name = 0;
+    seen.first_name = seen.first_stem = NULL;
+    if (bones < 1 || bones >= BL_WIDE_ENTRIES || !*(BYTE *const *)(skeleton + 0x14)) {
+        bs_no_skin(skin, &seen, "a bone count out of range, or no bones array", "");
+        return;
+    }
+    for (bone = 0; bone < bones; bone++) {
+        int count = *(const int *)(*(BYTE *const *)(skeleton + 0x14) + bone * 0x1c + 0x10);
+
+        for (rsd = 0; rsd < count && parts < BS_PARTS_MOST; rsd++) {
+            const BYTE *set = bs_polygon_set(skeleton, bone, rsd), *data;
+            const char *name;
+
+            seen.looked++;
+            if (!set || IsBadReadPtr(set, 0x34)) {
+                seen.no_set++;
+                continue;
+            }
+            if (!(data = *(BYTE *const *)(set + 0x30)) || IsBadReadPtr(data, 0x64)) {
+                seen.no_data++;
+                continue;
+            }
+            name = *(const char *const *)(data + 0x60);
+            if (!name || IsBadStringPtrA(name, 1024) || !bs_stem(name, name + 1024, bs_parts[parts].stem)) {
+                seen.no_name++;
+                continue;
+            }
+            bs_archive_stem(bs_parts[parts].stem);
+            if (!seen.first_name) {
+                seen.first_name = name;
+                seen.first_stem = bs_parts[parts].stem;
+            }
+            bs_parts[parts].bone = (short)bone;
+            bs_parts[parts].rsd = (short)rsd;
+            parts++;
+        }
+    }
+    if (!parts) {
+        bs_no_skin(skin, &seen, "no part has a name (not FFNx's loader?): no file can be chosen", "");
+        return;
+    }
+    if (!((bs_parts[0].stem[0] >= 'a' && bs_parts[0].stem[0] <= 'z') || (bs_parts[0].stem[0] >= '0' && bs_parts[0].stem[0] <= '9')) ||
+        !((bs_parts[0].stem[1] >= 'a' && bs_parts[0].stem[1] <= 'z') || (bs_parts[0].stem[1] >= '0' && bs_parts[0].stem[1] <= '9'))) {
+        bs_no_skin(skin, &seen, "the first stem does not start with two small letters or digits", "");
+        return;
+    }
+    skin->name[0] = bs_parts[0].stem[0];
+    skin->name[1] = bs_parts[0].stem[1];
+    skin->name[2] = 0;
+    lstrcpyA(file, BS_FOLDER);
+    lstrcatA(file, skin->name);
+    lstrcatA(file, BS_FILE_END);
+    text = read_whole_file(file, &size);
+    if (!text) {
+        bs_no_skin(skin, &seen, "no file for it", file);
+        return;
+    }
+    if (size > BS_FILE_MOST)
+        problem = "a file above 4 MB";
+    else if ((problem = bs_code_problem()) == NULL)
+        problem = bs_read_file(skin, skeleton, bones, parts, text, size, &at_line);
+    VirtualFree(text, 0, MEM_RELEASE);
+    if (problem) {
+        bs_free(skin);
+        skin->state = BS_REFUSED;
+        if (bs_may_log())
+            log_line("model_skinning: %s refused whole, nothing is written: %s (line %d)", file, problem, at_line);
+        return;
+    }
+    skin->bones = bones;
+    skin->state = BS_READY;
+    bs_count_used(skin);
+    if (bs_may_log())
+        log_line("model_skinning: %s taken: %d vertices in %d part(s) of a model of %d bones", file, skin->entry_count, skin->host_count, bones);
+}
+
+/* The inverse of a matrix of the bone table (16 floats, rows, translation in 12-14) as four rows of three.
+   FALSE: its determinant is near 0 (or not a number). */
+static BOOL bs_inverse(const float *m, double *out)
+{
+    double a = m[0], b = m[1], c = m[2], d = m[4], e = m[5], f = m[6], g = m[8], h = m[9], i = m[10];
+    double c0 = e * i - f * h, c1 = c * h - b * i, c2 = b * f - c * e;
+    double det = a * c0 + d * c1 + g * c2;
+    double rows = (a * a + b * b + c * c) * (d * d + e * e + f * f) * (g * g + h * h + i * i);
+    double x = m[12], y = m[13], z = m[14];
+
+    if (!(det * det > BS_DET_SMALL * BS_DET_SMALL * rows))
+        return FALSE;
+    out[0] = c0 / det;
+    out[1] = c1 / det;
+    out[2] = c2 / det;
+    out[3] = (f * g - d * i) / det;
+    out[4] = (a * i - c * g) / det;
+    out[5] = (c * d - a * f) / det;
+    out[6] = (d * h - e * g) / det;
+    out[7] = (b * g - a * h) / det;
+    out[8] = (a * e - b * d) / det;
+    out[9] = -(x * out[0] + y * out[3] + z * out[6]);
+    out[10] = -(x * out[1] + y * out[4] + z * out[7]);
+    out[11] = -(x * out[2] + y * out[5] + z * out[8]);
+    return TRUE;
+}
+
+/* out = T_t x inverse(T_p), four rows of three. */
+static void bs_relative(const float *t, const double *inverse, double *out)
+{
+    int row, column;
+
+    for (row = 0; row < 3; row++)
+        for (column = 0; column < 3; column++)
+            out[row * 3 + column] = t[row * 4] * inverse[column] + t[row * 4 + 1] * inverse[3 + column] + t[row * 4 + 2] * inverse[6 + column];
+    for (column = 0; column < 3; column++)
+        out[9 + column] = t[12] * inverse[column] + t[13] * inverse[3 + column] + t[14] * inverse[6 + column] + inverse[9 + column];
+}
+
+/* Does the record still fit the model being drawn? Reached only through the live skeleton, every index bounded before it is used:
+   the record's own pointers are compared, never followed. FALSE: the model is not the one the file was taken for, or something
+   else moved a vertex. */
+static BOOL bs_intact(const struct bs_skin *skin, const BYTE *skeleton)
+{
+    int k, axis;
+
+    if (*(const int *)(skeleton + 0x10) != skin->bones || !*(BYTE *const *)(skeleton + 0x14))
+        return FALSE;
+    for (k = 0; k < skin->host_count; k++) {
+        const struct bs_host *host = &skin->hosts[k];
+        const BYTE *set = bs_polygon_set(skeleton, host->bone, host->rsd);
+
+        if (set != host->set || !set || *(BYTE *const *)(set + 0x50) != host->arrays || !host->arrays)
+            return FALSE;
+    }
+    for (k = 0; k < skin->entry_count; k++) {
+        const struct bs_entry *entry = &skin->entries[k];
+        const struct bs_host *host = &skin->hosts[entry->host];
+        const BYTE *primitive;
+        const float *vertex;
+
+        if (entry->group >= *(const int *)(host->set + 0x10))
+            return FALSE;
+        primitive = *(BYTE *const *)(host->arrays + entry->group * 4);
+        if (!primitive || entry->vertex >= *(const int *)(primitive + 0x14) || !*(BYTE *const *)(primitive + 0x10))
+            return FALSE;
+        vertex = (const float *)(*(BYTE *const *)(primitive + 0x10) + entry->vertex * 32);
+        for (axis = 0; axis < 3; axis++)
+            if (vertex[axis] != entry->last[axis])
+                return FALSE;
+    }
+    return TRUE;
+}
+
+/* This draw's places. `table`: the bone table this draw filled. */
+static void bs_rewrite(struct bs_skin *skin, const BYTE *skeleton, const float *table, int table_entries)
+{
+    double relative[12];
+    int k, last_host = -1, last_bone = -1;
+
+    if (!bs_intact(skin, skeleton)) {   /* the model was loaded again under this record */
+        skin->state = ++skin->reloads > BS_RELOADS_MOST ? BS_NONE : BS_EMPTY;
+        bs_free(skin);
+        return;
+    }
+    if (skin->suspect) {                /* a record kept from the last battle: this model is still that one */
+        skin->suspect = 0;
+        bs_count_used(skin);
+    }
+    if (skin->top_bone + 1 >= table_entries)
+        return;
+    for (k = 0; k < skin->host_count; k++)
+        if (!bs_inverse(table + (skin->hosts[k].bone + 1) * 16, skin->hosts[k].inverse)) {
+            bs_skipped++;
+            return;
+        }
+    for (k = 0; k < skin->entry_count; k++) {
+        struct bs_entry *entry = &skin->entries[k];
+        const struct bs_host *host = &skin->hosts[entry->host];
+        const BYTE *primitive = *(BYTE *const *)(host->arrays + entry->group * 4);
+        double x = entry->place[0], y = entry->place[1], z = entry->place[2], out[3], moved;
+        float *vertex;
+        int axis;
+
+        if (entry->host != last_host || entry->bone != last_bone) {
+            bs_relative(table + (entry->bone + 1) * 16, host->inverse, relative);
+            last_host = entry->host;
+            last_bone = entry->bone;
+        }
+        moved = 0.0;
+        for (axis = 0; axis < 3; axis++) {
+            out[axis] = x * relative[axis] + y * relative[3 + axis] + z * relative[6 + axis] + relative[9 + axis];
+            if (!(bs_abs(out[axis]) < BS_PLACE_MOST))
+                break;
+            moved += (out[axis] - entry->rest[axis]) * (out[axis] - entry->rest[axis]);
+        }
+        if (axis < 3)
+            continue;                   /* not a place: the bone table held no number */
+        vertex = (float *)(*(BYTE *const *)(primitive + 0x10) + entry->vertex * 32);
+        vertex[0] = (float)out[0];
+        vertex[1] = (float)out[1];
+        vertex[2] = (float)out[2];
+        entry->last[0] = vertex[0];
+        entry->last[1] = vertex[1];
+        entry->last[2] = vertex[2];
+        bs_vertices++;
+        if (moved > bs_largest)
+            bs_largest = moved;
+    }
+    bs_draws++;
+}
+
+static int bs_root(double v)
+{
+    double r = v > 1.0 ? v : 1.0;
+    int k;
+
+    for (k = 0; k < 40; k++)
+        r = (r + v / r) / 2.0;
+    return (int)r;
+}
+
+/* The one line of a battle. At its end, or at the next battle's first draw when the end was not seen. */
+static void bs_log_battle(void)
+{
+    if (!bs_on || bs_said || !bs_seen)
+        return;
+    bs_said = 1;
+    log_line("model_skinning: this battle: %d skin file(s) in use; %lu vertices rewritten in %lu model draws of %d; %lu draws skipped (determinant near 0); the largest move from a vertex's place in its file was %d units",
+             bs_used, bs_vertices, bs_draws, bs_seen, bs_skipped, bs_root(bs_largest));
+}
+
+static void bs_battle_turn(void)
+{
+    int k;
+
+    bs_log_battle();
+    for (k = 0; k < BS_MODELS; k++) {
+        struct bs_skin *skin = &bs_skins[k];
+
+        skin->reloads = 0;
+        skin->counted = 0;
+        skin->noted = 0;
+        if (skin->state == BS_READY && !skin->suspect) {
+            skin->suspect = 1;
+            continue;
+        }
+        bs_free(skin);
+        skin->model = NULL;
+        skin->state = BS_EMPTY;
+        skin->suspect = 0;
+    }
+    bs_battle = battles_logged;
+    bs_said = bs_seen = bs_used = 0;
+    bs_draws = bs_vertices = bs_skipped = 0;
+    bs_largest = 0.0;
+}
+
+/* In bl_draw_body_hook, after the game's 005e0d3c, on each way that drew. `table`: the bone table that draw filled, NULL for
+   the one the model's +0x90 names; `table_entries` its entries. */
+static void bs_after_draw(int pack, int animation, int frame, BYTE *model, const float *table, int table_entries)
+{
+    const BYTE *skeleton, *record;
+    const BYTE *const *list;
+    struct bs_skin *skin = NULL;
+    int k;
+
+    if (!bs_on || !model)
+        return;
+    if (bs_battle != battles_logged && *(const int *)BS_ADDR_STAGE <= 1)
+        bs_battle_turn();
+    skeleton = *(BYTE *const *)(model + 4);
+    list = *(const BYTE *const *const *)(model + (pack ? 0x14 : 0xc));
+    if (!table)
+        table = *(const float *const *)(model + 0x90);
+    if (!skeleton || !table || !list || animation < 0 || animation >= *(const int *)(model + (pack ? 0x10 : 8)))
+        return;                         /* as 005e0d3c and the walk: this frame's table was not written */
+    record = list[animation];
+    if (!record || frame < 0 || frame >= *(const int *)(record + 4))
+        return;
+    if (*(const int *)(skeleton + 4) || !(*(const DWORD *)(skeleton + 0xc) & BS_FLAG_TABLE) || !(*(const DWORD *)BS_ADDR_MODEL_MODE & BS_MODE_TABLE))
+        return;                         /* not the battle's way: parts drawn in the walk, or no table */
+    bs_seen++;
+    for (k = 0; k < BS_MODELS && !skin; k++)
+        if (bs_skins[k].model == model)
+            skin = &bs_skins[k];
+    for (k = 0; k < BS_MODELS && !skin; k++)
+        if (!bs_skins[k].model) {
+            skin = &bs_skins[k];
+            skin->model = model;
+            skin->state = BS_EMPTY;
+        }
+    for (k = 0; k < BS_MODELS && !skin; k++)
+        if (bs_skins[k].suspect) {      /* full: last battle's record that nothing has claimed */
+            skin = &bs_skins[k];
+            bs_free(skin);
+            skin->model = model;
+            skin->state = BS_EMPTY;
+            skin->suspect = 0;
+        }
+    if (!skin)
+        return;
+    if (skin->state != BS_EMPTY && skin->skeleton != skeleton) {        /* whatever the record said, it said of another skeleton */
+        if (++skin->reloads > BS_RELOADS_MOST) {
+            bs_free(skin);
+            skin->skeleton = skeleton;
+            skin->state = BS_NONE;
+            return;
+        }
+        skin->state = BS_EMPTY;
+    }
+    if (skin->state == BS_EMPTY)
+        bs_load(skin, skeleton);
+    if (skin->state == BS_READY)
+        bs_rewrite(skin, skeleton, table, table_entries);
+}
+
+/* After each reading of the game file, behind bl_keys_settle: taken once, at the first reading. */
+static void bs_keys_settle(void)
+{
+    if (InterlockedExchange(&bs_settled, 1)) {
+        if (bs_asked != bs_on)
+            log_line("model_skinning: the game file now asks for %s; it is %s for this run (taken at start-up): restart the game for the change",
+                     bs_asked ? "on" : "off", bs_on ? "on" : "off");
+        return;
+    }
+    if (!bs_asked)
+        return;
+    if (bl_mode == BL_OFF) {
+        log_line("model_skinning: NOT on: it needs breaking_limits = on and wide_skeletons on (the call at %08lx): no skin file is read", BL_SITE_DRAW_BODY);
+        return;
+    }
+    bs_on = 1;
+    log_line("model_skinning: on: a battle model's %s<first two letters of its parts>%s is honoured", BS_FOLDER, BS_FILE_END);
+}
+/* ==== VERTEX BONES END ==== */
+
 /* At 0042fab2, in place of the game's call of model_battle_draw_body. */
 static void __cdecl bl_draw_body_hook(int pack, int animation, int frame, BYTE *model)
 {
@@ -39576,6 +42597,7 @@ static void __cdecl bl_draw_body_hook(int pack, int animation, int frame, BYTE *
 
     if (bl_mode == BL_OFF || !model || (actor = bl_actor_of(model)) < 0) {
         ((bl_draw_body_fn)BL_FN_DRAW_BODY)(pack, animation, frame, model);
+        bs_after_draw(pack, animation, frame, model, NULL, BL_GAME_ENTRIES);
         return;
     }
     skeleton = *(BYTE *const *)(model + 4);
@@ -39583,6 +42605,7 @@ static void __cdecl bl_draw_body_hook(int pack, int animation, int frame, BYTE *
         bones = *(const int *)(skeleton + 0x10);
     if (bl_mode != BL_ALL && bones <= BL_GAME_BONES) {
         ((bl_draw_body_fn)BL_FN_DRAW_BODY)(pack, animation, frame, model);
+        bs_after_draw(pack, animation, frame, model, NULL, BL_GAME_ENTRIES);
         return;
     }
     if (bones >= BL_WIDE_ENTRIES) {     /* the game's tables would be overrun, and so would these: not drawn */
@@ -39603,6 +42626,7 @@ static void __cdecl bl_draw_body_hook(int pack, int animation, int frame, BYTE *
     pointers[0] = (DWORD)bl_places[actor];
     pointers[1] = (DWORD)bl_matrices[actor];
     ((bl_draw_body_fn)BL_FN_DRAW_BODY)(pack, animation, frame, model);
+    bs_after_draw(pack, animation, frame, model, bl_matrices[actor][0], BL_WIDE_ENTRIES);
     pointers[0] = game_places;
     pointers[1] = game_matrices;
     copy_bytes((BYTE *)game_places, (const BYTE *)bl_places[actor], BL_GAME_ENTRIES * 12);
@@ -39771,6 +42795,7 @@ static void bl_keys_begin(void)
     bl_master_asked = 0;
     bl_wide_asked = BL_ON;          /* each item is on when breaking_limits is, unless its own key says off */
     bl_wide_given = 0;
+    bs_asked = 0;
 }
 
 /* 0: not a key of this block; 1: read; -1: a mistake (*fault says what; the key keeps its default). */
@@ -39784,6 +42809,18 @@ static int bl_key_line(char *start, char *key_end, char *value, char *stop, cons
         else {
             bl_master_asked = 0;
             *fault = "breaking_limits must be on or off: off is used";
+            return -1;
+        }
+        return 1;
+    }
+    if (word_is(start, key_end, "model_skinning")) {
+        if (word_is(value, stop, "on") || word_is(value, stop, "yes"))
+            bs_asked = 1;
+        else if (word_is(value, stop, "off") || word_is(value, stop, "no"))
+            bs_asked = 0;
+        else {
+            bs_asked = 0;
+            *fault = "model_skinning must be on or off: off is used";
             return -1;
         }
         return 1;
@@ -39860,10 +42897,11 @@ static void bl_keys_settle(void)
    BTLMD: a script battle that may not be escaped or lost stays so). */
 /* TEST BATTLE PURE BEGIN */
 #define TEST_BATTLE_OFF         (-1)
-#define TEST_BATTLE_LAST        1023    /* the field and the world map keep the number in 10 bits: 256 scenes of 4 formations */
+#define TEST_BATTLE_LAST        16383   /* the game's scenes: battles 0-1023 (256 scenes of 4 formations); 1024-16383: a DLL scene's (enemies = on: test_battle_settle) */
+#define TEST_BATTLE_GAME_LAST   1023
 
-/* test_battle's value: off / no / 0 (off), a battle number 1 to 1023 (decimal or 0x), or
-   scene:formation (scene 0 to 255, formation 0 to 3; 0:0 is battle 0). FALSE on a mistake. */
+/* test_battle's value: off / no / 0 (off), a battle number 1 to 16383 (decimal or 0x), or
+   scene:formation (scene 0 to 4095, formation 0 to 3; 0:0 is battle 0). FALSE on a mistake. */
 static BOOL test_battle_value(char *value, char *stop, LONG *out)
 {
     char *p = value;
@@ -39884,7 +42922,7 @@ static BOOL test_battle_value(char *value, char *stop, LONG *out)
     if (*p != ':')
         return FALSE;
     p++;
-    if (!parse_number(&p, stop, &formation) || p != stop || first > 255 || formation > 3)
+    if (!parse_number(&p, stop, &formation) || p != stop || first > TEST_BATTLE_LAST / 4 || formation > 3)
         return FALSE;
     *out = (LONG)(first * 4 + formation);
     return TRUE;
@@ -39897,18 +42935,43 @@ static BOOL test_battle_value(char *value, char *stop, LONG *out)
 #define TEST_BATTLE_LOG_MAX     100
 static LONG test_battle = TEST_BATTLE_OFF, test_battle_logged, test_battle_hook;   /* hook: 0 not tried, 1 on, -1 refused */
 
+static LONG enemies_map_wanted(WORD game, char *why);                   /* (enemies) [battle_map]: a DLL battle, or -1 */
+static BOOL enemies_hand_over(WORD game, LONG wanted, const char *why);  /* (enemies) builds it: FALSE = refused, the game's plays */
+static LONG battle_menu_pending = -1;   /* (battle menu) the battle the SpellExt menu's page asked the field for, -1 none */
+static BOOL battle_menu_at_hand_over(WORD number);     /* (battle menu) TRUE: this is the page's battle (its test mode is set) */
+
 static int __cdecl battle_number_hook(int op, int a, int b, int c, int d, int e, int f, int g, int h)
 {
     int result = ((int (__cdecl *)(int, int, int, int, int, int, int, int, int))FN_SOUND_OPERATION)(op, a, b, c, d, e, f, g, h);
-    LONG wanted = test_battle;
+    LONG wanted = -1;
     WORD *number = (WORD *)ADDR_BATTLE_NUMBER;
+    char why[64];
 
-    if (wanted >= 0) {
-        if (InterlockedIncrement(&test_battle_logged) <= TEST_BATTLE_LOG_MAX)
-            log_line("test_battle: battle %u (scene %u, formation %u) replaced by battle %ld (scene %ld, formation %ld)",
-                     *number, *number >> 2, *number & 3, wanted, wanted >> 2, wanted & 3);
-        *number = (WORD)wanted;
+    if ((battle_menu_pending >= 0 || battle_menu_owed) && battle_menu_at_hand_over(*number)) {
+        /* (battle menu) the page's battle, before [battle_map] and test_battle: a DLL scene's number, built as the
+           field's own (refused, the load plays its stand-in, as for a field's BATTLE) */
+        lstrcpyA(why, "battle menu");
+        enemies_hand_over(*number, *number, why);
+        return result;
     }
+    lstrcpyA(why, "test_battle");
+    if (enemies_live)
+        wanted = enemies_map_wanted(*number, why);  /* (enemies) a map line first: a test_battle covers the rest */
+    if (wanted < 0 && (wanted = test_battle) >= 0 && InterlockedIncrement(&test_battle_logged) <= TEST_BATTLE_LOG_MAX)
+        log_line("test_battle: battle %u (scene %u, formation %u) replaced by battle %ld (scene %ld, formation %ld)",
+                 *number, *number >> 2, *number & 3, wanted, wanted >> 2, wanted & 3);
+    if (wanted < 0 && enemies_live && *number > TEST_BATTLE_GAME_LAST && *number <= TEST_BATTLE_LAST) {
+        /* (enemies) the field asked for a DLL battle itself (its BATTLE opcode): built now; refused, the load
+           plays its stand-in (load_scene_hook) */
+        lstrcpyA(why, "the field's own number");
+        enemies_hand_over(*number, *number, why);
+        return result;
+    }
+    if (wanted < 0)
+        return result;
+    if (wanted > TEST_BATTLE_GAME_LAST && (!enemies_live || !enemies_hand_over(*number, wanted, why)))
+        return result;                  /* (enemies) refused (said): the game's own battle plays */
+    *number = (WORD)wanted;
     return result;
 }
 
@@ -39917,6 +42980,11 @@ static void test_battle_settle(void)
 {
     static LONG was_on;
 
+    if (test_battle > TEST_BATTLE_GAME_LAST && !enemies_on) {
+        log_line("test_battle = %ld (scene %ld, formation %ld) is a DLL scene's battle (1024 and up): it needs enemies = on in the game file (read at start-up); test_battle is off",
+                 test_battle, test_battle >> 2, test_battle & 3);
+        test_battle = TEST_BATTLE_OFF;
+    }
     if (test_battle < 0) {
         if (InterlockedExchange(&was_on, 0))
             log_line("test_battle off: battles are the game's own again");
@@ -39926,11 +42994,3865 @@ static void test_battle_settle(void)
     if (!test_battle_hook)
         test_battle_hook = patch_call(SITE_BATTLE_NUMBER_SET, FN_SOUND_OPERATION, battle_number_hook) ? 1 : -1;
     if (test_battle_hook > 0)
-        log_line("TESTING AID on: test_battle = %ld (scene %ld, formation %ld): every battle started from now is this one; remove the line when done",
-                 test_battle, test_battle >> 2, test_battle & 3);
+        log_line("TESTING AID on: test_battle = %ld (%sscene %ld, formation %ld): every battle started from now is this one; remove the line when done",
+                 test_battle, test_battle > TEST_BATTLE_GAME_LAST ? "DLL " : "", test_battle >> 2, test_battle & 3);
     else
         log_line("test_battle: NOT on: the call at %08lx is not the expected one (see the line above); battles are the game's own",
                  (DWORD)SITE_BATTLE_NUMBER_SET);
+}
+
+/* ---- Game settings: enemies (see ENEMIES (models) with the driver's file opens) ----
+   `enemies = on | off` (default off), taken at the first reading of the game file only: a later
+   change is said in the log, not taken, until the next start. */
+static void enemies_keys_begin(void)
+{
+    enemies_asked = 0;
+    enemies_given = 0;
+}
+
+/* 0: not this block's key; 1: read; -1: a mistake (*fault says what; off is used). */
+static int enemies_key_line(char *start, char *key_end, char *value, char *stop, const char **fault)
+{
+    if (!word_is(start, key_end, "enemies"))
+        return 0;
+    enemies_given = 1;
+    if (word_is(value, stop, "on") || word_is(value, stop, "yes"))
+        enemies_asked = 1;
+    else if (word_is(value, stop, "off") || word_is(value, stop, "no"))
+        enemies_asked = 0;
+    else {
+        enemies_asked = 0;
+        *fault = "enemies must be on or off: off is used";
+        return -1;
+    }
+    return 1;
+}
+
+/* After each reading of the game file: taken once, at the first reading (install_hooks, which runs
+   after it at start-up, then sets it up: enemies_start). */
+static void enemies_keys_settle(void)
+{
+    if (InterlockedExchange(&enemies_settled, 1)) {
+        if (enemies_asked != enemies_on)
+            log_line("enemies: the game file now says %s; it is %s for this run (read at start-up only): restart the game for the change",
+                     enemies_asked ? "on" : "off", enemies_on ? "on" : "off");
+        return;
+    }
+    enemies_on = enemies_asked;
+    if (!enemies_on && enemies_given)
+        log_line("enemies: off: no enemy model file is served, nothing is hooked for it");
+}
+
+/* ==== ENEMIES (scenes) BEGIN ====
+   enemies = on: battles of DLL SCENES, numbered 256-4095 (battle = scene x 4 + formation: 1024-16383),
+   made from the config folder's text files:
+       SpellExtConfig\scenes\<name>.ini over scenes\generated\<name>.ini        (a scene)
+       SpellExtConfig\enemies\<folder>\enemy.ini over ...\generated.ini        (an enemy)
+       ...\<folder>\<the block its `ai` key names: ai.ai for ai.ai.txt>        (its AI, assembled)
+       ...\<folder>\model\aa, ab, ..., da                                      (its model's files)
+   The scene image the game's loader would copy out of scene.bin (battle_load_scene_005d1050: 0x1e80
+   bytes) is built from them BYTE FOR BYTE as tools/work/ff8_enemies_s3/tools/scene_compile.py builds it
+   (--compile-only), with the same refusals in the same words where the two can agree (the native test of
+   stage 2b compares both on 1,014 scenes and every refusal rule). Enemy slot i of a DLL scene is drawn
+   from the pool model ENEMIES_POOL_FIRST + i (365, 366, 367: the compiler's rule), served from the
+   enemy's model folder for that battle only (enemies_model_assign).
+   Where: FF7_SpellExt_Enemies.ini ([enemies] load, [scenes] load, [battle_map]: which battle of the
+   game becomes which DLL battle) or test_battle. The scene is BUILT at the hand-over to the battle module
+   (battle_number_hook, after the swirl's routine wrote the number): a scene that cannot be built is
+   refused there with one line, and the game's own battle plays. load_scene_hook then lets the game load
+   the STAND-IN battle (the scene:formation the formation's `camera` names; its camera placement and the
+   set-up's camera bytes stay) and writes the image over the buffers in the call after which the loader
+   is done, puts back the field's battle flags (009a88a6) as the battle set them and runs the loader's
+   tail again (005d12b9-005d1475) on the DLL scene's set-up.
+   Nothing here runs with enemies off. Nothing names a game, a monster or a character. */
+
+/* ENEMIES SCENE PURE BEGIN  (no Win32 call inside but wsprintfA / wvsprintfA: tested natively, the enemies stage 2b test) */
+#define EN_IMAGE_SIZE           0x1e80
+#define EN_O_IDS                0x0000      /* 3 x u16 enemy model IDs, ffff */
+#define EN_O_SETUP              0x0008      /* 4 x 0x14 formation set-up */
+#define EN_O_CAMERA             0x0058      /* 4 x 0x30 camera placement */
+#define EN_O_ROWS               0x0118      /* 4 x 6 x 0x10 formation rows */
+#define EN_O_ENEMY              0x0298      /* 3 x 0xb8 enemy records */
+#define EN_O_ATTACK             0x04c0      /* 32 x 28 attack records */
+#define EN_O_ATTACK_ID          0x0840      /* 32 x u16 */
+#define EN_O_ATTACK_NAME        0x0880      /* 32 x 32 */
+#define EN_O_FORMATION_AI       0x0c80      /* 0x200 */
+#define EN_O_ENEMY_AI           0x0e80      /* 0x1000 */
+#define EN_SCENE_FIRST          256
+#define EN_SCENE_LAST           4095
+#define EN_BATTLE_FIRST         (EN_SCENE_FIRST * 4)
+#define EN_BATTLE_LAST          (EN_SCENE_LAST * 4 + 3)
+#define EN_ARENA_SIZE           0x80000     /* every file of one build */
+#define EN_FILE_MAX             0x10000     /* one file */
+#define EN_FILES_MAX            16
+#define EN_SECTIONS_MAX         64          /* in one file, and in an overlaid pair */
+#define EN_KEYS_MAX             1024
+#define EN_SECTION_KEYS_MAX     48
+#define EN_NAME_MAX             31
+#define EN_PROBLEM_MAX          1024        /* wvsprintfA writes at most 1024 bytes */
+#define EN_ITEM_NAMES           128         /* items 0-127 by name (the compiler's kernel2 section) */
+#define EN_TABLE_MAX            (3 * EN_SECTIONS_MAX)
+#define EN_MAP_MAX              256
+#define EN_LOAD_MAX             512
+#define EN_TEMPLATE_AI_SIZE     48
+
+struct en_file {
+    char label[64];             /* "geezard/enemy.ini", "generated/ff8_e074.ini": as the compiler names it */
+    char *text;
+    int size;
+};
+
+struct en_key {
+    char *key, *value;
+    const struct en_file *file;
+    int line;
+};
+
+struct en_section {
+    char *name;
+    int count;
+    short key[EN_SECTION_KEYS_MAX];
+};
+
+struct en_doc {
+    int sections, keys;
+    struct en_section section[EN_SECTIONS_MAX];
+    struct en_key key[EN_KEYS_MAX];
+};
+
+/* What the build asks of the world outside (the game, or the native test). */
+struct en_env {
+    int (*read_file)(const char *relative, char *buffer, int capacity);    /* bytes read; -1 absent; -2 larger or unreadable */
+    BOOL (*exists)(const char *relative);
+    BOOL (*older)(const char *relative, const char *than);                 /* both there and the first written before the second */
+    BOOL (*enemy_known)(const char *folder);                                /* registered ([enemies] load) */
+    void (*kernel_attack)(int id, BYTE *record, BYTE *name);                /* the active kernel's 28 bytes and its name (32, ff filled) */
+    BOOL (*item_name)(int id, char *out, int capacity);                     /* item 0-127: lower case, ' ' as '_' */
+    const BYTE *(*base_record)(int id, int *scene);                         /* a scene attack of the game's scene.bin, or NULL */
+    BOOL (*stand_in)(int scene, int formation, BYTE *setup, BYTE *camera);  /* FALSE: the game's own load gives them later */
+    void (*note)(const char *line);                                         /* a warning that refuses nothing */
+    int scene_count;                                                        /* scenes the game's scene.bin holds; 0 unknown */
+    int pool_first;                                                         /* enemy slot 0's model in a DLL scene */
+};
+
+struct en_result {
+    DWORD battle;               /* the battle built for (scene x 4 + formation) */
+    int scene, formation, dll;
+    char scene_name[EN_NAME_MAX + 1];
+    int enemies;
+    char folder[3][EN_NAME_MAX + 1];
+    char name[3][EN_NAME_MAX + 1];
+    BYTE served[3];             /* the slot's model folder has its aa and every file aa lists */
+    BYTE no_model[3];           /* no model\aa: the archive's own pool model is drawn */
+    int stand_in;               /* the battle the game loads first: S x 4 + F of the formation's camera */
+    int stand_bytes;            /* the image holds that formation's set-up +8..+0xf, +0x13 and camera placement, from the
+                                   game's own scene.bin (env->stand_in), as the compiler's; 0: the stand-in's load gives them */
+    int ai_bytes, attacks, kernel_attacks;
+    int fx_count[3];            /* stage 6a: the enemy's actions in its list's order, each with its SpellExt extras */
+    struct en_fx { WORD id, effect, effect_all, camera_multi; } fx[3][16];  /* effect 0 / camera_multi ffff: none */
+    BYTE image[EN_IMAGE_SIZE];
+};
+
+/* An enemy's action: its ID, model script and camera word (the image's), and the stage 6a extras the DLL keeps
+   beside the image (effect 0x100 and up: a SpellExt native effect; effect_all for several targets; camera_multi the
+   camera on several targets, ffff none). */
+struct en_action { const char *key; WORD id; BYTE script; WORD camera; WORD effect, effect_all, camera_multi; };
+
+struct en_enemy {
+    char folder[EN_NAME_MAX + 1];
+    struct en_doc *doc;
+    struct en_section *enemy;
+    int actions;
+    struct en_action action[EN_SECTIONS_MAX];
+};
+
+struct en_record { WORD id; BYTE record[28]; BYTE name[32]; };
+
+static const char *const en_elements[16] = {
+    "fire", "ice", "bolt", "earth", "poison", "gravity", "water", "wind", "holy", "restorative", "cut", "hit",
+    "punch", "shoot", "shout", "hidden",
+};
+static const char *const en_statuses[32] = {           /* the status word's bit order (tools/ai_tool.py's names) */
+    "death", "near_death", "sleep", "poison", "sadness", "fury", "confusion", "silence", "haste", "slow", "stop",
+    "frog", "small", "slow_numb", "petrify", "regen", "barrier", "mbarrier", "reflect", "dual", "shield",
+    "death_sentence", "manipulate", "berserk", "peerless", "paralysis", "darkness", "dual_drain", "death_force",
+    "resist", "lucky_girl", "imprisoned",
+};
+static const char *const en_rate_names[8] = { "death", "double", "weak", "half", "nullify", "immune", "absorb", "fullcure" };
+static const BYTE en_rate_values[8] = { 0, 2, 2, 4, 5, 5, 6, 7 };
+static const char *const en_kinds[5] = { "normal", "preemptive", "back", "side", "pincer" };
+static const char *const en_enemy_keys[23] = {
+    "name", "model", "level", "hp", "mp", "str", "def", "mag", "mdef", "spd", "eva", "luck", "exp", "ap", "gil",
+    "elements", "immune", "drops", "steals", "manipulate", "back_multiplier", "morph", "ai",
+};
+static const char *const en_scene_attack_keys[18] = {
+    "id", "name", "base", "power", "script", "camera", "accuracy", "element", "status", "status_chance", "target",
+    "mp", "formula", "effect", "impact", "sound", "effect_all", "camera_multi",
+};
+static const char *const en_kernel_attack_keys[6] = { "id", "script", "camera", "effect", "effect_all", "camera_multi" };
+static const char *const en_formation_keys[7] = { "stage", "camera", "rows", "kind", "escape_counter", "flags", "next" };
+#define EN_JOINED_ELEMENTS      "fire ice bolt earth poison gravity water wind holy restorative cut hit punch shoot shout hidden"
+#define EN_JOINED_STATUSES      "death near_death sleep poison sadness fury confusion silence haste slow stop frog small slow_numb petrify regen barrier mbarrier reflect dual shield death_sentence manipulate berserk peerless paralysis darkness dual_drain death_force resist lucky_girl imprisoned"
+#define EN_JOINED_RATES         "death double weak half nullify immune absorb fullcure"
+#define EN_JOINED_KINDS         "normal preemptive back side pincer"
+#define EN_SORTED_ENEMY_KEYS    "ai ap back_multiplier def drops elements eva exp gil hp immune level luck mag manipulate mdef model morph mp name spd steals str"
+#define EN_SORTED_ATTACK_KEYS   "accuracy base camera camera_multi effect effect_all element formula id impact mp name power script sound status status_chance target"
+#define EN_SORTED_KERNEL_KEYS   "camera camera_multi effect effect_all id script"
+#define EN_NATIVE_BASE          0x94        /* stage 6a: a scene attack's effect byte under a SpellExt effect: the game's enemy
+                                               effect 94, magic effect 02's routine 005d4788 (no file; it shows the hit) */
+#define EN_SORTED_FORMATION_KEYS "camera escape_counter flags kind next rows stage"
+
+static char en_arena[EN_ARENA_SIZE];
+static int en_arena_used, en_file_count;
+static struct en_file en_files[EN_FILES_MAX];
+static struct en_doc en_scene_doc, en_enemy_doc[3], en_user_doc;
+static struct en_enemy en_enemy_list[3];
+static struct en_record en_table[EN_TABLE_MAX];
+static char *en_out;            /* the problem being written (EN_PROBLEM_MAX) */
+
+static BOOL en_fail(const char *format, ...)
+{
+    va_list args;
+
+    va_start(args, format);
+    wvsprintfA(en_out, format, args);   /* (at most 1024 characters; every %s of a file's text is bounded as well) */
+    va_end(args);
+    en_out[EN_PROBLEM_MAX] = 0;         /* (the problem buffers hold EN_PROBLEM_MAX + 1 at least) */
+    return FALSE;
+}
+
+static BOOL en_space(char c)        /* Python's str.strip() and split(), for ASCII */
+{
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f' || (c >= 0x1c && c <= 0x1f);
+}
+
+static char en_lower(char c)
+{
+    return c >= 'A' && c <= 'Z' ? (char)(c + 0x20) : c;
+}
+
+static int en_len(const char *s)
+{
+    int n = 0;
+
+    while (s[n])
+        n++;
+    return n;
+}
+
+static int en_cmp(const char *a, const char *b)
+{
+    while (*a && *a == *b)
+        a++, b++;
+    return (BYTE)*a - (BYTE)*b;
+}
+
+/* Whether `s` is `word` (lower case) ignoring case. */
+static BOOL en_lower_is(const char *s, const char *word)
+{
+    while (*s && en_lower(*s) == *word)
+        s++, word++;
+    return !*s && !*word;
+}
+
+static void en_copy(char *out, int capacity, const char *start, int length)
+{
+    int i;
+
+    for (i = 0; i < length && i < capacity - 1; i++)
+        out[i] = start[i];
+    out[i] = 0;
+}
+
+/* "label line N" of a key, as the compiler says where (a few at a time). */
+static const char *en_at(const struct en_key *k)
+{
+    static char text[4][96];
+    static int next;
+    char *t = text[next++ & 3];
+
+    wsprintfA(t, "%s line %d", k->file->label, k->line);
+    return t;
+}
+
+/* A number of the compiler's (Python's int(v, 0), without 0o, 0b and _), in decimal for a message. */
+static void en_decimal(char *out, long long v)
+{
+    if (v < 0 && -v <= 0xffffffffLL)
+        wsprintfA(out, "-%lu", (DWORD)-v);
+    else if (v >= 0 && v <= 0xffffffffLL)
+        wsprintfA(out, "%lu", (DWORD)v);
+    else
+        lstrcpyA(out, "(a number too large)");
+}
+
+static int en_hex(char c)
+{
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    c = en_lower(c);
+    return c >= 'a' && c <= 'f' ? c - 'a' + 10 : -1;
+}
+
+static BOOL en_number(const char *v, const char *where, long long lo, long long hi, long long *out)
+{
+    const char *c = v, *e = v + en_len(v), *first;
+    long long n = 0;
+    int digits = 0, huge = 0, negative = 0;
+    char a[24], b[24], x[24];
+
+    while (c < e && en_space(*c))
+        c++;
+    while (e > c && en_space(e[-1]))
+        e--;
+    if (c < e && (*c == '+' || *c == '-'))
+        negative = *c++ == '-';
+    if (e - c > 2 && c[0] == '0' && (c[1] == 'x' || c[1] == 'X')) {
+        for (c += 2; c < e && en_hex(*c) >= 0; c++, digits++)
+            if (!huge && (n = n * 16 + en_hex(*c)) > 0xffffffffffLL)
+                huge = 1;
+    } else {
+        for (first = c; c < e && *c >= '0' && *c <= '9'; c++, digits++)
+            if (!huge && (n = n * 10 + (*c - '0')) > 0xffffffffffLL)
+                huge = 1;
+        if (digits > 1 && *first == '0' && (n || huge))
+            digits = 0;                 /* Python: no leading zero in a decimal number but 0 itself */
+    }
+    if (!digits || c != e)
+        return en_fail("%.320s: \"%.320s\" is not a number", where, v);
+    if (negative)
+        n = -n;
+    if (huge || n < lo || n > hi) {
+        en_decimal(a, lo);
+        en_decimal(b, hi);
+        if (huge)
+            en_copy(x, sizeof x, v, en_len(v));
+        else
+            en_decimal(x, n);
+        return en_fail("%.320s: %.320s is outside %.320s..%.320s", where, x, a, b);
+    }
+    *out = n;
+    return TRUE;
+}
+
+/* The words of `v`, split at white space (and at commas when `commas`): their count; the first `max`
+   in start[] and length[]. */
+static int en_split(const char *v, BOOL commas, const char **start, int *length, int max)
+{
+    int count = 0;
+
+    for (;;) {
+        const char *w;
+
+        while (*v && (en_space(*v) || (commas && *v == ',')))
+            v++;
+        if (!*v)
+            return count;
+        for (w = v; *w && !en_space(*w) && !(commas && *w == ','); w++)
+            ;
+        if (count < max) {
+            start[count] = v;
+            length[count] = (int)(w - v);
+        }
+        count++;
+        v = w;
+    }
+}
+
+/* Whether the words of `v` (commas too) are exactly ["none"] (the compiler's words(v) == ['none']). */
+static BOOL en_words_none(const char *v)
+{
+    const char *start[2];
+    int length[2];
+
+    return en_split(v, TRUE, start, length, 2) == 1 && length[0] == 4 && start[0][0] == 'n' && start[0][1] == 'o' &&
+           start[0][2] == 'n' && start[0][3] == 'e';
+}
+
+/* ---- the text files (s0_common.read_ini and overlay) ---- */
+
+/* `relative` into the arena: its file, NULL when absent (*bad and the problem when it cannot be read). A
+   UTF-8 byte-order mark is skipped (2a review, 1; the compiler refuses such a file). */
+static struct en_file *en_load(const struct en_env *env, const char *relative, const char *label, BOOL *bad)
+{
+    struct en_file *f;
+    int room = EN_ARENA_SIZE - en_arena_used - 1, size;
+
+    *bad = FALSE;
+    if (room > EN_FILE_MAX)
+        room = EN_FILE_MAX;
+    if (en_file_count >= EN_FILES_MAX || room < 1) {
+        *bad = TRUE;
+        en_fail("%.320s: too many files for one scene", label);
+        return NULL;
+    }
+    size = env->read_file(relative, en_arena + en_arena_used, room);
+    if (size == -1)
+        return NULL;
+    if (size < 0) {
+        *bad = TRUE;
+        en_fail("%.320s: cannot be read (or it is larger than %d bytes)", label, room);
+        return NULL;
+    }
+    f = &en_files[en_file_count++];
+    f->text = en_arena + en_arena_used;
+    f->size = size;
+    f->text[size] = 0;
+    en_arena_used = (en_arena_used + size + 1 + 3) & ~3;
+    if (size >= 3 && (BYTE)f->text[0] == 0xef && (BYTE)f->text[1] == 0xbb && (BYTE)f->text[2] == 0xbf) {
+        f->text += 3;
+        f->size -= 3;
+    }
+    en_copy(f->label, sizeof f->label, label, en_len(label));
+    return f;
+}
+
+static struct en_section *en_sec(struct en_doc *d, const char *name)
+{
+    int i;
+
+    for (i = 0; i < d->sections; i++)
+        if (!en_cmp(d->section[i].name, name))
+            return &d->section[i];
+    return NULL;
+}
+
+static struct en_key *en_get(struct en_doc *d, const struct en_section *s, const char *key)
+{
+    int i;
+
+    if (!s)
+        return NULL;
+    for (i = 0; i < s->count; i++)
+        if (!en_cmp(d->key[s->key[i]].key, key))
+            return &d->key[s->key[i]];
+    return NULL;
+}
+
+/* One file into `d`, in place (keys lower case, sections collapsed and lower case, all ended by 0). */
+static BOOL en_parse(const struct en_file *f, struct en_doc *d)
+{
+    char *p = f->text, *end = f->text + f->size;
+    struct en_section *current = NULL;
+    int line = 0, i;
+
+    d->sections = d->keys = 0;
+    while (p < end) {
+        char *s = p, *e, *c;
+
+        line++;
+        for (e = p; e < end && *e != '\n' && *e != '\r'; e++)
+            ;
+        p = e < end && *e == '\r' && e + 1 < end && e[1] == '\n' ? e + 2 : e < end ? e + 1 : end;
+        for (c = s; c < e && *c != ';'; c++)
+            ;
+        e = c;
+        while (s < e && en_space(*s))
+            s++;
+        while (e > s && en_space(e[-1]))
+            e--;
+        *e = 0;
+        if (s == e)
+            continue;
+        if (*s == '[' && e - s >= 3 && e[-1] == ']') {
+            for (c = s + 1; c < e - 1 && *c != ']'; c++)
+                ;
+            if (c == e - 1) {           /* [name]: white space collapsed to one space, lower case */
+                char *w = s, *r;
+                BOOL gap = FALSE;
+
+                e[-1] = 0;
+                for (r = s + 1; *r; r++) {
+                    if (en_space(*r)) {
+                        gap = TRUE;
+                        continue;
+                    }
+                    if (gap && w > s)
+                        *w++ = ' ';
+                    gap = FALSE;
+                    *w++ = en_lower(*r);
+                }
+                *w = 0;
+                for (i = 0; i < d->sections; i++)
+                    if (!en_cmp(d->section[i].name, s))
+                        return en_fail("%.320s line %d: section [%.320s] appears twice", f->label, line, s);
+                if (d->sections == EN_SECTIONS_MAX)
+                    return en_fail("%.320s line %d: more than %d sections in one file", f->label, line, EN_SECTIONS_MAX);
+                current = &d->section[d->sections++];
+                current->name = s;
+                current->count = 0;
+                continue;
+            }
+        }
+        for (c = s; c < e && *c != '='; c++)
+            ;
+        if (c == e)
+            return en_fail("%.320s line %d: \"%.320s\" is not \"key = value\"", f->label, line, s);
+        if (!current)
+            return en_fail("%.320s line %d: a key before any [section]", f->label, line);
+        {
+            char *k = s, *ke = c, *v = c + 1, *ve = e, *q;
+
+            while (ke > k && en_space(ke[-1]))
+                ke--;
+            while (v < ve && en_space(*v))
+                v++;
+            *ke = 0;
+            for (q = k; *q; q++)
+                *q = en_lower(*q);
+            for (i = 0; i < current->count; i++)
+                if (!en_cmp(d->key[current->key[i]].key, k))
+                    return en_fail("%.320s line %d: key \"%.320s\" appears twice in this section", f->label, line, k);
+            if (d->keys == EN_KEYS_MAX || current->count == EN_SECTION_KEYS_MAX)
+                return en_fail("%.320s line %d: too many keys", f->label, line);
+            d->key[d->keys].key = k;
+            d->key[d->keys].value = v;
+            d->key[d->keys].file = f;
+            d->key[d->keys].line = line;
+            current->key[current->count++] = (short)d->keys++;
+        }
+    }
+    return TRUE;
+}
+
+/* The user's file over the generated one: a key there wins, a section only there is added after. */
+static BOOL en_overlay(struct en_doc *base, const struct en_doc *user)
+{
+    int i, j, k;
+
+    for (i = 0; i < user->sections; i++) {
+        const struct en_section *us = &user->section[i];
+        struct en_section *bs = en_sec(base, us->name);
+
+        if (!bs) {
+            if (base->sections == EN_SECTIONS_MAX)
+                return en_fail("%.320s: more than %d sections with the generated file's", user->key[0].file ? user->key[0].file->label : "", EN_SECTIONS_MAX);
+            bs = &base->section[base->sections++];
+            bs->name = us->name;
+            bs->count = 0;
+        }
+        for (j = 0; j < us->count; j++) {
+            const struct en_key *uk = &user->key[us->key[j]];
+
+            for (k = 0; k < bs->count && en_cmp(base->key[bs->key[k]].key, uk->key); k++)
+                ;
+            if (k < bs->count) {
+                base->key[bs->key[k]] = *uk;
+                continue;
+            }
+            if (base->keys == EN_KEYS_MAX || bs->count == EN_SECTION_KEYS_MAX)
+                return en_fail("%.320s line %d: too many keys", uk->file->label, uk->line);
+            base->key[base->keys] = *uk;
+            bs->key[bs->count++] = (short)base->keys++;
+        }
+    }
+    return TRUE;
+}
+
+/* A generated file and the user's over it into `d`; *found: either was there. */
+static BOOL en_read_pair(const struct en_env *env, const char *generated, const char *generated_label,
+                         const char *user, const char *user_label, struct en_doc *d, BOOL *found)
+{
+    struct en_file *f;
+    BOOL bad;
+
+    d->sections = d->keys = 0;
+    *found = FALSE;
+    if ((f = en_load(env, generated, generated_label, &bad)) != NULL) {
+        *found = TRUE;
+        if (!en_parse(f, d))
+            return FALSE;
+    } else if (bad) {
+        return FALSE;
+    }
+    if ((f = en_load(env, user, user_label, &bad)) != NULL) {
+        *found = TRUE;
+        if (!en_parse(f, &en_user_doc) || !en_overlay(d, &en_user_doc))
+            return FALSE;
+    } else if (bad) {
+        return FALSE;
+    }
+    return TRUE;
+}
+
+/* A folder or scene file name: 1-31 letters, digits, _ and - (no path can be made of it). */
+static BOOL en_name_ok(const char *s, int length)
+{
+    int i;
+
+    if (length < 1 || length > EN_NAME_MAX)
+        return FALSE;
+    for (i = 0; i < length; i++)
+        if (!((s[i] >= 'a' && s[i] <= 'z') || (s[i] >= 'A' && s[i] <= 'Z') || (s[i] >= '0' && s[i] <= '9') || s[i] == '_' || s[i] == '-'))
+            return FALSE;
+    return TRUE;
+}
+
+/* ---- the parts of the image (scene_compile.py: attack_record, enemy_record, build_image) ---- */
+
+/* FF7 battle text (character - 0x20, ff filled) of `text`; FALSE (the compiler's words) when it cannot be. */
+static BOOL en_encode(const char *text, const char *where, BYTE *out, int length)
+{
+    int i, n = en_len(text);
+
+    for (i = 0; i < n; i++)
+        if ((BYTE)text[i] < 0x20 || (BYTE)text[i] >= 0x80)
+            break;
+    if (i < n || n >= length)
+        return en_fail("%.320s: name \"%.320s\": printable ASCII only, at most %d characters", where, text, length - 1);
+    for (i = 0; i < length; i++)
+        out[i] = i < n ? (BYTE)(text[i] - 0x20) : 0xff;
+    return TRUE;
+}
+
+/* The bits of the names of `v` (split at spaces and commas) in `table`. */
+static BOOL en_bits(const char *v, const char *const *table, int count, const char *joined, const char *where,
+                    const char *what, DWORD *out)
+{
+    const char *start[64];
+    int length[64], n = en_split(v, TRUE, start, length, 64), i, j;
+
+    *out = 0;
+    for (i = 0; i < n && i < 64; i++) {
+        char word[48], lower[48];
+
+        en_copy(word, sizeof word, start[i], length[i]);
+        for (j = 0; word[j]; j++)
+            lower[j] = en_lower(word[j]);
+        lower[j] = 0;
+        for (j = 0; j < count && (length[i] >= (int)sizeof word || en_cmp(lower, table[j])); j++)
+            ;
+        if (j == count)
+            return en_fail("%.320s: \"%.320s\" is no %.320s (%.320s)", where, word, what, joined);
+        *out |= 1u << j;
+    }
+    return TRUE;
+}
+
+/* An item by name (items 0-127, lower case, '_' for a space) or by number 0-0x13f. */
+static BOOL en_item(const struct en_env *env, const char *token, int token_length, const char *where, WORD *out)
+{
+    char word[64], lower[64], name[64];
+    long long n;
+    int i;
+
+    en_copy(word, sizeof word, token, token_length);
+    for (i = 0; word[i]; i++)
+        lower[i] = en_lower(word[i]);
+    lower[i] = 0;
+    if (token_length < (int)sizeof word)
+        for (i = 0; i < EN_ITEM_NAMES; i++)
+            if (env->item_name(i, name, sizeof name) && !en_cmp(name, lower)) {
+                *out = (WORD)i;
+                return TRUE;
+            }
+    if (!en_number(word, where, 0, 0x13f, &n))
+        return FALSE;
+    *out = (WORD)n;
+    return TRUE;
+}
+
+static BOOL en_one_of(const char *key, const char *const *table, int count)
+{
+    int i;
+
+    for (i = 0; i < count; i++)
+        if (!en_cmp(key, table[i]))
+            return TRUE;
+    return FALSE;
+}
+
+/* Stage 6a: an [attack] section's SpellExt extras, after its record (the compiler's attack_extras, in the same order):
+   a kernel attack's effect (a scene attack's was read with its record), effect_all, camera_multi; the warning of an
+   effect under script 3. Only a scene attack's effect byte is in the image (EN_NATIVE_BASE); the rest is the DLL's. */
+static BOOL en_attack_extras(const struct en_env *env, struct en_doc *d, const struct en_section *s, const char *key, struct en_action *a)
+{
+    struct en_key *k;
+    long long n;
+
+    if (a->id < 0x100 && (k = en_get(d, s, "effect")) != NULL) {
+        if (!en_number(k->value, en_at(k), 0x100, 0xffff, &n))
+            return FALSE;
+        if (a->id >= 0x38)
+            return en_fail("%.320s: kernel attack %02x is no magic (00-37): the game plays an enemy's summon, enemy skill or limit as one, so effect = is for kernel magic and scene attacks only",
+                           en_at(k), a->id);
+        a->effect = (WORD)n;
+    }
+    if ((k = en_get(d, s, "effect_all")) != NULL) {
+        if (!a->effect)
+            return en_fail("%.320s: effect_all needs effect, a SpellExt effect (0x100 and up), in [attack %.320s]", en_at(k), key);
+        if (!en_number(k->value, en_at(k), 0x100, 0xffff, &n))
+            return FALSE;
+        a->effect_all = (WORD)n;
+    }
+    if ((k = en_get(d, s, "camera_multi")) != NULL) {
+        if (a->camera == 0xffff)
+            return en_fail("%.320s: camera_multi needs camera, a camera number (the camera on one target), in [attack %.320s]", en_at(k), key);
+        if (!en_number(k->value, en_at(k), 0, 0xfffe, &n))
+            return FALSE;
+        a->camera_multi = (WORD)n;
+    }
+    if (a->effect && a->script == 3) {
+        char line[400];
+
+        wsprintfA(line, "enemies: %.95s: [attack %.31s] has effect %04x and script 3: a converted monster's script 3 shows its result with f7 and has no effect step, so the effect is never played (script 4 is the cast)",
+                  en_at(en_get(d, s, "effect")), key, a->effect);
+        env->note(line);
+    }
+    return TRUE;
+}
+
+/* One [attack KEY] section: its action (ID, script, camera, the extras) and its record and name. */
+static BOOL en_attack(const struct en_env *env, struct en_doc *d, const struct en_section *s, const char *key,
+                      struct en_action *a, struct en_record *r)
+{
+    struct en_key *k_id = en_get(d, s, "id"), *k_script = en_get(d, s, "script"), *k_camera = en_get(d, s, "camera");
+    struct en_key *k;
+    char absent[64];                    /* "attack " + a key of at most EN_NAME_MAX (en_load_enemy) */
+    const char *camera;
+    const BYTE *base;
+    long long n;
+    int i, scene;
+    DWORD bits;
+
+#define EN_W(k) ((k) ? en_at(k) : absent)
+    wsprintfA(absent, "attack %.31s", key);
+    if (!k_id)
+        return en_fail("[attack %.320s]: no id", key);
+    if (!en_number(k_id->value, en_at(k_id), 0, 0xfffe, &n))
+        return FALSE;
+    if (n >= 0x8000)
+        return en_fail("%.320s: an attack ID is 00-7f (the kernel's) or 0100-7fff (the game reads an AI's attack ID as signed)", en_at(k_id));
+    a->key = key;
+    a->id = (WORD)n;
+    a->effect = a->effect_all = 0;
+    a->camera_multi = 0xffff;
+    if (!en_number(k_script && k_script->value[0] ? k_script->value : "3", EN_W(k_script), 0, 0x3f, &n))
+        return FALSE;
+    if (n < 3)                          /* (6a review) a model's scripts 0 and 1 are idle loops (fe c0) that never reach ee */
+        return en_fail("%.320s: script is a model script, 3 to 0x3f (0 and 1 are idle loops, 2 the death)", EN_W(k_script));
+    a->script = (BYTE)n;
+    camera = k_camera && k_camera->value[0] ? k_camera->value : "default";
+    if (en_lower_is(camera, "default"))
+        a->camera = 0xffff;
+    else if (!en_number(k_camera->value, en_at(k_camera), 0, 0xfffe, &n))
+        return FALSE;
+    else
+        a->camera = (WORD)n;
+    r->id = a->id;
+    if (a->id < 0x100) {
+        for (i = 0; i < s->count; i++)
+            if (!en_one_of((k = &d->key[s->key[i]])->key, en_kernel_attack_keys, 6))
+                return en_fail("%.320s: [attack %.320s] is kernel attack %02x: the game uses the kernel's own record, so \"%.320s\" cannot change it (keys here: %.320s)",
+                               en_at(k), key, a->id, k->key, EN_SORTED_KERNEL_KEYS);
+        if (a->id >= 0x80)
+            return en_fail("%.320s: kernel IDs are 00-7f", EN_W(k_id));
+        env->kernel_attack(a->id, r->record, r->name);
+        return en_attack_extras(env, d, s, key, a);
+    }
+    for (i = 0; i < s->count; i++)
+        if (!en_one_of((k = &d->key[s->key[i]])->key, en_scene_attack_keys, 18))
+            return en_fail("%.320s: unknown key \"%.320s\" (keys: %.320s)", en_at(k), k->key, EN_SORTED_ATTACK_KEYS);
+    if (!en_get(d, s, "base") || !en_get(d, s, "name"))
+        return en_fail("[attack %.320s]: a scene attack needs base and name", key);
+    k = en_get(d, s, "base");
+    if (!en_number(k->value, en_at(k), 0x100, 0xfffe, &n))
+        return FALSE;
+    if ((base = env->base_record((int)n, &scene)) == NULL)
+        return en_fail("%.320s: no scene of the game's scene.bin has attack %04x", en_at(k), (int)n);
+    for (i = 0; i < 28; i++)
+        r->record[i] = base[i];
+#define EN_BYTE_KEY(name, at, high) \
+    if ((k = en_get(d, s, name)) != NULL) { if (!en_number(k->value, en_at(k), 0, high, &n)) return FALSE; r->record[at] = (BYTE)n; }
+    EN_BYTE_KEY("power", 15, 255)
+    EN_BYTE_KEY("accuracy", 0, 255)
+    EN_BYTE_KEY("target", 12, 255)
+    if ((k = en_get(d, s, "mp")) != NULL) {
+        if (!en_number(k->value, en_at(k), 0, 999, &n))
+            return FALSE;
+        r->record[4] = (BYTE)n;
+        r->record[5] = (BYTE)(n >> 8);
+    }
+    if ((k = en_get(d, s, "impact")) != NULL) {
+        if (en_lower_is(k->value, "none"))
+            r->record[1] = 0xff;
+        else if (!en_number(k->value, en_at(k), 0, 255, &n))
+            return FALSE;
+        else
+            r->record[1] = (BYTE)n;
+    }
+    if ((k = en_get(d, s, "effect")) != NULL) {
+        if (en_lower_is(k->value, "none"))
+            r->record[13] = 0xff;
+        else if (!en_number(k->value, en_at(k), 0, 0xffff, &n))
+            return FALSE;
+        else if (n >= 0x100) {
+            r->record[13] = EN_NATIVE_BASE;     /* a SpellExt effect (stage 6a): the DLL plays it over the game's file-less hit */
+            a->effect = (WORD)n;
+        } else
+            r->record[13] = (BYTE)n;
+    }
+    if ((k = en_get(d, s, "sound")) != NULL) {
+        if (en_lower_is(k->value, "none"))
+            n = 0xffff;
+        else if (!en_number(k->value, en_at(k), 0, 0xfffe, &n))
+            return FALSE;
+        r->record[6] = (BYTE)n;
+        r->record[7] = (BYTE)(n >> 8);
+    }
+    if ((k = en_get(d, s, "formula")) != NULL) {
+        char lower[64];
+
+        for (i = 0; k->value[i] && i < (int)sizeof lower - 1; i++)
+            lower[i] = en_lower(k->value[i]);
+        lower[i] = 0;
+        if (!en_cmp(lower, "physical"))
+            r->record[14] = 0x11;
+        else if (!en_cmp(lower, "magical"))
+            r->record[14] = 0x22;
+        else if (!en_number(lower, en_at(k), 0, 255, &n))
+            return FALSE;
+        else
+            r->record[14] = (BYTE)n;
+    }
+    if ((k = en_get(d, s, "element")) != NULL) {
+        if (en_words_none(k->value))
+            bits = 0;
+        else if (!en_bits(k->value, en_elements, 16, EN_JOINED_ELEMENTS, en_at(k), "element", &bits))
+            return FALSE;
+        r->record[24] = (BYTE)bits;
+        r->record[25] = (BYTE)(bits >> 8);
+    }
+    if ((k = en_get(d, s, "status")) != NULL) {
+        struct en_key *chance = en_get(d, s, "status_chance");
+
+        if (en_words_none(k->value)) {
+            r->record[17] = 0xff;
+            bits = 0xffffffff;
+        } else {
+            if (!en_bits(k->value, en_statuses, 32, EN_JOINED_STATUSES, en_at(k), "status", &bits))
+                return FALSE;
+            if (!en_number(chance && chance->value[0] ? chance->value : "63", chance ? en_at(chance) : absent, 0, 63, &n))
+                return FALSE;
+            r->record[17] = (BYTE)n;
+        }
+        for (i = 0; i < 4; i++)
+            r->record[20 + i] = (BYTE)(bits >> (8 * i));
+    } else if ((k = en_get(d, s, "status_chance")) != NULL) {
+        if (!en_number(k->value, en_at(k), 0, 63, &n))
+            return FALSE;
+        r->record[17] = (BYTE)n;
+    }
+#undef EN_BYTE_KEY
+    if (!en_attack_extras(env, d, s, key, a))
+        return FALSE;
+    k = en_get(d, s, "name");
+    return en_encode(k->value, en_at(k), r->name, 32);
+#undef EN_W
+}
+
+/* An enemy's two files: its [enemy] section (keys checked) and its [attack ...] sections, in order. */
+static BOOL en_load_enemy(const struct en_env *env, const char *folder, struct en_doc *d, struct en_enemy *E)
+{
+    char generated[96], user[96], generated_label[64], user_label[64];
+    BOOL found;
+    int i;
+
+    if (!en_name_ok(folder, en_len(folder)))
+        return en_fail("enemy \"%.320s\": a folder name of enemies\\ is 1 to %d letters, digits, _ or -", folder, EN_NAME_MAX);
+    if (!env->enemy_known(folder))
+        return en_fail("enemy %.320s is not registered: no enemy.ini or generated.ini in enemies\\%.320s, or [enemies] load of FF7_SpellExt_Enemies.ini leaves it out",
+                       folder, folder);
+    wsprintfA(generated, "enemies\\%s\\generated.ini", folder);
+    wsprintfA(user, "enemies\\%s\\enemy.ini", folder);
+    wsprintfA(generated_label, "%s/generated.ini", folder);
+    wsprintfA(user_label, "%s/enemy.ini", folder);
+    if (!en_read_pair(env, generated, generated_label, user, user_label, d, &found))
+        return FALSE;
+    if (!found)
+        return en_fail("enemy %.320s: no generated.ini or enemy.ini in enemies\\%.320s", folder, folder);
+    en_copy(E->folder, sizeof E->folder, folder, en_len(folder));
+    E->doc = d;
+    if ((E->enemy = en_sec(d, "enemy")) == NULL)
+        return en_fail("enemy %.320s: no [enemy] section", folder);
+    for (i = 0; i < E->enemy->count; i++) {
+        const struct en_key *k = &d->key[E->enemy->key[i]];
+
+        if (!en_one_of(k->key, en_enemy_keys, 23))
+            return en_fail("%.320s: unknown key \"%.320s\" (keys: %.320s)", en_at(k), k->key, EN_SORTED_ENEMY_KEYS);
+    }
+    {
+        static const char *const required[5] = { "name", "model", "level", "hp", "ai" };
+
+        for (i = 0; i < 5; i++)
+            if (!en_get(d, E->enemy, required[i]))
+                return en_fail("enemy %.320s: key \"%.320s\" missing", folder, required[i]);
+    }
+    E->actions = 0;
+    for (i = 0; i < d->sections; i++) {
+        char *name = d->section[i].name;
+
+        if (name[0] == 'a' && name[1] == 't' && name[2] == 't' && name[3] == 'a' && name[4] == 'c' && name[5] == 'k' && name[6] == ' ') {
+            char *key = name + 7;
+
+            while (en_space(*key))
+                key++;
+            if (en_len(key) > EN_NAME_MAX)
+                return en_fail("enemy %.320s: an attack section's name is at most %d characters (one has %d)", folder, EN_NAME_MAX, en_len(key));
+            E->action[E->actions].key = key;
+            E->action[E->actions++].id = (WORD)i;     /* (the section, until en_attack fills the action) */
+        }
+    }
+    return TRUE;
+}
+
+/* The 0xb8 bytes of an enemy (scene_compile.enemy_record), in the compiler's order of checks. */
+static BOOL en_enemy_record(const struct en_env *env, struct en_enemy *E, BYTE *out)
+{
+    struct en_doc *d = E->doc;
+    struct en_section *s = E->enemy;
+    struct en_key *k;
+    BYTE *r = out + 32;
+    long long n;
+    int i, items = 0;
+    WORD item_ids[8];
+    BYTE item_rates[8];
+    DWORD bits;
+
+    for (i = 0; i < 0x98; i++)
+        r[i] = 0xff;
+#define EN_STAT(name, at, low, high, fallback) \
+    if ((k = en_get(d, s, name)) != NULL) { if (!en_number(k->value, en_at(k), low, high, &n)) return FALSE; } else n = fallback; r[at] = (BYTE)n;
+    EN_STAT("level", 0, 1, 99, 0)
+    EN_STAT("spd", 1, 0, 255, 0)
+    EN_STAT("luck", 2, 0, 255, 0)
+    EN_STAT("eva", 3, 0, 255, 0)
+    EN_STAT("str", 4, 0, 255, 0)
+    EN_STAT("def", 5, 0, 255, 0)
+    EN_STAT("mag", 6, 0, 255, 0)
+    EN_STAT("mdef", 7, 0, 255, 0)
+#undef EN_STAT
+    if ((k = en_get(d, s, "elements")) != NULL && !en_words_none(k->value)) {
+        const char *start[16];
+        int length[16], count = en_split(k->value, TRUE, start, length, 16), j;
+
+        if (count > 8)
+            return en_fail("%.320s: at most 8 element entries", en_at(k));
+        for (i = 0; i < count; i++) {
+            char word[64], *colon;
+
+            en_copy(word, sizeof word, start[i], length[i]);
+            for (j = 0; word[j]; j++)
+                word[j] = en_lower(word[j]);
+            for (colon = word; *colon && *colon != ':'; colon++)
+                ;
+            if (!*colon) {
+                en_copy(word, sizeof word, start[i], length[i]);
+                return en_fail("%.320s: \"%.320s\" is not element:rate", en_at(k), word);
+            }
+            *colon++ = 0;
+            for (j = 0; j < 16 && en_cmp(word, en_elements[j]); j++)
+                ;
+            if (j == 16)
+                return en_fail("%.320s: \"%.320s\" is no element (%.320s)", en_at(k), word, EN_JOINED_ELEMENTS);
+            r[8 + i] = (BYTE)j;
+            for (j = 0; j < 8 && en_cmp(colon, en_rate_names[j]); j++)
+                ;
+            if (j == 8)
+                return en_fail("%.320s: \"%.320s\" is no rate (%.320s)", en_at(k), colon, EN_JOINED_RATES);
+            r[16 + i] = en_rate_values[j];
+        }
+    }
+    if (E->actions > 16)
+        return en_fail("enemy %.320s: %d attacks, an enemy record holds 16", E->folder, E->actions);
+    for (i = 0; i < E->actions; i++) {
+        r[24 + i] = E->action[i].script;
+        r[40 + 2 * i] = (BYTE)E->action[i].id;
+        r[41 + 2 * i] = (BYTE)(E->action[i].id >> 8);
+        r[72 + 2 * i] = (BYTE)E->action[i].camera;
+        r[73 + 2 * i] = (BYTE)(E->action[i].camera >> 8);
+    }
+    {
+        static const char *const lists[2] = { "drops", "steals" };
+        int l;
+
+        for (l = 0; l < 2; l++) {
+            const char *start[8];
+            int length[8], count;
+
+            if ((k = en_get(d, s, lists[l])) == NULL || en_words_none(k->value))
+                continue;
+            count = en_split(k->value, TRUE, start, length, 8);
+            for (i = 0; i < count; i++) {
+                const char *colon;
+                int item_length;
+
+                if (i >= 8 || items >= 8)
+                    return en_fail("enemy %.320s: drops and steals together hold 4 items", E->folder);
+                for (colon = start[i]; colon < start[i] + length[i] && *colon != ':'; colon++)
+                    ;
+                item_length = (int)(colon - start[i]);
+                {
+                    char rate[64];
+
+                    if (colon < start[i] + length[i])
+                        en_copy(rate, sizeof rate, colon + 1, (int)(start[i] + length[i] - colon - 1));
+                    else
+                        rate[0] = 0;
+                    if (!en_number(rate[0] ? rate : "8", en_at(k), 0, 63, &n))
+                        return FALSE;
+                }
+                item_rates[items] = (BYTE)((l ? 0x80 : 0) | n);
+                if (!en_item(env, start[i], item_length, en_at(k), &item_ids[items]))
+                    return FALSE;
+                items++;
+            }
+        }
+    }
+    if (items > 4)
+        return en_fail("enemy %.320s: drops and steals together hold 4 items", E->folder);
+    for (i = 0; i < items; i++) {
+        r[104 + i] = item_rates[i];
+        r[108 + 2 * i] = (BYTE)item_ids[i];
+        r[109 + 2 * i] = (BYTE)(item_ids[i] >> 8);
+    }
+    if ((k = en_get(d, s, "manipulate")) != NULL && !en_words_none(k->value)) {
+        const char *start[8];
+        int length[8], count = en_split(k->value, TRUE, start, length, 8), j;
+
+        if (count > 3)
+            return en_fail("%.320s: at most 3", en_at(k));
+        for (i = 0; i < count; i++) {
+            char word[64], keys[512];
+
+            en_copy(word, sizeof word, start[i], length[i]);
+            for (j = 0; j < E->actions && (length[i] >= (int)sizeof word || en_cmp(word, E->action[j].key)); j++)
+                ;
+            if (j == E->actions) {
+                int at = 0;
+
+                keys[0] = 0;
+                for (j = 0; j < E->actions; j++) {   /* the compiler's dict of keys: first appearance, in order */
+                    int m;
+
+                    for (m = 0; m < j && en_cmp(E->action[m].key, E->action[j].key); m++)
+                        ;
+                    if (m < j || at + en_len(E->action[j].key) + 2 >= (int)sizeof keys)
+                        continue;
+                    at += wsprintfA(keys + at, at ? " %s" : "%s", E->action[j].key);
+                }
+                return en_fail("%.320s: \"%.320s\" is not one of its attacks (%.320s)", en_at(k), word, keys);
+            }
+            r[116 + 2 * i] = (BYTE)E->action[j].id;
+            r[117 + 2 * i] = (BYTE)(E->action[j].id >> 8);
+        }
+    }
+    {
+        WORD morph = 0xffff;
+
+        if ((k = en_get(d, s, "morph")) != NULL && !en_lower_is(k->value, "none") &&
+            !en_item(env, k->value, en_len(k->value), en_at(k), &morph))
+            return FALSE;
+        r[122] = r[123] = 0xff;
+        if ((k = en_get(d, s, "mp")) != NULL) { if (!en_number(k->value, en_at(k), 0, 0xffff, &n)) return FALSE; } else n = 0;
+        r[124] = (BYTE)n;
+        r[125] = (BYTE)(n >> 8);
+        if ((k = en_get(d, s, "ap")) != NULL) { if (!en_number(k->value, en_at(k), 0, 0xffff, &n)) return FALSE; } else n = 0;
+        r[126] = (BYTE)n;
+        r[127] = (BYTE)(n >> 8);
+        r[128] = (BYTE)morph;
+        r[129] = (BYTE)(morph >> 8);
+    }
+    if ((k = en_get(d, s, "back_multiplier")) != NULL) { if (!en_number(k->value, en_at(k), 0, 255, &n)) return FALSE; } else n = 16;
+    r[130] = (BYTE)n;
+    r[131] = 0xff;
+    bits = 0;
+    if ((k = en_get(d, s, "immune")) != NULL && !en_words_none(k->value) &&
+        !en_bits(k->value, en_statuses, 32, EN_JOINED_STATUSES, en_at(k), "status", &bits))
+        return FALSE;
+    {
+        static const char *const words4[3] = { "hp", "exp", "gil" };
+        DWORD values[5];
+
+        for (i = 0; i < 3; i++) {
+            if ((k = en_get(d, s, words4[i])) != NULL) {
+                if (!en_number(k->value, en_at(k), i ? 0 : 1, 0xffffffffLL, &n))
+                    return FALSE;
+            } else {
+                n = 0;
+            }
+            values[i] = (DWORD)n;
+        }
+        values[3] = ~bits;
+        values[4] = 0xffffffff;
+        for (i = 0; i < 20; i++)
+            r[132 + i] = (BYTE)(values[i / 4] >> (8 * (i & 3)));
+    }
+    {
+        char name[EN_NAME_MAX + 3];
+
+        k = en_get(d, s, "name");
+        if (en_len(k->value) > EN_NAME_MAX)
+            return en_encode(k->value, en_at(k), out, 32);     /* (refused: the compiler's words) */
+        wsprintfA(name, "%s ", k->value);       /* the game's enemy names end in a space */
+        return en_encode(name, en_at(k), out, 32);
+    }
+}
+
+/* The AI template of `ai = none`: init none; main: target_mask = a random one of enemies_mask; attack
+   (push.b 20) the enemy's first attack ID; end. 48 bytes (tools/ai_tool.py's opcodes). */
+static void en_template_ai(BYTE *entry, WORD first_attack)
+{
+    static const BYTE main_script[16] = { 0x12, 0x70, 0x20, 0x02, 0xa0, 0x20, 0x82, 0x90, 0x60, 0x20, 0x61, 0, 0, 0x92, 0x73, 0xff };
+    int i;
+
+    for (i = 0; i < 32; i++)
+        entry[i] = 0xff;
+    entry[2] = 0x20;
+    entry[3] = 0x00;
+    for (i = 0; i < 16; i++)
+        entry[32 + i] = main_script[i];
+    entry[32 + 11] = (BYTE)first_attack;
+    entry[32 + 12] = (BYTE)(first_attack >> 8);
+}
+
+static const char *ai_block_check(const BYTE *b, DWORD size, int *entries, int *bad_entry, int *bad_section, DWORD *where);
+
+/* Enemy i's AI entry: the bytes after its block's own 2-byte table (*entry, *size). */
+static BOOL en_enemy_ai(const struct en_env *env, struct en_enemy *E, const BYTE **entry, int *size)
+{
+    static BYTE templates[3][EN_TEMPLATE_AI_SIZE];
+    static int next;
+    struct en_key *k = en_get(E->doc, E->enemy, "ai");
+    char file[64], relative[128], text[128], label[96];
+    int length = en_len(k->value), entries, bad_entry, bad_section;
+    struct en_file *f;
+    const char *problem;
+    DWORD where;
+    BOOL bad;
+
+    if (en_lower_is(k->value, "none")) {
+        BYTE *t = templates[next++ % 3];
+
+        if (!E->actions)
+            return en_fail("%.320s: ai = none needs at least one attack (the template uses the first)", en_at(k));
+        en_template_ai(t, E->action[0].id);
+        *entry = t;
+        *size = EN_TEMPLATE_AI_SIZE;
+        return TRUE;
+    }
+    {
+        int i;
+
+        for (i = 0; i < length; i++)
+            if (k->value[i] == '\\' || k->value[i] == '/' || k->value[i] == ':')
+                break;
+        if (i < length || length >= (int)sizeof file || (length == 2 && k->value[0] == '.' && k->value[1] == '.'))
+            return en_fail("%.320s: the AI file is a name beside enemy.ini (ai.ai.txt, or an .ai block)", en_at(k));
+    }
+    en_copy(file, sizeof file, k->value, length);
+    if (length > 4 && en_lower_is(file + length - 4, ".txt"))
+        file[length - 4] = 0;           /* the text: its assembled block beside it (tools/ai_tool.py asm) */
+    wsprintfA(relative, "enemies\\%.31s\\%.63s", E->folder, file);
+    wsprintfA(label, "%.31s/%.63s", E->folder, file);
+    if ((f = en_load(env, relative, label, &bad)) == NULL) {
+        if (bad)
+            return FALSE;
+        if (en_cmp(file, k->value))
+            return en_fail("%.320s: enemies\\%.320s\\%.320s not found: assemble %.320s (tools/ai_tool.py asm)", en_at(k), E->folder, file, k->value);
+        return en_fail("%.320s: enemies\\%.320s\\%.320s not found", en_at(k), E->folder, file);
+    }
+    if (en_cmp(file, k->value)) {
+        wsprintfA(text, "enemies\\%.31s\\%.63s", E->folder, k->value);
+        if (env->older(relative, text)) {
+            char line[300];
+
+            wsprintfA(line, "enemies: %.31s: %.63s is older than %.63s: assemble it (tools/ai_tool.py asm); the block is used as it is", E->folder, file, k->value);
+            env->note(line);
+        }
+    }
+    problem = ai_block_check((const BYTE *)f->text, (DWORD)f->size, &entries, &bad_entry, &bad_section, &where);
+    if (problem)
+        return en_fail("enemies\\%.320s\\%.320s fails the AI check: %.320s (entry %d, section %d, at %04lx)", E->folder, file, problem,
+                       bad_entry, bad_section, where);
+    if (entries != 1 || f->size < 2 || (BYTE)f->text[0] != 2 || (BYTE)f->text[1] != 0)
+        return en_fail("enemies\\%.320s\\%.320s: an enemy's AI is one entry (table 1, entry 0)", E->folder, file);
+    *entry = (const BYTE *)f->text + 2;
+    *size = f->size - 2;
+    return TRUE;
+}
+
+/* The attack IDs an AI entry gives to `attack` after `push.b 20` (push.b or push.w the ID, then 92: the
+   pattern scene_compile.ai_attack_ids looks for, byte by byte): each must be one of the enemy's attacks,
+   or the game would take a record that is not one (the scene's table past its last ID). */
+static BOOL en_ai_attacks(const struct en_enemy *E, const BYTE *entry, int size)
+{
+    WORD missing[64];
+    int count = 0, i, j;
+
+    for (i = 0; i < size - 4; i++) {
+        int id = -1;
+
+        if (entry[i] != 0x60 || entry[i + 1] != 0x20)
+            continue;
+        if (entry[i + 2] == 0x60 && i + 4 < size && entry[i + 4] == 0x92)
+            id = entry[i + 3];
+        else if (entry[i + 2] == 0x61 && i + 5 < size && entry[i + 5] == 0x92)
+            id = entry[i + 3] | entry[i + 4] << 8;
+        if (id < 0)
+            continue;
+        for (j = 0; j < E->actions && E->action[j].id != id; j++)
+            ;
+        if (j < E->actions)
+            continue;
+        for (j = 0; j < count && missing[j] != id; j++)
+            ;
+        if (j == count && count < 64) {
+            for (j = count++; j > 0 && missing[j - 1] > id; j--)
+                missing[j] = missing[j - 1];
+            missing[j] = (WORD)id;
+        }
+    }
+    if (count) {
+        char ids[64 * 5 + 1], *at = ids;
+        const struct en_key *k = en_get(E->doc, E->enemy, "ai");
+
+        for (i = 0; i < count; i++)
+            at += wsprintfA(at, i ? " %04x" : "%04x", missing[i]);
+        return en_fail("%.320s/%.63s: the AI uses attack(s) %.320s that %.320s does not have", E->folder, k->value, ids, E->folder);
+    }
+    return TRUE;
+}
+
+/* A DLL scene's enemy model: model\aa, if there, with every file it lists (ab, da, its textures from ac,
+   each part of a bone with a model from am, its weapons from ck: the rule the game's own files follow);
+   *served FALSE (no problem) when there is no aa at all. */
+static BOOL en_model_check(const struct en_env *env, const char *folder, BOOL *served)
+{
+    char relative[128], label[96];
+    struct en_file *f;
+    const BYTE *h;
+    DWORD bones, textures, weapons, i;
+    BOOL bad;
+
+    *served = FALSE;
+    wsprintfA(relative, "enemies\\%s\\model\\aa", folder);
+    wsprintfA(label, "%s/model/aa", folder);
+    if ((f = en_load(env, relative, label, &bad)) == NULL)
+        return !bad;
+    h = (const BYTE *)f->text;
+#define EN_U32(at) ((DWORD)h[at] | (DWORD)h[(at) + 1] << 8 | (DWORD)h[(at) + 2] << 16 | (DWORD)h[(at) + 3] << 24)
+    if (f->size < 0x34)
+        return en_fail("enemies\\%.320s\\model\\aa: %d bytes, not a battle skeleton (its header is 52)", folder, f->size);
+    bones = EN_U32(0x0c);
+    textures = EN_U32(0x18);
+    weapons = EN_U32(0x24);
+    if (bones > 600 || textures > 10 || weapons > 16 || (DWORD)f->size < 0x34 + 12 * bones)
+        return en_fail("enemies\\%.320s\\model\\aa: not a battle skeleton the game can read (%lu bones, %lu textures, %lu weapons, %d bytes)",
+                       folder, bones, textures, weapons, f->size);
+    {
+        static const char *const fixed[2] = { "ab", "da" };
+
+        for (i = 0; i < 2; i++) {
+            wsprintfA(relative, "enemies\\%s\\model\\%s", folder, fixed[i]);
+            if (!env->exists(relative))
+                return en_fail("enemies\\%.320s\\model\\ has aa but not %.320s (%.320s): the archive's file of the same name would be taken with it; the scene is refused",
+                               folder, fixed[i], i ? "its animations" : "its second file");
+        }
+    }
+    for (i = 0; i < textures + bones + weapons; i++) {
+        DWORD n = i < textures ? 2 + i : i < textures + bones ? 12 + (i - textures) : 2 * 26 + 10 + (i - textures - bones);
+
+        if (i >= textures && i < textures + bones && !EN_U32(0x34 + 12 * (i - textures) + 8))
+            continue;                   /* a bone without a model has no part */
+        wsprintfA(relative, "enemies\\%s\\model\\%c%c", folder, 'a' + (int)(n / 26), 'a' + (int)(n % 26));
+        if (!env->exists(relative))
+            return en_fail("enemies\\%.320s\\model\\aa lists %c%c (%.320s %lu) and the folder has no such file: the archive's file of the same name would be taken with it; the scene is refused",
+                           folder, 'a' + (int)(n / 26), 'a' + (int)(n % 26),
+                           i < textures ? "texture" : i < textures + bones ? "the part of bone" : "weapon",
+                           i < textures ? i : i < textures + bones ? i - textures : i - textures - bones);
+    }
+#undef EN_U32
+    *served = TRUE;
+    return TRUE;
+}
+
+/* The scene `name`'s image for `battle` (scene x 4 + formation; `want` the scene number the registry
+   gave it, -1: any, the formation 0). FALSE and the problem (one line) on a mistake; *mismatch when the
+   file's number is not `want` (the registry is out of date). */
+static BOOL en_build(const struct en_env *env, const char *name, int want, DWORD battle, struct en_result *r,
+                     char *problem, BOOL *mismatch)
+{
+    struct en_section *sc, *forms[4];
+    struct en_key *k, *list[4][2 * EN_SECTION_KEYS_MAX];
+    char generated[96], user[96], generated_label[64], user_label[64];
+    const char *start[8];
+    int length[8], count, i, j, f, number, table = 0, dll;
+    int list_count[4];
+    long long n;
+    BYTE *img = r->image;
+    BOOL found;
+
+    en_out = problem;
+    problem[0] = 0;
+    *mismatch = FALSE;
+    en_arena_used = en_file_count = 0;
+    if (!en_name_ok(name, en_len(name)))
+        return en_fail("scene \"%.320s\": a scene file's name is 1 to %d letters, digits, _ or -", name, EN_NAME_MAX);
+    wsprintfA(generated, "scenes\\generated\\%s.ini", name);
+    wsprintfA(user, "scenes\\%s.ini", name);
+    wsprintfA(generated_label, "generated/%s.ini", name);
+    wsprintfA(user_label, "scenes/%s.ini", name);
+    if (!en_read_pair(env, generated, generated_label, user, user_label, &en_scene_doc, &found))
+        return FALSE;
+    if ((sc = en_sec(&en_scene_doc, "scene")) == NULL)
+        return en_fail("scene %.320s: no [scene] section", name);
+    for (i = 0; i < sc->count; i++) {
+        k = &en_scene_doc.key[sc->key[i]];
+        if (en_cmp(k->key, "number") && en_cmp(k->key, "enemies"))
+            return en_fail("%.320s: unknown key \"%.320s\" (keys: number enemies)", en_at(k), k->key);
+    }
+    if ((k = en_get(&en_scene_doc, sc, "number")) == NULL)
+        return en_fail("scene %.320s [scene]: key \"number\" missing", name);
+    if (!en_number(k->value, en_at(k), 0, 4095, &n))
+        return FALSE;
+    number = (int)n;
+    if (number == 255)
+        return en_fail("%.320s: scene 255 is never reached by the game's lookup (0-254 scene.bin, 256-4095 DLL scenes)", en_at(k));
+    if (want >= 0 && number != want) {
+        *mismatch = TRUE;
+        return en_fail("%.320s: the scene's number is %d now, not %d", en_at(k), number, want);
+    }
+    dll = number >= EN_SCENE_FIRST;
+    r->battle = want >= 0 ? battle : (DWORD)number * 4;
+    r->scene = number;
+    r->formation = (int)(r->battle & 3);
+    r->dll = dll;
+    en_copy(r->scene_name, sizeof r->scene_name, name, en_len(name));
+    if ((k = en_get(&en_scene_doc, sc, "enemies")) == NULL)
+        return en_fail("scene %.320s [scene]: key \"enemies\" missing", name);
+    count = en_split(k->value, TRUE, start, length, 8);
+    if (count < 1 || count > 3)
+        return en_fail("%.320s: 1 to 3 enemies", en_at(k));
+    r->enemies = count;
+    for (i = 0; i < 3; i++) {
+        r->folder[i][0] = r->name[i][0] = 0;
+        r->served[i] = r->no_model[i] = 0;
+    }
+    for (i = 0; i < count; i++) {
+        en_copy(r->folder[i], sizeof r->folder[i], start[i], length[i]);
+        if (length[i] > EN_NAME_MAX)
+            return en_fail("enemy \"%.320s\": a folder name of enemies\\ is 1 to %d letters, digits, _ or -", r->folder[i], EN_NAME_MAX);
+        if (!en_load_enemy(env, r->folder[i], &en_enemy_doc[i], &en_enemy_list[i]))
+            return FALSE;
+    }
+    for (i = 0; i < EN_IMAGE_SIZE; i++)
+        img[i] = 0xff;
+    /* models: a DLL scene's enemy slot i is the pool's i-th number, whatever `model` says */
+    for (i = 0; i < count; i++) {
+        struct en_enemy *E = &en_enemy_list[i];
+        int model;
+
+        k = en_get(E->doc, E->enemy, "model");
+        if (dll) {
+            model = env->pool_first + i;
+        } else {
+            if (en_lower_is(k->value, "pool"))
+                return en_fail("%.320s: \"model = pool\" works in a DLL scene (number 256 and up) only: scene %d is a scene.bin scene", en_at(k), number);
+            if (!en_number(k->value, en_at(k), 0, 369, &n))
+                return FALSE;
+            model = (int)n;
+        }
+        for (j = 0; j < i; j++)
+            if ((img[EN_O_IDS + 2 * j] | img[EN_O_IDS + 2 * j + 1] << 8) == model)
+                return en_fail("enemy %.320s: model %d is already enemy slot %d", E->folder, model, j);
+        img[EN_O_IDS + 2 * i] = (BYTE)model;
+        img[EN_O_IDS + 2 * i + 1] = (BYTE)(model >> 8);
+    }
+    /* attacks: every enemy's, one record per ID, sorted */
+    for (i = 0; i < count; i++) {
+        struct en_enemy *E = &en_enemy_list[i];
+
+        for (j = 0; j < E->actions; j++) {
+            struct en_record rec;
+            int t;
+
+            if (!en_attack(env, E->doc, &E->doc->section[E->action[j].id], E->action[j].key, &E->action[j], &rec))
+                return FALSE;
+            for (t = 0; t < table && en_table[t].id != rec.id; t++)
+                ;
+            if (t < table) {
+                int b;
+
+                for (b = 0; b < 28 && en_table[t].record[b] == rec.record[b]; b++)
+                    ;
+                for (n = 0; b == 28 && n < 32 && en_table[t].name[n] == rec.name[n]; n++)
+                    ;
+                if (b < 28 || n < 32)
+                    return en_fail("attack ID %04x is given two different records in this scene (%.320s)", rec.id, E->action[j].key);
+                continue;
+            }
+            if (table == EN_TABLE_MAX)
+                return en_fail("the scene has more than %d attack records: FF7 holds 32", EN_TABLE_MAX);
+            en_table[table++] = rec;
+        }
+    }
+    if (table > 32)
+        return en_fail("the scene has %d attack records: FF7 holds 32", table);
+    for (i = 1; i < table; i++) {
+        struct en_record moving = en_table[i];
+
+        for (j = i; j > 0 && en_table[j - 1].id > moving.id; j--)
+            en_table[j] = en_table[j - 1];
+        en_table[j] = moving;
+    }
+    r->attacks = table;
+    r->kernel_attacks = 0;
+    for (i = 0; i < table; i++) {
+        for (j = 0; j < 28; j++)
+            img[EN_O_ATTACK + 28 * i + j] = en_table[i].record[j];
+        img[EN_O_ATTACK_ID + 2 * i] = (BYTE)en_table[i].id;
+        img[EN_O_ATTACK_ID + 2 * i + 1] = (BYTE)(en_table[i].id >> 8);
+        for (j = 0; j < 32; j++)
+            img[EN_O_ATTACK_NAME + 32 * i + j] = en_table[i].name[j];
+        if (en_table[i].id < 0x100)
+            r->kernel_attacks++;
+    }
+    for (i = 0; i < 3; i++)
+        r->fx_count[i] = 0;
+    for (i = 0; i < count; i++) {
+        if (!en_enemy_record(env, &en_enemy_list[i], img + EN_O_ENEMY + 0xb8 * i))
+            return FALSE;
+        for (j = 0; j < en_enemy_list[i].actions && j < 16; j++) {     /* (en_enemy_record refuses more than 16) */
+            r->fx[i][j].id = en_enemy_list[i].action[j].id;
+            r->fx[i][j].effect = en_enemy_list[i].action[j].effect;
+            r->fx[i][j].effect_all = en_enemy_list[i].action[j].effect_all;
+            r->fx[i][j].camera_multi = en_enemy_list[i].action[j].camera_multi;
+        }
+        r->fx_count[i] = j;
+        for (j = 0; j < 32 && img[EN_O_ENEMY + 0xb8 * i + j] != 0xff; j++)
+            r->name[i][j] = (char)(img[EN_O_ENEMY + 0xb8 * i + j] + 0x20);
+        while (j > 0 && r->name[i][j - 1] == ' ')
+            j--;
+        r->name[i][j] = 0;
+    }
+    /* formations: [formation 0], and 1-3 a copy of it changed by their own section's keys */
+    for (f = 0; f < 4; f++) {
+        char section[16];
+
+        wsprintfA(section, "formation %d", f);
+        forms[f] = en_sec(&en_scene_doc, section);
+        if (!f && !forms[0])
+            return en_fail("scene %.320s: no [formation 0]", name);
+    }
+    for (f = 0; f < 4; f++) {
+        int c = 0;
+
+        for (i = 0; i < forms[0]->count; i++)
+            list[f][c++] = &en_scene_doc.key[forms[0]->key[i]];
+        if (f && forms[f])
+            for (i = 0; i < forms[f]->count; i++) {
+                k = &en_scene_doc.key[forms[f]->key[i]];
+                for (j = 0; j < forms[0]->count && en_cmp(list[f][j]->key, k->key); j++)
+                    ;
+                list[f][j < forms[0]->count ? j : c++] = k;
+            }
+        list_count[f] = c;
+    }
+    for (f = 0; f < 4; f++) {
+        struct en_key *keyed[7];
+        BYTE *setup = img + EN_O_SETUP + 0x14 * f, *camera_out = img + EN_O_CAMERA + 0x30 * f, *row;
+        BYTE stand_setup[0x14], stand_camera[0x30];
+        long long part[3];
+        int parts, cs, cf, kind = 0, rows;
+        const char *c, *row_start[8];
+        int row_length[8];
+
+        for (i = 0; i < 7; i++)
+            keyed[i] = NULL;
+        for (i = 0; i < list_count[f]; i++) {
+            k = list[f][i];
+            for (j = 0; j < 7 && en_cmp(k->key, en_formation_keys[j]); j++)
+                ;
+            if (j == 7)
+                return en_fail("%.320s: unknown key \"%.320s\" (keys: %.320s)", en_at(k), k->key, EN_SORTED_FORMATION_KEYS);
+            keyed[j] = k;
+        }
+        for (i = 0; i < 3; i++)
+            if (!keyed[i])
+                return en_fail("scene %.320s [formation %d]: key \"%.320s\" missing", name, f, en_formation_keys[i]);
+        if (!en_number(keyed[0]->value, en_at(keyed[0]), 0, 89, &n))
+            return FALSE;
+        setup[0] = (BYTE)n;
+        setup[1] = (BYTE)(n >> 8);
+        /* camera = S:F */
+        parts = 0;
+        for (c = keyed[1]->value;;) {
+            char piece[64];
+            const char *e = c;
+
+            while (*e && *e != ':')
+                e++;
+            en_copy(piece, sizeof piece, c, (int)(e - c));
+            if (parts < 3 && !en_number(piece, en_at(keyed[1]), 0, 255, &part[parts]))
+                return FALSE;
+            parts++;
+            if (!*e)
+                break;
+            c = e + 1;
+        }
+        if (parts != 2)
+            return en_fail("%.320s: camera is scene:formation (like 79:2)", en_at(keyed[1]));
+        cs = (int)part[0];
+        cf = (int)part[1];
+        if (cs > 254 || (env->scene_count && cs >= env->scene_count) || cf > 3)
+            return en_fail("%.320s: camera %d:%d is no scene:formation of the game's scene.bin (scene 0-%d, formation 0-3)", en_at(keyed[1]),
+                           cs, cf, env->scene_count ? (env->scene_count < 255 ? env->scene_count : 255) - 1 : 254);
+        if (f == r->formation)
+            r->stand_in = cs * 4 + cf;
+        if (keyed[3]) {
+            for (kind = 0; kind < 5 && !en_lower_is(keyed[3]->value, en_kinds[kind]); kind++)
+                ;
+            if (kind == 5)
+                return en_fail("%.320s: kind is one of %.320s", en_at(keyed[3]), EN_JOINED_KINDS);
+        }
+        if (!keyed[6] || en_lower_is(keyed[6]->value, "none"))
+            n = 0xffff;
+        else if (!en_number(keyed[6]->value, en_at(keyed[6]), 0, 0xfffe, &n))
+            return FALSE;
+        else if ((n >= 1020 && n <= 1023) || n > EN_BATTLE_LAST)
+            return en_fail("%.320s: next is none, a battle 0-1019 (the game's scenes 0-254) or 1024-16383 (a DLL scene's)", en_at(keyed[6]));
+        setup[2] = (BYTE)n;
+        setup[3] = (BYTE)(n >> 8);
+        if (keyed[4]) { if (!en_number(keyed[4]->value, en_at(keyed[4]), 0, 0xffff, &n)) return FALSE; } else n = 1;
+        setup[4] = (BYTE)n;
+        setup[5] = (BYTE)(n >> 8);
+        setup[6] = setup[7] = 0xff;
+        if (keyed[5]) { if (!en_number(keyed[5]->value, en_at(keyed[5]), 0, 0xffff, &n)) return FALSE; } else n = 0xfffd;
+        setup[0x10] = (BYTE)n;
+        setup[0x11] = (BYTE)(n >> 8);
+        setup[0x12] = (BYTE)kind;
+        if (f == r->formation)
+            r->stand_bytes = 0;
+        if (env->stand_in(cs, cf, stand_setup, stand_camera)) {
+            for (i = 8; i < 0x10; i++)
+                setup[i] = stand_setup[i];
+            setup[0x13] = stand_setup[0x13];
+            for (i = 0; i < 0x30; i++)
+                camera_out[i] = stand_camera[i];
+            if (f == r->formation)
+                r->stand_bytes = 1;
+        }                               /* (else ff: the game's own load of the stand-in gives them) */
+        rows = en_split(keyed[2]->value, FALSE, row_start, row_length, 8);
+        if (rows < 1 || rows > 6)
+            return en_fail("%.320s: 1 to 6 rows", en_at(keyed[2]));
+        for (i = 0; i < rows; i++) {
+            char token[128], *piece[8], *p;
+            int pieces = 1, slot, xyz_count = 0, model;
+            long long xyz[3], row_number = 1, cover = 0;
+
+            en_copy(token, sizeof token, row_start[i], row_length[i]);
+            piece[0] = token;
+            for (p = token; *p; p++)
+                if (*p == ':') {
+                    *p = 0;
+                    if (pieces < 8)
+                        piece[pieces] = p + 1;
+                    pieces++;
+                }
+            for (slot = 0; slot < count && en_cmp(piece[0], r->folder[slot]); slot++)
+                ;
+            if (slot == count || row_length[i] >= (int)sizeof token) {
+                char joined[3 * (EN_NAME_MAX + 2) + 1];
+                int at = 0;
+
+                for (j = 0; j < count; j++)
+                    at += wsprintfA(joined + at, j ? ", %s" : "%s", r->folder[j]);
+                if (!count)
+                    joined[0] = 0;
+                return en_fail("%.320s: \"%.320s\" is not one of the scene's enemies (%.320s)", en_at(keyed[2]), piece[0], joined);
+            }
+            if (pieces > 1) {
+                for (c = piece[1];;) {
+                    char number_text[64];
+                    const char *e = c;
+                    long long v;
+
+                    while (*e && *e != ',')
+                        e++;
+                    en_copy(number_text, sizeof number_text, c, (int)(e - c));
+                    if (!en_number(number_text, en_at(keyed[2]), -32768, 32767, &v))
+                        return FALSE;
+                    if (xyz_count < 3)
+                        xyz[xyz_count] = v;
+                    xyz_count++;
+                    if (!*e)
+                        break;
+                    c = e + 1;
+                }
+            }
+            if (xyz_count != 3) {
+                en_copy(token, sizeof token, row_start[i], row_length[i]);
+                return en_fail("%.320s: \"%.320s\" needs x,y,z", en_at(keyed[2]), token);
+            }
+            if (pieces > 2 && !en_number(piece[2], en_at(keyed[2]), 0, 0xffff, &row_number))
+                return FALSE;
+            if (pieces > 3 && !en_number(piece[3], en_at(keyed[2]), 0, 0xffff, &cover))
+                return FALSE;
+            row = img + EN_O_ROWS + 0x60 * f + 16 * i;
+            model = img[EN_O_IDS + 2 * slot] | img[EN_O_IDS + 2 * slot + 1] << 8;
+            row[0] = (BYTE)model;
+            row[1] = (BYTE)(model >> 8);
+            for (j = 0; j < 3; j++) {
+                row[2 + 2 * j] = (BYTE)xyz[j];
+                row[3 + 2 * j] = (BYTE)(xyz[j] >> 8);
+            }
+            row[8] = (BYTE)row_number;
+            row[9] = (BYTE)(row_number >> 8);
+            row[10] = (BYTE)cover;
+            row[11] = (BYTE)(cover >> 8);
+            row[12] = row[13] = row[14] = row[15] = 0xff;
+        }
+    }
+    /* the AI area: three entry offsets, then each enemy's entry at an even offset */
+    {
+        BYTE *area = img + EN_O_ENEMY_AI;
+        int pos = 6, entries, bad_entry, bad_section;
+        const char *bad;
+        DWORD where;
+
+        for (i = 0; i < count; i++) {
+            const BYTE *entry;
+            int size;
+
+            if (!en_enemy_ai(env, &en_enemy_list[i], &entry, &size))
+                return FALSE;
+            if (!en_ai_attacks(&en_enemy_list[i], entry, size))
+                return FALSE;
+            if (pos + size > 0x1000)
+                return en_fail("the AI does not fit in the scene's 4090 bytes");
+            area[2 * i] = (BYTE)pos;
+            area[2 * i + 1] = (BYTE)(pos >> 8);
+            for (j = 0; j < size; j++)
+                area[pos + j] = entry[j];
+            pos = (pos + size + 1) & ~1;
+        }
+        bad = ai_block_check(area, 0x1000, &entries, &bad_entry, &bad_section, &where);
+        if (bad)
+            return en_fail("the scene's AI area fails the AI check: %.320s (entry %d, section %d, at %04lx)", bad, bad_entry, bad_section, where);
+        r->ai_bytes = pos;
+    }
+    /* a DLL scene's enemy models (no rule of the compiler's: after all of its) */
+    if (dll)
+        for (i = 0; i < count; i++) {
+            BOOL served;
+
+            for (j = 0; j < i && en_cmp(r->folder[j], r->folder[i]); j++)
+                ;
+            if (j < i) {
+                r->served[i] = r->served[j];
+                r->no_model[i] = r->no_model[j];
+                continue;
+            }
+            if (!en_model_check(env, r->folder[i], &served))
+                return FALSE;
+            r->served[i] = (BYTE)served;
+            r->no_model[i] = (BYTE)!served;
+        }
+    return TRUE;
+}
+
+/* The [scene] number of the scene `name` (registration reads only that), or -1 and the problem. */
+static int en_scene_number(const struct en_env *env, const char *name, char *problem)
+{
+    char generated[96], user[96], generated_label[64], user_label[64];
+    struct en_section *sc;
+    struct en_key *k;
+    long long n;
+    BOOL found;
+
+    en_out = problem;
+    problem[0] = 0;
+    en_arena_used = en_file_count = 0;
+    if (!en_name_ok(name, en_len(name))) {
+        en_fail("scene \"%.40s\": a scene file's name is 1 to %d letters, digits, _ or -", name, EN_NAME_MAX);
+        return -1;
+    }
+    wsprintfA(generated, "scenes\\generated\\%s.ini", name);
+    wsprintfA(user, "scenes\\%s.ini", name);
+    wsprintfA(generated_label, "generated/%s.ini", name);
+    wsprintfA(user_label, "scenes/%s.ini", name);
+    if (!en_read_pair(env, generated, generated_label, user, user_label, &en_scene_doc, &found))
+        return -1;
+    if ((sc = en_sec(&en_scene_doc, "scene")) == NULL) {
+        en_fail("scene %.320s: no [scene] section", name);
+        return -1;
+    }
+    if ((k = en_get(&en_scene_doc, sc, "number")) == NULL) {
+        en_fail("scene %.320s [scene]: key \"number\" missing", name);
+        return -1;
+    }
+    if (!en_number(k->value, en_at(k), 0, 4095, &n))
+        return -1;
+    if (n < EN_SCENE_FIRST) {
+        en_fail("%.320s: scene %d is a scene of scene.bin (0-254): a DLL scene is numbered 256-4095", en_at(k), (int)n);
+        return -1;
+    }
+    return (int)n;
+}
+
+/* (battle menu, stage 2) What the SpellExt menu's battle page shows of a scene, read from its text right after
+   en_scene_number gave its number (en_scene_doc still holds it): the folders `enemies =` names (the first three; a
+   fourth is the build's refusal, said when the battle is chosen) and each formation's `stage =` (a formation with no
+   section of its own, or without the key in it, has formation 0's, as en_build copies it); -1 where there is none or
+   it is no location 0-89. Nothing is refused here: the page lists, the build judges. */
+struct en_listing {
+    int enemies;
+    char folder[3][EN_NAME_MAX + 1];
+    short stage[4];
+};
+
+static void en_scene_listing(struct en_listing *out)
+{
+    struct en_section *sc = en_sec(&en_scene_doc, "scene"), *form[4];
+    struct en_key *k;
+    const char *start[3];
+    int length[3], count, i, f;
+    char *was = en_out, scratch[EN_PROBLEM_MAX + 16];
+    long long n;
+
+    en_out = scratch;               /* (a stage that is no number is the build's refusal: not written over the scan's problem) */
+    out->enemies = 0;
+    for (i = 0; i < 3; i++)
+        out->folder[i][0] = 0;
+    if (sc && (k = en_get(&en_scene_doc, sc, "enemies")) != NULL) {
+        count = en_split(k->value, TRUE, start, length, 3);
+        out->enemies = count < 3 ? count : 3;
+        for (i = 0; i < out->enemies; i++)
+            en_copy(out->folder[i], sizeof out->folder[i], start[i], length[i]);
+    }
+    for (f = 0; f < 4; f++) {
+        char section[16];
+
+        wsprintfA(section, "formation %d", f);
+        form[f] = en_sec(&en_scene_doc, section);
+        k = form[f] ? en_get(&en_scene_doc, form[f], "stage") : NULL;
+        if (!k && f && form[0])
+            k = en_get(&en_scene_doc, form[0], "stage");
+        out->stage[f] = (short)(k && en_number(k->value, "", 0, 89, &n) ? n : -1);
+    }
+    en_out = was;
+}
+
+/* (battle menu, stage 2) The `name =` of enemy folder `folder` ([enemy] of enemy.ini over generated.ini) as the page
+   shows it: at most EN_NAME_MAX characters, anything but printable ASCII as '?'; "" when there is none (the page
+   then shows the folder's name). */
+static void en_enemy_shown_name(const struct en_env *env, const char *folder, char *out)
+{
+    char generated[96], user[96], generated_label[64], user_label[64];
+    char *was = en_out, scratch[EN_PROBLEM_MAX + 16];
+    struct en_key *k;
+    BOOL found;
+    int i;
+
+    out[0] = 0;
+    if (!en_name_ok(folder, en_len(folder)))
+        return;
+    en_out = scratch;
+    en_arena_used = en_file_count = 0;
+    wsprintfA(generated, "enemies\\%s\\generated.ini", folder);
+    wsprintfA(user, "enemies\\%s\\enemy.ini", folder);
+    wsprintfA(generated_label, "%s/generated.ini", folder);
+    wsprintfA(user_label, "%s/enemy.ini", folder);
+    if (en_read_pair(env, generated, generated_label, user, user_label, &en_enemy_doc[0], &found) && found &&
+        (k = en_get(&en_enemy_doc[0], en_sec(&en_enemy_doc[0], "enemy"), "name")) != NULL) {
+        for (i = 0; i < EN_NAME_MAX && k->value[i]; i++)
+            out[i] = (BYTE)k->value[i] >= 0x20 && (BYTE)k->value[i] < 0x7f ? k->value[i] : '?';
+        out[i] = 0;
+    }
+    en_out = was;
+}
+
+/* ---- the scene.bin index (the bases of scene attacks, read once) ---- */
+
+/* Walks the 0x2000 blocks of a scene.bin: each gzip member inflated (`inflate`, raw deflate) into
+   `scratch` (EN_IMAGE_SIZE), `each(n, image, context)` for the n-th scene in the file. The scene count,
+   or -1 and the problem. */
+static int en_scene_bin_walk(const BYTE *file, DWORD size, int (*inflate)(const BYTE *, DWORD, BYTE *, DWORD),
+                             BYTE *scratch, void (*each)(int, const BYTE *, void *), void *context, char *problem)
+{
+    DWORD block, i;
+    int scenes = 0;
+
+    problem[0] = 0;
+    for (block = 0; block + 0x2000 <= size; block += 0x2000) {
+        const BYTE *b = file + block;
+
+        for (i = 0; i < 16; i++) {
+            DWORD offset = (DWORD)b[4 * i] | (DWORD)b[4 * i + 1] << 8 | (DWORD)b[4 * i + 2] << 16 | (DWORD)b[4 * i + 3] << 24, at, flags;
+
+            if (offset == 0xffffffff)
+                continue;
+            at = offset * 4;
+            if (at < 0x40 || at + 18 > 0x2000 || b[at] != 0x1f || b[at + 1] != 0x8b || b[at + 2] != 8) {
+                wsprintfA(problem, "block %lu member %lu: no gzip member at %04lx", block / 0x2000, i, at);
+                return -1;
+            }
+            flags = b[at + 3];
+            at += 10;
+            if (flags & 4)
+                at += 2 + (b[at] | b[at + 1] << 8);
+            if (flags & 8)
+                while (at < 0x2000 && b[at++])
+                    ;
+            if (flags & 16)
+                while (at < 0x2000 && b[at++])
+                    ;
+            if (flags & 2)
+                at += 2;
+            if (at >= 0x2000 || inflate(b + at, 0x2000 - at, scratch, EN_IMAGE_SIZE) != EN_IMAGE_SIZE) {
+                wsprintfA(problem, "block %lu member %lu (scene %d) does not inflate to %d bytes", block / 0x2000, i, scenes, EN_IMAGE_SIZE);
+                return -1;
+            }
+            each(scenes++, scratch, context);
+        }
+    }
+    return scenes;
+}
+
+/* ---- the registry file FF7_SpellExt_Enemies.ini ([enemies], [scenes], [battle_map], [models], [attack N]) ---- */
+
+struct en_map_line { BYTE where; WORD field, from, to; };   /* where: 0 any, 1 field, 2 world */
+
+/* Stage 6a: [attack 0xNNNN], the extras of attack ID N in any battle (a DLL scene's own extras for it win). given:
+   the keys given, a bit each (1 effect, 2 effect_all, 4 camera, 8 camera_multi, 16 script); bad: skipped. */
+#define EN_REG_ATTACKS_MAX      256
+struct en_reg_attack { WORD id, effect, effect_all, camera, camera_multi; short script; int line; BYTE given, bad; };
+
+struct en_registry {
+    BYTE enemies_all, scenes_all;
+    int enemies_listed, scenes_listed;
+    char enemies_load[EN_LOAD_MAX][EN_NAME_MAX + 1], scenes_load[EN_LOAD_MAX][EN_NAME_MAX + 1];
+    int maps;
+    struct en_map_line map[EN_MAP_MAX];
+    char models[ENEMIES_POOL_COUNT][ENEMIES_NAME_MAX + 1];
+    int models_given, problems, lines;
+    int attacks;
+    struct en_reg_attack attack[EN_REG_ATTACKS_MAX];
+};
+
+static BOOL en_word(const char *start, const char *end, const char *word)    /* [start, end) is `word`, any case */
+{
+    for (; start < end && *word; start++, word++)
+        if (en_lower(*start) != *word)
+            return FALSE;
+    return start == end && !*word;
+}
+
+/* A whole number (decimal or 0x) of [start, end): FALSE if it is not one. */
+static BOOL en_whole(const char *start, const char *end, DWORD *out)
+{
+    DWORD v = 0;
+    int digits = 0;
+
+    if (end - start > 2 && start[0] == '0' && (start[1] | 0x20) == 'x')
+        for (start += 2; start < end && en_hex(*start) >= 0 && digits < 8; start++, digits++)
+            v = v * 16 + (DWORD)en_hex(*start);
+    else
+        for (; start < end && *start >= '0' && *start <= '9' && digits < 9; start++, digits++)
+            v = v * 10 + (DWORD)(*start - '0');
+    *out = v;
+    return digits && start == end;
+}
+
+/* One [battle_map] line "where : the game's battle = the DLL battle" (where: field N, world, any). NULL,
+   or what is wrong. */
+static const char *en_map_entry(const char *key, const char *key_end, const char *value, const char *stop, struct en_map_line *m)
+{
+    const char *colon, *w, *we, *n;
+    DWORD number;
+
+    for (colon = key; colon < key_end && *colon != ':'; colon++)
+        ;
+    if (colon == key_end)
+        return "a map line is WHERE : BATTLE = DLL BATTLE (field 123 : 268 = 1200, world : 140 = 1204, any : 16 = 1004)";
+    for (w = key; w < colon && en_space(*w); w++)
+        ;
+    for (we = w; we < colon && !en_space(*we); we++)
+        ;
+    for (n = we; n < colon && en_space(*n); n++)
+        ;
+    {
+        const char *ne = colon;
+
+        while (ne > n && en_space(ne[-1]))
+            ne--;
+        if (en_word(w, we, "field")) {
+            if (!en_whole(n, ne, &number) || number > 0xffff)
+                return "field takes the field's number (field 123 : ...)";
+            m->where = 1;
+            m->field = (WORD)number;
+        } else if (en_word(w, we, "world") || en_word(w, we, "any")) {
+            if (n != ne)
+                return "world and any take no number";
+            m->where = en_word(w, we, "world") ? 2 : 0;
+            m->field = 0;
+        } else {
+            return "where is field N, world or any";
+        }
+    }
+    for (n = colon + 1; n < key_end && en_space(*n); n++)
+        ;
+    if (!en_whole(n, key_end, &number) || number > 0xffff)
+        return "the game's battle number (before =) is a number 0 to 65535";
+    m->from = (WORD)number;
+    if (!en_whole(value, stop, &number) || number < EN_BATTLE_FIRST || number > EN_BATTLE_LAST)
+        return "the DLL battle (after =) is a number 1024 to 16383 (scene x 4 + formation)";
+    m->to = (WORD)number;
+    return NULL;
+}
+
+static int enemies_models_entry(const char *key, const char *key_end, const char *value, const char *stop,
+                                int *index, char *folder, const char **fault);     /* (ENEMIES MODEL PURE) */
+
+/* A section's name [inner, inner_end): 1 "attack N" with N an attack ID (00-7f, 0100-7fff) in *id; -1 "attack" and
+   something else; 0 not an attack section. */
+static int en_reg_attack_section(const char *inner, const char *inner_end, DWORD *id)
+{
+    const char *n = inner + 6;
+
+    if (inner_end - inner < 7 || !en_word(inner, n, "attack") || !en_space(*n))
+        return 0;
+    while (n < inner_end && en_space(*n))
+        n++;
+    return en_whole(n, inner_end, id) && (*id <= 0x7f || (*id >= 0x100 && *id <= 0x7fff)) ? 1 : -1;
+}
+
+/* One key of an [attack N] section into A: NULL, or what is wrong (the line is skipped). */
+static const char *en_reg_attack_key(const char *key, const char *key_end, const char *value, const char *stop, struct en_reg_attack *A)
+{
+    static const char *const names[5] = { "effect", "effect_all", "camera", "camera_multi", "script" };
+    static const DWORD low[5] = { 0x100, 0x100, 0, 0, 3 }, high[5] = { 0xffff, 0xffff, 0xfffe, 0xfffe, 0x3f };
+    DWORD n;
+    int i;
+
+    for (i = 0; i < 5 && !en_word(key, key_end, names[i]); i++)
+        ;
+    if (i == 5)
+        return "an [attack N] section's keys are effect, effect_all, camera, camera_multi and script";
+    if (A->given & (1 << i))
+        return "the key is given twice in the section (the first is kept)";
+    if (!en_whole(value, stop, &n) || n < low[i] || n > high[i])
+        return i < 2 ? "effect and effect_all are SpellExt effects, 0x100 to 0xffff" : i < 4 ? "a camera is a number, 0 to 0xfffe"
+             : "script is a model script, 3 to 0x3f (0 and 1 are idle loops, 2 the death)";
+    A->given |= (BYTE)(1 << i);
+    if (i == 0)
+        A->effect = (WORD)n;
+    else if (i == 1)
+        A->effect_all = (WORD)n;
+    else if (i == 2)
+        A->camera = (WORD)n;
+    else if (i == 3)
+        A->camera_multi = (WORD)n;
+    else
+        A->script = (short)n;
+    return NULL;
+}
+
+/* The whole file (text, 0 after it; changed in place). Each problem is told to `say` (one line). */
+static void en_registry_parse(char *text, int size, struct en_registry *g, void (*say)(const char *line))
+{
+    char *line = text, *end, *file_end = text + size, message[400];
+    int line_number = 0, section = 0, given[ENEMIES_POOL_COUNT] = { 0 }, i;    /* section: 0 none, 1 enemies, 2 scenes, 3 battle_map, 4 models, 5 another, 6 attack N, 7 attack N skipped */
+
+    g->enemies_all = g->scenes_all = 1;
+    g->enemies_listed = g->scenes_listed = g->maps = g->models_given = g->problems = g->lines = 0;
+    g->attacks = 0;
+    for (i = 0; i < ENEMIES_POOL_COUNT; i++)
+        g->models[i][0] = 0;
+    if (size >= 3 && (BYTE)text[0] == 0xef && (BYTE)text[1] == 0xbb && (BYTE)text[2] == 0xbf)
+        line += 3;                      /* a UTF-8 byte-order mark (2a review, 1) */
+    for (; line < file_end; line = end + 1) {
+        char *start = line, *stop, *equals, *key_end, *value;
+
+        for (end = line; end < file_end && *end != '\n'; end++)
+            ;
+        line_number++;
+        for (stop = start; stop < end; stop++)
+            if ((*stop == ';' || *stop == '#') && (stop == start || en_space(stop[-1])))
+                break;
+        while (start < stop && en_space(*start))
+            start++;
+        while (stop > start && en_space(stop[-1]))
+            stop--;
+        if (start == stop)
+            continue;
+        if (*start == '[') {
+            char *inner = start + 1, *close = inner;
+
+            while (close < stop && *close != ']')
+                close++;
+            {
+                char *inner_end = close;
+
+                while (inner < inner_end && en_space(*inner))
+                    inner++;
+                while (inner_end > inner && en_space(inner_end[-1]))
+                    inner_end--;
+                section = close == stop ? 5 : en_word(inner, inner_end, "enemies") ? 1 : en_word(inner, inner_end, "scenes") ? 2
+                        : en_word(inner, inner_end, "battle_map") ? 3 : en_word(inner, inner_end, "models") ? 4 : 5;
+                if (section == 5 && close < stop) {
+                    DWORD id;
+                    int attack = en_reg_attack_section(inner, inner_end, &id), j;
+
+                    for (j = 0; attack > 0 && j < g->attacks && g->attack[j].id != id; j++)
+                        ;
+                    if (attack < 0) {
+                        wsprintfA(message, "enemies: %s line %d: [attack N]: N is an attack ID, 0x00-0x7f (the kernel's) or 0x100-0x7fff (a scene's): the section is skipped", ENEMIES_FILE_NAME, line_number);
+                        say(message);
+                        g->problems++;
+                        section = 7;
+                    } else if (attack > 0 && j < g->attacks) {
+                        wsprintfA(message, "enemies: %s line %d: [attack %04lx] is given twice: the first is kept, this one is skipped", ENEMIES_FILE_NAME, line_number, id);
+                        say(message);
+                        g->problems++;
+                        section = 7;
+                    } else if (attack > 0 && g->attacks == EN_REG_ATTACKS_MAX) {
+                        wsprintfA(message, "enemies: %s line %d: more than %d [attack N] sections: this one is skipped", ENEMIES_FILE_NAME, line_number, EN_REG_ATTACKS_MAX);
+                        say(message);
+                        g->problems++;
+                        section = 7;
+                    } else if (attack > 0) {
+                        struct en_reg_attack *A = &g->attack[g->attacks++];
+
+                        A->id = (WORD)id;
+                        A->effect = A->effect_all = 0;
+                        A->camera = A->camera_multi = 0xffff;
+                        A->script = -1;
+                        A->line = line_number;
+                        A->given = A->bad = 0;
+                        section = 6;
+                    }
+                }
+                if (section == 5) {
+                    char name[64];
+
+                    en_copy(name, sizeof name, start, (int)(stop - start));
+                    wsprintfA(message, "enemies: %s line %d: section %s is not one of this DLL's ([enemies] [scenes] [battle_map] [models] [attack N]): skipped", ENEMIES_FILE_NAME, line_number, name);
+                    say(message);
+                }
+            }
+            continue;
+        }
+        if (section == 0 || section == 5 || section == 7)
+            continue;
+        for (equals = start; equals < stop && *equals != '='; equals++)
+            ;
+        if (equals == stop) {
+            wsprintfA(message, "enemies: %s line %d: a line here is KEY = VALUE: skipped", ENEMIES_FILE_NAME, line_number);
+            say(message);
+            g->problems++;
+            continue;
+        }
+        key_end = equals;
+        value = equals + 1;
+        while (key_end > start && en_space(key_end[-1]))
+            key_end--;
+        while (value < stop && en_space(*value))
+            value++;
+        g->lines++;
+        if (section == 1 || section == 2) {
+            const char *w = value;
+
+            if (!en_word(start, key_end, "load")) {
+                wsprintfA(message, "enemies: %s line %d: [%s] has one key, load = all, or names: skipped", ENEMIES_FILE_NAME, line_number, section == 1 ? "enemies" : "scenes");
+                say(message);
+                g->problems++;
+                continue;
+            }
+            if (en_word(value, stop, "all")) {
+                if (section == 1)
+                    g->enemies_all = 1;
+                else
+                    g->scenes_all = 1;
+                continue;
+            }
+            if (section == 1)
+                g->enemies_all = 0;
+            else
+                g->scenes_all = 0;
+            while (w < stop) {
+                const char *we;
+
+                while (w < stop && (en_space(*w) || *w == ','))
+                    w++;
+                if (w == stop)
+                    break;
+                for (we = w; we < stop && !en_space(*we) && *we != ','; we++)
+                    ;
+                if (!en_name_ok(w, (int)(we - w))) {
+                    char name[48];
+
+                    en_copy(name, sizeof name, w, (int)(we - w));
+                    wsprintfA(message, "enemies: %s line %d: \"%s\" is no folder or scene name (1 to 31 letters, digits, _ or -): skipped", ENEMIES_FILE_NAME, line_number, name);
+                    say(message);
+                    g->problems++;
+                } else if ((section == 1 ? g->enemies_listed : g->scenes_listed) >= EN_LOAD_MAX) {
+                    wsprintfA(message, "enemies: %s line %d: more than %d names in load: the rest are skipped", ENEMIES_FILE_NAME, line_number, EN_LOAD_MAX);
+                    say(message);
+                    g->problems++;
+                    break;
+                } else if (section == 1) {
+                    en_copy(g->enemies_load[g->enemies_listed++], EN_NAME_MAX + 1, w, (int)(we - w));
+                } else {
+                    en_copy(g->scenes_load[g->scenes_listed++], EN_NAME_MAX + 1, w, (int)(we - w));
+                }
+                w = we;
+            }
+            continue;
+        }
+        if (section == 6) {
+            struct en_reg_attack *A = &g->attack[g->attacks - 1];
+            const char *fault = en_reg_attack_key(start, key_end, value, stop, A);
+
+            if (fault) {
+                wsprintfA(message, "enemies: %s line %d: [attack %04x]: %s: skipped", ENEMIES_FILE_NAME, line_number, A->id, fault);
+                say(message);
+                g->problems++;
+            }
+            continue;
+        }
+        if (section == 3) {
+            struct en_map_line m;
+            const char *fault = en_map_entry(start, key_end, value, stop, &m);
+
+            if (fault) {
+                wsprintfA(message, "enemies: %s line %d: %s: skipped", ENEMIES_FILE_NAME, line_number, fault);
+                say(message);
+                g->problems++;
+            } else if (g->maps == EN_MAP_MAX) {
+                wsprintfA(message, "enemies: %s line %d: more than %d map lines: this one is dropped", ENEMIES_FILE_NAME, line_number, EN_MAP_MAX);
+                say(message);
+                g->problems++;
+            } else {
+                g->map[g->maps++] = m;
+            }
+            continue;
+        }
+        {                               /* [models] (stage 2a's testing aid) */
+            const char *fault = "";
+            char folder[ENEMIES_NAME_MAX + 1];
+            int index;
+
+            if (enemies_models_entry(start, key_end, value, stop, &index, folder, &fault) < 0) {
+                wsprintfA(message, "enemies: %s line %d: %s: skipped", ENEMIES_FILE_NAME, line_number, fault);
+                say(message);
+                g->problems++;
+            } else if (given[index]) {
+                wsprintfA(message, "enemies: %s line %d: model %d is given twice: the first line is kept", ENEMIES_FILE_NAME, line_number, ENEMIES_POOL_FIRST + index);
+                say(message);
+                g->problems++;
+            } else {
+                given[index] = 1;
+                en_copy(g->models[index], ENEMIES_NAME_MAX + 1, folder, en_len(folder));
+                if (folder[0])
+                    g->models_given++;
+            }
+        }
+    }
+    for (i = 0; i < g->attacks; i++) {         /* [attack N]: what needs another key */
+        struct en_reg_attack *A = &g->attack[i];
+        const char *fault = !A->given ? "no key: nothing to do"
+                          : (A->given & 2) && !(A->given & 1) ? "effect_all needs effect"
+                          : (A->given & 8) && !(A->given & 4) ? "camera_multi needs camera (the camera on one target)" : NULL;
+
+        if (fault) {
+            A->bad = 1;
+            wsprintfA(message, "enemies: %s line %d: [attack %04x]: %s: the section is skipped", ENEMIES_FILE_NAME, A->line, A->id, fault);
+            say(message);
+            g->problems++;
+        }
+    }
+}
+
+/* Whether the load list takes `name` (all, or listed; any case). */
+static BOOL en_listed(BYTE all, char (*list)[EN_NAME_MAX + 1], int listed, const char *name)
+{
+    int i;
+
+    if (all)
+        return TRUE;
+    for (i = 0; i < listed; i++) {
+        const char *a = list[i], *b = name;
+
+        while (*a && en_lower(*a) == en_lower(*b))
+            a++, b++;
+        if (!*a && !*b)
+            return TRUE;
+    }
+    return FALSE;
+}
+
+/* The map line for the game's battle `battle` here (field_mode: the field module called; `field` its id),
+   a line of the place first, then an `any` line: its index, or -1. */
+static int en_map_find(const struct en_registry *g, BOOL field_mode, WORD field, WORD battle)
+{
+    int i;
+
+    for (i = 0; i < g->maps; i++)
+        if (g->map[i].from == battle && ((g->map[i].where == 1 && field_mode && g->map[i].field == field) || (g->map[i].where == 2 && !field_mode)))
+            return i;
+    for (i = 0; i < g->maps; i++)
+        if (g->map[i].from == battle && g->map[i].where == 0)
+            return i;
+    return -1;
+}
+
+/* The overwrite of formation f (enemies_overwrite): the loaded stand-in's set-up (0x14, setup_buffer) and camera
+   placement (0x30, camera_buffer) against the image. The set-up's location, next, escape, ffff (+0..+7) and flags, kind
+   (+0x10..+0x12) are the image's; its camera words (+8..+0xf), its camera byte (+0x13) and the camera placement are
+   the image's too when it holds them (from_image: the game's own scene.bin, so the battle is the compiler's image
+   under any kernel's scene.bin), else the image takes the stand-in's (as stage 2b did). */
+static void en_overwrite_formation(BYTE *img, int f, BOOL from_image, BYTE *setup_buffer, BYTE *camera_buffer)
+{
+    BYTE *setup = img + EN_O_SETUP + 0x14 * f, *camera = img + EN_O_CAMERA + 0x30 * f;
+    int i;
+
+    for (i = 0; i < 0x14; i++)
+        if (i < 8 || (i >= 0x10 && i < 0x13) || from_image)
+            setup_buffer[i] = setup[i];
+        else
+            setup[i] = setup_buffer[i];
+    for (i = 0; i < 0x30; i++)
+        if (from_image)
+            camera_buffer[i] = camera[i];
+        else
+            camera[i] = camera_buffer[i];
+}
+
+/* ---- stage 6a: an enemy's attack with SpellExt extras ---- */
+
+/* What applies to attack `id` of the enemy in slot `slot`: the live DLL scene's extras of that slot (the first entry of
+   its list with the ID, as the game's own scan of the list), when it has any; else the registry's [attack N]. When the
+   live slot lists the ID without extras, the registry gives it effect, effect_all and camera_multi only: the slot's own
+   camera and script (the image's) stay. `camera` is the registry's only (a DLL scene's camera is in its image); ffff
+   none, script -1 none. from: 1 the scene, 2 the registry. FALSE: nothing applies. */
+struct en_extras { WORD effect, effect_all, camera, camera_multi; short script; BYTE from; };
+
+static BOOL en_extras_find(const struct en_result *r, BOOL scene_live, const struct en_registry *g, int slot, int id, struct en_extras *x)
+{
+    int i;
+    BOOL listed = FALSE;
+
+    x->effect = x->effect_all = 0;
+    x->camera = x->camera_multi = 0xffff;
+    x->script = -1;
+    x->from = 0;
+    if (scene_live && slot >= 0 && slot < 3 && slot < r->enemies)
+        for (i = 0; i < r->fx_count[slot] && i < 16; i++)
+            if (r->fx[slot][i].id == id) {
+                listed = TRUE;
+                if (!r->fx[slot][i].effect && r->fx[slot][i].camera_multi == 0xffff)
+                    break;
+                x->effect = r->fx[slot][i].effect;
+                x->effect_all = r->fx[slot][i].effect_all;
+                x->camera_multi = r->fx[slot][i].camera_multi;
+                x->from = 1;
+                return TRUE;
+            }
+    for (i = 0; i < g->attacks && i < EN_REG_ATTACKS_MAX; i++)
+        if (g->attack[i].id == id && !g->attack[i].bad) {
+            x->effect = g->attack[i].effect;
+            x->effect_all = g->attack[i].effect_all;
+            x->camera_multi = g->attack[i].camera_multi;
+            if (!listed) {
+                x->camera = g->attack[i].camera;
+                x->script = g->attack[i].script;
+            }
+            x->from = 2;
+            return x->effect || x->camera_multi != 0xffff || x->camera != 0xffff || x->script >= 0;
+        }
+    return FALSE;
+}
+
+/* One effect number as the effects file has it (the glue fills it from effect_copies); index -1: not there. */
+struct en_fx_effect { int index; BYTE usable, play, script_ok; int play_base; };
+/* The note's result: the record's effect byte to write, and the effect's index for one target / several / the targets asked. */
+struct en_fx_choice { int number, single, several, now; };
+
+/* The note's decision: TRUE and `out` if the native effect is to play; FALSE and `why` (under 200 characters) if not
+   (nothing is written then: the game's own effect plays). A kernel attack is played as magic (type 02, handler 07's
+   typing) and its record's byte becomes the native effect's file-less base; a scene attack (type 20) has the enemy
+   effect EN_NATIVE_BASE. */
+static BOOL en_fx_decide(int type, WORD effect, WORD effect_all, const struct en_fx_effect *one, const struct en_fx_effect *all,
+                         unsigned targets, BOOL natives_on, BOOL base_ok, char *why, struct en_fx_choice *out)
+{
+    int i, several = (targets & (targets - 1)) != 0;
+
+    why[0] = 0;
+    if (type != 2 && type != 0x20) {
+        wsprintfA(why, "the game plays this attack as type %02x (magic 02, a scene attack 20): effect = is for kernel magic and scene attacks", type);
+        return FALSE;
+    }
+    if (!natives_on) {
+        wsprintfA(why, "native effects are off (no usable play = effect: see the start of the log)");
+        return FALSE;
+    }
+    if (type == 0x20 && !base_ok) {
+        wsprintfA(why, "scene-attack effects are OFF (enemy effect %02x is not the game's file-less routine: see the start of the log)", EN_NATIVE_BASE);
+        return FALSE;
+    }
+    for (i = 0; i < (effect_all ? 2 : 1); i++) {
+        const struct en_fx_effect *e = i ? all : one;
+        unsigned number = i ? effect_all : effect;
+
+        if (e->index < 0) {
+            wsprintfA(why, "effect %04x is not in FF7_SpellExt_Effects.ini", number);
+            return FALSE;
+        }
+        if (!e->usable) {
+            wsprintfA(why, "effect %04x was refused when the effects file was read (see the start of the log)", number);
+            return FALSE;
+        }
+        if (!e->play) {
+            wsprintfA(why, "effect %04x is a copy: an enemy attack plays native effects (play =), not copies", number);
+            return FALSE;
+        }
+        if (!e->script_ok) {
+            wsprintfA(why, "effect %04x's script is not usable (see the start of the log)", number);
+            return FALSE;
+        }
+        if (type == 2 && !(e->play_base >= 0 && (e->play_base <= 0x04 || e->play_base == 0x19))) {
+            wsprintfA(why, "effect %04x's base %02x is none of the file-less magic effects (00-04, 19)", number, e->play_base & 0xff);
+            return FALSE;
+        }
+    }
+    if (type == 2 && effect_all && all->play_base != one->play_base) {
+        wsprintfA(why, "effects %04x and %04x have other bases (%02x, %02x): a kernel attack's record holds one", effect, effect_all,
+                  one->play_base & 0xff, all->play_base & 0xff);
+        return FALSE;
+    }
+    out->single = one->index;
+    out->several = effect_all ? all->index : one->index;
+    out->now = several ? out->several : out->single;
+    out->number = type == 0x20 ? EN_NATIVE_BASE : one->play_base;     /* (type 02: one base for both, above) */
+    return TRUE;
+}
+
+/* ---- the loader's tail (005d12b9-005d1475), on a DLL scene's set-up ---- */
+struct en_tail {
+    WORD field_flags;           /* 009a88a6: the field's battle flags, as the battle set them */
+    WORD flags;                 /* 009a8760: the set-up's flags */
+    BYTE kind;                  /* 009a8762 */
+    WORD escape;                /* 009a8754: the set-up's escape counter */
+    WORD kind_word;             /* 009aad20 */
+    WORD escape_now, escape_copy;   /* 009aad0a, 009aad0e */
+};
+
+/* As the game does it, without the Battle Square's branch: TRUE if the field's flags ask for that branch
+   (bit 0x40; a DLL scene is refused there at the hand-over: nothing is done for it). */
+static BOOL en_tail(struct en_tail *t, const BYTE *kind_table)
+{
+    BOOL square = FALSE;
+
+    if ((t->field_flags & 4) && (t->flags & 0x10) && t->kind == 0)
+        t->kind = 1;                    /* pre-emptive, from the field's flags */
+    t->kind_word = kind_table[t->kind];
+    if (t->field_flags & 0x40)
+        square = TRUE;
+    else if (t->field_flags & 8)
+        t->flags &= 0xfffb;
+    if (!(t->flags & 4))
+        t->field_flags |= 8;
+    t->escape_now = t->escape;
+    if (t->kind_word == 1 || t->kind_word == 3)
+        t->escape_now = 1;
+    t->escape_copy = t->escape_now;
+    return square;
+}
+/* ENEMIES SCENE PURE END */
+
+/* ---- enemies (scenes): the registry, the folders, the scene.bin index, the hand-over and the load ---- */
+#define ENEMIES_KNOWN_MAX       512
+#define ENEMIES_BASES_MAX       1024
+#define ENEMIES_SCAN_LOG_MAX    40
+#define ENEMIES_BATTLE_LOG_MAX  200
+#define ENEMIES_LINE_MAX        600     /* the enemies part of a hand-over line: 3 x ~140 */
+#define ENEMIES_POOL_LOG_MAX    20
+#define ADDR_FIELD_FLAGS_BATTLE 0x00db958au  /* WORD: the field's battle flags (BTLMD), written at 0040827a, before the hand-over */
+#define ADDR_BATTLE_FIELD_FLAGS 0x009a88a6u  /* WORD: the battle's copy of them (the loader's tail reads and sets it) */
+#define ADDR_LOADER_STATE       0x00c069bcu  /* DWORD: battle_load_scene_005d1050's state, 0 between loads */
+#define ADDR_LOADER_DONE        0x009a89d0u  /* DWORD: 1 when the loader has copied a scene (its callers reset it) */
+#define ADDR_SCENE_SETUP        0x009a8750u  /* 0x14: location, next, escape, ffff, 4 x camera words, flags, kind, camera byte */
+#define ADDR_SCENE_CAMERA       0x009a8764u  /* 0x30 */
+#define ADDR_SCENE_ATTACKS      0x009a90c4u  /* 0x380, then IDs 009a9444 (0x40), names 009a9484 (0x400) */
+#define ADDR_SCENE_FORMATION_AI 0x009a9afcu  /* 0x200, then the enemy AI 009a9cfc (0x1000) */
+#define ADDR_KIND_TABLE         0x007b76f0u  /* the kind byte's word (009aad20): 00 01 02 03 04 03 03 03 */
+#define ADDR_FIELD_MODE         0x00cc0d84u  /* 1: the field module started the swirl (the main loop's case 0x17) */
+#define ENEMIES_ADDR_BATTLE_3D  0x009adfd8u  /* the battle's 3D data: made at its set-up (FUN_00428b12), 0 again at its end (FUN_00428f59) */
+
+static struct en_registry enemies_registry;
+static char enemies_known[ENEMIES_KNOWN_MAX][EN_NAME_MAX + 1];
+static int enemies_known_count;
+static char enemies_scene_of[EN_SCENE_LAST - EN_SCENE_FIRST + 1][EN_NAME_MAX + 1];      /* "" = none */
+static int enemies_scene_count;
+/* (battle menu, stage 2) what the battle page lists, kept by the scan while the page is shown (battle_menu_shown):
+   each folder's `name =`, each scene's three enemies (an index of enemies_known; -1 none, -2 a folder that is not
+   registered) and each formation's stage (-1 none) */
+static char enemies_known_name[ENEMIES_KNOWN_MAX][EN_NAME_MAX + 1];
+static short enemies_scene_enemy[EN_SCENE_LAST - EN_SCENE_FIRST + 1][3];
+static short enemies_scene_stage[EN_SCENE_LAST - EN_SCENE_FIRST + 1][4];
+static LONG enemies_scans, enemies_scan_listed;    /* scans so far; the last one kept the lists above */
+static FILETIME enemies_folder_times[3];
+static struct { WORD id; BYTE scene; BYTE record[28]; } enemies_bases[ENEMIES_BASES_MAX];
+static int enemies_base_count, enemies_bin_scenes;      /* the game's scene.bin: attacks indexed, scenes in it */
+static struct en_result enemies_staged;                 /* the scene built at the hand-over (or at the load) */
+/* each formation's set-up and camera placement of the game's own scene.bin (enemies_index_one); enemies_stand_scenes
+   0: no index (the stand-in's load gives them, whichever scene.bin is active) */
+static BYTE enemies_stand_setup[255][4][0x14], enemies_stand_camera[255][4][0x30];
+static int enemies_stand_scenes;
+static LONG enemies_staged_ok;          /* enemies_staged holds a built scene (describe_battle, the crash line) */
+static LONG enemies_staged_fresh;       /* built at the hand-over and not yet loaded: its load takes it as it is */
+static char enemies_problem[EN_PROBLEM_MAX + 16];
+static LONG enemies_battle_logged, enemies_scan_logged, enemies_battle_seen_3d, enemies_battle_assigned, enemies_pool_seen;
+/* The hold of a DLL battle (enemies_battle_holds) is that battle's number of this counter, never 0; the driver
+   thread's watch notes the hold it saw the 3D data of (enemies_battle_seen_3d) and gives back only that hold, by
+   compare-and-exchange, so a watch of the last battle cannot end the hold of the next one (2b review, round 2). */
+static LONG enemies_battle_generation;
+static struct {
+    DWORD number;               /* the battle being loaded */
+    DWORD stand_in;
+    int failed, applied, calls;
+    WORD field_flags;           /* 009a88a6 when the load began */
+} enemies_load;
+
+static void enemies_say(const char *line)
+{
+    log_line("%s", line);
+}
+
+/* ---- the build's world: the config folder's files, the live kernel, the index ---- */
+static BOOL enemies_path(const char *relative, char *path)
+{
+    if (lstrlenA(config_dir) + lstrlenA(relative) >= MAX_PATH + 100)
+        return FALSE;
+    lstrcpyA(path, config_dir);
+    lstrcatA(path, relative);
+    return TRUE;
+}
+
+static int enemies_env_read(const char *relative, char *buffer, int capacity)
+{
+    char path[MAX_PATH + 128];
+    HANDLE file;
+    DWORD size, got = 0;
+
+    if (!enemies_path(relative, path))
+        return -2;
+    file = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE)
+        return GetLastError() == ERROR_FILE_NOT_FOUND || GetLastError() == ERROR_PATH_NOT_FOUND ? -1 : -2;
+    size = GetFileSize(file, NULL);
+    if (size == INVALID_FILE_SIZE || size > (DWORD)capacity || (size && (!ReadFile(file, buffer, size, &got, NULL) || got != size))) {
+        CloseHandle(file);
+        return -2;
+    }
+    CloseHandle(file);
+    return (int)size;
+}
+
+static BOOL enemies_env_exists(const char *relative)
+{
+    char path[MAX_PATH + 128];
+    DWORD attributes;
+
+    if (!enemies_path(relative, path))
+        return FALSE;
+    attributes = GetFileAttributesA(path);
+    return attributes != INVALID_FILE_ATTRIBUTES && !(attributes & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+static BOOL enemies_env_older(const char *relative, const char *than)
+{
+    char a[MAX_PATH + 128], b[MAX_PATH + 128];
+    WIN32_FILE_ATTRIBUTE_DATA da, db;
+
+    return enemies_path(relative, a) && enemies_path(than, b) && GetFileAttributesExA(a, GetFileExInfoStandard, &da) &&
+           GetFileAttributesExA(b, GetFileExInfoStandard, &db) && CompareFileTime(&da.ftLastWriteTime, &db.ftLastWriteTime) < 0;
+}
+
+static BOOL enemies_env_known(const char *folder)
+{
+    int i;
+
+    for (i = 0; i < enemies_known_count; i++)
+        if (!lstrcmpiA(enemies_known[i], folder))
+            return TRUE;
+    return FALSE;
+}
+
+/* A kernel attack: the live table's record (the active kernel's, as the game uses it) and its name
+   through the DLL's text path (a SpellExt rename counts), first ff on, ff filled, at most 31. */
+static void enemies_env_kernel_attack(int id, BYTE *record, BYTE *name)
+{
+    const BYTE *text = text_fetch_hook(*(const BYTE *)(ADDR_TEXT_SECTION_BASE + TEXT_TYPE_MAGIC) + TEXT_NAME_OFFSET, id, 0);
+    int i, end = 0;
+
+    copy_bytes(record, kernel_record(id), ATTACK_RECORD_SIZE);
+    if (text && !IsBadReadPtr(text, 32))
+        while (end < 31 && text[end] != 0xff)
+            end++;
+    for (i = 0; i < 32; i++)
+        name[i] = i < end ? text[i] : 0xff;
+}
+
+/* Item `id`'s name as the compiler compares it (s0_common._names: f8 / f9 take the next byte along, a
+   character past the font's first 0x60 is '?'; lower case; a space as '_'). */
+static BOOL enemies_env_item(int id, char *out, int capacity)
+{
+    const BYTE *text = text_fetch_hook(*(const BYTE *)(ADDR_TEXT_SECTION_BASE + TEXT_TYPE_ITEM) + TEXT_NAME_OFFSET, id, 0);
+    int i, n = 0;
+
+    out[0] = 0;
+    if (!text || IsBadReadPtr(text, 64))
+        return FALSE;
+    for (i = 0; i < 64 && text[i] != 0xff && n < capacity - 1; i++) {
+        BYTE c = text[i];
+
+        if (c == 0xf8 || c == 0xf9) {
+            i++;
+            continue;
+        }
+        out[n++] = c < 0x60 ? (c + 0x20 == ' ' ? '_' : (char)en_lower((char)(c + 0x20))) : '?';
+    }
+    out[n] = 0;
+    return TRUE;
+}
+
+static const BYTE *enemies_env_base(int id, int *scene)
+{
+    int low = 0, high = enemies_base_count - 1;
+
+    while (low <= high) {
+        int middle = (low + high) / 2;
+
+        if (enemies_bases[middle].id == id) {
+            *scene = enemies_bases[middle].scene;
+            return enemies_bases[middle].record;
+        }
+        if (enemies_bases[middle].id < id)
+            low = middle + 1;
+        else
+            high = middle - 1;
+    }
+    return NULL;
+}
+
+static BOOL enemies_env_stand_in(int scene, int formation, BYTE *setup, BYTE *camera)
+{
+    if (scene < 0 || scene >= enemies_stand_scenes || formation < 0 || formation > 3)
+        return FALSE;                   /* the game's own load of the stand-in gives them (enemies_overwrite) */
+    copy_bytes(setup, enemies_stand_setup[scene][formation], 0x14);
+    copy_bytes(camera, enemies_stand_camera[scene][formation], 0x30);
+    return TRUE;
+}
+
+static void enemies_env_note(const char *line)
+{
+    log_line("%s", line);
+}
+
+static void enemies_env(struct en_env *env)
+{
+    env->read_file = enemies_env_read;
+    env->exists = enemies_env_exists;
+    env->older = enemies_env_older;
+    env->enemy_known = enemies_env_known;
+    env->kernel_attack = enemies_env_kernel_attack;
+    env->item_name = enemies_env_item;
+    env->base_record = enemies_env_base;
+    env->stand_in = enemies_env_stand_in;
+    env->note = enemies_env_note;
+    env->scene_count = enemies_bin_scenes;
+    env->pool_first = ENEMIES_POOL_FIRST;
+}
+
+/* ---- the game's scene.bin: every scene attack's record by ID (the first scene that has it), once ---- */
+static void enemies_index_one(int scene, const BYTE *image, void *context)
+{
+    int a, i;
+
+    (void)context;
+    for (a = 0; a < 4 && scene < 255; a++) {
+        copy_bytes(enemies_stand_setup[scene][a], image + EN_O_SETUP + 0x14 * a, 0x14);
+        copy_bytes(enemies_stand_camera[scene][a], image + EN_O_CAMERA + 0x30 * a, 0x30);
+    }
+    for (a = 0; a < 3; a++) {
+        WORD model = (WORD)(image[EN_O_IDS + 2 * a] | image[EN_O_IDS + 2 * a + 1] << 8);
+
+        if (model >= ENEMIES_POOL_FIRST && model < ENEMIES_POOL_FIRST + ENEMIES_POOL_COUNT &&
+            InterlockedIncrement(&enemies_pool_seen) <= ENEMIES_POOL_LOG_MAX)
+            log_line("enemies: WARNING: scene %d of the game's scene.bin uses model %u, a number of the pool: while a DLL battle or [models] serves that number from a folder, that scene's battles would draw it",
+                     scene, model);
+    }
+    for (a = 0; a < 32; a++) {
+        WORD id = (WORD)(image[EN_O_ATTACK_ID + 2 * a] | image[EN_O_ATTACK_ID + 2 * a + 1] << 8);
+
+        if (id < 0x100 || id == 0xffff || enemies_base_count == ENEMIES_BASES_MAX)
+            continue;
+        for (i = enemies_base_count; i > 0 && enemies_bases[i - 1].id > id; i--)
+            ;
+        if (i > 0 && enemies_bases[i - 1].id == id)
+            continue;                   /* the first scene's wins (scene_compile's lookup order) */
+        {
+            int m;
+
+            for (m = enemies_base_count; m > i; m--)
+                enemies_bases[m] = enemies_bases[m - 1];
+        }
+        enemies_bases[i].id = id;
+        enemies_bases[i].scene = (BYTE)scene;
+        copy_bytes(enemies_bases[i].record, image + EN_O_ATTACK + 28 * a, 28);
+        enemies_base_count++;
+    }
+}
+
+static int enemies_inflate(const BYTE *in, DWORD in_length, BYTE *out, DWORD out_length)
+{
+    return px_inflate(in, in_length, out, out_length);
+}
+
+static void enemies_index_scene_bin(void)
+{
+    static const char *const tails[2] = { "data\\lang-en\\battle\\scene.bin", "data\\battle\\scene.bin" };
+    char path[MAX_PATH + 64];
+    DWORD n = GetModuleFileNameA(NULL, path, MAX_PATH), size = 0, got = 0;
+    BYTE *bytes = NULL, *scratch;
+    HANDLE file = INVALID_HANDLE_VALUE;
+    int t, scenes;
+
+    while (n > 0 && path[n - 1] != '\\' && path[n - 1] != '/')
+        n--;
+    for (t = 0; t < 2 && file == INVALID_HANDLE_VALUE; t++) {
+        lstrcpyA(path + n, tails[t]);
+        file = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    }
+    enemies_stand_scenes = 0;
+    if (file == INVALID_HANDLE_VALUE) {
+        log_line("enemies: the game's scene.bin was not found (data\\lang-en\\battle, data\\battle): a scene attack's `base` is refused, so is its scene; the camera placements are the stand-in's (the active scene.bin's)");
+        return;
+    }
+    size = GetFileSize(file, NULL);
+    if (size != INVALID_FILE_SIZE && size >= 0x2000 && size <= 0x200000)
+        bytes = VirtualAlloc(NULL, size + EN_IMAGE_SIZE, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!bytes || !ReadFile(file, bytes, size, &got, NULL) || got != size) {
+        CloseHandle(file);
+        if (bytes)
+            VirtualFree(bytes, 0, MEM_RELEASE);
+        log_line("enemies: %s could not be read (%lu bytes): a scene attack's `base` is refused, so is its scene; the camera placements are the stand-in's (the active scene.bin's)", path, size);
+        return;
+    }
+    CloseHandle(file);
+    scratch = bytes + size;
+    enemies_base_count = 0;
+    scenes = en_scene_bin_walk(bytes, size, enemies_inflate, scratch, enemies_index_one, NULL, enemies_problem);
+    VirtualFree(bytes, 0, MEM_RELEASE);
+    if (scenes < 0) {
+        log_line("enemies: %s: %s; the attacks of the scenes before it are indexed (%d); the camera placements are the stand-in's (the active scene.bin's)",
+                 path, enemies_problem, enemies_base_count);
+        return;
+    }
+    enemies_bin_scenes = scenes;
+    enemies_stand_scenes = scenes < 255 ? scenes : 255;
+    if (!enemies_pool_seen)
+        log_line("enemies: no scene of %s uses a model of the pool (%d-%d)", path, ENEMIES_POOL_FIRST, ENEMIES_POOL_FIRST + ENEMIES_POOL_COUNT - 1);
+    log_line("enemies: scene attacks and formation cameras indexed from %s (%lu bytes, %d scenes, %d records)%s", path, size, scenes, enemies_base_count,
+             size == 270336 ? "" : ": NOT the size of the game's own file (270336): a mod's, as the mod manager answered the open?");
+}
+
+/* ---- the registry and the folders ---- */
+static BOOL enemies_folder_time(const char *relative, FILETIME *time)
+{
+    char path[MAX_PATH + 128];
+    WIN32_FILE_ATTRIBUTE_DATA data;
+
+    time->dwLowDateTime = time->dwHighDateTime = 0;
+    if (!enemies_path(relative, path) || !GetFileAttributesExA(path, GetFileExInfoStandard, &data))
+        return FALSE;
+    *time = data.ftLastWriteTime;
+    return TRUE;
+}
+
+/* Whether a folder of the three (enemies, scenes, scenes\generated) was written since the last scan. */
+static BOOL enemies_folders_changed(void)
+{
+    static const char *const folders[3] = { "enemies", "scenes", "scenes\\generated" };
+    FILETIME now;
+    int i;
+
+    for (i = 0; i < 3; i++) {
+        enemies_folder_time(folders[i], &now);
+        if (CompareFileTime(&now, &enemies_folder_times[i]))
+            return TRUE;
+    }
+    return FALSE;
+}
+
+static void enemies_scan_say(const char *line)
+{
+    if (InterlockedIncrement(&enemies_scan_logged) <= ENEMIES_SCAN_LOG_MAX)
+        log_line("%s", line);
+}
+
+/* (battle menu) The place of `folder` in enemies_known (ASCII case ignored, as the file system), or -2. */
+static int enemies_known_index(const char *folder)
+{
+    int i, j;
+
+    for (i = 0; i < enemies_known_count; i++) {
+        for (j = 0; folder[j] && en_lower(folder[j]) == en_lower(enemies_known[i][j]); j++)
+            ;
+        if (!folder[j] && !enemies_known[i][j])
+            return i;
+    }
+    return -2;
+}
+
+static BOOL battle_menu_shown(void);    /* (battle menu) the page can be opened: the scan keeps what it lists */
+
+/* Adds the scene `name` (once; each read for its [scene] number). */
+static void enemies_scan_scene(const char *name, int *problems)
+{
+    struct en_env env;
+    int number, slot;
+    char line[EN_PROBLEM_MAX + 64];
+    struct en_listing listing;
+
+    if (!en_listed(enemies_registry.scenes_all, enemies_registry.scenes_load, enemies_registry.scenes_listed, name))
+        return;
+    enemies_env(&env);
+    number = en_scene_number(&env, name, enemies_problem);
+    if (number < 0) {
+        wsprintfA(line, "enemies: scene %.31s skipped: %.900s", name, enemies_problem);
+        enemies_scan_say(line);
+        (*problems)++;
+        return;
+    }
+    slot = number - EN_SCENE_FIRST;
+    if (enemies_scene_of[slot][0]) {
+        wsprintfA(line, "enemies: scene %.31s says number %d, which scene %.31s has: %.31s skipped", name, number, enemies_scene_of[slot], name);
+        enemies_scan_say(line);
+        (*problems)++;
+        return;
+    }
+    lstrcpynA(enemies_scene_of[slot], name, EN_NAME_MAX + 1);
+    enemies_scene_count++;
+    if (battle_menu_shown()) {      /* (battle menu, stage 2) the same text, still parsed: the page's columns */
+        int i;
+
+        en_scene_listing(&listing);
+        for (i = 0; i < 3; i++)
+            enemies_scene_enemy[slot][i] = (short)(i < listing.enemies ? enemies_known_index(listing.folder[i]) : -1);
+        for (i = 0; i < 4; i++)
+            enemies_scene_stage[slot][i] = listing.stage[i];
+    }
+}
+
+/* The enemy folders and the scene files, registered again (start-up, Re-init, a folder written since). */
+static void enemies_scan(const char *why)
+{
+    static const char *const scene_folders[2] = { "scenes\\*.ini", "scenes\\generated\\*.ini" };
+    char path[MAX_PATH + 128];
+    WIN32_FIND_DATAA found;
+    HANDLE search;
+    int i, problems = 0, dropped = 0;
+    DWORD started = GetTickCount();
+    struct en_env env;
+    BOOL lists;
+
+    enemies_scan_logged = 0;
+    enemies_known_count = 0;
+    lists = battle_menu_shown();    /* (battle menu, stage 2) the enemies' names and the scenes' columns: only while the page is there */
+    if (lists)
+        enemies_env(&env);
+    enemies_folder_time("enemies", &enemies_folder_times[0]);
+    enemies_folder_time("scenes", &enemies_folder_times[1]);
+    enemies_folder_time("scenes\\generated", &enemies_folder_times[2]);
+    if (enemies_path("enemies\\*", path) && (search = FindFirstFileA(path, &found)) != INVALID_HANDLE_VALUE) {
+        do {
+            char inner[96];
+
+            if (!(found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || found.cFileName[0] == '.')
+                continue;
+            if (!en_name_ok(found.cFileName, lstrlenA(found.cFileName)) ||
+                !en_listed(enemies_registry.enemies_all, enemies_registry.enemies_load, enemies_registry.enemies_listed, found.cFileName))
+                continue;
+            wsprintfA(inner, "enemies\\%s\\enemy.ini", found.cFileName);
+            if (!enemies_env_exists(inner)) {
+                wsprintfA(inner, "enemies\\%s\\generated.ini", found.cFileName);
+                if (!enemies_env_exists(inner))
+                    continue;
+            }
+            if (enemies_known_count == ENEMIES_KNOWN_MAX) {
+                dropped++;
+                continue;
+            }
+            lstrcpynA(enemies_known[enemies_known_count], found.cFileName, EN_NAME_MAX + 1);
+            if (lists)
+                en_enemy_shown_name(&env, enemies_known[enemies_known_count], enemies_known_name[enemies_known_count]);
+            enemies_known_count++;
+        } while (FindNextFileA(search, &found));
+        FindClose(search);
+    }
+    if (dropped)
+        log_line("enemies: more than %d enemy folders: %d are not registered", ENEMIES_KNOWN_MAX, dropped);
+    for (i = 0; i <= EN_SCENE_LAST - EN_SCENE_FIRST; i++)
+        enemies_scene_of[i][0] = 0;
+    enemies_scene_count = 0;
+    for (i = 0; i < 2; i++)
+        if (enemies_path(scene_folders[i], path) && (search = FindFirstFileA(path, &found)) != INVALID_HANDLE_VALUE) {
+            do {
+                int length = lstrlenA(found.cFileName);
+                char name[EN_NAME_MAX + 1];
+
+                if ((found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || length < 5 || lstrcmpiA(found.cFileName + length - 4, ".ini"))
+                    continue;
+                if (!en_name_ok(found.cFileName, length - 4)) {
+                    char line[MAX_PATH + 96];
+
+                    wsprintfA(line, "enemies: scenes\\%s%s skipped: a scene file's name is 1 to 31 letters, digits, _ or -", i ? "generated\\" : "", found.cFileName);
+                    enemies_scan_say(line);
+                    problems++;
+                    continue;
+                }
+                en_copy(name, sizeof name, found.cFileName, length - 4);
+                if (i) {
+                    char user[64];
+
+                    wsprintfA(user, "scenes\\%s.ini", name);
+                    if (enemies_env_exists(user))
+                        continue;       /* (read with the user's file, in the first folder) */
+                }
+                enemies_scan_scene(name, &problems);
+            } while (FindNextFileA(search, &found));
+            FindClose(search);
+        }
+    if (enemies_scan_logged > ENEMIES_SCAN_LOG_MAX)
+        log_line("enemies: ... %ld more such lines not written", enemies_scan_logged - ENEMIES_SCAN_LOG_MAX);
+    InterlockedExchange(&enemies_scan_listed, lists);
+    InterlockedIncrement(&enemies_scans);
+    log_line("enemies: registered (%s): %d enemies (SpellExtConfig\\enemies), %d scenes (SpellExtConfig\\scenes and scenes\\generated), %d file(s) skipped; %lu ms%s",
+             why, enemies_known_count, enemies_scene_count, problems, GetTickCount() - started,
+             lists ? "; the names and stages the SpellExt menu's battle page lists were read with them" : "");
+}
+
+/* The registry file; [models] (the testing aid) assigned and held for the run while it assigns one. */
+static void enemies_read_registry(void)
+{
+    char *text;
+    DWORD size = 0;
+    int i;
+
+    text = read_whole_file(ENEMIES_FILE_NAME, &size);
+    if (!text) {
+        en_registry_parse((char *)"", 0, &enemies_registry, enemies_say);
+        log_line("enemies: no %s: every enemy folder and scene file is registered, no battle of the game is mapped, no pool model is assigned for the run", ENEMIES_FILE_NAME);
+    } else {
+        text[size] = 0;
+        en_registry_parse(text, (int)size, &enemies_registry, enemies_say);
+        VirtualFree(text, 0, MEM_RELEASE);
+    }
+    for (i = 0; i < ENEMIES_POOL_COUNT; i++) {
+        char letters[3], path[MAX_PATH + 200];
+        DWORD attributes;
+
+        if (!enemies_registry.models[i][0])
+            continue;
+        enemies_model_letters(ENEMIES_POOL_FIRST + i, letters);
+        if (!enemies_model_path(config_dir, enemies_registry.models[i], "aa", path, sizeof path)) {
+            log_line("enemies: model %d (%s..) = %s: the path is too long; nothing is served for it", ENEMIES_POOL_FIRST + i, letters, enemies_registry.models[i]);
+            enemies_registry.models[i][0] = 0;
+            enemies_registry.models_given--;
+            continue;
+        }
+        attributes = GetFileAttributesA(path);
+        if (attributes != INVALID_FILE_ATTRIBUTES && !(attributes & FILE_ATTRIBUTE_DIRECTORY))
+            log_line("enemies: [models] model %d (files %s..) is served from %s\\%s\\model\\ for the run (outside the battles of DLL scenes)",
+                     ENEMIES_POOL_FIRST + i, letters, ENEMIES_FOLDER_NAME, enemies_registry.models[i]);
+        else
+            log_line("enemies: [models] model %d (files %s..) = %s: %s\\%s\\model\\aa (the skeleton) is MISSING: each file the folder lacks comes from wherever the driver finds it (the archive holds a model of these letters)",
+                     ENEMIES_POOL_FIRST + i, letters, enemies_registry.models[i], ENEMIES_FOLDER_NAME, enemies_registry.models[i]);
+    }
+    log_line("enemies: %s: enemies %s, scenes %s, %d battle map line(s), [models] %d of %d pool models for the run, %d [attack N] section(s), %d problem line(s)",
+             ENEMIES_FILE_NAME, enemies_registry.enemies_all ? "all" : "as listed", enemies_registry.scenes_all ? "all" : "as listed",
+             enemies_registry.maps, enemies_registry.models_given, ENEMIES_POOL_COUNT, enemies_registry.attacks, enemies_registry.problems);
+}
+
+/* The pool's table as it is outside a DLL battle: [models], and the slots held for the run while it
+   assigns one (a DLL battle's assignment replaces it until that battle is over). */
+static void enemies_static_models(void)
+{
+    int i;
+
+    for (i = 0; i < ENEMIES_POOL_COUNT; i++)
+        enemies_model_assign(i, enemies_registry.models[i]);
+    InterlockedExchange(&enemies_holds_opens, enemies_driver_found && enemies_registry.models_given > 0);
+    driver_opens_settle();
+}
+
+/* A battle of a DLL scene is over (or a battle of the game's starts): the pool goes back to [models],
+   the driver's slots to what they held (unless another reason holds them). */
+static void enemies_battle_release(const char *why)
+{
+    if (!InterlockedExchange(&enemies_battle_assigned, 0))
+        return;
+    InterlockedExchange(&enemies_battle_holds, 0);
+    InterlockedExchange(&enemies_battle_seen_3d, 0);
+    enemies_static_models();
+    if (InterlockedIncrement(&enemies_battle_logged) <= ENEMIES_BATTLE_LOG_MAX)
+        log_line("enemies: the pool models of the last DLL battle are given back (%s); the driver's file opens are %s", why,
+                 driver_opens_in ? "taken (another reason holds them)" : "its own");
+}
+
+/* From the driver's opens (any thread) while a DLL battle holds them: the battle is over once its 3D data,
+   seen made, is gone (FUN_00428f59 at the battle module's quit, FUN_0041b87d). Only the slots are given
+   back here; the pool table goes back to [models] on the main thread, at the next load
+   (enemies_battle_release from load_scene_hook), before that battle's models are read. */
+static void enemies_battle_watch(void)
+{
+    LONG hold = enemies_battle_holds;
+
+    if (!hold)
+        return;
+    if (*(const DWORD *)ENEMIES_ADDR_BATTLE_3D)
+        InterlockedExchange(&enemies_battle_seen_3d, hold);
+    else if (enemies_battle_seen_3d == hold && InterlockedCompareExchange(&enemies_battle_holds, 0, hold) == hold) {
+        InterlockedCompareExchange(&enemies_battle_seen_3d, 0, hold);
+        driver_opens_settle();
+        if (InterlockedIncrement(&enemies_battle_logged) <= ENEMIES_BATTLE_LOG_MAX)
+            log_line("enemies: the DLL battle is over (its 3D data is freed): the driver's file opens are %s",
+                     driver_opens_in ? "still taken (another reason holds them)" : "its own again");
+    }
+}
+
+/* load_scene_hook: a scene of the game's is about to load (at the first call of its load). */
+static void enemies_game_scene(void)
+{
+    if (*(const DWORD *)ADDR_LOADER_STATE == 0 && enemies_battle_assigned)
+        enemies_battle_release("a battle of the game's own loads");
+}
+
+/* ---- the hand-over (battle_number_hook) ---- */
+static LONG enemies_map_wanted(WORD game, char *why)
+{
+    BOOL field = *(const WORD *)ADDR_FIELD_MODE == 1;
+    WORD id = *(const WORD *)ADDR_FIELD_MODULE_ID;
+    int i = en_map_find(&enemies_registry, field, id, game);
+
+    if (i < 0)
+        return -1;
+    if (enemies_registry.map[i].where == 1)
+        wsprintfA(why, "map, field %u (00cff468 %u, 00cc15d0 %u)", enemies_registry.map[i].field, id, *(const WORD *)ADDR_FIELD_ID_NOW);
+    else
+        wsprintfA(why, enemies_registry.map[i].where == 2 ? "map, world" : "map, any (%s %u)", field ? "field" : "world map", id);
+    return enemies_registry.map[i].to;
+}
+
+/* Builds the DLL scene of `battle` into enemies_staged (registry re-scanned once if it is out of date). */
+static BOOL enemies_build(DWORD battle)
+{
+    struct en_env env;
+    int scene = (int)(battle >> 2), attempt;
+    BOOL mismatch = FALSE;
+    const char *name = "";
+
+    if (scene < EN_SCENE_FIRST || scene > EN_SCENE_LAST)
+        return FALSE;
+    if (enemies_folders_changed())
+        enemies_scan("a folder was written");
+    for (attempt = 0; attempt < 2; attempt++) {
+        name = enemies_scene_of[scene - EN_SCENE_FIRST];
+        if (name[0]) {
+            enemies_env(&env);
+            InterlockedExchange(&enemies_staged_ok, 0);
+            if (en_build(&env, name, scene, battle, &enemies_staged, enemies_problem, &mismatch)) {
+                InterlockedExchange(&enemies_staged_ok, 1);
+                return TRUE;
+            }
+            if (!mismatch)
+                return FALSE;
+        }
+        if (attempt || !name[0])
+            break;
+        enemies_scan("a scene's number changed");   /* (once: the scene's file now says another number) */
+    }
+    if (!name[0])
+        wsprintfA(enemies_problem, "DLL scene %d is not registered: no scene file of SpellExtConfig\\scenes says number = %d (or [scenes] load leaves it out; a number changed inside a file is seen after Re-init .ini files)", scene, scene);
+    return FALSE;
+}
+
+/* The line of a built scene's enemies: 365 'Name' (folder), ... */
+static void enemies_built_line(char *out)          /* out: ENEMIES_LINE_MAX */
+{
+    int i, n = 0;
+
+    out[0] = 0;
+    for (i = 0; i < enemies_staged.enemies && i < 3; i++)
+        n += wsprintfA(out + n, "%s%d '%.31s' (%.31s%s)", i ? ", " : "", enemies_staged.dll ? ENEMIES_POOL_FIRST + i : -1,
+                       enemies_staged.name[i], enemies_staged.folder[i],
+                       enemies_staged.no_model[i] ? ": no model\\aa, the archive's own model of the number is drawn" : "");
+}
+
+static BOOL enemies_hand_over(WORD game, LONG wanted, const char *why)
+{
+    DWORD started = GetTickCount();
+    char line[ENEMIES_LINE_MAX];
+
+    if (wanted < EN_BATTLE_FIRST || wanted > EN_BATTLE_LAST)
+        return FALSE;
+    if (*(const WORD *)ADDR_FIELD_FLAGS_BATTLE & 0x40) {
+        log_line("enemies: battle %ld (%s) refused: the Battle Square plays no DLL scene; the game's own battle %u (scene %u, formation %u) plays",
+                 wanted, why, game, game >> 2, game & 3);
+        return FALSE;
+    }
+    if (!enemies_build((DWORD)wanted)) {
+        if (game == wanted)             /* (the field's own BATTLE named it: there is no game's battle to fall back to) */
+            log_line("enemies: battle %ld (DLL scene %ld '%s', formation %ld; %s) cannot be built: %s; its load plays the stand-in battle 0 (scene 0:0)",
+                     wanted, wanted >> 2, enemies_scene_of[(wanted >> 2) - EN_SCENE_FIRST][0] ? enemies_scene_of[(wanted >> 2) - EN_SCENE_FIRST] : "-",
+                     wanted & 3, why, enemies_problem);
+        else
+            log_line("enemies: battle %ld (DLL scene %ld '%s', formation %ld; %s) refused: %s; the game's own battle %u (scene %u, formation %u) plays",
+                     wanted, wanted >> 2, enemies_scene_of[(wanted >> 2) - EN_SCENE_FIRST][0] ? enemies_scene_of[(wanted >> 2) - EN_SCENE_FIRST] : "-",
+                     wanted & 3, why, enemies_problem, game, game >> 2, game & 3);
+        return FALSE;
+    }
+    InterlockedExchange(&enemies_staged_fresh, 1);
+    enemies_built_line(line);
+    log_line("enemies: battle %u -> %ld (DLL scene %d '%s' formation %d; %s): enemies %s; stand-in battle %d (scene %d:%d); AI %d of 4096 bytes; %d attacks (%d of the kernel); built in %lu ms",
+             game, wanted, enemies_staged.scene, enemies_staged.scene_name, enemies_staged.formation, why, line, enemies_staged.stand_in,
+             enemies_staged.stand_in >> 2, enemies_staged.stand_in & 3, enemies_staged.ai_bytes, enemies_staged.attacks,
+             enemies_staged.kernel_attacks, GetTickCount() - started);
+    return TRUE;
+}
+
+/* ==== BATTLE MENU BEGIN ====
+   The SpellExt menu's battle page (stages 1-3 of SpellExt_Battle_Test_Menu_Design.md): the debug list's row
+   "Fight: external battles" lists the registered DLL scenes, and OK on one starts it the way a field's random
+   encounter starts; the battle comes back to the same spot. No new patch site:
+     - OK builds the scene first (enemies_build: a broken file is refused on the page), then leaves what a random
+       encounter leaves (field_evaluate_encounter_rate_0060b2c6): the request type 2 at 00cc0d89, the battle at
+       00cc0d8a and the random mark 1 at 00cc1658; and closes the menu module through its finished flag 00dc12f4
+       (as the name screen does), so that the main menu's close block, which clears the type, does not run;
+     - the menu loop (006cc623) goes back to the field (00cc0d84 = 5: in place), the field loop (0063c17f) takes
+       the type on its next pass (the player's place saved, the swirl), the swirl hands over through FUN_00408243 and
+       battle_number_hook sees the number: the page's battle goes before [battle_map] and test_battle there;
+     - the field's return after the battle (0063bda8 with 00cc0d84 = 2) clears the type, for the random mark.
+   TEST MODE, the game's own switches (nothing patched): bit 0x80 of the battle flags 00db958a, ORed in at the
+   hand-over after FUN_00408243 wrote the word (the battle end 00430dd0 then gives no EXP, AP, gil or drops);
+   00cc0dc5 = 1, BTMD2's "a loss is no game over" (read at the battle's end in 0041c0bb); and the party's three
+   records copied at the hand-over and put back where the field is read again after the battle (field_read_hook at
+   0060ba9f; put in at the first test battle when neither the new characters nor the field capacity did).
+   Refused on the page, nothing written: enemies off, the hand-over not hooked, any mode but a field's menu (the
+   world map is a later stage), a menu that a script or a save point opened (request 9 with parameter 1: its TUTOR
+   opcode waits for type 9 and would wait for ever), SPECIAL's flag 00cbfb6c (the swirl would not hand over), and,
+   with battle_menu_locked = refuse, a field whose random battles are off.
+   With battle_menu = off or debug = false, what runs is two tests of zero (the hand-over, the field read) and one at
+   the SpellExt menu's opening; the debug list has its ten rows, the scan reads what it read before. With the page
+   shown (debug = true, battle_menu not off) but never used, the same, and the scan reads two more files per enemy
+   folder (its `name =`). Nothing names a character. */
+#define ADDR_GAME_MODE          0x00cbf9dcu  /* WORD: the main loop's mode: 1 field, 3 world map, 5 the menu from a field, 0x17 the swirl */
+#define ADDR_FIELD_REQUEST      0x00cc0d89u  /* byte: the field's request (its record +1): 2 a battle, 9 the main menu */
+#define ADDR_FIELD_REQUEST_ARG  0x00cc0d8au  /* WORD: its parameter: the battle for 2; 0 for the menu button's menu, 1 TUTOR's (= ADDR_FIELD_ID_NEXT) */
+#define ADDR_FIELD_RANDOM_MARK  0x00cc1658u  /* byte: 1 = a random encounter: the field's return after the battle clears the request (0063bda8) */
+#define ADDR_SPECIAL_FLAG       0x00cbfb6cu  /* byte: SPECIAL's flag: not 0, the swirl does not call FUN_00408243 (main loop case 0x17) */
+#define ADDR_MENU_AFTER_BATTLE  0x00dc12f8u  /* dword: the menu module runs after a won battle (mode 0x11): it leaves another way */
+#define ADDR_FIELD_BATTLES_OFF  0x00cc0dc3u  /* byte: BTLON's operand (field record +0x3b): not 0, no random battles (0060b2c6) */
+#define ADDR_FIELD_TABLE_CHOICE 0x00cc0dc4u  /* byte: BTLTB's operand (+0x3c): 0 the field's first encounter table, else the second */
+#define ADDR_FIELD_ENCOUNTERS   0x00cff45cu  /* pointer: the field's two encounter tables, 0x18 bytes each; bit 0 of a table's first word: on */
+#define ADDR_FIELD_LOSS_RETURNS 0x00cc0dc5u  /* byte: BTMD2's third operand (+0x3d): not 0, a lost battle is no game over (0041c0bb) */
+#define ADDR_FIELD_SCRIPT_ASKED 0x00cbf6b8u  /* byte: set by a script's BATTLE / MENU / TUTOR request (0061370a ...), consumed at the start of the field's next pass (0060bb58) */
+#define ADDR_FIELD_WAIT_WORD    0x00cc0daeu  /* WORD: what a script's BATTLE / MENU waits on (+0x26): 2 done; the menu's exit leaves 2, the opcodes write 0 */
+#define ADDR_PARTY_COPY         0x00dba498u  /* the menu's party copy, 0x440 a party slot: HP, max HP, MP, max MP at +0x10 .. +0x16 (FUN_006c545b) */
+#define PARTY_COPY_SIZE         0x440
+#define BM_FLAG_NO_REWARDS      0x0080       /* in 00db958a: 00430dd0 gives no EXP, AP, gil or drops ((009ae11c & 0xde) != 0) */
+#define BM_FLAG_FAST            0x0120       /* in 00db958a: 0x20 no victory fanfare (00430c15), 0x100 no victory pose (00430dd0) */
+
+/* BATTLE MENU PURE BEGIN  (no Win32 call: tested natively, tools/work/battle_menu/build_m1/test) */
+#define BM_SPECIAL_ROWS         3            /* the page's Again, Next and Previous rows, above the list */
+#define BM_LIST_ROWS            11           /* the list's rows on the page */
+#define BM_JUMP                 100          /* the page buttons' step after [SWITCH] */
+#define BM_RECORD_SIZE          0x84         /* a character's record (the save's) */
+#define BM_GO                   0
+#define BM_NO_ENEMIES           1
+#define BM_NO_HAND_OVER         2
+#define BM_WORLD_MAP            3
+#define BM_NOT_FIELD            4
+#define BM_SCRIPT_MENU          5
+#define BM_SPECIAL              6
+#define BM_LOCKED               7
+#define BM_REFUSALS             8
+
+/* What the page asks of the game before anything is written. */
+struct bm_where {
+    int mode;                   /* 00cbf9dc */
+    int after_battle;           /* 00dc12f8 */
+    int request, argument;      /* 00cc0d89, 00cc0d8a */
+    int special;                /* 00cbfb6c */
+    int locked;                 /* the field's random battles are off (BTLON, or its encounter table) */
+    int refuse_locked;          /* battle_menu_locked = refuse */
+    int enemies;                /* enemies_live */
+    int hand_over;              /* battle_number_hook is at 004082b5 */
+};
+
+static const char *const bm_refusal_text[BM_REFUSALS] = {
+    "",
+    "enemies = off in the game file: there is no DLL scene to fight",
+    "the hand-over at 004082b5 is not hooked (see FF7_SpellExt.log)",
+    "not from the world map (a later stage): open the menu on a field",
+    "only from the menu of a field",
+    "opened by a script or at a save point: open it with the menu button",
+    "a special scene is running",
+    "random battles are off in this field (battle_menu_locked = refuse)",
+};
+
+/* BM_GO, or why the page will not start a battle now (in this order). */
+static int bm_refusal(const struct bm_where *w)
+{
+    if (!w->enemies)
+        return BM_NO_ENEMIES;
+    if (!w->hand_over)
+        return BM_NO_HAND_OVER;
+    if (w->mode == 3)
+        return BM_WORLD_MAP;
+    if (w->mode != 5 || w->after_battle)
+        return BM_NOT_FIELD;
+    if (w->request != 9 || w->argument != 0)
+        return BM_SCRIPT_MENU;      /* (TUTOR: 9 with 1; a MENU opcode's other types wait for theirs) */
+    if (w->special)
+        return BM_SPECIAL;
+    if (w->locked && w->refuse_locked)
+        return BM_LOCKED;
+    return BM_GO;
+}
+
+/* The page's cursor: rows 0-2 are Again, Next and Previous, row BM_SPECIAL_ROWS + k the list's k-th scene (`count`
+   of them); *top is the first scene shown. It moves by `delta` rows and is held at both ends (no wrap round, so a
+   page or a jump of 100 stops at the end); the list follows it. */
+static void bm_cursor_move(int *row, int *top, int count, int delta)
+{
+    int last = BM_SPECIAL_ROWS + (count > 0 ? count : 0) - 1, most = count > BM_LIST_ROWS ? count - BM_LIST_ROWS : 0, r, k;
+
+    r = *row + delta;
+    if (r > last)
+        r = last;
+    if (r < 0)
+        r = 0;
+    *row = r;
+    k = r - BM_SPECIAL_ROWS;
+    if (k >= 0 && k < *top)
+        *top = k;
+    if (k >= *top + BM_LIST_ROWS)
+        *top = k - BM_LIST_ROWS + 1;
+    if (*top > most)
+        *top = most;
+    if (*top < 0)
+        *top = 0;
+}
+
+/* Left and Right: the formation 0-3, round. */
+static int bm_formation_step(int formation, int step)
+{
+    return (formation + (step < 0 ? 3 : 1)) & 3;
+}
+
+/* The registered scenes in number order (the page's list): the slots of `scene_of` that hold a name. */
+static int bm_index(char (*scene_of)[EN_NAME_MAX + 1], int slots, short *scenes)
+{
+    int i, n = 0;
+
+    for (i = 0; i < slots; i++)
+        if (scene_of[i][0])
+            scenes[n++] = (short)(EN_SCENE_FIRST + i);
+    return n;
+}
+
+/* The list's place of the scene after (step 1) or before (step -1) scene `scene` among the `count` scenes of
+   `scenes` (ascending), round from one end to the other; with `scene` < 0 (nothing fought yet) the first, or the
+   last. The scene itself need not be listed (it may be gone since). -1: the list is empty. */
+static int bm_neighbour(const short *scenes, int count, int scene, int step)
+{
+    int k;
+
+    if (count <= 0)
+        return -1;
+    if (scene < 0)
+        return step > 0 ? 0 : count - 1;
+    if (step > 0) {
+        for (k = 0; k < count; k++)
+            if (scenes[k] > scene)
+                return k;
+        return 0;
+    }
+    for (k = count - 1; k >= 0; k--)
+        if (scenes[k] < scene)
+            return k;
+    return count - 1;
+}
+
+/* Test mode's copy of the party's records. */
+struct bm_snapshot {
+    int count;
+    struct {
+        int slot, id;
+        BYTE *record;
+        BYTE kept[BM_RECORD_SIZE];
+    } member[3];
+};
+
+/* The records of the three party slots (`party`: a character ID each, ff empty) copied; a slot that is empty, or
+   whose character has no record `record_of` finds, is left out. */
+static void bm_snapshot_take(struct bm_snapshot *s, const BYTE *party, BYTE *(*record_of)(int id))
+{
+    int slot, i;
+
+    s->count = 0;
+    for (slot = 0; slot < 3; slot++) {
+        BYTE *record = party[slot] == 0xff ? NULL : record_of(party[slot]);
+
+        if (!record)
+            continue;
+        s->member[s->count].slot = slot;
+        s->member[s->count].id = party[slot];
+        s->member[s->count].record = record;
+        for (i = 0; i < BM_RECORD_SIZE; i++)
+            s->member[s->count].kept[i] = record[i];
+        s->count++;
+    }
+}
+
+/* The copies written back, and the snapshot emptied. A record that no longer starts with its character's ID
+   (another character took the seat, or a load came between) is left alone. `said` (or NULL) hears each member:
+   its ID, the record as the battle left it, the copy, and whether it was written. Returns how many were. */
+static int bm_snapshot_put(struct bm_snapshot *s, void (*said)(int id, const BYTE *left, const BYTE *kept, int written))
+{
+    BYTE left[BM_RECORD_SIZE];
+    int n, i, put = 0;
+
+    for (n = 0; n < s->count; n++) {
+        BYTE *record = s->member[n].record;
+        int written = record[0] == (BYTE)s->member[n].id;
+
+        for (i = 0; i < BM_RECORD_SIZE; i++)
+            left[i] = record[i];
+        if (written) {
+            for (i = 0; i < BM_RECORD_SIZE; i++)
+                record[i] = s->member[n].kept[i];
+            put++;
+        }
+        if (said)
+            said(s->member[n].id, left, s->member[n].kept, written);
+    }
+    s->count = 0;
+    return put;
+}
+
+/* After the put (`s` as it was before it): the menu's party copy of each member whose record was written (`copies`:
+   PARTY_COPY_SIZE a party slot) gets the record's HP, max HP, MP and max MP (+0x2c, +0x2e, +0x30, +0x32 into +0x10,
+   +0x12, +0x14, +0x16: the four words FUN_006c545b copies). What works from the copy on the field (the Cat's Bell's
+   steps, 006cc4a8 -> 006cba6a: record HP = copy HP + 3; the field's HP and MP opcodes) then starts from the record
+   put back, not from the battle's figures. Returns how many copies were written. */
+static int bm_party_copy_refresh(const struct bm_snapshot *s, BYTE *copies)
+{
+    int n, i, done = 0;
+
+    for (n = 0; n < s->count; n++) {
+        const BYTE *record = s->member[n].record;
+        BYTE *copy = copies + s->member[n].slot * PARTY_COPY_SIZE + 0x10;
+
+        if (record[0] != (BYTE)s->member[n].id)
+            continue;               /* (not written: the copy left as the battle left it, as its record) */
+        for (i = 0; i < 8; i++)
+            copy[i] = record[0x2c + i];
+        done++;
+    }
+    return done;
+}
+/* BATTLE MENU PURE END */
+
+typedef char bm_check_record[BM_RECORD_SIZE == SAVE_RECORD_SIZE ? 1 : -1];
+
+/* ---- the keys (FF7_SpellExt_Game.ini; read at start-up and at Re-init, taken at once) ---- */
+static int bm_key_menu, bm_key_test, bm_key_rewards, bm_key_lose, bm_key_restore, bm_key_fast, bm_key_locked;   /* -1: not given */
+
+static void battle_menu_keys_begin(void)
+{
+    bm_key_menu = bm_key_test = bm_key_rewards = bm_key_lose = bm_key_restore = bm_key_fast = bm_key_locked = -1;
+}
+
+/* 0: not this block's key; 1: read; -1: a mistake (*fault says what; the key's default is used). */
+static int battle_menu_key_line(char *start, char *key_end, char *value, char *stop, const char **fault)
+{
+    static const struct { const char *key, *yes, *no, *fault; int *out; } keys[7] = {
+        { "battle_menu", "on", "off", "battle_menu must be on or off: on is used", &bm_key_menu },
+        { "battle_menu_test", "on", "off", "battle_menu_test must be on or off: on is used", &bm_key_test },
+        { "battle_menu_rewards", "on", "off", "battle_menu_rewards must be on or off: battle_menu_test decides", &bm_key_rewards },
+        { "battle_menu_lose", "return", "game_over", "battle_menu_lose must be return or game_over: battle_menu_test decides", &bm_key_lose },
+        { "battle_menu_restore", "party", "off", "battle_menu_restore must be party or off: battle_menu_test decides", &bm_key_restore },
+        { "battle_menu_fast", "on", "off", "battle_menu_fast must be on or off: off is used", &bm_key_fast },
+        { "battle_menu_locked", "refuse", "allow", "battle_menu_locked must be allow or refuse: allow is used", &bm_key_locked },
+    };
+    int i;
+
+    for (i = 0; i < 7 && !word_is(start, key_end, keys[i].key); i++)
+        ;
+    if (i == 7)
+        return 0;
+    if (word_is(value, stop, keys[i].yes) || ((i == 0 || i == 1 || i == 2 || i == 5) && word_is(value, stop, "yes")))
+        *keys[i].out = 1;
+    else if (word_is(value, stop, keys[i].no) || ((i == 0 || i == 1 || i == 2 || i == 5) && word_is(value, stop, "no")))
+        *keys[i].out = 0;
+    else {
+        *keys[i].out = -1;
+        *fault = keys[i].fault;
+        return -1;
+    }
+    return 1;
+}
+
+/* The page is there: a row of the debug list (debug = true) unless battle_menu = off. */
+static BOOL battle_menu_shown(void)
+{
+    return debug_menu && bm_key_menu != 0;
+}
+
+static BOOL battle_menu_rewards(void)       /* the battle gives EXP, AP, gil and drops */
+{
+    return bm_key_rewards >= 0 ? bm_key_rewards : bm_key_test == 0;
+}
+
+static BOOL battle_menu_lose_returns(void)  /* a lost battle goes back to the field */
+{
+    return bm_key_lose >= 0 ? bm_key_lose : bm_key_test != 0;
+}
+
+static BOOL battle_menu_restores(void)      /* the party's records are put back after the battle */
+{
+    return bm_key_restore >= 0 ? bm_key_restore : bm_key_test != 0;
+}
+
+/* After each reading of the game file: one line, when what it says has changed. */
+static void battle_menu_keys_settle(void)
+{
+    static char said[400];
+    char line[400];
+
+    if (!battle_menu_shown())
+        wsprintfA(line, "battle menu: no page (%s)", bm_key_menu == 0 ? "battle_menu = off" : "debug = false: the SpellExt menu is not shown");
+    else
+        wsprintfA(line, "battle menu: the SpellExt menu's \"Fight: external battles\" is on%s; test mode %s: rewards %s, a loss %s, the party %s; battle_menu_fast %s; fields whose random battles are off: %s",
+                  enemies_on ? "" : " (enemies = off: it has nothing to list)", bm_key_test == 0 ? "off" : "on",
+                  battle_menu_rewards() ? "given" : "off", battle_menu_lose_returns() ? "returns to the field" : "is a game over",
+                  battle_menu_restores() ? "put back" : "as the battle leaves it", bm_key_fast > 0 ? "on" : "off",
+                  bm_key_locked > 0 ? "refused" : "allowed");
+    if (!lstrcmpA(line, said))
+        return;
+    lstrcpyA(said, line);
+    log_line("%s", line);
+}
+
+/* ---- the request, the hand-over and the field's return ---- */
+static LONG battle_menu_last = -1;          /* the page's last battle (its Again row) */
+static int bm_request_rewards, bm_request_fast, bm_request_restore, bm_request_lose;
+static BYTE bm_loss_kept;                   /* 00cc0dc5 as the field had it */
+static WORD bm_loss_field;                  /* and in which field */
+static LONG bm_loss_due, bm_party_due;
+static struct bm_snapshot bm_party;
+static int bm_field_hook;                   /* field_read_hook at 0060ba9f: 0 not tried, 1 in, -1 not */
+
+static void battle_menu_owed_settle(void)
+{
+    InterlockedExchange(&battle_menu_owed, bm_loss_due || bm_party_due);
+}
+
+/* The record of character `id`, as the battle's write-back finds it (FUN_005c6b60: the record whose first byte is
+   the ID, among the nine and, with new characters, the seats' records its lengthened loop sees); NULL: none. */
+static BYTE *battle_menu_record_of(int id)
+{
+    int i;
+
+    for (i = 0; i < 9; i++)
+        if (record_at_index(i)[0] == (BYTE)id)
+            return record_at_index(i);
+    if (new_characters_live && id >= NEW_CHARACTER_FIRST_ID && id < NEW_CHARACTER_FIRST_ID + seat_count &&
+        new_character_record(id)[0] == (BYTE)id)
+        return new_character_record(id);
+    return NULL;
+}
+
+/* The field reader's call goes through field_read_hook (the restore point): already, or put in now with the same
+   checks as the field capacity's. Once; FALSE: the party is not put back after a test battle. */
+static BOOL battle_menu_field_hook(void)
+{
+    static const BYTE before[5] = { 0x68, 0xf0, 0x1e, 0xcc, 0x00 };     /* push 00cc1ef0: the field's name */
+    static const BYTE after[5] = { 0x83, 0xc4, 0x04, 0x85, 0xc0 };      /* add esp, 4 / test eax, eax */
+    const BYTE *code = (const BYTE *)(SITE_FIELD_READ - 5);
+
+    if (bm_field_hook)
+        return bm_field_hook > 0;
+    if (code[5] == 0xe8 && SITE_FIELD_READ + 5 + *(const DWORD *)(code + 6) == (DWORD)field_read_hook) {
+        bm_field_hook = 1;
+        log_line("battle menu: the party is put back where the field is read after a test battle (the field reader's call at %08lx is this DLL's already)",
+                 SITE_FIELD_READ);
+        return TRUE;
+    }
+    if (!fields_bytes_are(SITE_FIELD_READ - 5, before, 5) || !fields_bytes_are(SITE_FIELD_READ + 5, after, 5))
+        bm_field_hook = -1;
+    else
+        bm_field_hook = patch_call_chained(SITE_FIELD_READ, FN_FIELD_READ, field_read_hook, &field_read_next) ? 1 : -1;
+    log_line(bm_field_hook > 0 ? "battle menu: the field reader's call at %08lx goes through this DLL now (chained): the party is put back there after a test battle"
+                               : "battle menu: the field reader's call at %08lx is NOT the game's (push 00cc1ef0 / call / add esp,4 / test eax,eax): not hooked; the party is NOT put back after a test battle",
+             SITE_FIELD_READ);
+    return bm_field_hook > 0;
+}
+
+/* 00cc0dc5 back to the field's own value, when test mode set it: only in the field it was set in and while it still
+   holds the 1 written (a fresh field load zeroes it, 0060bcfa; a script's BTMD2 may have written it since). */
+static void battle_menu_loss_back(const char *why)
+{
+    BYTE *loss = (BYTE *)ADDR_FIELD_LOSS_RETURNS;
+
+    if (!InterlockedExchange(&bm_loss_due, 0))
+        return;
+    if (*(const WORD *)ADDR_FIELD_MODULE_ID != bm_loss_field || *loss != 1) {
+        log_line("battle menu: 00cc0dc5 (a loss is no game over) left at %u (%s): field %u now, %u when it was set; the game has written it since",
+                 *loss, why, *(const WORD *)ADDR_FIELD_MODULE_ID, bm_loss_field);
+        return;
+    }
+    *loss = bm_loss_kept;
+    log_line("battle menu: 00cc0dc5 (a loss is no game over) back to the field's %u (%s)", bm_loss_kept, why);
+}
+
+/* A request that the field never took (the menu opened again first, or another battle started): forgotten. */
+static void battle_menu_check_pending(const char *why)
+{
+    LONG pending = InterlockedExchange(&battle_menu_pending, -1);
+
+    if (pending < 0)
+        return;
+    /* the scripts' wait word: the menu's exit left 2; 0 means an opcode answered the request since (a BATTLE that
+       met type 2 with wait 2 took it as its own battle, finished: that battle did not play). A hint, not a proof. */
+    log_line("battle menu: the request for battle %ld was NOT taken by the field (%s; request byte 00cc0d89 %u, wait word 00cc0dae %u: %s): dropped",
+             pending, why, *(const BYTE *)ADDR_FIELD_REQUEST, *(const WORD *)ADDR_FIELD_WAIT_WORD,
+             *(const WORD *)ADDR_FIELD_WAIT_WORD == 0 ? "a field script's opcode answered it, probably a BATTLE taking it as its own (that battle did not play)"
+                                                      : "the menu was opened again before the field started it");
+    if (*(const BYTE *)ADDR_FIELD_RANDOM_MARK == 1) {
+        *(BYTE *)ADDR_FIELD_RANDOM_MARK = 0;    /* (no random encounter is under way while the menu is open: a stale mark would make the next scripted battle play twice, 0063bda8) */
+        log_line("battle menu: the random-encounter mark 00cc1658 the request set is cleared");
+    }
+    battle_menu_loss_back("the request was dropped");
+    battle_menu_owed_settle();
+}
+
+/* The game's state the page's refusals read. */
+static void battle_menu_where(struct bm_where *w)
+{
+    const BYTE *tables = *(const BYTE *const *)ADDR_FIELD_ENCOUNTERS;
+    const BYTE *table = tables ? tables + (*(const BYTE *)ADDR_FIELD_TABLE_CHOICE ? 0x18 : 0) : NULL;
+
+    w->mode = *(const short *)ADDR_GAME_MODE;
+    w->after_battle = *(const DWORD *)ADDR_MENU_AFTER_BATTLE != 0;
+    w->request = *(const BYTE *)ADDR_FIELD_REQUEST;
+    w->argument = *(const short *)ADDR_FIELD_REQUEST_ARG;
+    w->special = *(const BYTE *)ADDR_SPECIAL_FLAG;
+    w->locked = *(const BYTE *)ADDR_FIELD_BATTLES_OFF || !table || IsBadReadPtr(table, 2) || !(table[0] & 1);
+    w->refuse_locked = bm_key_locked > 0;
+    w->enemies = enemies_live;
+    w->hand_over = test_battle_hook > 0;
+}
+
+/* The page's OK, after the refusals and the build: test mode prepared, the three words of a random encounter
+   written. The caller closes the menu (00dc12f4). */
+static void battle_menu_start(LONG battle, BOOL locked)
+{
+    const char *name = enemies_scene_of[(battle >> 2) - EN_SCENE_FIRST];
+    BOOL hooked;
+
+    battle_menu_check_pending("a new request");
+    battle_menu_loss_back("a new request");
+    if (InterlockedExchange(&bm_party_due, 0))
+        log_line("battle menu: the party copy of the last test battle was never put back (no field came back from it): dropped");
+    bm_request_rewards = battle_menu_rewards();
+    bm_request_fast = bm_key_fast > 0;
+    bm_request_lose = battle_menu_lose_returns();
+    hooked = (battle_menu_restores() || bm_request_lose) && battle_menu_field_hook();     /* (for either part: the loss flag is put back at the battle's return too, not at a later battle) */
+    bm_request_restore = battle_menu_restores() && hooked;
+    if (bm_request_lose) {
+        bm_loss_kept = *(const BYTE *)ADDR_FIELD_LOSS_RETURNS;
+        bm_loss_field = *(const WORD *)ADDR_FIELD_MODULE_ID;
+        *(BYTE *)ADDR_FIELD_LOSS_RETURNS = 1;
+        InterlockedExchange(&bm_loss_due, 1);
+        log_line("battle menu: TEST MODE SET: 00cc0dc5 (a loss is no game over) %u -> 1 in field %u", bm_loss_kept, bm_loss_field);
+    }
+    battle_menu_owed_settle();
+    battle_menu_last = battle;
+    *(BYTE *)ADDR_FIELD_REQUEST = 2;
+    *(WORD *)ADDR_FIELD_REQUEST_ARG = (WORD)battle;
+    *(BYTE *)ADDR_FIELD_RANDOM_MARK = 1;
+    InterlockedExchange(&battle_menu_pending, battle);
+    log_line("battle menu: START battle %ld (DLL scene %ld '%s', formation %ld) asked from field %u (%.15s; its random battles %s): 00cc0d89 = 2, 00cc0d8a = %ld, 00cc1658 = 1 and the menu closed (00dc12f4 = 1); test mode: rewards %s, a loss %s, the party %s%s",
+             battle, battle >> 2, name, battle & 3, *(const WORD *)ADDR_FIELD_MODULE_ID, (const char *)ADDR_FIELD_NAME,
+             locked ? "off" : "on", battle, bm_request_rewards ? "given" : "off", bm_request_lose ? "returns to the field" : "is a game over",
+             bm_request_restore ? "put back" : battle_menu_restores() ? "NOT put back (the field reader is not hooked)" : "as the battle leaves it",
+             bm_request_fast ? "; no fanfare, no victory pose" : "");
+}
+
+/* From battle_number_hook while a request waits or something is owed. TRUE: `number` is the page's battle (its test
+   mode set now); FALSE: another battle starts, a waiting request is forgotten and what is owed is settled first. */
+static BOOL battle_menu_at_hand_over(WORD number)
+{
+    LONG pending = InterlockedExchange(&battle_menu_pending, -1);
+    WORD *flags = (WORD *)ADDR_FIELD_FLAGS_BATTLE, before = *flags;
+
+    if (InterlockedExchange(&bm_party_due, 0))
+        log_line("battle menu: the party copy of the last test battle was never put back (no field came back from it): dropped");
+    if (pending < 0 || number != (WORD)pending) {
+        if (pending >= 0) {
+            BOOL script = *(const BYTE *)ADDR_FIELD_SCRIPT_ASKED != 0;
+
+            log_line("battle menu: the request for battle %ld was NOT taken: the field starts battle %u (scene %u, formation %u) instead, %s; dropped",
+                     pending, number, number >> 2, number & 3,
+                     script ? "asked by a field script (00cbf6b8 set)" : "a random encounter (no script asked: 00cbf6b8 clear)");
+            if (script && *(const BYTE *)ADDR_FIELD_RANDOM_MARK == 1) {
+                *(BYTE *)ADDR_FIELD_RANDOM_MARK = 0;    /* (the request's mark: left, the return of this scripted battle would clear its request and the script would start it again, 0063bda8 / 0061370a) */
+                log_line("battle menu: the random-encounter mark 00cc1658 the request set is cleared (a scripted battle must not play twice)");
+            }
+        }
+        battle_menu_loss_back("another battle starts");
+        battle_menu_owed_settle();
+        return FALSE;
+    }
+    if (bm_request_restore) {
+        bm_snapshot_take(&bm_party, (const BYTE *)ADDR_PARTY, battle_menu_record_of);
+        InterlockedExchange(&bm_party_due, bm_party.count > 0);
+    }
+    if (!bm_request_rewards)
+        *flags |= BM_FLAG_NO_REWARDS;
+    if (bm_request_fast)
+        *flags |= BM_FLAG_FAST;
+    battle_menu_owed_settle();
+    log_line("battle menu: the field started battle %u, the page's (it goes before [battle_map] and test_battle); TEST MODE SET: battle flags 00db958a %04x -> %04x (%s%s); a loss %s; the party: %d record(s) copied, to be put back%s",
+             number, before, *flags, bm_request_rewards ? "rewards given" : "0x80: no EXP, AP, gil or drops", bm_request_fast ? ", 0x20 and 0x100: no fanfare, no pose" : "",
+             bm_request_lose ? "returns to the field (00cc0dc5 = 1)" : "is a game over", bm_request_restore ? bm_party.count : 0,
+             bm_request_restore ? "" : " (test mode does not put it back)");
+    return TRUE;
+}
+
+static void battle_menu_said(int id, const BYTE *left, const BYTE *kept, int written)
+{
+    if (written)
+        log_line("battle menu:   character %d: HP %u -> %u, MP %u -> %u, limit gauge %u -> %u, status byte %02x -> %02x (the record as before the battle)", id,
+                 *(const WORD *)(left + 0x2c), *(const WORD *)(kept + 0x2c), *(const WORD *)(left + 0x30), *(const WORD *)(kept + 0x30),
+                 left[0x0f], kept[0x0f], left[0x1f], kept[0x1f]);
+    else
+        log_line("battle menu:   character %d: NOT put back: its record now starts with %u (another character's)", id, left[0]);
+}
+
+/* From field_read_hook while something is owed. The field's return from a battle (0060e0bd with 00cc0d84 = 2) is the
+   test battle's: the party is put back before the field draws or runs a script; any other read of a field means the
+   return was missed (a game over, a load): the copy is dropped, never written. */
+static void battle_menu_field_read(void)
+{
+    WORD from = *(const WORD *)ADDR_FIELD_MODE;
+
+    if (from != 2) {
+        if (InterlockedExchange(&bm_party_due, 0))
+            log_line("battle menu: a field is read (00cc0d84 = %u, not the return from a battle): the party copy of the test battle is dropped, not written", from);
+        battle_menu_loss_back("a field is read");
+        battle_menu_owed_settle();
+        return;
+    }
+    if (InterlockedExchange(&bm_party_due, 0)) {
+        static struct bm_snapshot was;      /* (the snapshot before the put empties it: the slots and records) */
+        int count = bm_party.count, put, copies;
+
+        copy_bytes((BYTE *)&was, (const BYTE *)&bm_party, sizeof was);
+        log_line("battle menu: back on the field after the test battle (result word 00db958a = %04x; bit 0x01: lost): the party is put back:",
+                 *(const WORD *)ADDR_FIELD_FLAGS_BATTLE);
+        put = bm_snapshot_put(&bm_party, battle_menu_said);
+        copies = bm_party_copy_refresh(&was, (BYTE *)ADDR_PARTY_COPY);
+        log_line("battle menu: TEST MODE RESTORED: %d of %d record(s) put back; the menu's party copy (00dba4a8 + slot x 0x440: HP, MP and their maxima) of %d made the same",
+                 put, count, copies);
+    }
+    battle_menu_loss_back("the field resumes after the test battle");
+    battle_menu_owed_settle();
+}
+/* ==== BATTLE MENU END (the page itself is with the SpellExt menu: BATTLE PAGE) ==== */
+
+/* ---- the load (load_scene_hook) ---- */
+
+/* The DLL scene's buffers written over the stand-in's, the field's flags put back, the tail again, the
+   pool assigned for this battle. */
+static void enemies_overwrite(DWORD number)
+{
+    BYTE *img = enemies_staged.image;
+    int f = (int)(number & 3), i;
+    struct en_tail t;
+    BOOL any = FALSE;
+
+    copy_bytes((BYTE *)ADDR_SCENE_ENEMY_IDS, img + EN_O_IDS, 8);
+    /* the set-up and the camera placement: the image's (the game's own scene.bin, as the compiler) when it holds
+       them, else the stand-in's (en_overwrite_formation) */
+    en_overwrite_formation(img, f, enemies_staged.stand_bytes, (BYTE *)ADDR_SCENE_SETUP, (BYTE *)ADDR_SCENE_CAMERA);
+    copy_bytes((BYTE *)ADDR_SCENE_FORMATION, img + EN_O_ROWS + 0x60 * f, 0x60);
+    copy_bytes((BYTE *)ADDR_SCENE_ENEMIES, img + EN_O_ENEMY, 0x228);
+    copy_bytes((BYTE *)ADDR_SCENE_ATTACKS, img + EN_O_ATTACK, 0x380 + 0x40 + 0x400);  /* records, IDs, names: one run in both */
+    copy_bytes((BYTE *)ADDR_SCENE_FORMATION_AI, img + EN_O_FORMATION_AI, 0x200 + 0x1000);
+    t.field_flags = enemies_load.field_flags;
+    t.flags = *(const WORD *)(ADDR_SCENE_SETUP + 0x10);
+    t.kind = *(const BYTE *)(ADDR_SCENE_SETUP + 0x12);
+    t.escape = *(const WORD *)(ADDR_SCENE_SETUP + 4);
+    if (en_tail(&t, (const BYTE *)ADDR_KIND_TABLE))
+        log_line("enemies: the field's battle flags ask for the Battle Square (%04x): its part of the loader's tail is not done for a DLL scene", t.field_flags);
+    *(WORD *)ADDR_BATTLE_FIELD_FLAGS = t.field_flags;
+    *(WORD *)(ADDR_SCENE_SETUP + 0x10) = t.flags;
+    *(BYTE *)(ADDR_SCENE_SETUP + 0x12) = t.kind;
+    *(WORD *)0x009aad20u = t.kind_word;
+    *(WORD *)0x009aad0au = t.escape_now;
+    *(WORD *)0x009aad0eu = t.escape_copy;
+    /* the pool: slot i's model from its folder for this battle */
+    for (i = 0; i < ENEMIES_POOL_COUNT; i++) {
+        enemies_model_assign(i, i < 3 && enemies_staged.served[i] ? enemies_staged.folder[i] : "");
+        any |= i < 3 && enemies_staged.served[i];
+    }
+    InterlockedExchange(&enemies_battle_assigned, 1);   /* (until the battle is over: [models] again then) */
+    if (any && enemies_driver_found) {
+        LONG hold = InterlockedIncrement(&enemies_battle_generation);
+
+        if (!hold)
+            hold = InterlockedIncrement(&enemies_battle_generation);    /* (never 0: 0 is "no hold") */
+        InterlockedExchange(&enemies_battle_seen_3d, 0);
+        InterlockedExchange(&enemies_battle_holds, hold);
+        driver_opens_settle();
+    }
+    if (InterlockedIncrement(&enemies_battle_logged) <= ENEMIES_BATTLE_LOG_MAX)
+        log_line("enemies: DLL scene %d written over stand-in %lu after loader call %d; camera placement %s; field flags %04x, kind %u, escape %u; pool models %s%s",
+                 enemies_staged.scene, enemies_load.stand_in, enemies_load.calls,
+                 enemies_staged.stand_bytes ? "the game's own scene.bin's (as the compiler)" : "the stand-in's (no index of the game's scene.bin)",
+                 t.field_flags, t.kind, t.escape_now,
+                 any ? "served from the enemy folders" : "none served (no model\\aa)",
+                 any && enemies_driver_found ? ": the driver's file opens pass through this DLL until the battle is over" : "");
+}
+
+static void enemies_load_scene(DWORD number, void *callback)
+{
+    DWORD state = *(const DWORD *)ADDR_LOADER_STATE;
+
+    if (state == 0) {                   /* a new load begins with this call */
+        enemies_load.number = number;
+        enemies_load.applied = enemies_load.failed = enemies_load.calls = 0;
+        enemies_load.field_flags = *(const WORD *)ADDR_BATTLE_FIELD_FLAGS;
+        if (!InterlockedExchange(&enemies_staged_fresh, 0) || !enemies_staged_ok || enemies_staged.battle != number) {
+            DWORD started = GetTickCount();
+            char line[ENEMIES_LINE_MAX];
+
+            /* a chained `next`, or a field's BATTLE naming a DLL number: built now */
+            if (!enemies_build(number)) {
+                enemies_load.failed = 1;
+                log_line("enemies: battle %lu: %s; the stand-in battle 0 (scene 0:0) plays", number, enemies_problem);
+            } else {
+                enemies_built_line(line);
+                log_line("enemies: battle %lu (DLL scene %d '%s' formation %d, built at its load): enemies %s; stand-in battle %d; AI %d of 4096 bytes; %d attacks; %lu ms",
+                         number, enemies_staged.scene, enemies_staged.scene_name, enemies_staged.formation, line, enemies_staged.stand_in,
+                         enemies_staged.ai_bytes, enemies_staged.attacks, GetTickCount() - started);
+            }
+        }
+        enemies_load.stand_in = enemies_load.failed ? 0 : (DWORD)enemies_staged.stand_in;
+        if (enemies_battle_assigned)
+            enemies_battle_release("another battle loads");
+    } else if (enemies_load.number != number) {
+        log_line("enemies: battle %lu: the loader is in the middle of a load (state %lu) of battle %lu: this call goes on with its stand-in",
+                 number, state, enemies_load.number);
+    }
+    enemies_load.calls++;
+    ((void (__cdecl *)(DWORD, void *))FN_LOAD_SCENE)(enemies_load.stand_in, callback);
+    if (!enemies_load.failed && !enemies_load.applied && enemies_load.number == number && (state == 0 || state == 2) &&
+        *(const DWORD *)ADDR_LOADER_STATE == 0 && *(const DWORD *)ADDR_LOADER_DONE == 1) {
+        enemies_overwrite(number);
+        enemies_load.applied = 1;
+    }
+}
+
+/* describe_battle: a DLL battle's scene ("DLL scene N 'name'", when `scene`) and slot's folder (" (name)"). */
+static BOOL enemies_describe(LONG battle, char *scene, int slot, char *folder)
+{
+    if (!enemies_staged_ok || enemies_staged.battle != (DWORD)battle)
+        return FALSE;
+    if (scene)
+        wsprintfA(scene, "DLL scene %d '%s'", enemies_staged.scene, enemies_staged.scene_name);
+    folder[0] = 0;
+    if (slot < enemies_staged.enemies)
+        wsprintfA(folder, " (%s)", enemies_staged.folder[slot]);
+    return TRUE;
+}
+
+/* ---- stage 6a: enemy attacks with SpellExt's effects and cameras ----
+   An enemy's action is command 20; handler 07 (FUN_005c93a1) types it by its attack ID: a kernel ID below 0x38 is
+   magic (type 02), 0x38-0xff summon, enemy skill, limit; a scene ID (0x100 and up) stays 20. Handler 0c (the DLL's
+   action_setup_hook) reads the record (the kernel's, or the scene's copy) and the enemy's list: script and camera.
+   The note, after it: a native effect of FF7_SpellExt_Effects.ini for the actor, played by native_effect_step at the
+   effect step (ec) as a party member's cast is; the record's effect byte (action[9], which the display record and
+   the actor's 00be119a take) its file-less base: a magic base 00-04/19 (type 02) or the enemy effect 94 (type 20),
+   which the preload (e8) and the game's fallback routine find without a file. The cameras: action[0x18] / [0x19]. */
+#define ADDR_ENEMY_EFFECT_ROUTINES 0x008fe5e8u   /* FUN_00427c22, type 20: the routine per enemy attack effect (008fe4b0 + 0x4e entries) */
+#define ADDR_ENEMY_EFFECT_PRELOADS 0x007c1868u   /* FUN_004281b1, type 20: a short per enemy attack effect, its loader's index; 0 = none */
+#define FN_EFFECT_FILELESS_HIT     0x005d4788u   /* magic effect 02's routine: no file; one task per target shows the hit, sound 0x45 */
+#define ENEMIES_FX_LOG_MAX         200
+static const BYTE enemies_fileless_start[8] = { 0x55, 0x8b, 0xec, 0x68, 0xd7, 0x47, 0x5d, 0x00 };   /* push ebp; mov ebp,esp; push 005d47d7 */
+static LONG enemies_native_base_ok, enemies_fx_logged;
+
+/* At start-up (enemies on): is the enemy effect EN_NATIVE_BASE the game's file-less routine, as the exe has it? Read
+   only: two table entries and the routine's first bytes. Kernel-attack effects do not depend on it. */
+static void enemies_native_base_check(void)
+{
+    DWORD routine = *(const DWORD *)(ADDR_ENEMY_EFFECT_ROUTINES + EN_NATIVE_BASE * 4);
+    short preload = *(const short *)(ADDR_ENEMY_EFFECT_PRELOADS + EN_NATIVE_BASE * 2);
+    BOOL code = bytes_are(FN_EFFECT_FILELESS_HIT, enemies_fileless_start, sizeof enemies_fileless_start);
+
+    enemies_native_base_ok = routine == FN_EFFECT_FILELESS_HIT && preload == 0 && code;
+    if (enemies_native_base_ok)
+        log_line("enemies: scene-attack effects: enemy effect %02x is the game's file-less routine %08lx (no preload): an [attack] effect of 0x100 and up plays over it",
+                 EN_NATIVE_BASE, routine);
+    else
+        log_line("enemies: scene-attack effects OFF: enemy effect %02x is not the game's file-less routine (%08lx, preload %d, its first bytes %s); kernel-attack effects are not affected",
+                 EN_NATIVE_BASE, routine, preload, code ? "as the exe has them" : "CHANGED");
+}
+
+/* effect `number` of the effects file, for en_fx_decide */
+static void enemies_fx_effect(WORD number, struct en_fx_effect *e)
+{
+    int i;
+
+    e->index = -1;
+    e->usable = e->play = e->script_ok = 0;
+    e->play_base = -1;
+    for (i = 0; number && i < effect_copy_count; i++)
+        if (effect_copies[i].number == number) {
+            e->index = i;
+            e->usable = effect_copies[i].usable != 0;
+            e->play = effect_copies[i].play != 0;
+            e->script_ok = nfx_scripts[i].usable != 0;
+            e->play_base = effect_copies[i].play_base;
+            return;
+        }
+}
+
+/* action_setup_hook's plain branch, after the game's set-up (see above). Reads action[0], [2] (the enemy's slot),
+   [6], [10], [0xb]; writes action[9] and the actor's note only when its effect is played, action[0x18] / [0x19] / [8]
+   only for a camera or script given. Nothing with enemies off, for the party, or for an attack without extras. */
+static void enemies_attack_note(int *action)
+{
+    int actor = action[ACT_ACTOR], type = action[ACT_COMMAND_TYPE], id = action[ACT_ATTACK_ID];
+    unsigned targets = (unsigned)action[6] & 0xffff;
+    struct en_extras x;
+    char from[64], why[220], cameras[80];
+    BOOL noted = FALSE, said;
+
+    if (!enemies_live || actor < 4 || actor >= 10)
+        return;
+    if (!en_extras_find(&enemies_staged, enemies_battle_assigned && enemies_staged_ok, &enemies_registry, action[2], id, &x))
+        return;
+    said = InterlockedIncrement(&enemies_fx_logged) <= ENEMIES_FX_LOG_MAX;
+    if (said) {
+        if (x.from == 1)
+            wsprintfA(from, "DLL scene %d, enemy slot %d", enemies_staged.scene, action[2]);
+        else
+            wsprintfA(from, "%s [attack %04x]", ENEMIES_FILE_NAME, id & 0xffff);
+    }
+    why[0] = 0;
+    if (x.effect) {
+        struct en_fx_effect one, all;
+        struct en_fx_choice choice;
+
+        enemies_fx_effect(x.effect, &one);
+        enemies_fx_effect(x.effect_all, &all);
+        if (en_fx_decide(type, x.effect, x.effect_all, &one, &all, targets, effect_natives_usable > 0, enemies_native_base_ok, why, &choice)) {
+            effect_copy_cast[actor].single = (short)choice.single;
+            effect_copy_cast[actor].several = (short)choice.several;
+            effect_copy_cast[actor].now = (short)choice.now;
+            action[9] = choice.number;
+            enemy_native[actor].type = (BYTE)type;
+            enemy_native[actor].number = (BYTE)choice.number;
+            enemy_native[actor].on = 1;
+            noted = TRUE;
+        }
+    }
+    if (x.camera != 0xffff)
+        action[0x18] = action[0x19] = x.camera;
+    if (x.camera_multi != 0xffff)
+        action[0x19] = x.camera_multi;
+    if (x.script >= 0)
+        action[ACT_SCRIPT] = x.script;
+    if (!said)
+        return;
+    cameras[0] = 0;
+    if (x.camera != 0xffff || x.camera_multi != 0xffff || x.script >= 0)
+        wsprintfA(cameras, "; cameras %04x (one target) %04x (several)%s", action[0x18] & 0xffff, action[0x19] & 0xffff,
+                  x.script >= 0 ? ", model script set" : "");
+    if (noted)
+        log_line("enemies: actor %d's attack %04x (%s): native effect %04x (%04x on several), record effect %02x, type %02x, targets %04x%s",
+                 actor, id & 0xffff, from, x.effect, x.effect_all ? x.effect_all : x.effect, action[9] & 0xff, type, targets, cameras);
+    else if (x.effect)
+        log_line("enemies: actor %d's attack %04x (%s): effect %04x NOT played: %s; the game's effect %02x plays (type %02x)%s",
+                 actor, id & 0xffff, from, x.effect, why, action[9] & 0xff, type, cameras);
+    else
+        log_line("enemies: actor %d's attack %04x (%s): type %02x, targets %04x%s", actor, id & 0xffff, from, type, targets, cameras);
+    if (enemies_fx_logged == ENEMIES_FX_LOG_MAX)
+        log_line("enemies: (%d lines of enemy attack extras written: the rest of the run's are not)", ENEMIES_FX_LOG_MAX);
+}
+
+/* "Re-init .ini files": the registry and the folders again (enemies on). */
+static void enemies_reread(const char *why)
+{
+    if (!enemies_live)
+        return;
+    enemies_read_registry();
+    if (!enemies_battle_assigned)
+        enemies_static_models();
+    enemies_scan(why);
+}
+
+/* enemies on: set up once, from install_hooks (after the game file's first reading, config_dir known).
+   *ok and *total count the game's calls patched for it (the six of open_file_hook when the loose
+   files did not already take them, and the hand-over's when test_battle did not). */
+static void enemies_start(int *ok, int *total)
+{
+    static LONG started;
+    const char *opens;
+
+    if (!enemies_on || InterlockedExchange(&started, 1))
+        return;
+    enemies_model_clear();
+    if (!override_on) {
+        unsigned i;
+
+        for (i = 0; i < sizeof open_file_sites / sizeof open_file_sites[0]; i++, (*total)++)
+            *ok += patch_call(open_file_sites[i], FN_OPEN_FILE, open_file_hook);
+    }
+    (*total)++;
+    if (!test_battle_hook)
+        test_battle_hook = patch_call(SITE_BATTLE_NUMBER_SET, FN_SOUND_OPERATION, battle_number_hook) ? 1 : -1;
+    *ok += test_battle_hook > 0;
+    opens = enemies_find_driver_opens();
+    enemies_native_base_check();
+    enemies_live = 1;
+    enemies_read_registry();
+    enemies_static_models();
+    enemies_index_scene_bin();
+    enemies_scan("start-up");
+    log_line("enemies: on: %d enemies, %d scenes (SpellExtConfig\\%s, \\scenes), model pool %d-%d (files ob.. to of..: enemy slot i of a DLL scene is %d + i), battle map %d lines; the hand-over at %08lx %s; model files served %s",
+             enemies_known_count, enemies_scene_count, ENEMIES_FOLDER_NAME, ENEMIES_POOL_FIRST, ENEMIES_POOL_FIRST + ENEMIES_POOL_COUNT - 1,
+             ENEMIES_POOL_FIRST, enemies_registry.maps, (DWORD)SITE_BATTLE_NUMBER_SET,
+             test_battle_hook > 0 ? "is hooked" : "is NOT hooked (see the line above): no DLL scene can play", opens);
 }
 
 static void load_game_settings(void)
@@ -39963,6 +46885,8 @@ static void load_game_settings(void)
     test_battle = TEST_BATTLE_OFF;  /* (test_battle) off unless this reading names a battle */
     fields_keys_begin();            /* (field capacity) fields_file, fields_table_size, field_buffer_bytes: their defaults */
     bl_keys_begin();                /* (breaking limits) breaking_limits, wide_skeletons: their defaults */
+    enemies_keys_begin();           /* (enemies) enemies: off unless the file says on */
+    battle_menu_keys_begin();       /* (battle menu) battle_menu and its test mode's keys: their defaults */
     text = read_whole_file(GAME_FILE_NAME, &size);
     if (text) {
         file_end = text + size;
@@ -40063,7 +46987,7 @@ static void load_game_settings(void)
                 /* TESTING AID: every battle becomes this one (see test_battle_settle); a line with a mistake leaves it off */
                 if (!test_battle_value(value, stop, &test_battle)) {
                     test_battle = TEST_BATTLE_OFF;
-                    log_line("game file line %d: test_battle takes a battle number 1 to 1023 (like 16), or scene:formation (like 4:0; scene 0 to 255, formation 0 to 3), or off: the line gives nothing", line_number);
+                    log_line("game file line %d: test_battle takes a battle number 1 to 16383 (like 16; 1024 and up: a DLL scene's, with enemies = on), or scene:formation (like 4:0; scene 0 to 4095, formation 0 to 3), or off: the line gives nothing", line_number);
                     problems++;
                 }
             } else if (word_is(start, key_end, "seats")) {
@@ -40136,6 +47060,16 @@ static void load_game_settings(void)
                     log_line("game file line %d: %s", line_number, box_fault);
                     problems++;
                 }
+            } else if ((box_answer = enemies_key_line(start, key_end, value, stop, &box_fault)) != 0) { /* (enemies) enemies */
+                if (box_answer < 0) {
+                    log_line("game file line %d: %s", line_number, box_fault);
+                    problems++;
+                }
+            } else if ((box_answer = battle_menu_key_line(start, key_end, value, stop, &box_fault)) != 0) {   /* (battle menu) battle_menu, battle_menu_test, _rewards, _lose, _restore, _fast, _locked */
+                if (box_answer < 0) {
+                    log_line("game file line %d: %s", line_number, box_fault);
+                    problems++;
+                }
             } else if (word_is(start, key_end, "debug")) {
                 if (word_is(value, stop, "true") || word_is(value, stop, "yes"))
                     debug_menu = TRUE;
@@ -40167,7 +47101,10 @@ static void load_game_settings(void)
     box_keys_settle();              /* (the box) */
     fields_keys_settle();           /* (field capacity) built once at start-up: a later change is said, not taken */
     bl_keys_settle();               /* (breaking limits) the calls are patched once, at start-up */
+    bs_keys_settle();               /* (vertex bones) behind it: it needs that call */
+    enemies_keys_settle();          /* (enemies) taken at start-up only; set up by install_hooks (enemies_start); before test_battle, which asks it */
     test_battle_settle();           /* (test_battle) */
+    battle_menu_keys_settle();      /* (battle menu) one line when what the keys say has changed */
     {
         static LONG fixed_hooked;
 
@@ -40305,8 +47242,9 @@ static void load_game_settings(void)
    home spot to the target, or to the centre of the box round several). An older SpellExt refuses a file with either. */
 /* CAMERA TEXT PURE BEGIN */
 #define CAMERA_FOLDER_NAME      "cameras"
-#define MAX_OWN_CAMERAS         128          /* (camera stage 3: 64 before; the converter's 53 FF8 spell cameras and the installed ones together) */
-#define CAMERA_POOL_BYTES       32768
+#define MAX_OWN_CAMERAS         256          /* (128 before; camera stage 3: 64 before that; the 77 installed, and a text camera and an FF8 port for each
+                                                of 36 more limits, leave 107 spare) */
+#define CAMERA_POOL_BYTES       65536        /* (32768 before) own_camera.seq_at is an int because of it */
 #define CAMERA_NUMBER_LIMIT     0x2000
 #define CAMERA_ROLL_LINES       32           /* camera stage 0: [roll] lines of one camera */
 #define CAMERA_ROLL_MAX         8192         /* a roll: 4096ths of a turn either way (two turns); FUN_00662ad8 takes any short */
@@ -40320,8 +47258,8 @@ struct camera_roll_line {
 };
 /* camera stage 1: engine = ff8 cameras (FF8's camera animations: FUN_00503c70 reads a segment, FUN_005035e0 plays it) */
 #define CAMERA_ENGINE_FF8       1            /* own_camera.engine: played by this DLL (0: the game's scripts) */
-#define CAMERA_FF8_SEGMENTS     4096         /* segments of every engine = ff8 camera together (camera stage 3: 256 before; the
-                                                converter's 53 sequence cameras keep 2,415; chain_first / ff8_first are shorts) */
+#define CAMERA_FF8_SEGMENTS     8192         /* segments of every engine = ff8 camera together (4096 before; camera stage 3: 256 before that;
+                                                the converter's 53 sequence cameras keep 2,415; chain_first / ff8_first are shorts) */
 #define CAMERA_FF8_CHAIN        16           /* segments in the chain played */
 #define CAMERA_FF8_KEYS         32           /* keys a segment: FF8's record holds 32 (key times at +0x24..+0x63); 3 or more: its spline (camera stage 2) */
 #define CAMERA_FF8_FRAMES       NFX_LENGTH_MAX   /* a key's frames at most: a native effect's length (480 before 2026-10-24) */
@@ -40397,7 +47335,8 @@ struct own_camera {
     BYTE sequence;                      /* select = sequence: every chain kept, [sequence] played */
     BYTE anims;                         /* FF8's animation count (the highest [anim A] + 1): a start of a higher one is ignored */
     BYTE mode[2];                       /* camera_mode = A, B: FF8's two bytes var00 is drawn from (FUN_00500f70) */
-    short seq_at, seq_length;           /* the assembled program in camera_pool */
+    int seq_at;                         /* the assembled program in camera_pool: its place (the pool passes a short's 32767) */
+    short seq_length;                   /* ... and its bytes (CAMERA_FF8_SEQ_BYTES at most) */
     short chain_first[16][8];           /* chain A.V in camera_ff8_pool */
     BYTE chain_count[16][8];            /* its segments (0: empty) */
     BYTE clock;                         /* CAMERA_CLOCK_EFFECT (the default) or CAMERA_CLOCK_ACTION (clock = action) */
@@ -40408,7 +47347,9 @@ static int camera_ff8_used;
    time (16 a frame) of a segment within a short; the chain's frames within an int */
 typedef char camera_ff8_limits_check[32768LL * CAMERA_FF8_SCALE_MAX <= 0x7fffffffLL && 65536LL * 4096 <= 0x7fffffffLL &&
                               CAMERA_FF8_SEGMENT_FRAMES * 16 < 32768 && CAMERA_FF8_KEYS == 32 &&
-                              CAMERA_FF8_CHAIN * CAMERA_FF8_SEGMENT_FRAMES < 0x7fff && CAMERA_FF8_SEGMENTS <= 0x7fff ? 1 : -1];
+                              CAMERA_FF8_CHAIN * CAMERA_FF8_SEGMENT_FRAMES < 0x7fff && CAMERA_FF8_SEGMENTS <= 0x7fff &&
+                              CAMERA_FF8_SEQ_BYTES <= 0x7fff &&   /* seq_length is a short */
+                              CAMERA_POOL_BYTES == 65536 && CAMERA_FF8_SEGMENTS == 8192 ? 1 : -1];   /* parse_camera_text's messages name both */
 /* the arithmetic below (camera_roll_glide): (to - from) x a frame and x 1024 within an int, a frame x 1024 too */
 typedef char camera_roll_check[CAMERA_ROLL_MAX * 2LL * CAMERA_ROLL_FRAMES <= 0x7fffffffLL && CAMERA_ROLL_MAX * 2LL * 1024 <= 0x7fffffffLL &&
                                CAMERA_ROLL_FRAMES * 1024LL <= 0x7fffffffLL &&
@@ -41795,13 +48736,13 @@ static const char *parse_camera_text(char *text, DWORD size, struct own_camera *
             int seq_length = 0, seq_problem_line = seq_line; \
             const char *seq_problem; \
             if (camera_pool_used + CAMERA_FF8_SEQ_BYTES > CAMERA_POOL_BYTES) \
-                return "too much camera script in all (32768 bytes)"; \
+                return "too much camera script in all (65536 bytes)"; \
             seq_problem = camera_ff8_assemble(seq_from, line < file_end ? line : file_end, seq_line, camera_pool + camera_pool_used, &seq_length, &seq_problem_line); \
             if (seq_problem) { \
                 *problem_line = seq_problem_line; \
                 return seq_problem; \
             } \
-            camera->seq_at = (short)camera_pool_used; \
+            camera->seq_at = camera_pool_used; \
             camera->seq_length = (short)seq_length; \
             camera_pool_used += seq_length; \
         } \
@@ -41896,7 +48837,7 @@ static const char *parse_camera_text(char *text, DWORD size, struct own_camera *
                     if (camera->chain_count[a][v] == CAMERA_FF8_CHAIN)
                         return "more than 16 segments in this chain";
                     if (camera_ff8_used == CAMERA_FF8_SEGMENTS)
-                        return "too many ff8 segments in all (4096)";
+                        return "too many ff8 segments in all (8192)";
                     if (!camera->chain_count[a][v])
                         camera->chain_first[a][v] = (short)camera_ff8_used;
                     camera->chain_count[a][v]++;
@@ -41910,7 +48851,7 @@ static const char *parse_camera_text(char *text, DWORD size, struct own_camera *
                     if (camera->ff8_count == CAMERA_FF8_CHAIN)
                         return "more than 16 segments in the chain played";
                     if (camera_ff8_used == CAMERA_FF8_SEGMENTS)
-                        return "too many ff8 segments in all (4096)";
+                        return "too many ff8 segments in all (8192)";
                     seg = &camera_ff8_pool[camera_ff8_used++];
                     camera->ff8_count++;
                 } else
@@ -42086,7 +49027,7 @@ static const char *parse_camera_text(char *text, DWORD size, struct own_camera *
                 op = op * 16 + digit;
             }
             if (camera_pool_used + 16 > CAMERA_POOL_BYTES)
-                return "too much camera script in all (32768 bytes)";
+                return "too much camera script in all (65536 bytes)";
             if (op == 0xc0) {                               /* the byte after fe that makes it a loop */
                 camera_pool[camera_pool_used++] = 0xc0;
                 continue;
@@ -42139,7 +49080,7 @@ static const char *parse_camera_text(char *text, DWORD size, struct own_camera *
         if (camera->clock == CAMERA_CLOCK_ACTION && camera->blend)
             return "blend = counts the effect's last frames, which the action's clock does not have (clock = action): use a [sequence]'s blend N";
         if (camera_pool_used + 4 > CAMERA_POOL_BYTES)
-            return "too much camera script in all (32768 bytes)";
+            return "too much camera script in all (65536 bytes)";
         start = camera_pool + camera_pool_used;
         start[0] = 0xe1, start[1] = 0xff, start[2] = 0xe1, start[3] = 0xff;
         camera_pool_used += 4;
@@ -45915,7 +52856,7 @@ static void live_tables_refresh(const char *why)
     live_entry("effects", LIVE_STATIC, effect_copies, sizeof(struct effect_copy), EFFECT_COPY_MAX, effect_copy_count, &effect_copy_count, sizeof effect_copy_count, LIVE_NONE);
     live_entry("effect_bases", LIVE_STATIC, effect_bases, sizeof(struct effect_base), EFFECT_BASE_COUNT, LIVE_NONE, NULL, 0, LIVE_NONE);
     live_entry("nfx_scripts", LIVE_STATIC, nfx_scripts, sizeof(struct nfx_script), EFFECT_COPY_MAX, LIVE_NONE, NULL, 0, LIVE_NONE);
-    live_entry("nfx_pool", LIVE_STATIC, nfx_pool, sizeof(struct nfx_item), NFX_POOL_ITEMS, nfx_pool_used, &nfx_pool_used, sizeof nfx_pool_used, LIVE_NONE);
+    live_entry("nfx_pool", LIVE_HEAP, nfx_pool, sizeof(struct nfx_item), (DWORD)nfx_pool_capacity, nfx_pool_used, &nfx_pool_used, sizeof nfx_pool_used, LIVE_NONE);   /* (stage 6b: made at the first script read, sized to need) */
     live_entry("sounds", LIVE_STATIC, sound_handles, sizeof(struct sound_handle), SOUND_HANDLE_MAX, sound_handle_count, &sound_handle_count, sizeof sound_handle_count, LIVE_NONE);
     live_entry("cameras", LIVE_STATIC, own_cameras, sizeof(struct own_camera), MAX_OWN_CAMERAS, own_camera_count, &own_camera_count, sizeof own_camera_count, LIVE_NONE);
     live_entry("camera_pool", LIVE_STATIC, camera_pool, 1, CAMERA_POOL_BYTES, camera_pool_used, &camera_pool_used, sizeof camera_pool_used, LIVE_NONE);
@@ -45938,6 +52879,7 @@ static void reload_config(void)
     character_names_scanned = 0;                        /* the character file's names, for `equip` lists */
     load_spell_names();
     load_game_settings();
+    enemies_reread("Re-init .ini files");   /* (enemies) the registry and the folders again; nothing when off */
     load_effect_copies();       /* (before the spell file: a spell's `animation = 0x100` is looked up in it) */
     load_spells();
     effect_copies_check_files();    /* (a copy whose files are missing is dropped) */
@@ -47775,6 +54717,229 @@ static void shop_view_input(void)
     }
 }
 
+/* ==== BATTLE PAGE (menu_view BATTLE_VIEW): "Fight: external battles" (battle menu, stages 1 and 2) ====
+   Three rows, Again (the page's last battle), Next and Previous (the registered scene after or before it, round, in
+   its formation), then the registered DLL scenes by number, BM_LIST_ROWS at a time: the battle (scene x 4 +
+   formation), the scene, the formation shown, the scene file, its enemies (their `name =`, else the folder's name)
+   and the formation's stage. Up and down a row, the page buttons BM_LIST_ROWS rows (100 after [SWITCH]), left and
+   right the formation of the row under the cursor (kept while the page is open), OK fights (battle_menu_start),
+   Cancel goes back. A refusal is written over the list, whole, in red, until the cursor moves; it is in the log too.
+   After Re-init .ini files (a new scan) the list is made again at the next frame and the cursor held to it. */
+#define BATTLE_VIEW             11
+#define BATTLE_VIEW_COLOUR_NOTE 2            /* the menu's red (BOX_COLOUR_WARNING) */
+#define BATTLE_VIEW_NOTE_WIDTH  64           /* characters of a refusal's line at three quarters size (menu_text draws 64 at most) */
+static short battle_view_scenes[EN_SCENE_LAST - EN_SCENE_FIRST + 1];   /* the registered scenes, by number */
+static BYTE battle_view_form[EN_SCENE_LAST - EN_SCENE_FIRST + 1];      /* the formation chosen on each scene's row */
+static int battle_view_count, battle_view_row, battle_view_top, battle_view_jump;
+static LONG battle_view_scan = -1;                                      /* enemies_scans when the list was made */
+static char battle_view_note[EN_PROBLEM_MAX + 160];
+
+static const char *menu_battles(void)
+{
+    int i;
+
+    battle_menu_check_pending("the SpellExt menu's battle page opened");
+    if (enemies_live && !enemies_scan_listed)
+        enemies_scan("the battle page opened");     /* (the last scan did not keep the page's columns: the page was off then) */
+    for (i = 0; i <= EN_SCENE_LAST - EN_SCENE_FIRST; i++)
+        battle_view_form[i] = 0;
+    battle_view_scan = -1;
+    battle_view_note[0] = 0;
+    menu_view = BATTLE_VIEW;
+    return NULL;
+}
+
+/* The battle a row stands for, or -1 (Again before any battle; an empty list). */
+static LONG battle_view_battle(int row)
+{
+    int k, scene;
+
+    if (row == 0)
+        return battle_menu_last;
+    if (row < BM_SPECIAL_ROWS) {
+        k = bm_neighbour(battle_view_scenes, battle_view_count, battle_menu_last >= 0 ? (int)(battle_menu_last >> 2) : -1, row == 1 ? 1 : -1);
+        return k < 0 ? -1 : (LONG)battle_view_scenes[k] * 4 + (battle_menu_last >= 0 ? (battle_menu_last & 3) : 0);
+    }
+    k = row - BM_SPECIAL_ROWS;
+    if (k >= battle_view_count)
+        return -1;
+    scene = battle_view_scenes[k];
+    return (LONG)scene * 4 + battle_view_form[scene - EN_SCENE_FIRST];
+}
+
+/* A list row: battle, scene, formation, file, enemies, stage. */
+static void battle_view_columns(int y, LONG battle, int colour)
+{
+    int scene = (int)(battle >> 2), slot = scene - EN_SCENE_FIRST, formation = (int)(battle & 3), i, n = 0;
+    char enemies[3 * (26 + 2) + 4], cut[28], file[16];
+
+    screen_line(0x30, y, colour, "%d", (int)battle);
+    screen_line(0x6c, y, colour, "%d", scene);
+    screen_line(0xa0, y, colour, "%d", formation);
+    if (!enemies_scene_of[slot][0]) {
+        screen_line(0xb8, y, 0, "(not registered now)");
+        return;
+    }
+    lstrcpynA(file, enemies_scene_of[slot], 15);
+    screen_line(0xb8, y, colour, "%s", file);
+    enemies[0] = 0;
+    for (i = 0; i < 3; i++) {
+        int e = enemies_scene_enemy[slot][i];
+        const char *shown = e >= 0 ? (enemies_known_name[e][0] ? enemies_known_name[e] : enemies_known[e]) : e == -2 ? "?" : NULL;
+
+        if (shown)
+            n += wsprintfA(enemies + n, "%s%.26s", n ? ", " : "", shown);
+    }
+    lstrcpynA(cut, enemies, 27);
+    screen_line(0x150, y, colour, "%s", cut);
+    if (enemies_scene_stage[slot][formation] >= 0)
+        screen_line(0x250, y, colour, "%d", enemies_scene_stage[slot][formation]);
+    else
+        screen_line(0x250, y, 0, "-");
+}
+
+static void draw_battle_view(void)
+{
+    static const char *const labels[BM_SPECIAL_ROWS] = { "Again", "Next", "Previous" };
+    static const int column[6] = { 0x30, 0x6c, 0xa0, 0xb8, 0x150, 0x250 };
+    static const char *const heading[6] = { "Battle", "Scene", "F", "File", "Enemies", "Stage" };
+    int row, k, y, top = 0x33 + 0x0c + BM_SPECIAL_ROWS * VIEW_ROW_PITCH + 4;
+
+    if (battle_view_scan != enemies_scans) {
+        battle_view_scan = enemies_scans;
+        battle_view_count = bm_index(enemies_scene_of, EN_SCENE_LAST - EN_SCENE_FIRST + 1, battle_view_scenes);
+        bm_cursor_move(&battle_view_row, &battle_view_top, battle_view_count, 0);     /* (held to the new count) */
+    }
+    for (row = 0; row < BM_SPECIAL_ROWS; row++) {
+        LONG battle = battle_view_battle(row);
+        int slot = battle >= 0 ? (int)(battle >> 2) - EN_SCENE_FIRST : 0;
+        char file[16];
+
+        y = 0x33 + 0x0c + row * VIEW_ROW_PITCH;
+        screen_line(0x30, y, 5, "%s", labels[row]);
+        lstrcpynA(file, enemies_scene_of[slot][0] ? enemies_scene_of[slot] : "(not registered)", 15);
+        if (battle < 0)
+            screen_line(0x90, y, 0, "%s", row ? "no scene is registered" : "none yet");
+        else
+            screen_line(0x90, y, enemies_scene_of[slot][0] ? 7 : 0, "battle %d   scene %d   f%d   %s", (int)battle, (int)(battle >> 2), (int)(battle & 3), file);
+    }
+    for (k = 0; k < 6; k++)
+        menu_text_ascii(column[k], top, heading[k], 5);
+    if (battle_view_note[0]) {
+        const char *p = battle_view_note;
+
+        for (row = 0; row < BM_LIST_ROWS && *p; row++) {
+            char piece[BATTLE_VIEW_NOTE_WIDTH + 1];
+            int length = lstrlenA(p), cut = length;
+
+            if (cut > BATTLE_VIEW_NOTE_WIDTH) {
+                for (cut = BATTLE_VIEW_NOTE_WIDTH; cut > BATTLE_VIEW_NOTE_WIDTH / 2 && p[cut] != ' '; cut--)
+                    ;
+                if (p[cut] != ' ')
+                    cut = BATTLE_VIEW_NOTE_WIDTH;
+            }
+            lstrcpynA(piece, p, cut + 1);
+            screen_line(0x30, top + 0x1a + row * VIEW_ROW_PITCH, BATTLE_VIEW_COLOUR_NOTE, "%s", piece);
+            p += cut;
+            while (*p == ' ')
+                p++;
+        }
+        lstrcpyA(spell_view_line, "Refused (the reason is above, and in the log)   Cancel: back");
+    } else {
+        for (row = 0; row < BM_LIST_ROWS && battle_view_top + row < battle_view_count; row++)
+            battle_view_columns(top + 0x1a + row * VIEW_ROW_PITCH, battle_view_battle(BM_SPECIAL_ROWS + battle_view_top + row), 7);
+        if (!battle_view_count)
+            screen_line(0x30, top + 0x1a, 0, "%s", enemies_live ? "No DLL scene is registered (SpellExtConfig\\scenes)" : "enemies = off in the game file: no DLL scenes");
+        wsprintfA(spell_view_line, "OK: fight   Left/Right: formation   [SWITCH]: page %d   (%d scenes)", battle_view_jump ? BM_JUMP : BM_LIST_ROWS,
+                  battle_view_count);    /* (at most 70 characters: the line holds 80) */
+    }
+    y = battle_view_row < BM_SPECIAL_ROWS ? 0x33 + 0x0c + battle_view_row * VIEW_ROW_PITCH
+                                          : top + 0x1a + (battle_view_row - BM_SPECIAL_ROWS - battle_view_top) * VIEW_ROW_PITCH;
+    menu_text_quarters = 4;         /* (the cursor is the game's own picture; nothing more is drawn small after it) */
+    ((void (__cdecl *)(int, int, DWORD))FN_DRAW_CURSOR)(0x04, y + 2, DEPTH_CURSOR);
+}
+
+/* OK: the refusals, the build, then the start; the menu closes. */
+static void battle_view_fight(void)
+{
+    LONG battle = battle_view_battle(battle_view_row);
+    struct bm_where where;
+    int refusal;
+
+    if (battle < 0) {
+        ((void (__cdecl *)(int))FN_MENU_SOUND)(3);
+        lstrcpyA(battle_view_note, battle_view_row ? "No DLL scene is registered" : "Nothing has been fought from this page yet");
+        return;
+    }
+    battle_menu_where(&where);
+    refusal = bm_refusal(&where);
+    if (refusal != BM_GO) {
+        ((void (__cdecl *)(int))FN_MENU_SOUND)(3);
+        wsprintfA(battle_view_note, "Battle %ld: refused: %s", battle, bm_refusal_text[refusal]);
+        log_line("battle menu: battle %ld REFUSED: %s (mode %d, menu after a battle %d, request %d with %d, SPECIAL %d, random battles %s here, enemies %s, hand-over %s)",
+                 battle, bm_refusal_text[refusal], where.mode, where.after_battle, where.request, where.argument, where.special,
+                 where.locked ? "off" : "on", where.enemies ? "on" : "off", where.hand_over ? "hooked" : "not hooked");
+        return;
+    }
+    if (!enemies_build((DWORD)battle)) {
+        char *c;
+
+        ((void (__cdecl *)(int))FN_MENU_SOUND)(3);
+        wsprintfA(battle_view_note, "Battle %ld: refused: it does not build: %.900s", battle, enemies_problem);
+        for (c = battle_view_note; *c; c++)
+            if ((BYTE)*c < 0x20 || (BYTE)*c > 0x7e)
+                *c = '?';           /* (a file's text: no byte of it may reach the font as one of the game's codes) */
+        log_line("battle menu: battle %ld (DLL scene %ld, formation %ld) REFUSED: it does not build: %s", battle, battle >> 2, battle & 3, enemies_problem);
+        return;
+    }
+    ((void (__cdecl *)(int))FN_MENU_SOUND)(1);
+    battle_view_note[0] = 0;
+    battle_menu_start(battle, where.locked);
+    *(DWORD *)ADDR_MENU_FINISHED = 1;       /* the module leaves on it (006cc623), as after the name screen; the main menu's close block is not run */
+}
+
+static void battle_view_input(void)
+{
+    int before = battle_view_row, step = battle_view_jump ? BM_JUMP : BM_LIST_ROWS, k = battle_view_row - BM_SPECIAL_ROWS, turn;
+    BOOL listed = k >= 0 && k < battle_view_count;
+
+    if (*(const DWORD *)ADDR_MENU_FINISHED)
+        return;                     /* (a battle was started this frame: the module leaves; no second OK if the handler runs again) */
+    if (((int (__cdecl *)(int, int))FN_BUTTON_REPEAT)(0x1000, 1))
+        bm_cursor_move(&battle_view_row, &battle_view_top, battle_view_count, -1);
+    else if (((int (__cdecl *)(int, int))FN_BUTTON_REPEAT)(0x4000, 2))
+        bm_cursor_move(&battle_view_row, &battle_view_top, battle_view_count, 1);
+    else if (((int (__cdecl *)(int))FN_BUTTON_ONCE)(4))
+        bm_cursor_move(&battle_view_row, &battle_view_top, battle_view_count, -step);
+    else if (((int (__cdecl *)(int))FN_BUTTON_ONCE)(8))
+        bm_cursor_move(&battle_view_row, &battle_view_top, battle_view_count, step);
+    else if (listed && (turn = ((int (__cdecl *)(int, int))FN_BUTTON_REPEAT)(0x8000, 8) ? -1
+                             : ((int (__cdecl *)(int, int))FN_BUTTON_REPEAT)(0x2000, 4) ? 1 : 0) != 0) {
+        BYTE *formation = &battle_view_form[battle_view_scenes[k] - EN_SCENE_FIRST];
+
+        *formation = (BYTE)bm_formation_step(*formation, turn);
+        battle_view_note[0] = 0;
+        ((void (__cdecl *)(int))FN_MENU_SOUND)(1);
+        return;
+    }
+    if (battle_view_row != before) {
+        battle_view_note[0] = 0;
+        ((void (__cdecl *)(int))FN_MENU_SOUND)(1);
+        return;
+    }
+    if (((unsigned (__cdecl *)(unsigned))FN_BUTTON_PRESSED)(0x80)) {
+        battle_view_jump = !battle_view_jump;
+        ((void (__cdecl *)(int))FN_MENU_SOUND)(1);
+    } else if (((unsigned (__cdecl *)(unsigned))FN_BUTTON_PRESSED)(0x20)) {
+        battle_view_fight();
+    } else if (((unsigned (__cdecl *)(unsigned))FN_BUTTON_PRESSED)(0x40)) {
+        ((void (__cdecl *)(int))FN_MENU_SOUND)(4);
+        battle_view_note[0] = 0;
+        menu_view = 0;
+    }
+}
+/* ==== BATTLE PAGE: end ==== */
+
 static const struct { const char *label; const char *(*run)(void); } menu_entries[] = {
     { "Re-init .ini files", menu_reinit },
     { "Check External Spells", menu_spells },
@@ -47786,8 +54951,15 @@ static const struct { const char *label; const char *(*run)(void); } menu_entrie
     { "Check External Characters", menu_characters },
     { "Check Current Seats", menu_seats },
     { "Check Shops", menu_shops },
+    { "Fight: external battles", menu_battles },     /* (battle menu) the last row: left out with battle_menu = off */
 };
 #define MENU_ENTRY_COUNT        ((int)(sizeof menu_entries / sizeof menu_entries[0]))
+
+/* The rows the debug list shows: all, or all but the battle page's (battle_menu = off). */
+static int menu_entry_count(void)
+{
+    return battle_menu_shown() ? MENU_ENTRY_COUNT : MENU_ENTRY_COUNT - 1;
+}
 
 static DWORD own_grid[14];
 static const char *menu_message;
@@ -48303,7 +55475,7 @@ static void box_screen(BOOL open)
             for (i = 0; i < 14; i++)
                 own_grid[i] = 0;
             own_grid[2] = own_grid[6] = 1;
-            own_grid[3] = own_grid[7] = MENU_ENTRY_COUNT;
+            own_grid[3] = own_grid[7] = menu_entry_count();
             own_grid[11] = 1;
             menu_view = 0;
             menu_message = "OK: run the entry    Cancel: back";
@@ -48363,10 +55535,11 @@ static void __cdecl own_menu_init(int unused)
     for (i = 0; i < 14; i++)
         own_grid[i] = 0;
     own_grid[2] = own_grid[6] = 1;                      /* one column */
-    own_grid[3] = own_grid[7] = MENU_ENTRY_COUNT;
+    own_grid[3] = own_grid[7] = menu_entry_count();
     own_grid[11] = 1;                                   /* as the game's one-column lists: the cursor wraps round */
     menu_view = 0;
     menu_message = "OK: run the entry    Cancel: back";
+    battle_menu_check_pending("the SpellExt menu opened");     /* (battle menu) nothing unless a request still waits */
     own_menu_as_box = box_shown();  /* (box = auto) a sleeping box has no row: the row is the debug menu's, as with box = off */
     if (own_menu_as_box) {
         box_seen();                 /* (box = auto) the Box screen is opened: "Box new" no more */
@@ -48416,6 +55589,7 @@ static void __cdecl own_menu_handler(DWORD frame)
                     : menu_view == 4 ? "SpellExt  -  external items"
                     : menu_view == 7 ? "SpellExt  -  current seats"
                     : menu_view == 9 ? "SpellExt  -  shops"
+                    : menu_view == BATTLE_VIEW ? "SpellExt  -  external battles"
                     : menu_view >= 5 ? "SpellExt  -  external characters" : "SpellExt  -  debug");
     menu_text(0x18, 0x0d, text, 7);
     if (menu_view) {
@@ -48434,12 +55608,14 @@ static void __cdecl own_menu_handler(DWORD frame)
             draw_seats_view();
         else if (menu_view == 9)
             draw_shop_view();
+        else if (menu_view == BATTLE_VIEW)
+            draw_battle_view();
         menu_text_quarters = 4;
         if (menu_view == 5)
             draw_character_list();
         menu_message = spell_view_line;
     } else {
-        for (i = 0; i < MENU_ENTRY_COUNT; i++) {
+        for (i = 0; i < menu_entry_count(); i++) {
             encode_text(text, menu_entries[i].label);
             menu_text(0x42, 0x33 + 0x10 + i * 0x1a, text, 7);
         }
@@ -48458,6 +55634,8 @@ static void __cdecl own_menu_handler(DWORD frame)
             seats_view_input();
         else if (menu_view == 9)
             shop_view_input();
+        else if (menu_view == BATTLE_VIEW)
+            battle_view_input();
         else
             character_view_input();
         if (menu_view == 0)
@@ -48470,9 +55648,14 @@ static void __cdecl own_menu_handler(DWORD frame)
             menu_message = "OK: run the entry    Cancel: back";
         return;
     }
+    if (own_grid[3] != (DWORD)menu_entry_count()) {     /* (battle menu) Re-init .ini files changed battle_menu: the list's rows follow */
+        own_grid[3] = own_grid[7] = menu_entry_count();
+        if (own_grid[1] >= own_grid[3])
+            own_grid[1] = own_grid[3] - 1;
+    }
     ((void (__cdecl *)(DWORD *))FN_GRID_MOVE)(own_grid);
     if (((unsigned (__cdecl *)(unsigned))FN_BUTTON_PRESSED)(0x20)) {
-        if (own_grid[1] < (DWORD)MENU_ENTRY_COUNT) {
+        if (own_grid[1] < (DWORD)menu_entry_count()) {
             ((void (__cdecl *)(int))FN_MENU_SOUND)(1);
             menu_message = menu_entries[own_grid[1]].run();
         }
@@ -49687,6 +56870,7 @@ static void __cdecl wide_battle_end_hook(void)
 {
     ((void (__cdecl *)(void))WIDE_FN_BATTLE_END_NEXT)();
     wide_sync("a battle's end (the list written back)");
+    bs_log_battle();                /* (vertex bones) the battle's one line */
     if (box_live)       /* (the box, stage B3, R8) gear gained in a battle the game reports WON goes to the box; nothing with the box LOCKED or off, or without the note of the battle's start */
         box_battle_surplus(!IsBadReadPtr((const void *)BOX_ADDR_BATTLE_WON, 2) && *(const WORD *)BOX_ADDR_BATTLE_WON == BOX_BATTLE_WON);
 }
@@ -50805,8 +57989,12 @@ BOOL WINAPI DllMain(HINSTANCE self, DWORD reason, LPVOID reserved)
         live_tables_refresh("start-up");    /* (live tables) the arrays are known; the heap tables do not exist yet */
     } else if (reason == DLL_PROCESS_DETACH) {
         log_line("unloading; kernel loader was called %ld time(s)", loader_calls);
-        if (log_file != INVALID_HANDLE_VALUE)
-            CloseHandle(log_file);
+        if (log_file != INVALID_HANDLE_VALUE) {
+            HANDLE closing = log_file;
+
+            log_file = INVALID_HANDLE_VALUE;    /* (2a review, 4) a later call through a driver slot still pointing here logs nothing */
+            CloseHandle(closing);
+        }
     }
     return TRUE;
 }
