@@ -66,6 +66,8 @@ game yet, this page says so.
 - `keep_seat`, `copy_of` and joining by field script. `atb_follows_dexterity = yes` makes a battle script's change of a
   party member's dexterity change its time gauge's speed at the next action's set-up (it needs at least one new
   character defined; not yet seen in the game).
+- `body_blend = yes`: the groups of a new character's own battle model (`battle_files`) keep their `.P` blend mode,
+  so a cloak or a veil can be see-through (the game draws every group of a party member's body solid).
 
 ### Limit breaks (for new characters)
 - Twelve limits per new character (levels 1-4, three each) in `FF7_SpellExt_Limits.ini`, each built on a game limit
@@ -78,6 +80,11 @@ game yet, this page says so.
   eighth, are read from the code and not yet seen in the game.
 - **Props** (a model held during a limit), **states** (a limit that leaves the character in a lasting stance with its
   own attacks, idle and commands) and **follow-up chains**.
+- **Transformations** (`form`, defined in a `[form NAME]` section): a limit turns its user into another battle model
+  for the rest of the battle, as the game's beast limits do: an enemy's own model (`model_enemy`) with a script file
+  in the party layout, a party-slot model of the game's (`model_like`) or a full set of files (`model_files`). The AI
+  then takes the character's turns, and when knocked out the character changes back to its own model. A form has no
+  size, height or stat changes of its own yet.
 
 ### Effects and cameras
 - **Effect copies** (`FF7_SpellExt_Effects.ini`, numbered from 0x100): a spell plays its own copy of one of 38 game
@@ -87,14 +94,36 @@ game yet, this page says so.
   fills, flashes and shake, stage darkening, and moving, hiding or tinting actors. Used by a spell (`animation =
   0x100` and up) or a limit (`effect N:FRAME`). Up to 32 files and 600 frames an effect, one playing at a time. It was
   built to carry effects converted from FF8; none ship with the mod. Some commands are not yet seen in the game
-  (see its readme).
+  (see its readme). Up to 1,024 effect sections and 1,024 sound handles; the pool of timeline lines grows to what
+  the scripts need (up to 1,048,576).
+- **Models that change shape**: a model's file line can name a morph file (`morph=NAME.MRF`, up to 600 vertex sets),
+  and a model line steps through its sets (`shape=A>B`, blended with `tween=smooth`): a ribbon growing, a beam
+  stretching. The sets are written through the game's own vertex lock. `face=yaw` keeps a model upright and turns it
+  about the vertical to face the camera.
 - **Battle cameras of your own** (`SpellExtConfig\cameras`, numbered from 190 hex), added in memory to whichever of
   the game's camera files is loaded and used through a spell's or limit's `camera_single` / `camera_multi`. A camera
   can also turn the arena about its long axis (`[roll]`, a roll when the shot looks along it), or use FF8's kind of
   camera (`engine = ff8`: keyframes, splines, zoom, roll, blends and sequences). Both play only while a native effect
   runs. An `engine = ff8` camera with `clock = action` plays instead on the action's own frames, from its effect step
   through all of its steps; FF8 cameras also take the references `home` and `frame0.home`. `clock = action` and the
-  two references are not yet seen in the game.
+  two references are not yet seen in the game. Up to 256 cameras and 65,536 bytes of script in all.
+
+### Enemies and battles
+- **Enemies and scenes of your own** (`enemies = on` in the game file, read at start-up): battles built by the DLL
+  from text files in `SpellExtConfig\enemies` and `SpellExtConfig\scenes`, with no change to `scene.bin`. A scene
+  holds up to three enemies, the arena, the camera and up to four formations; scenes are numbered 256-4095, so their
+  battles are 1024-16383. Each enemy's model files, AI and attacks come from its own folder.
+- `FF7_SpellExt_Enemies.ini` puts them in place of the game's battles: `[battle_map]` lines by field, on the world map
+  or anywhere (`field 123 : 268 = 1200`), and `test_battle` takes their numbers. A scene with a mistake is refused
+  with the file and line in the log, and the game's own battle plays. Edits to a scene's files take effect at its next
+  battle, with no restart.
+- **Enemy attacks with SpellExt's effects and cameras**: an enemy's `[attack]` section, or `[attack N]` in the enemies
+  file for attack N in any battle (the game's own too), can name a native effect (`effect`, `effect_all`) and cameras
+  (`camera`, `camera_multi`).
+- **The battle page**: with `debug = true`, the SpellExt menu's "Fight: external battles" lists every registered scene
+  and starts the one you pick from the field you stand in, with Again, Next and Previous rows. By default it is a test
+  battle: no rewards, a loss returns to the field and the party is put back (the `battle_menu_*` keys change that).
+  It starts battles from fields only, not the world map.
 
 ### Fields and the engine
 - **Bodies in the field for new characters**: `field_entities = party` or `seats` (default off), with the character's
@@ -110,6 +139,9 @@ game yet, this page says so.
   default once the master is on, so `breaking_limits = on` alone widens skeletons; write `wide_skeletons = off` to
   keep the game's limit. `all` is a testing aid. The game's effects, hit numbers and cursor see bones 0-48 only. Seen
   in the game with a 69-bone model.
+  `model_skinning = on` (default off; it needs the master and `wide_skeletons`) lets single vertices of a battle
+  model's part follow another bone, from a file in `SpellExtConfig\skins`, so a polygon that crosses a joint bends
+  with it instead of tearing. It relies on FFNx keeping a part's vertices in memory.
 - More than 256 texts in one field; name codes for new characters in dialogue.
 
 ### Saves
@@ -138,13 +170,14 @@ The readmes inside a release zip can be older than, or missing from, the ones in
 read those.
 
 ### Configuring
-- Edits are made in the mod's `SpellExtConfig` folder: the `.ini` files, and the folders `cameras`, `effects`, `ai`
-  and `files` (loose files and portraits). Each file's keys are explained in its readme in
+- Edits are made in the mod's `SpellExtConfig` folder: the `.ini` files, and the folders `cameras`, `effects`, `ai`,
+  `files` (loose files and portraits), `enemies`, `scenes` and `skins`. Each file's keys are explained in its readme in
   [`docs/Readme`](docs/Readme/).
 - **Reloading without a restart**: the SpellExt menu (under Quit, or on the Box screen once the Box is at work, with
   `debug = true`) has **Re-init .ini files**, which reads the files again. Its other pages list what was read:
   spells, materia, gear, items, characters, seats and shops. Some keys are read at start-up only and need a restart:
-  `wide_items`, `wide_rows`, `box` and its other keys, `seats`, `breaking_limits`, `wide_skeletons`, and the field
+  `wide_items`, `wide_rows`, `box` and its other keys, `seats`, `breaking_limits`, `wide_skeletons`,
+  `model_skinning`, `enemies`, and the field
   keys `fields_file`, `fields_table_size`, `field_buffer_bytes` and `fields_fallback`. A new file (a portrait, a
   model, an effect's or an AI file) is seen only after a restart: 7th Heaven lists a mod's files when the game
   starts.
@@ -166,6 +199,8 @@ The main switches, in `FF7_SpellExt_Game.ini`:
 | `fields_file` | a file name, or `none` | none | The registry of new fields |
 | `breaking_limits` | `on`, `off` | `off` | The master switch: nothing of Breaking Limits is done without `on` |
 | `wide_skeletons` | `on`, `off`, `all` | `on` once `breaking_limits = on`; ignored without it | Battle models of more than 48 bones |
+| `model_skinning` | `on`, `off` | `off` | Vertices that follow another bone (needs `breaking_limits` and `wide_skeletons`) |
+| `enemies` | `on`, `off` | `off` | Enemies and scenes of your own |
 | `atb_follows_dexterity` | `yes`, `no` | `no` | Dexterity changes in battle change the time gauge's speed |
 | `achievement_materia_view` | `yes`, `no` | `yes` | Keeps FFNx's mastered-materia count from writing outside its list (keep it on) |
 
