@@ -2,7 +2,8 @@ FF7 SpellExt - Breaking Limits
 ==============================
 
 Breaking Limits lifts limits that are built into the game's engine itself, not into its
-data. Each lift is an "item" with its own key. The first item is wide battle skeletons.
+data. Each lift is an "item" with its own key. The first item is wide battle skeletons;
+the second, model skinning, is off unless its own key says on.
 
 Nothing of this is done unless the game file says breaking_limits = on. Without that line
 the game runs exactly as without SpellExt: no code of the game is changed.
@@ -18,8 +19,12 @@ the game runs exactly as without SpellExt: no code of the game is changed.
 ;                         be used. all: a TESTING AID: every battle model, however
 ;                         small, goes through the same new code (see "Testing it"
 ;                         below); set it back to on when done.
+; model_skinning            on or off (default off). on: a battle model's file in
+;                         SpellExtConfig\skins can give single vertices another
+;                         bone (see "Model skinning" below). Needs breaking_limits
+;                         = on and wide_skeletons on or all.
 ;
-; Both are read at start-up only: a change needs a restart of the game
+; All are read at start-up only: a change needs a restart of the game
 ; (Re-init .ini files says so in the log and changes nothing).
 
 
@@ -75,6 +80,38 @@ three is changed, the log says which, and the game keeps its limit:
 FFNx neither replaces nor reads any of these places.
 
 
+--- Model skinning --------------------------------------------------------------------
+
+The game has one rigid part per bone, so a polygon that crosses two bones must live in
+one part and tears or stretches wrongly when the joint bends. With model_skinning = on, a
+model can say that single vertices of a part follow another bone. Each time the model is
+drawn in battle the DLL works out where that bone puts them and writes them into the part
+before it is drawn. Nothing else about the model changes. No file: the model is left alone.
+
+The file is SpellExtConfig\skins\<first two letters of the model's parts>.skin, plain text,
+the parts being named as in the battle archive (rtax, rt.skin; a new character's battle_files
+letters for its own), one vertex a line; an empty line or one starting with ; or # is skipped:
+
+  part=rtax group=0 vertex=59 bone=12 x=18.5 y=-191.7 z=30.6 rx=18.544249 ry=28.303410 rz=-86.441521
+
+  part     the part file's name, without folder or extension (capitals do not matter)
+  group    the group inside that part
+  vertex   the vertex, counted inside that group
+  bone     the bone it follows, from 0
+  x y z    its place in that bone's frame
+  rx ry rz where the part file has it (within 0.01): the check that this file belongs to
+           the part that is loaded
+
+Numbers are plain decimals. The file is taken whole or not at all: a part, group, vertex or
+bone that does not exist, a vertex not at rx ry rz, a vertex listed twice, the part's own
+bone given as the true bone, or a part with no vertex arrays (not FFNx) refuses the whole
+file with one log line, and that model is drawn as if the file were not there. A model
+made to lean on this looks wrong without it, so such a model needs this DLL.
+
+Seen in the code only so far. It relies on FFNx drawing a part from the vertices it keeps in
+memory; a new FFNx could change that.
+
+
 --- Testing it ------------------------------------------------------------------------
 
 wide_skeletons = all sends EVERY battle model and animation through the new code. A
@@ -97,3 +134,20 @@ At start-up, one of:
   breaking limits: off (breaking_limits is not on): wide_skeletons is not taken; ...
   breaking limits: wide_skeletons NOT on (see the line above): nothing patched; ...
 No line at all when neither key is in the game file.
+
+With model_skinning asked for, at start-up, one of:
+  model_skinning: on: a battle model's skins\<first two letters of its parts>.skin is honoured
+  model_skinning: NOT on: it needs breaking_limits = on and wide_skeletons on (the call at
+      0042fab2): no skin file is read
+In a battle (at most 64 of the first three kinds a run):
+  model_skinning: skins\rt.skin taken: 3 vertices in 1 part(s) of a model of 23 bones
+  model_skinning: skins\rt.skin refused whole, nothing is written: <why> (line N)
+  model_skinning: a model of 23 bones has no skin: <why>; part sets looked at N, without a
+      set N, without data N, without a name N; first name '...', first stem '...'; file
+      'skins\rt.skin' did not open
+      (once per model per battle. <why> "no file for it" is the usual case: a model with no
+      skin file. Read the file's name here if you expected one to be taken.)
+  model_skinning: this battle: 1 skin file(s) in use; V vertices rewritten in D model draws
+      of N; S draws skipped (determinant near 0); the largest move from a vertex's place
+      in its file was U units
+The last is one line a battle, at its end.

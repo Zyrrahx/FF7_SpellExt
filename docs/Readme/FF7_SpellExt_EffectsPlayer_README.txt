@@ -59,11 +59,12 @@ Head:
               this sheet (each must still be a loaded texture). A model file is never one of a sheet's
               textures: the default list stops before it, and tex= naming one is refused.
 
-  file N = MODEL.RSD [blend=KIND]
+  file N = MODEL.RSD [blend=KIND] [morph=NAME.MRF]
       A 3-D model, drawn by `model` lines: the game reads NAME.RSD, the .P its PLY line names and the
       textures (.TIM, asked for as .TEX) its TEX lines name. A model's line names the .RSD alone: no
       second name and no tex=. blend: add (the default), average, subtract, quarter, or solid (drawn
-      as an opaque model; solid is for a model only). At "Re-init .ini files" the DLL looks for NAME.RSD
+      as an opaque model; solid is for a model only). morph: the model's vertex sets, for a model
+      whose shape changes from frame to frame (see "Morph files" below). At "Re-init .ini files" the DLL looks for NAME.RSD
       and the .P its PLY line names (108.RSD names 101.PLY: 101.P is looked for; NAME.P when the RSD
       cannot be read or has no PLY line); its textures are only checked when the effect is cast. Sprite and model files may be mixed in
       one effect (the game's own effects do: Holy's group is a sprite sheet and a model).
@@ -222,6 +223,23 @@ Timeline: one command a line, `FRAME` or `FIRST-LAST` first (0 to length - 1):
                         (negative: toward the camera), and turn=X,Y,Z turns it about the screen's axes
                         (turn=0,0,0>0,0,360: once round in the screen's plane). face=world: the default.
                         With at=screen face=camera is implied (it may be given; face=world is refused).
+        face=yaw        the model stays upright in the world and turns about the vertical to face the
+                        camera (a cylindrical billboard: a tree, a pillar of light, a standing wave). Its
+                        axes: x the screen's right made level, y the world's vertical (down, as y always
+                        is), z the line of sight made level (away from the camera). With a level camera
+                        it is face=camera; with a camera looking down it is seen tilted by that pitch
+                        only. x=, y= and z= move it along those axes (y the vertical), turn=X,Y,Z turns it
+                        about them (turn=0,0>360,0 spins it about the vertical). It works with at=target,
+                        caster, centre and arena, bone= and each= as without it. Not with at=screen
+                        (refused: a screen model's axes are the screen's). The last face= of a line counts.
+                        (A camera looking within about 14 degrees of straight down takes the screen's
+                        right for x instead.)
+        shape=N         a model with a morph file (morph= on its file line): its vertex set N, 0 and up
+                        (below the file's set count). shape=A>B: from set A at FIRST to set B at LAST in
+                        whole sets, as a sprite's page=A>B (the last set shows on the last frame;
+                        shape=59>0 backwards). Without shape= a line of a morph file draws set 0.
+        tween=smooth    with shape=A>B: blended between neighbouring sets instead of stepping, in 256ths
+                        of a step (10 sets over 60 frames, smoothly). tween=step: the default.
         zoom=fixed      at=screen only: as a sprite's zoom=fixed (the model keeps the size it has at H
                         512 whatever H a camera plays; its depth unchanged). Keep such a model's scale=
                         at 150 or below if it must stay whole down to H 128 (x 4): the matrix holds at
@@ -229,11 +247,41 @@ Timeline: one command a line, `FRAME` or `FIRST-LAST` first (0 to length - 1):
         each=K          targets in turn, as for a sprite. Not with at=caster, at=centre, at=screen or
                         at=arena.
       x, y, z, fade, colour, uv and palette may be FROM>TO too. A model has no page=, rot=, depth=
-      (refused). The colour mixing and fading above is FFNx's (the user's driver); the stock driver
+      (refused; shape= is a model's page). The colour mixing and fading above is FFNx's (the user's driver); the stock driver
       uses other routines for them: not checked.
       The game's own effect models are often tiny in their files and enlarged when the game loads them
       (Blizzaga's spike BRIZAG_1 stands 106 units tall in its file and is loaded 25 times larger): a
       script draws a model at its file's size, so such a model needs a large scale.
+
+  Morph files: a model that changes its shape
+      A model whose vertices move from frame to frame (a ribbon growing, a beam stretching, a cloud
+      billowing) keeps its polygons, colours and texture and takes its vertex POSITIONS from a morph
+      file, one set of them a frame:
+          file 0 = RIBBON.RSD blend=add morph=RIBBON.MRF
+          0-59 model 0 at=target bone=ground shape=0>59
+      draws set 0 at frame 0, set 1 at frame 1, ... set 59 at frame 59.
+        NAME.MRF        in SpellExtConfig\effects, beside the scripts (the DLL reads it itself, at
+                        "Re-init .ini files"; the game never asks for it, so it is never looked for in
+                        the magic folder or magic.lgp). Several file lines and scripts may name one: it
+                        is read once.
+        its bytes       (little-endian) "SXMORPH1", then 32 (the header's size), V (the vertices of a
+                        set, 1 to 32768: the .P's own count), S (the sets, 1 to 600), and three 0s; then
+                        S sets of V vertices, each three 32-bit floats x, y, z in the .P's own units and
+                        axes, in the .P's vertex order (group by group, as its vertex block). Exactly
+                        32 + S x V x 12 bytes. Every value finite and below 2097152 either way.
+                        (A 60-set ribbon of 400 vertices: 288,032 bytes.)
+        the .P          an ordinary model. Its own vertices are not drawn while a morph line draws it:
+                        make them set 0. Give its box block room for every set.
+      One set a frame for each FILE. A file is one model in the engine, so every copy of it drawn in a
+      frame shows that frame's set: several targets are fine (each gets the same set). Two lines of one
+      morph file that would ask for different sets on one frame refuse the script, and so does each=
+      with a changing shape= (the targets would ask for different sets): for copies at different sets,
+      give each its own file line naming the same RSD and morph= (file 3 and file 4 both
+      RIBBON.RSD morph=RIBBON.MRF). An each=K line is taken as on to LAST + 9 K for that test. A line
+      of a morph file without shape= asks for set 0.
+      The sets are written into the model's own vertices each frame it is drawn, through the game's own
+      vertex lock (the routine its fades use); under FFNx they reach the screen the same frame. Cost:
+      12 bytes a vertex a frame for each morph file drawn.
 
   FRAME hit [each=K]
       Shows the cast's result on every target (the damage number and the target's reaction). Each
@@ -439,15 +487,15 @@ a script from another game's frames would make) is simply one line per sprite pe
 ---------
 
     files per effect         32         texture pages per sheet   4
-    frames (length)          600 (40 s) timeline lines per script 2048 (256000 for all scripts together)
+    frames (length)          600 (40 s) timeline lines per script 2048 (1048576 for all scripts together)
     lines in a script file   12000      script file size          512 KB
     sprites drawn per frame  128 (the rest of that frame is not drawn; the log says so once)
     models drawn per frame   256 (the same; counted apart from the sprites)
     turn                     -36000 to 36000 degrees about each axis
     fade                     0-255      uv                        0-255 each (256ths of the texture)
     sound ids                1-751      each=                     0-60 frames
-    sound handles            256        a handle's name           1-23 characters
-    [effect] sections        256 (effect copies and native effects together)
+    sound handles            1024       a handle's name           1-23 characters
+    [effect] sections        1024 (effect copies and native effects together)
     scale                    0-700 %    rot                       -3600 to 3600 degrees (sprites)
     palette rows             0-255, and below the count in every .TEX the sheet draws with (checked at the cast);
                              a model's: below its first texture's count
@@ -461,6 +509,13 @@ a script from another game's frames would make) is simply one line per sprite pe
     actors move x, y, z      -8192 to 8192 battle units from the actor's own place
     actors turn              -36000 to 36000 degrees about each axis
     backdrop (layer=back)    one a frame (the last line on)
+    morph file (.MRF)        1-600 vertex sets of 1-32768 vertices (the .P's count); 16 MiB a file;
+                             64 MiB and 256 names for all the scripts' morph files together
+    shape                    0-599, below the morph file's set count; one set a frame for each file
+
+The pool of timeline lines grows to what the scripts need, up to 1048576 (the log says its size after each reading:
+"native effects: N timeline line(s) read into a pool of M"). If the memory for more is not to be had, the log says so
+and a refusal names the size the pool has then: that is the limit for that run.
 
 One native effect plays at a time (a cast's script waits for its effect before the next action; a limit's
 second `effect` step ends the first one, whose hits are shown then). An
@@ -503,6 +558,18 @@ Refused for now (the whole script is not used, as for any refused line):
     at=screen without z=, or with z below 1; with bone=, each=, depth= (a sprite) or face=world (a model);
     z= on a sprite that is not at=screen or at=arena
     zoom=fixed on a line that is not at=screen; zoom= other than camera or fixed
+    face=yaw with at=screen
+    morph= on a sprite file, or a name that is not NAME.MRF; shape= on a model without morph=; tween=
+    without shape=; each= with a changing shape=; two lines of one morph file asking for different sets
+    on one frame:
+    effect script effects\x.txt line 14: this line and line 12 draw file 0 with different vertex sets on frame 6: a morph file shows one vertex set a frame for all its lines and copies (...)
+    the morph file itself (on the file line): not found, a bad header, a size that does not match its
+    counts, a value that is not a finite number below 2097152 (the log names its set and vertex), past
+    16 MiB, or past 64 MiB for all the morph files together; a shape= at or past its set count; a .P
+    whose vertex count is not the morph file's (when the .P can be read at "Re-init .ini files"):
+    native effects: morph file effects\RIBBON.MRF (4000 bytes): the morph file's size is not 32 + sets x vertices x 12 bytes (...)
+    effect script effects\x.txt line 3: the morph file's size is not 32 + sets x vertices x 12 bytes (...)
+    effect script effects\x.txt line 3: the morph file has 400 vertices in a set, but the model's .P has 396: a set holds every vertex of the .P, in the .P's order (file 0)
 
 A sound handle refused in the effects file (section 5), or a script naming one that is not usable:
     effects file line 160: a sound handle's number is 53848 to 58089 (...); the log names the usable runs
@@ -518,6 +585,12 @@ Refused when the effect is cast (not played this time; its spells play their bas
     native effect 0204: effects\x.txt line 20 asks for palette row 1, but the first texture of file 0 (F8RING.RSD) has 1 palette row(s) (0-0): not played
     native effect 0204: file 1 (KAYAKU.RSD): the model has no texture 0 (TEX[0]) on any of its states, so palette= cannot be checked: not played
     native effect 0204: file 0 (BRIZAG_1.RSD): palette= needs a model with one texture (its RSD names more; FFNx would draw the others with TEX[0]'s picture when the row changes): not played
+    native effect 04f0: file 0 (SXF1QUAD.RSD): morph file SXF1QUAD.MRF: its .P's vertex count is not the morph file's (6, 8): not played
+      (the loaded model checked against its morph file: its .P there, the group counts, no pre-lit screen
+      vertices, every group's vertices within the morph file's, and the game's vertex lock giving them)
+    native effects: morph files OFF: 00670196 is not as expected (byte 3 is ..., not 83); an effect with a morph file plays its base effect (first: 04f0)
+      (once: the game's vertex lock 00670196 / 00670144 is not as the DLL knows it; effects without a morph
+      file play as before)
 
 A script may start with a UTF-8 byte-order mark (as some editors save one): it is passed over.
 
@@ -531,7 +604,15 @@ and each cast:
     native effect 0203: first model draw at frame 0: 0 sprite(s), 2 model(s), the last model of line 16 at (...), turn (0, 0, 0), scale (300, 300, 300)
     native effect 0205: first model draw at frame 0: ..., the last model of line 12 at (...) on the ground, turn (0, 0, 0), scale (500, 500, 500), fade 255 colour none 000000 uv 0,0 row -1 (context ...)
       (the line is about the last model line drawn in that frame; the longer form when that line uses
-      bone=ground or a key of fade, colour, uv, palette, face)
+      bone=ground or a key of fade, colour, uv, palette, face; face=yaw says "turned to the camera's yaw")
+    native effects: morph file effects\SXF1QUAD.MRF: 60 vertex set(s) of 6 vertices (4 KiB)
+    native effects: 1 morph file(s) named, 1 read (4 KiB of vertex sets; 64 MiB at most)
+      (at "Re-init .ini files", only when a script names a morph file)
+    native effects: morph files on (00670196, 00670144 as expected; the driver's vertex arrays (d3d2_flag 1: FFNx)): ...
+      (once, at the first cast of an effect with a morph file)
+    native effect 04f0: first morph set at frame 0: line 13, file 0 (SXF1QUAD.RSD, SXF1QUAD.MRF): set 0, 6 vertices
+      (once a cast, the first set written; when that frame falls between two sets of a tween=smooth line, the
+      line ends "set A and N/256 of the way to set A+1")
     native effect 0286: first arena draw at frame 90: line 896 (sprite) at (14, -6575, 61) in the world (caster 0, targets 0010)
       (once a cast, the first at=arena line drawn, at the place the line gives: the same for every caster)
     native effect 0201: hit queued at frame 14 for targets 0010
@@ -570,7 +651,9 @@ effects\stage2a_palette.txt (palette rows), with NFXPAL00.TEX and NFXPAL01.TEX i
 Fire's two textures with row 0 made blue and row 1 grey (rows 2 and 3 Fire's own); effects\stage3a_model.txt
 (model lines), with the game's own Blizzaga spike from magic.lgp (folder magic/brizag): no file needed;
 effects\stage3b_model.txt (bone=ground beside bone 0, fade, colour, uv, face=camera, a solid model), with the
-game's own BRIZAG_1, DYNAMITE and Fire files: no file needed.
+game's own BRIZAG_1, DYNAMITE and Fire files: no file needed; effects\SXF1_MORPH.txt (a quad stretched by its
+morph file SXF1QUAD.MRF over 60 frames, then shrunk back with tween=smooth, and a face=yaw plane beside a
+face=camera one), with base\magic\SXF1QUAD.RSD/.P and SXF1YAW.RSD/.P.
 
 
 5. Sound handles: sounds of your own

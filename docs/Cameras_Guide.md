@@ -79,7 +79,8 @@ ff
   number the loaded file already has is replaced by yours.
 - Both scripts, for all three variants, must be given. One heading may name several variants.
 - Anything after `;` is a comment.
-- Up to 128 cameras and 32,768 bytes of script in all; engine = ff8 cameras keep up to 4,096 segments between them.
+- Up to 256 cameras and 65,536 bytes of script in all (a `[sequence]` program is refused when under 2,048 bytes are
+  free); engine = ff8 cameras keep up to 8,192 segments between them.
 - Numbers between the file's last camera and yours behave as camera 0.
 
 Then point an attack at it, in the spells file or the limits file:

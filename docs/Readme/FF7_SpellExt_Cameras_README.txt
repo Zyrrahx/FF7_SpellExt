@@ -381,9 +381,10 @@ starting again. One more line before the first heading changes that:
 
 Known limits
 ------------
-- Up to 128 cameras, 32768 bytes of script in all.
+- Up to 256 cameras, 65536 bytes of script in all (a [sequence] program is
+  refused when under 2048 of them are free).
 - Up to 32 roll lines a camera.
-- engine = ff8: up to 16 segments a chain, 4096 segments in all the cameras,
+- engine = ff8: up to 16 segments a chain, 8192 segments in all the cameras,
   32 keys a segment, 2047 frames a segment; a [sequence] of 2048 bytes and
   256 labels at most, 4096 steps a frame.
 - A camera file from another mod that already uses numbers from 190 up would

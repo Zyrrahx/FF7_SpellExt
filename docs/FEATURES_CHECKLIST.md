@@ -32,6 +32,9 @@ reported in `FF7_SpellExt.log` beside `ff7_en.exe`, with the file and line.
       magic effect with files of your own (a recoloured Fire, say), beside the original in the same battle; 38 of the
       54 magic effects can be copied. *Played (Blue Fire, then Fire in its own colours)*
 - [ ] **More Enemy Skills than the game's set**. *Played*
+- [ ] **Morph files in effect scripts** (`morph=NAME.MRF`, `shape=`, `tween=smooth`): a model of a native effect takes
+      its vertex positions from a set a frame, so it changes shape (a ribbon growing, a beam stretching). *Built*
+- [ ] **`face=yaw` in effect scripts**: a model stays upright and turns about the vertical to face the camera. *Built*
 
 ## 2. Materia
 - [ ] **New materia** (`FF7_SpellExt_Materia.ini`, numbers 96-254): magic, summon, command, support, independent.
@@ -109,6 +112,8 @@ reported in `FF7_SpellExt.log` beside `ff7_en.exe`, with the file and line.
 - [ ] **Enhanced Stock UI's battle avatars** for a new character. *Played*
 - [ ] **Shops** treat them like the nine (who can equip what). *Built*
 - [ ] **Saved in a companion file**, never in the game's save. *Played*
+- [ ] **See-through groups on their own battle model** (`body_blend = yes`): the groups keep their .P blend mode
+      instead of being drawn solid. *Built*
 
 ## 7. Limit breaks
 - [ ] **Limits of their own** (`FF7_SpellExt_Limits.ini`): up to twelve per character over four levels; name,
@@ -118,13 +123,26 @@ reported in `FF7_SpellExt.log` beside `ff7_en.exe`, with the file and line.
 - [ ] **Props**: a model drawn in the hand for part of an animation (`prop`, `prop_bone`, `prop_frames` ...). *Played*
 - [ ] **States**: a limit puts the character into a lasting state that changes stance, attack animation and hits per
       attack until the battle ends or they fall. *Played*
+- [ ] **Transformations** (`form`, `[form NAME]`): a limit turns its user into another battle model (an enemy's own,
+      with a script file in the party layout) for the rest of the battle, as the game's beast limits do, and it
+      changes back to its own model when knocked out. *Built*
 - [ ] **Testing aids**: `full_gauge`, `learn_all_on_load`. *Played*
 
 ## 8. Battle
 - [ ] **Damage above 9,999**: up to 9,999,999 HP and 65,532 MP a hit (`enemy_damage_limit`,
       `enemy_mp_damage_limit`). *Played*
 - [ ] **Battle cameras of your own** (`SpellExtConfig/cameras/*.txt`, numbers 190 and up), added in memory to whichever
-      camera file the battle loads; read at every battle start. *Played*
+      camera file the battle loads; read at every battle start. *Played*. Up to 256 cameras and 65,536 bytes of
+      script. *Built*
+- [ ] **Enemies and scenes of your own** (`enemies = on`, `FF7_SpellExt_Enemies.ini`, `SpellExtConfig/enemies/`,
+      `SpellExtConfig/scenes/`): battles 1024-16383 built from text files, put in place of the game's battles by
+      `[battle_map]` or `test_battle`, their models served from the enemy folders. *Built*
+- [ ] **Enemy attacks with SpellExt's effects and cameras** (`effect`, `effect_all`, `camera`, `camera_multi` in an
+      enemy's `[attack]` or the enemies file's `[attack N]`, in any battle). *Built*
+- [ ] **Fight your own battles from the SpellExt menu** ("Fight: external battles", with `debug = true`): as a test
+      battle by default (no rewards, a loss returns to the field, the party put back; `battle_menu_*` keys). *Built*
+- [ ] **Model skinning** (`model_skinning = on`, Breaking Limits): single vertices of a battle model's part follow
+      another bone, from a file in `SpellExtConfig/skins/`. *Built*
 - [ ] **Fix: Blue Light's screen fade on several targets**. *Played*
 - [ ] **Fix: Super Nova outside Safer Sephiroth's arena**. *Played*
 - [ ] **The battle's pause** written to the log (for testing). *Played*

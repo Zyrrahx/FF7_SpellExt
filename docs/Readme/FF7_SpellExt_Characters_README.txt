@@ -197,6 +197,19 @@ battle_files    Two letters: the prefix of the character's own battle model
                 full set, every part renamed to your prefix.
                 The character then has its own model, separate from the
                 original character's, who keeps theirs.
+body_blend      yes or no; default no. In battle the game draws every group of
+                a party member's body solid, whatever its .P file says; only
+                weapons and enemies keep the blend mode of each group. With
+                yes, the groups of this character's own model keep theirs,
+                so a cloak or a veil can be see-through: a group marked
+                blend 4 stays solid, one marked 0-3 blends (0 half and half,
+                1 adds to what is behind it, 2 subtracts, 3 adds a quarter).
+                It needs `battle_files` (it does nothing for a model of the
+                game's: the log says so) and takes effect at the next battle.
+                A blended group is drawn after the solid ones, with the
+                depth test on and writing no depth, and back faces are not
+                drawn. `copy_of` copies it. Any other character is not
+                touched.
 equip_like      One of the nine (name or 0-8): the character may equip
                 whatever they can. Or none: the character may equip only
                 what all nine can (armour and accessories every one of the

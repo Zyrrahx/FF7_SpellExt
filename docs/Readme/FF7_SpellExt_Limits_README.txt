@@ -291,6 +291,10 @@ prop_animation  N. Which animation of the limit's pack the prop goes with, 0
                 use of the limit.
                 NOT THERE YET: letting go of the prop (a throw), and a blended
                 (see-through or glowing) prop: it is always drawn solid.
+form            NAME. The limit turns its user into the form NAME, a battle
+                model of its own defined in a section [form NAME] of this file
+                (anywhere in it). See "Transformations" below. A limit takes
+                form or state, not both.
 state           NAME. Once the limit has been carried out, its user is in the
                 state NAME for the rest of the battle: one of the character's
                 own states, defined in a section [12 state NAME] of this file
@@ -906,13 +910,133 @@ kills = [level 2, level 3].  uses = [1-2, 1-3, 2-2, 2-3, 3-2, 3-3]; 65535
 means "never".  gauge = levels 1-4.
 
 
+---- New part ----
+Transformations
+---------------
+A limit can turn its user into another battle model for the rest of the
+battle, the way the game's own beast limits do: an AI then takes the
+character's turns, and when the character is knocked out it changes back.
+(Read from the code. NOT YET SEEN IN THE GAME.)
+
+The model is a FORM, defined once in its own section; any character's limit
+may name it. The usual way: an enemy's OWN model, with one file of the
+form's own, its script file, which a party slot needs in another layout:
+
+    [form myform]
+    model_enemy  = 331         ; the model: enemy 331's own files (mt..)
+    model_script = ZOAB        ; its script file, 74 scripts in the party layout
+    weapon       = no
+
+    [14 2-1]
+    name           = My Transformation
+    base           = 173       ; a game transformation: additional effect 3,
+                               ;   target the user, no damage
+    form           = myform
+    effect         = none
+    animation_pack = none
+    script         = ac 00 fc 00 e0 ea f4 19 f3 d8 01 29 00 e2 c5 f3 c9 f4 01 f3 ca a2 11 f1
+
+Keys of a [form NAME] section (NAME: 1 to 15 letters, digits or _):
+model_enemy     The enemy model the form is: its number, 0 to 369 (the
+                battle archive's two letters: 331 = mt). Its skeleton,
+                animations, parts and textures are loaded as the game loads
+                that enemy's: from the battle archive, or from a mod that
+                puts files of those names in its place (a model mod's look
+                applies to the form too).
+model_like      Or: one of the game's own party-slot model names (GALL,
+                DEATHGIG, CLOUD ...: the log lists them). Give one of
+                model_enemy and model_like.
+model_script    The form's script file, named as the battle archive names
+                files: its two letters or its whole name (zo or ZOAB). It
+                goes where a character's battle_files go (the mod's battle
+                folder, or SpellExtConfig\files). It must hold 74 scripts in
+                the party layout (an enemy model's own has 32,
+                enemy-numbered: it must be rebuilt). Two letters a
+                character's battle_files already uses are refused.
+model_files     Instead (or as well): two letters naming a FULL set of the
+                form's own files (XYAA the skeleton, XYAB the scripts, XYDA
+                the animations, XYAC.. textures, XYAM.. parts), for a model
+                that is not the game's as it is. With both, model_script
+                names the script file and model_files the rest. Two letters
+                a character's battle_files already uses are refused.
+weapon          no (the default): the model has no weapon models, as the
+                game's beasts. yes: the equipped weapon's model is loaded with
+                it, as for a character.
+
+A form needs model_script or model_files: without either the model's own
+script file would be used, and an enemy's is not in the party layout.
+
+Forms are numbered from 0x20 in the order of their sections and loaded under
+the names FORM00.DAT, FORM01.DAT ... The log says "form NAME is number 0x20".
+
+Each time a form is about to be loaded, its script file, skeleton file and
+animation file are read first, the way the game reads them. If one is not
+found (a new file is seen only after 7th Heaven and the game restart), if
+the script file is not in the party layout or a script in it has no end, or
+if its scripts play an animation the model does not have (a model mod that
+changed the model's animations), the form is NOT loaded: the character
+keeps its own model, and the log says why ("form NAME is NOT loaded into
+slot N: ..."). The model's own script file is never used in place of a
+missing one.
+
+The limit that transforms:
+  - its record's additional_effect must be 3 (the game's transformation):
+    take a base that has it (173-176) or set the key.
+  - it needs a script of its own with an `ac` command (ac 00 ... a2 11 above
+    is the game's own). The DLL writes the form's number into the operand of
+    the script's first ac and into the record's additional_modifier; `a2 11`
+    then loads the form and plays its script 17.
+  - the character may not have any state ([12 state NAME] sections): a state
+    lends scripts into the model the character has, and a form replaces it.
+  - if any of these fails, if no section defines the form, if that section
+    had a problem, if the limit also has a state, or if the form hooks are
+    off (below), the limit is LEFT OUT (as if its section were not there),
+    with a line in the log. As written it would turn its user into the game's
+    own Galian Beast.
+  - the log says "limit [14 2-1] transforms into form myform".
+  - a limit of level 2 or more is offered in battle only while the
+    character's limit level is set to it (main menu, Limit; a level can be
+    chosen once one of its limits is learned, and choosing one empties the
+    gauge).
+
+What the game does from there (read from the code): the user is controlled by
+its AI (the character file's `ai` key: its main script), Confusion, Frog and
+Berserk are cleared and cannot touch it, it is healed in full, its limit gauge
+does not fill and it does not Cover. A form gets no stat changes of its own
+(the game's four beasts do). When it is knocked out, the form's script 3 runs:
+`ac 0a ... a2 02` brings the character's OWN model back (the log: "revert:
+slot N loads NEWCH14.DAT"), lying down. The next battle starts with its own
+model whatever happened.
+
+What the form's script file must have: 74 script slots in the party layout,
+script 3 the way back (`ac 0a 01 e2 c5 f3 c9 f4 01 f3 ca a2 02 f1`, with an
+animation of its own), script 17 its arrival (what `a2 11` plays), 0 and 1
+idles, 20 its Attack. The camera and the target cursor use the height word of
+its header.
+
+At start-up the log says "form hooks: 2 of 2". If the game's code at the
+places the DLL needs is not as expected (another DLL or patch), it says
+"form hooks: 0 of 2" and why, no form key is honoured, and a knocked out
+character comes back as the game says.
+
+FFNx at 30 or 60 fps (ff7_fps_limiter 2 or 3): FFNx then wraps the battle's
+model script interpreter and copies a model's state around each step.
+Whether a model swapped inside a step survives that copy was not traced; the
+same is true of the game's own beast limits. At the usual setting
+(ff7_fps_limiter = 1) the wrapper is not in use.
+
+NOT THERE YET: a form's own size (scale), height or stat changes.
+
 Known limits
 ------------
 - Twelve limits per new character (four levels of three); no total across
   characters.
 - Animations are always an existing limit's.
-- Vincent's limits are transformations into other models; using them as a
-  base for a new character has not been tried.
+- Vincent's limits are transformations into other models. Used as a base
+  for a new character (tried 2026-10-08) the character turns into the beast,
+  and when knocked out comes back as the game's own Vincent model unless the
+  DLL's form hooks are in: then it comes back as itself (see
+  "Transformations").
 - A character already stored in a save keeps the limits it had learned.
   Changing this file changes what those learned slots contain.
 
