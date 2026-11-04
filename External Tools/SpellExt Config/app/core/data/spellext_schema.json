@@ -1,7 +1,7 @@
 {
  "schema_version": 1,
- "dll_source_sha1": "c979244c233ff0ffaf30df3ccce34649ffa0f06f",
- "dll_source_lines": 50812,
+ "dll_source_sha1": "e009e2616fa7436a173b487edd0388ba417d54d6",
+ "dll_source_lines": 58000,
  "note": "Hand-written from FF7_SpellExt/src/spellext.c and the readmes in SpellExtConfig/Readme; held to the source by `spellext_config.py schema-check`.",
  "files": {
   "FF7_SpellExt_Game.ini": {
@@ -15,7 +15,9 @@
     "test_battle_value",
     "wide_items_key",
     "wide_rows_key",
-    "parse_yes_no"
+    "parse_yes_no",
+    "enemies_key_line",
+    "battle_menu_key_line"
    ],
    "log_prefix": "game file line %d: ",
    "grammar": "flat",
@@ -26,7 +28,9 @@
     "FF7_SpellExt_BreakingLimits_README.txt",
     "FF7_SpellExt_WideItems_README.txt",
     "FF7_SpellExt_Field_README.txt",
-    "FF7_SpellExt_Materia_README.txt"
+    "FF7_SpellExt_Materia_README.txt",
+    "FF7_SpellExt_Enemies_README.txt",
+    "FF7_SpellExt_BattleMenu_README.txt"
    ],
    "help": "The game file is flat: a line starting with [ is skipped, every key stands alone and is read by its name (case does not matter). An unknown key is logged and the rest of the file is read. A repeated key: the later line is used.",
    "sections": [
@@ -102,6 +106,146 @@
         "debug must be true or false"
        ],
        "source_line": 38007
+      },
+      {
+       "name": "battle_menu",
+       "type": "bool",
+       "true": [
+        "on",
+        "yes"
+       ],
+       "false": [
+        "off",
+        "no"
+       ],
+       "default": "on",
+       "restart": "hot",
+       "group": "Battle menu",
+       "help": "on or off (default on). With debug = true, the SpellExt menu's last row \"Fight: external battles\" lists your DLL scenes (enemies = on) and starts the one you pick from the field you stand in; the field comes back at the same spot. off: no such row. Read at start-up and at Re-init .ini files; a wrong value is said in the log and the default is used. (FF7_SpellExt_BattleMenu_README.txt)",
+       "messages": [
+        "battle_menu must be on or off: on is used"
+       ],
+       "source_line": 46296
+      },
+      {
+       "name": "battle_menu_test",
+       "type": "bool",
+       "true": [
+        "on",
+        "yes"
+       ],
+       "false": [
+        "off",
+        "no"
+       ],
+       "default": "on",
+       "restart": "hot",
+       "group": "Battle menu",
+       "help": "on or off (default on): a battle from that page is a test: no rewards, a loss returns to the field, the party's HP, MP and status are put back afterwards. The master of battle_menu_rewards, battle_menu_lose and battle_menu_restore: each of those, when given, wins over it for its part. off: all three are the game's (rewards given, a loss is a game over, the party stays as the battle leaves it). Read at start-up and at Re-init .ini files; a wrong value is said in the log and the default is used. (FF7_SpellExt_BattleMenu_README.txt)",
+       "messages": [
+        "battle_menu_test must be on or off: on is used"
+       ],
+       "source_line": 46297
+      },
+      {
+       "name": "battle_menu_rewards",
+       "type": "bool",
+       "true": [
+        "on",
+        "yes"
+       ],
+       "false": [
+        "off",
+        "no"
+       ],
+       "default": "off",
+       "restart": "hot",
+       "group": "Battle menu",
+       "help": "on or off; left out, battle_menu_test decides (on: no rewards). on: the battle gives EXP, AP, gil and drops (and the battle-end screen); with battle_menu_restore = party the party's records are put back after it (gil and items kept). Read at start-up and at Re-init .ini files; a wrong value is said in the log and the default is used. (FF7_SpellExt_BattleMenu_README.txt)",
+       "messages": [
+        "battle_menu_rewards must be on or off: battle_menu_test decides"
+       ],
+       "source_line": 46298
+      },
+      {
+       "name": "battle_menu_lose",
+       "type": "enum",
+       "values": [
+        [
+         "return"
+        ],
+        [
+         "game_over"
+        ]
+       ],
+       "default": "return",
+       "restart": "hot",
+       "group": "Battle menu",
+       "help": "return or game_over; left out, battle_menu_test decides (on: return). return: a lost battle from the page goes back to the field. Read at start-up and at Re-init .ini files; a wrong value is said in the log and the default is used. (FF7_SpellExt_BattleMenu_README.txt)",
+       "messages": [
+        "battle_menu_lose must be return or game_over: battle_menu_test decides"
+       ],
+       "source_line": 46299
+      },
+      {
+       "name": "battle_menu_restore",
+       "type": "enum",
+       "values": [
+        [
+         "party"
+        ],
+        [
+         "off"
+        ]
+       ],
+       "default": "party",
+       "restart": "hot",
+       "group": "Battle menu",
+       "help": "party or off; left out, battle_menu_test decides (on: party). party: the party's records (HP, MP, status; EXP, levels and AP of the three party members) are put back after the battle. Read at start-up and at Re-init .ini files; a wrong value is said in the log and the default is used. (FF7_SpellExt_BattleMenu_README.txt)",
+       "messages": [
+        "battle_menu_restore must be party or off: battle_menu_test decides"
+       ],
+       "source_line": 46300
+      },
+      {
+       "name": "battle_menu_fast",
+       "type": "bool",
+       "true": [
+        "on",
+        "yes"
+       ],
+       "false": [
+        "off",
+        "no"
+       ],
+       "default": "off",
+       "restart": "hot",
+       "group": "Battle menu",
+       "help": "on or off (default off). on: no victory fanfare and no victory pose after a battle from the page. Read at start-up and at Re-init .ini files; a wrong value is said in the log and the default is used. (FF7_SpellExt_BattleMenu_README.txt)",
+       "messages": [
+        "battle_menu_fast must be on or off: off is used"
+       ],
+       "source_line": 46301
+      },
+      {
+       "name": "battle_menu_locked",
+       "type": "enum",
+       "values": [
+        [
+         "allow"
+        ],
+        [
+         "refuse"
+        ]
+       ],
+       "default": "allow",
+       "restart": "hot",
+       "group": "Battle menu",
+       "help": "allow or refuse (default allow): whether the page starts a battle in a field whose random battles are off (towns). Read at start-up and at Re-init .ini files; a wrong value is said in the log and the default is used. (FF7_SpellExt_BattleMenu_README.txt)",
+       "messages": [
+        "battle_menu_locked must be allow or refuse: allow is used"
+       ],
+       "source_line": 46302
       },
       {
        "name": "seats",
@@ -338,6 +482,26 @@
        "source_line": 37676
       },
       {
+       "name": "model_skinning",
+       "type": "bool",
+       "true": [
+        "on",
+        "yes"
+       ],
+       "false": [
+        "off",
+        "no"
+       ],
+       "default": "off",
+       "restart": "first_reading",
+       "group": "Breaking limits",
+       "help": "on or off (default off): a battle model's SpellExtConfig\\skins\\<first two letters of its parts>.skin can give single vertices another bone. Needs breaking_limits = on and wide_skeletons on or all. Read at start-up only. (FF7_SpellExt_BreakingLimits_README.txt)",
+       "messages": [
+        "model_skinning must be on or off: off is used"
+       ],
+       "source_line": 40554
+      },
+      {
        "name": "wide_skeletons",
        "type": "enum",
        "values": [
@@ -361,6 +525,26 @@
         "wide_skeletons must be on, off or all (all: a testing aid, every battle model through the wide path): off is used"
        ],
        "source_line": 37687
+      },
+      {
+       "name": "enemies",
+       "type": "bool",
+       "true": [
+        "on",
+        "yes"
+       ],
+       "false": [
+        "off",
+        "no"
+       ],
+       "default": "off",
+       "restart": "first_reading",
+       "group": "Enemies and scenes",
+       "help": "on or off (default off): battles of your own scenes (256 to 4095; battles 1024 to 16383), made from the text files of SpellExtConfig\\scenes and SpellExtConfig\\enemies, with FF7_SpellExt_Enemies.ini saying which folders count and which battle of the game becomes which of yours. With off, or without the line, no file is read and nothing is hooked for it. Read at start-up only: restart the game after changing it. (FF7_SpellExt_Enemies_README.txt)",
+       "messages": [
+        "enemies must be on or off: off is used"
+       ],
+       "source_line": 43016
       },
       {
        "name": "fields_file",
@@ -512,11 +696,11 @@
        "restart": "next_battle",
        "group": "Testing aids",
        "testing_aid": true,
-       "help": "TESTING AID: every battle the game starts becomes this one, until the line is removed: a battle number 1 to 1023 (like 16), or scene:formation (like 4:0; scene 0 to 255, formation 0 to 3), or off. The music and the field's battle flags stay those of the battle the game chose. A line with a mistake gives nothing.",
+       "help": "TESTING AID: every battle the game starts becomes this one, until the line is removed: a battle number 1 to 16383 (like 16), or scene:formation (like 4:0; scene 0 to 4095, formation 0 to 3), or off. 1024 and up (scene 256 and up) are your own scenes' battles: they need enemies = on, else test_battle is off and the log says so at start-up. The music and the field's battle flags stay those of the battle the game chose. A line with a mistake gives nothing. (FF7_SpellExt_Enemies_README.txt)",
        "messages": [
-        "test_battle takes a battle number 1 to 1023 (like 16), or scene:formation (like 4:0; scene 0 to 255, formation 0 to 3), or off: the line gives nothing"
+        "test_battle takes a battle number 1 to 16383 (like 16; 1024 and up: a DLL scene's, with enemies = on), or scene:formation (like 4:0; scene 0 to 4095, formation 0 to 3), or off: the line gives nothing"
        ],
-       "source_line": 37939
+       "source_line": 46986
       },
       {
        "name": "shop_add",
@@ -540,7 +724,7 @@
     "game file line %d: test_stitm takes up to 8 entries like 10000 or 1024:3 (an item ID 0 to 511, a wide item's number 1024 to 9999 or wide gear's 10000 to 27999; count 1 to 99, else the script's own): the line gives nothing",
     "game file line %d: test_steal takes up to 8 item IDs like 320 448 (item ID 0 to 511, a wide item's number 1024 to 9999 or wide gear's 10000 to 27999): the line gives nothing",
     "game file line %d: shop_add takes entries like 37:243 (shop 0 to 79, item ID 0 to 511 or a wide item's number 1024 to 9999) or 37:m49 (a materia ID)",
-    "game file line %d: test_battle takes a battle number 1 to 1023 (like 16), or scene:formation (like 4:0; scene 0 to 255, formation 0 to 3), or off: the line gives nothing",
+    "game file line %d: test_battle takes a battle number 1 to 16383 (like 16; 1024 and up: a DLL scene's, with enemies = on), or scene:formation (like 4:0; scene 0 to 4095, formation 0 to 3), or off: the line gives nothing",
     "game file line %d: seats must be 2 or 4",
     "game file line %d: field_entities must be off, party or seats",
     "game file line %d: field_model_check must be yes or no",
@@ -566,7 +750,16 @@
     "field_buffer_bytes takes a number of bytes from 4000000 to 67108864 (it can only raise the size): 4000000 is used",
     "fields_fallback takes none, or five numbers: a field of the game's own (an id from 65 to 786), x, y (-32768 to 32767), a walkmesh triangle (0 to 65535) and a direction (0 to 255), as 576, -57, -132, 31, 124: none is used (a save in a registered field is saved as it is, and a field id the game cannot read is not sent anywhere)",
     "breaking_limits must be on or off: off is used",
-    "wide_skeletons must be on, off or all (all: a testing aid, every battle model through the wide path): off is used"
+    "wide_skeletons must be on, off or all (all: a testing aid, every battle model through the wide path): off is used",
+    "model_skinning must be on or off: off is used",
+    "enemies must be on or off: off is used",
+    "battle_menu must be on or off: on is used",
+    "battle_menu_test must be on or off: on is used",
+    "battle_menu_rewards must be on or off: battle_menu_test decides",
+    "battle_menu_lose must be return or game_over: battle_menu_test decides",
+    "battle_menu_restore must be party or off: battle_menu_test decides",
+    "battle_menu_fast must be on or off: off is used",
+    "battle_menu_locked must be allow or refuse: allow is used"
    ],
    "not_keys": [
     "off",
@@ -771,7 +964,7 @@
     "a section is [effect NUMBER], the copy's own number from 0x100 to 0xffff (or [sound NUMBER], a sound handle)",
     "a section is [effect NUMBER], the copy's own number from 0x100 to 0xffff",
     "this effect number is already defined above: neither section is used",
-    "too many effect sections, copies and native effects together (256 at most): the section is skipped",
+    "too many effect sections, copies and native effects together (1024 at most): the section is skipped",
     "this line is not inside an [effect NUMBER] section",
     "expected key = value",
     "copy is a magic effect's number, 0x05 to 0x35 (enemy attacks, limits and summons are not copied yet)",
@@ -796,7 +989,7 @@
     "sounds 1-751 are the game's own: a script plays them by number (sound 9) without a section",
     "a sound handle's number is 53848 to 58089 (where FFNx's one unchecked read of the game's sound table lands in read-only data); the log names the usable runs",
     "this sound number is already defined above: neither section is used",
-    "too many sound handles (256 at most): the section is skipped",
+    "too many sound handles (1024 at most): the section is skipped",
     "expected key = value (a sound section has name =, channel =)",
     "name is given twice",
     "a sound's name is 1 to 23 letters, digits and _, not starting with a digit (name = my_sound_0)",
@@ -1723,6 +1916,24 @@
         "battle_files must be two letters, the prefix of the model's files (for example sn for snaa, snab ...)"
        ],
        "source_line": 17397
+      },
+      {
+       "name": "body_blend",
+       "type": "bool",
+       "default": "no",
+       "restart": "hot",
+       "group": "Looks",
+       "true": [
+        "yes"
+       ],
+       "false": [
+        "no"
+       ],
+       "help": "yes: the groups of its own battle model keep the blend mode each one's .P file gives them, so a cloak or a veil can be see-through. Groups marked solid (blend 4) stay solid. Needs battle_files: it does nothing for a model of the game's. Takes effect at the next battle. Default: no: every group of a party member's body is drawn solid, whatever its file says. Copied by copy_of. (FF7_SpellExt_Characters_README.txt)",
+       "messages": [
+        "expected yes or no"
+       ],
+       "source_line": 18068
       },
       {
        "name": "equip_like",
@@ -6454,7 +6665,12 @@
     "finish_limit",
     "finish_states",
     "state_hide_text",
-    "apply_key"
+    "apply_key",
+    "form_section_start",
+    "form_name",
+    "form_key",
+    "form_finish",
+    "finish_forms"
    ],
    "log_prefix": "limits file line %d: ",
    "grammar": "sections",
@@ -6864,6 +7080,21 @@
        "source_line": 26582
       },
       {
+       "name": "form",
+       "type": "text",
+       "maxlen": 15,
+       "words": [
+        "none"
+       ],
+       "default": "none",
+       "messages": [
+        "form is the name of a [form NAME] section of this file, 1 to 15 letters, digits or _, or none"
+       ],
+       "help": "NAME. The limit turns its user into the form NAME, a battle model of its own defined in a section [form NAME] of this file (anywhere in it): an AI then takes the character's turns, and when the character is knocked out it changes back. A limit takes form or state, not both, and the character may have no state. The limit needs additional_effect 3 (the game's transformation: a base such as 173, or the key) and a script of its own with an ac command (ac 00 ... a2 11); otherwise it is LEFT OUT, with a line in the log. none = no form (the default). (FF7_SpellExt_Limits_README.txt, \"Transformations\")",
+       "restart": "hot",
+       "source_line": 30004
+      },
+      {
        "name": "effect",
        "type": "int_or_word",
        "words": [
@@ -7204,6 +7435,21 @@
        "help": "NAME. Once the limit has been carried out, its user is in the state NAME for the rest of the battle: one of the character's own states, defined in a section [12 state NAME] of this file (anywhere in it). NAME is 1 to 15 letters, digits or _. state = akimbo The state begins at the effect step of the limit's own script (ec), as a prop does. If the script has no ec, it begins when the character's next attack, magic, summon or limit is set up (not an item, Steal, Throw or Defend: those come and go first), and the log says so. A limit that is never carried out (no target left) begins nothing. Using the limit again while in the state changes nothing. If no section defines NAME the log says so in one line and the limit works without a state. none = no state (the default).",
        "restart": "hot",
        "source_line": 26582
+      },
+      {
+       "name": "form",
+       "type": "text",
+       "maxlen": 15,
+       "words": [
+        "none"
+       ],
+       "default": "none",
+       "messages": [
+        "form is the name of a [form NAME] section of this file, 1 to 15 letters, digits or _, or none"
+       ],
+       "help": "NAME. The limit turns its user into the form NAME, a battle model of its own defined in a section [form NAME] of this file (anywhere in it): an AI then takes the character's turns, and when the character is knocked out it changes back. A limit takes form or state, not both, and the character may have no state. The limit needs additional_effect 3 (the game's transformation: a base such as 173, or the key) and a script of its own with an ac command (ac 00 ... a2 11); otherwise it is LEFT OUT, with a line in the log. none = no form (the default). (FF7_SpellExt_Limits_README.txt, \"Transformations\")",
+       "restart": "hot",
+       "source_line": 30004
       },
       {
        "name": "effect",
@@ -7766,6 +8012,82 @@
      ]
     },
     {
+     "kind": "form",
+     "header": "[form NAME]",
+     "id_range": null,
+     "title": "A form: a battle model a limit can turn its user into",
+     "keys": [
+      {
+       "name": "model_enemy",
+       "type": "int",
+       "min": 0,
+       "max": 369,
+       "default": "",
+       "messages": [
+        "model_enemy is the number of an enemy model, 0 to 369 (the battle archive's two letters: 331 = mt..)",
+        "a form's parts are named after one model: model_enemy or model_like, once"
+       ],
+       "help": "The enemy model the form is: its number, 0 to 369 (the battle archive's two letters: 331 = mt). Its skeleton, animations, parts and textures are loaded as the game loads that enemy's: from the battle archive, or from a mod that puts files of those names in its place. Give one of model_enemy and model_like. (FF7_SpellExt_Limits_README.txt)",
+       "restart": "hot",
+       "source_line": 18652
+      },
+      {
+       "name": "model_like",
+       "type": "text",
+       "default": "",
+       "messages": [
+        "model_like is one of the game's own party-slot battle model names (the log lists them)",
+        "model_like: the game's table of battle model names (008ff2f0) is not as expected; use model_enemy",
+        "a form's parts are named after one model: model_enemy or model_like, once"
+       ],
+       "help": "Or: one of the game's own party-slot model names (GALL, DEATHGIG, CLOUD ...: the log lists them; the DLL reads them from the game, so this editor does not check the name). Give one of model_enemy and model_like. (FF7_SpellExt_Limits_README.txt)",
+       "restart": "hot",
+       "source_line": 18652
+      },
+      {
+       "name": "model_script",
+       "type": "text",
+       "maxlen": 4,
+       "default": "",
+       "messages": [
+        "model_script is the form's script file in the battle archive's naming, its two letters or its name (zo or ZOAB: 74 slots in the party layout)"
+       ],
+       "help": "The form's script file, named as the battle archive names files: its two letters or its whole name (zo or ZOAB). It goes where a character's battle_files go (the mod's battle folder, or SpellExtConfig\\files). It must hold 74 scripts in the party layout (an enemy model's own has 32, enemy-numbered: it must be rebuilt). Two letters a character's battle_files already uses are refused. A form needs model_script or model_files. (FF7_SpellExt_Limits_README.txt)",
+       "restart": "hot",
+       "source_line": 18637
+      },
+      {
+       "name": "model_files",
+       "type": "text",
+       "maxlen": 2,
+       "default": "",
+       "messages": [
+        "model_files is two letters: the form's own files in the battle archive's naming (xy: XYAA, XYAB, XYDA and its parts)"
+       ],
+       "help": "Instead (or as well): two letters naming a FULL set of the form's own files (XYAA the skeleton, XYAB the scripts, XYDA the animations, XYAC.. textures, XYAM.. parts), for a model that is not the game's as it is. With both, model_script names the script file and model_files the rest. Two letters a character's battle_files already uses are refused. (FF7_SpellExt_Limits_README.txt)",
+       "restart": "hot",
+       "source_line": 18637
+      },
+      {
+       "name": "weapon",
+       "type": "bool",
+       "true": [
+        "yes"
+       ],
+       "false": [
+        "no"
+       ],
+       "default": "no",
+       "messages": [
+        "weapon is yes (the equipped weapon's model is loaded with the form) or no (the default: none, as the game's beasts)"
+       ],
+       "help": "no (the default): the model has no weapon models, as the game's beasts. yes: the equipped weapon's model is loaded with it, as for a character. (FF7_SpellExt_Limits_README.txt)",
+       "restart": "hot",
+       "source_line": 18679
+      }
+     ]
+    },
+    {
      "kind": "test",
      "header": "[test]",
      "id_range": null,
@@ -7818,7 +8140,10 @@
     "limits file line %d: %s",
     "limits file line %d: the limit has no base; skipped",
     "limits file line %d: character %d limit %d-%d has prop_offset, prop_turn, prop_scale, prop_frames or prop_animation but no prop: they do nothing",
-    "limits file: character %d limit %d-%d: state = %s, but there is no section [%d state %s]: the limit works without a state"
+    "limits file: character %d limit %d-%d: state = %s, but there is no section [%d state %s]: the limit works without a state",
+    "limits file line %d: form %s: %s",
+    "limits file line %d: form %s: %s %s is also character %d's battle_files: the form would load that character's files; give the form two letters of its own",
+    "limits file line %d: [%d %d-%d] form = %s: %s: the limit is LEFT OUT (not learned, not in the menu)"
    ],
    "returned": [
     "gauge takes four numbers from 1 to 65535, one per limit level",
@@ -7900,7 +8225,21 @@
     "this state is already defined for the character",
     "a character may have up to 4 states",
     "prop_frames and prop_animation are a limit's keys: a state's prop is there for as long as the state lasts (see prop_hide)",
-    "a state's section takes: hits, commands, ends (battle ko frog), retarget, hit_gap, stop_step, camera, attack_script / _next / _next2 / _last / _only, idle_script, idle_weak_script, prop (a name, or weapon), prop_bone, prop_offset, prop_turn, prop_scale, prop_hide, prop_colour, attack_targets, attack_element, long_range, physical_evade, script_NN, view_raise, view_back, pointer_raise"
+    "a state's section takes: hits, commands, ends (battle ko frog), retarget, hit_gap, stop_step, camera, attack_script / _next / _next2 / _last / _only, idle_script, idle_weak_script, prop (a name, or weapon), prop_bone, prop_offset, prop_turn, prop_scale, prop_hide, prop_colour, attack_targets, attack_element, long_range, physical_evade, script_NN, view_raise, view_back, pointer_raise",
+    "form is the name of a [form NAME] section of this file, 1 to 15 letters, digits or _, or none",
+    "a form's section looks like [form NAME]: the word form, a name of 1 to 15 letters, digits or _",
+    "this form is already defined above: this section is passed over",
+    "too many forms (16 at most): this section is passed over",
+    "the form has neither model_enemy nor model_like (the model whose files it loads): no limit transforms into it",
+    "the form has neither model_script (its script file in the party layout) nor model_files (a full set of its own): the model's own script file is not in the party layout, so no limit transforms into it",
+    "model_script is the form's script file in the battle archive's naming, its two letters or its name (zo or ZOAB: 74 slots in the party layout)",
+    "model_files is two letters: the form's own files in the battle archive's naming (xy: XYAA, XYAB, XYDA and its parts)",
+    "a form's parts are named after one model: model_enemy or model_like, once",
+    "model_enemy is the number of an enemy model, 0 to 369 (the battle archive's two letters: 331 = mt..)",
+    "model_like: the game's table of battle model names (008ff2f0) is not as expected; use model_enemy",
+    "model_like is one of the game's own party-slot battle model names (the log lists them)",
+    "weapon is yes (the equipped weapon's model is loaded with the form) or no (the default: none, as the game's beasts)",
+    "a form's section takes: model_enemy or model_like, model_script, model_files, weapon"
    ],
    "not_keys": [
     "materia",

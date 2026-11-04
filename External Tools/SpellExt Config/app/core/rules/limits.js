@@ -3,6 +3,10 @@
 // state_lend_key (25905), state_key (25951), prop_name_value (25822), prop_bone_value (25846), prop_three_value
 // (25863), prop_scale_value (25883), parse_signed (38329), parse_flags (9890) with element_flags (9739), finish_limit
 // (26303), finish_states (26196).
+// Transformations (source e009e261): form_section_start (29332), form_name (18597), form_key (18630), form_finish
+// (18684) and finish_forms (29358). Not forecast here: model_like's names (the DLL reads them from the game's table
+// at 008ff2f0), a form whose two letters are also a character's battle_files, and the limit's own checks that need the
+// game or the kernel (the form hooks, additional_effect 3, a script with an ac command): the DLL's log says those.
 //
 // What it reads from the files read before it in the same reading (all optional; absent = not forecast):
 //   'characters_defined'   the character file's section IDs that load_characters left defined (roster_character(n)
@@ -48,6 +52,9 @@ export const STATE_SCRIPT_MAX = 48;
 export const STATE_IDLE_MAX = 16;
 export const STATE_LEND_MAX = 32;
 export const STATE_LENDS_MAX = 16;
+export const FORM_MAX = 16;
+export const FORM_NAME_MAX = 15;
+export const FORM_ENEMY_MODELS = 370;
 export const STATE_GAP_MAX = 60;
 export const STATE_VIEW_RAISE_MAX = 6000;
 export const STATE_VIEW_BACK_MAX = 100;
@@ -131,6 +138,52 @@ export function state_name(s, start, end) {
     out += c;
   }
   return out;
+}
+
+// form_name: the lower-case name, or null (the same rule as a state's name).
+export function form_name(s, start, end) {
+  if (end - start > FORM_NAME_MAX) return null;
+  return state_name(s, start, end);
+}
+
+// form_key (18630): the problem, or null. model_like is taken as one of the game's names (not known here).
+export function form_key(f, s, key, key_end, value, stop) {
+  if (word_is(s, key, key_end, 'model_files') || word_is(s, key, key_end, 'model_script')) {
+    const scripts = word_is(s, key, key_end, 'model_script');
+    const whole = scripts && stop - value === 4 && lower_or20(s[value + 2]) === 'a' && lower_or20(s[value + 3]) === 'b';
+    if ((stop - value !== 2 && !whole) || !inRange(lower_or20(s[value]), 'a', 'z') || !inRange(lower_or20(s[value + 1]), 'a', 'z')) {
+      return scripts
+        ? 'model_script is the form\'s script file in the battle archive\'s naming, its two letters or its name (zo or ZOAB: 74 slots in the party layout)'
+        : 'model_files is two letters: the form\'s own files in the battle archive\'s naming (xy: XYAA, XYAB, XYDA and its parts)';
+    }
+    f[scripts ? 'scripts' : 'files'] = true;
+    return null;
+  }
+  if (word_is(s, key, key_end, 'model_enemy') || word_is(s, key, key_end, 'model_like')) {
+    if (f.stem) return 'a form\'s parts are named after one model: model_enemy or model_like, once';
+    if (word_is(s, key, key_end, 'model_enemy')) {
+      const [ok, p, n] = parse_number(s, value, stop);
+      if (!ok || p !== stop || n >= FORM_ENEMY_MODELS) {
+        return 'model_enemy is the number of an enemy model, 0 to 369 (the battle archive\'s two letters: 331 = mt..)';
+      }
+    }
+    f.stem = true;
+    return null;
+  }
+  if (word_is(s, key, key_end, 'weapon')) {
+    if (word_is(s, value, stop, 'yes') || word_is(s, value, stop, 'no')) return null;
+    return 'weapon is yes (the equipped weapon\'s model is loaded with the form) or no (the default: none, as the game\'s beasts)';
+  }
+  return 'a form\'s section takes: model_enemy or model_like, model_script, model_files, weapon';
+}
+
+// form_finish (18684): the problem of a form once the file is read, or null.
+export function form_finish(f) {
+  if (!f.stem) return 'the form has neither model_enemy nor model_like (the model whose files it loads): no limit transforms into it';
+  if (!f.files && !f.scripts) {
+    return 'the form has neither model_script (its script file in the party layout) nor model_files (a full set of its own): the model\'s own script file is not in the party layout, so no limit transforms into it';
+  }
+  return null;
 }
 
 export function state_command_word(s, start, end) {
@@ -449,8 +502,9 @@ export class Character {
     this.id = ident;
     this.own_limits = false;
     this.limit_set = '';
-    this.defined_limits = new Map();     // index 0-11 -> [start_line, state name]
+    this.defined_limits = new Map();     // index 0-11 -> [start_line, state name, form name]
     this.states = [];                    // names, in their slots
+    this.state_lines = [];               // the line of each one's section
     this.limit_item = 0;
   }
 }
@@ -521,6 +575,8 @@ export function check(r) {
   let c = null;
   let owner = null;
   let state_section = null;
+  let form_section = null;
+  const forms = [];    // [form NAME] sections in their order: {name, line, bad, stem, files, scripts}
   let in_test = false;
   let lim = null;      // the limit being read: its draft
 
@@ -534,7 +590,7 @@ export function check(r) {
       r.log(d.line, 'limits file line %d: character %d limit %d-%d has prop_offset, prop_turn, prop_scale, prop_frames or prop_animation but no prop: they do nothing',
             d.line, who.id, d.level, d.position);
     }
-    who.defined_limits.set((d.level - 1) * 3 + d.position - 1, [d.line, d.state]);
+    who.defined_limits.set((d.level - 1) * 3 + d.position - 1, [d.line, d.state, d.form]);
     limits_defined += 1;
   };
 
@@ -549,10 +605,25 @@ export function check(r) {
       owner = null;
       c = null;
       state_section = null;
+      form_section = null;
       in_test = stop - start === 6 && word_is(s, start + 1, stop - 1, 'test') && s[stop - 1] === ']';
       let [ok, p, ident] = parse_number(s, start + 1, stop);
       if (in_test) {
         // nothing
+      } else if (stop - start > 6 && word_is(s, start + 1, start + 5, 'form') && is_space(s[start + 5])) {
+        // form_section_start: [form NAME], a model a limit may turn its user into; no character's
+        const [name, name_end] = trim(s, start + 5, stop - 1);
+        const lower = s[stop - 1] === ']' ? form_name(s, name, name_end) : null;
+        if (lower === null) {
+          problem = 'a form\'s section looks like [form NAME]: the word form, a name of 1 to 15 letters, digits or _';
+        } else if (forms.some(f => f.name === lower)) {
+          problem = 'this form is already defined above: this section is passed over';
+        } else if (forms.length === FORM_MAX) {
+          problem = 'too many forms (16 at most): this section is passed over';
+        } else {
+          form_section = { name: lower, line: n, bad: false, stem: false, files: false, scripts: false };
+          forms.push(form_section);
+        }
       } else if (!ok || !roster_character(ident < 0x80000000 ? ident : -1)) {
         problem = 'a section starts with the ID of a character defined in the character file: [12] or [12 1-1]';
       } else {
@@ -571,6 +642,7 @@ export function check(r) {
             problem = 'a character may have up to 4 states';
           } else {
             c.states.push(lower);
+            c.state_lines.push(n);
             state_section = { name: lower, lends: [], prop: false };
           }
           if (problem) c = null;
@@ -594,7 +666,7 @@ export function check(r) {
             problem = 'this limit is already defined';
           } else {
             lim = { level: s.charCodeAt(p) - 48, position: s.charCodeAt(p + 2) - 48, line: n, base: -1, state: '',
-                    prop: false, placing: false, spell: {} };
+                    form: '', prop: false, placing: false, spell: {} };
             owner = c;
           }
         }
@@ -630,6 +702,17 @@ export function check(r) {
           problem = 'the [test] section takes: full_gauge, learn_all_on_load = game character IDs';
         }
       }
+    } else if (form_section !== null) {
+      const equals = pyFind(s, '=', start, stop);
+      if (equals < 0) {
+        problem = 'expected key = value';
+      } else {
+        const [key, key_end] = trim(s, start, equals);
+        let value;
+        [value, stop] = trim(s, equals + 1, stop);
+        problem = form_key(form_section, s, key, key_end, value, stop);
+      }
+      if (problem) form_section.bad = true;
     } else if (!c) {
       continue;
     } else {
@@ -658,6 +741,31 @@ export function check(r) {
         r.log(line, 'limits file: character %d limit %d-%d: state = %s, but there is no section [%d state %s]: the limit works without a state',
               ident, Math.floor(i / 3) + 1, i % 3 + 1, name, ident, name);
       }
+    }
+  }
+  // finish_forms: each form's own problem, then each limit's form (only the checks that need neither the game nor the
+  // kernel; the order is the DLL's, so the first reason is the one it gives)
+  for (const f of forms) {
+    const why = form_finish(f);
+    if (why && !f.bad) r.log(f.line, 'limits file line %d: form %s: %s', f.line, f.name, why);
+    if (why) f.bad = true;
+  }
+  for (const ident of [...chars.keys()].sort((a, b) => a - b)) {
+    const cc = chars.get(ident);
+    if (!cc.own_limits) continue;
+    for (const i of [...cc.defined_limits.keys()].sort((a, b) => a - b)) {
+      const [line, state, name] = cc.defined_limits.get(i);
+      if (!name) continue;
+      const f = forms.find(x => x.name === name);
+      let why;
+      if (f === undefined) why = `there is no section [form ${name}] in this file`;
+      else if (f.bad) why = `that form is not usable (its section, line ${f.line}, had a problem)`;
+      else if (state) why = `it has state = ${state} too: a transforming limit cannot leave a state`;
+      else if (cc.states.length) {
+        why = `character ${ident} has a state ([${ident} state ${cc.states[0]}], line ${cc.state_lines[0]}): a form and a state are not held together`;
+      } else continue;
+      r.log(line, 'limits file line %d: [%d %d-%d] form = %s: %s: the limit is LEFT OUT (not learned, not in the menu)',
+            line, ident, Math.floor(i / 3) + 1, i % 3 + 1, name, why);     // (the DLL's count of limits defined stays)
     }
   }
   r.shared.set('limits_defined', limits_defined);
@@ -817,6 +925,14 @@ export function limit_key(d, s, key, key_end, value, stop, apply_key) {
       if (name === null) {
         return 'state is the name of one of the character\'s states, 1 to 15 letters, digits or _ (its section: [12 state NAME]), or none';
       }
+    }
+  } else if (word_is(s, key, key_end, 'form')) {
+    if (word_is(s, value, stop, 'none')) {
+      d.form = '';
+    } else {
+      const name = form_name(s, value, stop);
+      d.form = name || '';
+      if (name === null) return 'form is the name of a [form NAME] section of this file, 1 to 15 letters, digits or _, or none';
     }
   } else if (word_is(s, key, key_end, 'prop')) {
     const problem = prop_name_value(s, value, stop);
@@ -984,12 +1100,17 @@ export function spell_effects(s, value, stop) {
   return problem;
 }
 
-// [12] character, [12 L-P] limit, [12 L-P set] set_limit, [12 state NAME] state, [test] test; null: refused.
+// [12] character, [12 L-P] limit, [12 L-P set] set_limit, [12 state NAME] state, [form NAME] form, [test] test;
+// null: refused.
 // (Whether the ID is a character the character file defines is not known here.)
 export function section_kind(header) {
   const s = header;
   const [start, stop] = trim(s, 0, s.length);
   if (stop - start === 6 && word_is(s, start + 1, stop - 1, 'test') && s[stop - 1] === ']') return 'test';
+  if (stop - start > 6 && word_is(s, start + 1, start + 5, 'form') && is_space(s[start + 5])) {
+    const [a, b] = trim(s, start + 5, stop - 1);
+    return s[stop - 1] === ']' && form_name(s, a, b) ? 'form' : null;
+  }
   let [ok, p, ident] = parse_number(s, start + 1, stop);
   if (!ok || !(NEW_CHARACTER_FIRST_ID <= ident && ident < NEW_CHARACTER_FIRST_ID + ROSTER_MAX)) return null;
   while (p < stop && is_space(s[p])) p += 1;

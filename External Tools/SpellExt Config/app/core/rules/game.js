@@ -1,6 +1,7 @@
 // FF7_SpellExt_Game.ini: port of sxcfg/rules/game.py. load_game_settings (spellext.c 37832) and its helpers
 // box_key_line (6910), fields_key_line (19172) with fields_parse_signed (19145), bl_key_line (37673), test_battle_value
-// (37763), wide_items_key (5201), wide_rows_key (5215), parse_yes_no (35278).
+// (37763), wide_items_key (5201), wide_rows_key (5215), parse_yes_no (35278), enemies_key_line and battle_menu_key_line
+// (source e009e261: 43014, 46293).
 import { lines, trim, parse_number, word_is, next_word, parse_yes_no, is_space } from '../grammar.js';
 import { register } from '../validate.js';
 import { pyFind } from '../py.js';
@@ -30,7 +31,7 @@ export const FIELD_BUFFER_MOST = 0x04000000;
 export const FIELDS_FILE_NAME_MAX = 64;
 export const FIELDS_FALLBACK_LOW = 65;
 export const FIELDS_FALLBACK_HIGH = 786;
-export const TEST_BATTLE_LAST = 1023;
+export const TEST_BATTLE_LAST = 16383;   // (enemies) 1024-16383: a DLL scene's battle; scene:formation up to 4095:3
 
 export function wide_item_number(n) {
   return WIDE_ITEM_FIRST <= n && n <= WIDE_ITEM_LAST;
@@ -166,6 +167,10 @@ export function bl_key_line(s, start, key_end, value, stop) {
     if (['on', 'yes', 'off', 'no'].some(w => word_is(s, value, stop, w))) return [1, null];
     return [-1, 'breaking_limits must be on or off: off is used'];
   }
+  if (word_is(s, start, key_end, 'model_skinning')) {
+    if (['on', 'yes', 'off', 'no'].some(w => word_is(s, value, stop, w))) return [1, null];
+    return [-1, 'model_skinning must be on or off: off is used'];
+  }
   if (word_is(s, start, key_end, 'wide_skeletons')) {
     if (['on', 'yes', 'off', 'no', 'all'].some(w => word_is(s, value, stop, w))) return [1, null];
     return [-1, 'wide_skeletons must be on, off or all (all: a testing aid, every battle model through the wide path): off is used'];
@@ -186,8 +191,34 @@ export function test_battle_value(s, value, stop) {
   p += 1;
   let formation;
   [ok, p, formation] = parse_number(s, p, stop);
-  if (!ok || p !== stop || first > 255 || formation > 3) return null;
+  if (!ok || p !== stop || first > Math.floor(TEST_BATTLE_LAST / 4) || formation > 3) return null;
   return first * 4 + formation;
+}
+
+export function enemies_key_line(s, start, key_end, value, stop) {
+  if (!word_is(s, start, key_end, 'enemies')) return [0, null];
+  if (['on', 'yes', 'off', 'no'].some(w => word_is(s, value, stop, w))) return [1, null];
+  return [-1, 'enemies must be on or off: off is used'];
+}
+
+// battle_menu_key_line: key, the two words, the fault; the four on/off keys also take yes and no
+export const BATTLE_MENU_KEYS = [
+  ['battle_menu', 'on', 'off', 'battle_menu must be on or off: on is used'],
+  ['battle_menu_test', 'on', 'off', 'battle_menu_test must be on or off: on is used'],
+  ['battle_menu_rewards', 'on', 'off', 'battle_menu_rewards must be on or off: battle_menu_test decides'],
+  ['battle_menu_lose', 'return', 'game_over', 'battle_menu_lose must be return or game_over: battle_menu_test decides'],
+  ['battle_menu_restore', 'party', 'off', 'battle_menu_restore must be party or off: battle_menu_test decides'],
+  ['battle_menu_fast', 'on', 'off', 'battle_menu_fast must be on or off: off is used'],
+  ['battle_menu_locked', 'refuse', 'allow', 'battle_menu_locked must be allow or refuse: allow is used'],
+];
+
+export function battle_menu_key_line(s, start, key_end, value, stop) {
+  const i = BATTLE_MENU_KEYS.findIndex(k => word_is(s, start, key_end, k[0]));
+  if (i < 0) return [0, null];
+  const [, yes, no, fault] = BATTLE_MENU_KEYS[i];
+  const words = [yes, no].concat([0, 1, 2, 5].includes(i) ? ['yes', 'no'] : []);
+  if (words.some(w => word_is(s, value, stop, w))) return [1, null];
+  return [-1, fault];
 }
 
 export function check(r) {
@@ -306,7 +337,7 @@ export function check(r) {
       shop_add_total = count_entries;
     } else if (word_is(s, start, key_end, 'test_battle')) {
       if (test_battle_value(s, value, stop) === null) {
-        r.log(n, 'game file line %d: test_battle takes a battle number 1 to 1023 (like 16), or scene:formation (like 4:0; scene 0 to 255, formation 0 to 3), or off: the line gives nothing', n);
+        r.log(n, 'game file line %d: test_battle takes a battle number 1 to 16383 (like 16; 1024 and up: a DLL scene\'s, with enemies = on), or scene:formation (like 4:0; scene 0 to 4095, formation 0 to 3), or off: the line gives nothing', n);
       }
     } else if (word_is(s, start, key_end, 'seats')) {
       let v;
@@ -341,7 +372,7 @@ export function check(r) {
       if (parse_yes_no(s, value, stop) === null) r.log(n, 'game file line %d: achievement_materia_view must be yes or no', n);
     } else {
       let handled = false;
-      for (const helper of [box_key_line, fields_key_line, bl_key_line]) {
+      for (const helper of [box_key_line, fields_key_line, bl_key_line, enemies_key_line, battle_menu_key_line]) {
         const [answer, fault] = helper(s, start, key_end, value, stop);
         if (answer !== 0) {
           if (answer < 0) r.log(n, 'game file line %d: %s', n, fault);

@@ -36,10 +36,10 @@ export const MP_COST_MAX = 999;
 export const EFFECT_BASE_COUNT = 0x36;
 export const EFFECT_COPY_FIRST = 0x100;
 export const EFFECT_COPY_LAST = 0xffff;
-export const EFFECT_COPY_MAX = 256;
+export const EFFECT_COPY_MAX = 1024;
 export const EFFECT_RENAMES_MAX = 16;
 export const EFFECT_NAME_MAX = 32;
-export const SOUND_HANDLE_MAX = 256;
+export const SOUND_HANDLE_MAX = 1024;
 export const SOUND_NAME_MAX = 24;
 export const SOUND_GAME_LAST = 751;
 export const SOUND_POOL_FIRST = 53848;
@@ -200,7 +200,7 @@ export function sound_file_parse(r, s) {
         continue;
       }
       if (handles.length === SOUND_HANDLE_MAX) {
-        say(n, 'too many sound handles (256 at most): the section is skipped');
+        say(n, 'too many sound handles (1024 at most): the section is skipped');
         continue;
       }
       c = { id: num, usable: true, line: n, name: '' };
@@ -308,7 +308,7 @@ export function effect_file_parse(r, s) {
         continue;
       }
       if (copies.length === EFFECT_COPY_MAX) {
-        problem(n, 'too many effect sections, copies and native effects together (256 at most): the section is skipped');
+        problem(n, 'too many effect sections, copies and native effects together (1024 at most): the section is skipped');
         continue;
       }
       c = { number: num, base: -1, line: n, usable: true, renames: [], play: false, play_base: -1, play_base_line: 0 };

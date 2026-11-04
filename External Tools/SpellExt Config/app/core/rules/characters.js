@@ -228,6 +228,9 @@ export function apply_character_key(c, s, key, key_end, value, end) {
     }
     return null;
   }
+  if (word_is(s, key, key_end, 'body_blend')) {
+    return parse_yes_no(s, value, end) === null ? 'expected yes or no' : null;
+  }
   if (word_is(s, key, key_end, 'battle_like') || word_is(s, key, key_end, 'battle_model')) {
     let found = false;
     for (const [name, v] of MODELS) {
