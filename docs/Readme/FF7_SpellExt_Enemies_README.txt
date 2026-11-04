@@ -114,7 +114,7 @@ scene, and the line lists the keys that section takes.
 
 enemy.ini (and generated.ini): [enemy]
 
-    name             REQUIRED. The name shown in battle, at most 31 characters.
+    name             REQUIRED. The name shown in battle, at most 30 characters (the game adds a space).
     model            REQUIRED. In a scene of yours its value is not used: enemy
                      slot 0, 1, 2 is drawn as model 365, 366, 367 from the
                      folder's model\ files (see "The models"). Write `pool`.
