@@ -298,3 +298,26 @@ export function character_ai(characters_text, ai_names) {
   }
   return out;
 }
+
+// the NAMEs of the effective `ai = NAME` lines of character_ai's list
+export function ai_values(chars) {
+  return chars.filter(c => c.effective && c.effective.key === 'ai').map(c => c.effective.value);
+}
+
+// (ai_newthreat) character_ai's list with what a mod folder serves (`served`: mods7h.served_ai's Map): an effective ai = NAME that a
+// folder of the config's mod holds gets 'served' (that entry) and is not 'missing'. The DLL asks for <game>\direct\ai\NAME.ai
+// before ai\NAME.ai; a folder whose option is off serves nothing, and the character then has no AI of its own: what the option
+// means, not a missing file. (sxcfg/aicards.py add_served)
+export function add_served(chars, served) {
+  for (const c of chars) {
+    const e = c.effective;
+    if (e && e.key === 'ai') {
+      const s = served.get(pyLower(e.value));
+      if (s) {
+        e.served = Object.assign({}, s);
+        e.missing = false;
+      }
+    }
+  }
+  return chars;
+}

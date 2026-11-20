@@ -3,12 +3,17 @@
 // state_lend_key (25905), state_key (25951), prop_name_value (25822), prop_bone_value (25846), prop_three_value
 // (25863), prop_scale_value (25883), parse_signed (38329), parse_flags (9890) with element_flags (9739), finish_limit
 // (26303), finish_states (26196).
-// Transformations (source e009e261): form_section_start (29332), form_name (18597), form_key (18630), form_finish
-// (18684) and finish_forms (29358). Not forecast here: model_like's names (the DLL reads them from the game's table
-// at 008ff2f0), a form whose two letters are also a character's battle_files, and the limit's own checks that need the
-// game or the kernel (the form hooks, additional_effect 3, a script with an ac command): the DLL's log says those.
+// Of the source of 2026-11-13 (2664156951ba): the limit keys status2, status2_mode, form, hits_on_every_target and the
+// `room N` word of spell_effects (load_limits 32331), finish_limit's refusal of a hits_on_every_target limit's one-target
+// entries (31963), the state keys cover, counter, dexterity_per_target (state_key 31589), and the forms: [form NAME]
+// sections (form_section_start 32146, form_name 20254, form_key 20287, form_finish), and finish_forms (32172) with
+// form_ac_operand. model_like's names are the exe's table at 008ff2f0 (FORM_LIKE: as the Steam 2013 exe holds it;
+// another exe's table is said in the log, not forecast). A limit naming a form whose additional_effect is its base's
+// (the exe's limit record, not this file) is not forecast past that check; nor are the form hooks being off.
 //
 // What it reads from the files read before it in the same reading (all optional; absent = not forecast):
+//   'characters'           (the character port's Map) each character's battle_prefix, for finish_forms' refusal of a
+//                          form whose two letters are a character's battle_files.
 //   'characters_defined'   the character file's section IDs that load_characters left defined (roster_character(n)
 //                          != NULL). Also accepted: 'characters' as a Set/Array of IDs, or a Map whose keys are IDs
 //                          (or that holds 'defined': the IDs). Absent: every ID 12-43 is taken as defined (the "a
@@ -25,7 +30,7 @@
 import { lines, trim, parse_number, word_is, next_word, parse_yes_no, is_space, hex_digit } from '../grammar.js';
 import { register } from '../validate.js';
 import { pyFind, pyIn, pyInt } from '../py.js';
-import { apply_key_for_limits } from './spells.js';
+import { apply_key_for_limits, REC_ADDITIONAL_EFFECT, STATUS_FLAGS, SPELL_BYTES_MAX } from './spells.js';
 
 export const FILE = 'FF7_SpellExt_Limits.ini';
 
@@ -52,9 +57,6 @@ export const STATE_SCRIPT_MAX = 48;
 export const STATE_IDLE_MAX = 16;
 export const STATE_LEND_MAX = 32;
 export const STATE_LENDS_MAX = 16;
-export const FORM_MAX = 16;
-export const FORM_NAME_MAX = 15;
-export const FORM_ENEMY_MODELS = 370;
 export const STATE_GAP_MAX = 60;
 export const STATE_VIEW_RAISE_MAX = 6000;
 export const STATE_VIEW_BACK_MAX = 100;
@@ -62,6 +64,22 @@ export const STATE_POINTER_RAISE_MAX = 6000;
 export const SEQ_LIMIT = 'limit';
 export const SEQ_NATIVE = 'native';
 export const SEQ_HIT = 'hit';
+export const SEQ_ROOM_MAX = 100;
+export const FORM_FIRST = 0x20, FORM_MAX = 16, FORM_NAME_MAX = 15, FORM_ENEMY_MODELS = 370, FORM_OPCODE_STORE = 0xac;
+// the game's battle model names model_like may name: entries 2-22 of the exe's table at 008ff2f0 (form_read_like_names)
+export const FORM_LIKE = Object.freeze(['FROG', 'CLOUD', 'TIFA', 'EARITH', 'RED13', 'YUFI', 'KETCY', 'CID1', 'SEFIROS',
+  'BARRETT', 'BARRETT2', 'BARRETT3', 'BARRETT4', 'VINSENT', 'VINSENT2', 'VINSENT3', 'HICLOUD', 'GALL', 'DEATHGIG',
+  'HELLMASK', 'CHAOS']);
+// form_operands: the operand bytes after each command byte 0x8e-0xff of a battle model script
+export const FORM_OPERANDS = Object.freeze([
+  0, 0, 3, 1, 0, 0, 5, 0, 2, 2, 1, 6, 4, 0, 0, 1, 0, 0,
+  1, 2, 1, 1, 0, 0, 0, 1, 2, 2, 0, 4, 1, 5, 0, 1,
+  0, 0, 0, 0, 0, 11, 1, 0, 0, 1, 2, 0, 1, 4, 1, 2,
+  0, 0, 1, 0, 3, 0, 1, 3, 5, 0, 0, 8, 1, 0, 0, 8,
+  3, 5, 0, 0, 3, 8, 1, 2, 3, 0, 1, 4, 3, 2, 2, 0,
+  0, 0, 0, 0, 0, 0, 0, 1, 0, 3, 0, 0, 0, 0, 0, 0,
+  0, 0, 0, 0, 1, 1, 0, 1, 1, 0, 0, 4, 0, 6, 0, 0]);
+export const STATUS2_FAULT = 'status2 is a list of status names, as for status (regen barrier ...), or none';
 
 export const ELEMENT_FLAGS = Object.freeze([
   ['fire', 0x0001], ['ice', 0x0002], ['lightning', 0x0004], ['bolt', 0x0004],
@@ -140,52 +158,6 @@ export function state_name(s, start, end) {
   return out;
 }
 
-// form_name: the lower-case name, or null (the same rule as a state's name).
-export function form_name(s, start, end) {
-  if (end - start > FORM_NAME_MAX) return null;
-  return state_name(s, start, end);
-}
-
-// form_key (18630): the problem, or null. model_like is taken as one of the game's names (not known here).
-export function form_key(f, s, key, key_end, value, stop) {
-  if (word_is(s, key, key_end, 'model_files') || word_is(s, key, key_end, 'model_script')) {
-    const scripts = word_is(s, key, key_end, 'model_script');
-    const whole = scripts && stop - value === 4 && lower_or20(s[value + 2]) === 'a' && lower_or20(s[value + 3]) === 'b';
-    if ((stop - value !== 2 && !whole) || !inRange(lower_or20(s[value]), 'a', 'z') || !inRange(lower_or20(s[value + 1]), 'a', 'z')) {
-      return scripts
-        ? 'model_script is the form\'s script file in the battle archive\'s naming, its two letters or its name (zo or ZOAB: 74 slots in the party layout)'
-        : 'model_files is two letters: the form\'s own files in the battle archive\'s naming (xy: XYAA, XYAB, XYDA and its parts)';
-    }
-    f[scripts ? 'scripts' : 'files'] = true;
-    return null;
-  }
-  if (word_is(s, key, key_end, 'model_enemy') || word_is(s, key, key_end, 'model_like')) {
-    if (f.stem) return 'a form\'s parts are named after one model: model_enemy or model_like, once';
-    if (word_is(s, key, key_end, 'model_enemy')) {
-      const [ok, p, n] = parse_number(s, value, stop);
-      if (!ok || p !== stop || n >= FORM_ENEMY_MODELS) {
-        return 'model_enemy is the number of an enemy model, 0 to 369 (the battle archive\'s two letters: 331 = mt..)';
-      }
-    }
-    f.stem = true;
-    return null;
-  }
-  if (word_is(s, key, key_end, 'weapon')) {
-    if (word_is(s, value, stop, 'yes') || word_is(s, value, stop, 'no')) return null;
-    return 'weapon is yes (the equipped weapon\'s model is loaded with the form) or no (the default: none, as the game\'s beasts)';
-  }
-  return 'a form\'s section takes: model_enemy or model_like, model_script, model_files, weapon';
-}
-
-// form_finish (18684): the problem of a form once the file is read, or null.
-export function form_finish(f) {
-  if (!f.stem) return 'the form has neither model_enemy nor model_like (the model whose files it loads): no limit transforms into it';
-  if (!f.files && !f.scripts) {
-    return 'the form has neither model_script (its script file in the party layout) nor model_files (a full set of its own): the model\'s own script file is not in the party layout, so no limit transforms into it';
-  }
-  return null;
-}
-
 export function state_command_word(s, start, end) {
   for (const [number, name] of STATE_COMMAND_NAMES) {
     let k = 0;
@@ -224,7 +196,8 @@ export function state_bytes(s, most, value, stop) {
       digits += 1;
     }
     if (out.length === most) {
-      return [most === STATE_SCRIPT_MAX ? 'a state\'s attack script may be up to 48 bytes'
+      return [most === SPELL_BYTES_MAX ? "a spell's script_bytes may be up to 128 bytes"
+        : most === STATE_SCRIPT_MAX ? 'a state\'s attack script may be up to 48 bytes'
         : most === STATE_LEND_MAX ? 'a state\'s script_NN may be up to 32 bytes'
           : 'a state\'s idle script may be up to 16 bytes', null];
     }
@@ -470,6 +443,15 @@ export function state_key(st, s, key, key_end, value, stop) {
     if (!(word_is(s, value, stop, '100') || word_is(s, value, stop, '100%') || word_is(s, value, stop, 'normal'))) {
       return 'physical_evade is normal (the default) or 100: every physical hit on the actor misses while the state lasts';
     }
+  } else if (word_is(s, key, key_end, 'cover') || word_is(s, key, key_end, 'counter')) {
+    const cover = word_is(s, key, key_end, 'cover');
+    if (stop > value && s[stop - 1] === '%') stop -= 1;
+    [ok, p, n] = parse_number(s, p, stop);
+    if (!ok || p !== stop || n > 100) {
+      return cover
+        ? 'cover is 0 (the default) to 100: the per cent chance the actor covers an ally (takes a single physical hit meant for it), as the Cover materia\'s, while the state lasts; the Cover materia\'s own chance if it is higher'
+        : 'counter is 0 (the default) to 100: the per cent chance the actor counters with Attack when an enemy hits it, as the Counter Attack materia\'s, while the state lasts; the materia\'s own chance if it is higher';
+    }
   } else if (word_is(s, key, key_end, 'view_raise')) {
     [ok, p, n] = parse_number(s, p, stop);
     if (!ok || p !== stop || n > STATE_VIEW_RAISE_MAX) {
@@ -486,12 +468,210 @@ export function state_key(st, s, key, key_end, value, stop) {
     if (!ok || p !== stop || n > STATE_POINTER_RAISE_MAX) {
       return 'pointer_raise is 0 (the default) to 6000: units the yellow pointer over the party member whose command menu is open goes up while the actor is in the state';
     }
+  } else if (word_is(s, key, key_end, 'dexterity_per_target')) {
+    [ok, p, n] = parse_number(s, p, stop);
+    if (!ok || p !== stop || n > 255) {
+      return 'dexterity_per_target is 0 (the default) to 255: how much the actor\'s battle dexterity rises, while the state lasts, for each target a status of the limit that began the state landed on (255 at most in all)';
+    }
   } else if (key_end - key >= 7 && word_is(s, key, key + 7, 'script_')) {
     return state_lend_key(st, s, key, key_end, value, stop);
   } else {
-    return 'a state\'s section takes: hits, commands, ends (battle ko frog), retarget, hit_gap, stop_step, camera, attack_script / _next / _next2 / _last / _only, idle_script, idle_weak_script, prop (a name, or weapon), prop_bone, prop_offset, prop_turn, prop_scale, prop_hide, prop_colour, attack_targets, attack_element, long_range, physical_evade, script_NN, view_raise, view_back, pointer_raise';
+    return 'a state\'s section takes: hits, commands, ends (battle ko frog), retarget, hit_gap, stop_step, camera, attack_script / _next / _next2 / _last / _only, idle_script, idle_weak_script, prop (a name, or weapon), prop_bone, prop_offset, prop_turn, prop_scale, prop_hide, prop_colour, attack_targets, attack_element, long_range, physical_evade, cover, counter, script_NN, view_raise, view_back, pointer_raise, dexterity_per_target';
   }
   return null;
+}
+
+// ---- the forms ([form NAME] sections) ----
+
+// form_name (20254): the lower-case name, or null (also for none).
+export function form_name(s, start, end) {
+  const length = end - start;
+  if (length < 1 || length > FORM_NAME_MAX || word_is(s, start, end, 'none')) return null;
+  let out = '';
+  for (let k = 0; k < length; k++) {
+    let c = s[start + k];
+    if (inRange(c, 'A', 'Z')) c = String.fromCharCode(c.charCodeAt(0) + 0x20);
+    if (!(inRange(c, 'a', 'z') || inRange(c, '0', '9') || c === '_')) return null;
+    out += c;
+  }
+  return out;
+}
+
+// form_ac_operand: the offset of the operand of the script's first ac, -1 if it has none, -2 if a command's operands
+// run past the end before one is met.
+export function form_ac_operand(script) {
+  let at = 0;
+  const length = script.length;
+  while (at < length) {
+    const op = script[at];
+    const operands = op >= 0x8e ? FORM_OPERANDS[op - 0x8e] : 0;
+    if (at + 1 + operands > length) return -2;
+    if (op === FORM_OPCODE_STORE) return at + 1;
+    at += 1 + operands;
+  }
+  return -1;
+}
+
+const _letter = c => { const o = c.charCodeAt(0) | 0x20; return o >= 97 && o <= 122; };
+const _upper = c => String.fromCharCode(c.charCodeAt(0) & ~0x20);
+const _upper_az = c => (inRange(c, 'a', 'z') ? String.fromCharCode(c.charCodeAt(0) - 0x20) : c);
+
+// form_same_name: [start, end) is `name`, ignoring the case of a-z on both sides.
+export function form_same_name(s, start, end, name) {
+  if (end - start !== name.length) return false;
+  for (let k = 0; k < name.length; k++) if (_upper_az(s[start + k]) !== _upper_az(name[k])) return false;
+  return true;
+}
+
+// form_key (20287): one key of a [form NAME] section; null, or the problem.
+export function form_key(f, s, key, key_end, value, stop) {
+  let p = value;
+  if (word_is(s, key, key_end, 'model_files') || word_is(s, key, key_end, 'model_script')) {
+    const script = word_is(s, key, key_end, 'model_script');
+    // model_script also takes the file's whole archive name, XYAB
+    const whole = script && stop - value === 4 && (s.charCodeAt(value + 2) | 0x20) === 0x61 && (s.charCodeAt(value + 3) | 0x20) === 0x62;
+    if ((stop - value !== 2 && !whole) || !_letter(s[value]) || !_letter(s[value + 1])) {
+      return script
+        ? 'model_script is the form\'s script file in the battle archive\'s naming, its two letters or its name (zo or ZOAB: 74 slots in the party layout)'
+        : 'model_files is two letters: the form\'s own files in the battle archive\'s naming (xy: XYAA, XYAB, XYDA and its parts)';
+    }
+    f[script ? 'scripts' : 'files'] = _upper(s[value]) + _upper(s[value + 1]);
+    return null;
+  }
+  if (word_is(s, key, key_end, 'model_enemy') || word_is(s, key, key_end, 'model_like')) {
+    if (f.stem) return 'a form\'s parts are named after one model: model_enemy or model_like, once';
+    if (word_is(s, key, key_end, 'model_enemy')) {
+      let ok, n;
+      [ok, p, n] = parse_number(s, p, stop);
+      if (!ok || p !== stop || n >= FORM_ENEMY_MODELS) {
+        return 'model_enemy is the number of an enemy model, 0 to 369 (the battle archive\'s two letters: 331 = mt..)';
+      }
+      f.stem = 'ENEMY' + String(n).padStart(3, '0');
+      return null;
+    }
+    for (const name of FORM_LIKE) {
+      if (form_same_name(s, value, stop, name)) {
+        f.stem = name;
+        return null;
+      }
+    }
+    return 'model_like is one of the game\'s own party-slot battle model names (the log lists them)';
+  }
+  if (word_is(s, key, key_end, 'weapon')) {
+    if (word_is(s, value, stop, 'yes')) f.weapon = 1;
+    else if (word_is(s, value, stop, 'no')) f.weapon = 0;
+    else return 'weapon is yes (the equipped weapon\'s model is loaded with the form) or no (the default: none, as the game\'s beasts)';
+    return null;
+  }
+  return 'a form\'s section takes: model_enemy or model_like, model_script, model_files, weapon';
+}
+
+// form_finish: null, or why no limit transforms into the form.
+export function form_finish(f) {
+  if (!f.stem) return 'the form has neither model_enemy nor model_like (the model whose files it loads): no limit transforms into it';
+  if (!f.files && !f.scripts) {
+    return 'the form has neither model_script (its script file in the party layout) nor model_files (a full set of its own): the model\'s own script file is not in the party layout, so no limit transforms into it';
+  }
+  return null;
+}
+
+// load_limits' test for [form NAME] (after [test]): more than six characters, `form` and a blank after [.
+export function is_form_header(s, start, stop) {
+  return stop - start > 6 && word_is(s, start + 1, start + 5, 'form') && is_space(s[start + 5]);
+}
+
+// form_section_start (32146): [problem, the form or null]. `name` is just past [form.
+export function form_section_start(s, name, stop, line, forms) {
+  let name_end;
+  [name, name_end] = trim(s, name, stop - 1);
+  const lower = s[stop - 1] === ']' ? form_name(s, name, name_end) : null;
+  if (lower === null) return ['a form\'s section looks like [form NAME]: the word form, a name of 1 to 15 letters, digits or _', null];
+  if (forms.some(f => f.name === lower)) return ['this form is already defined above: this section is passed over', null];
+  if (forms.length === FORM_MAX) return ['too many forms (16 at most): this section is passed over', null];
+  const f = { name: lower, files: '', scripts: '', stem: '', weapon: 0, line, bad: false };
+  forms.push(f);
+  return [null, f];
+}
+
+// finish_forms (32172), as far as the file says it: each form's own problem, or a clash of its two letters with a
+// character's battle_files; then each limit that names a form, in the order of the C's checks. Not forecast: the form
+// hooks being off (the C's first check: the log says so at start-up), and the additional_effect check when the limit
+// does not set additional_effect itself (its base's is in the exe's limit record): then the script checks after it,
+// which are the file's, are said as the tool's own line (r.note) when one fails, since the DLL leaves the limit out
+// either way.
+function finish_forms(r, forms, chars) {
+  const info = r.shared.has('characters') ? r.shared.get('characters') : null;
+  const prefixes = [];
+  if (info instanceof Map) {
+    // the C's loop n over 2 * ROSTER_MAX: every character's battle_files, then every character's battle_files_when
+    for (const key of ['battle_prefix', 'battle_when_prefix']) {
+      for (const ident of [...info.keys()].sort((a, b) => a - b)) {
+        const e = info.get(ident);
+        // (the character port's entries are objects; a Python dict handed over by the oracle is a Map)
+        const bp = e instanceof Map ? e.get(key) : e && typeof e === 'object' ? e[key] : undefined;
+        if (bp) prefixes.push([ident, bp, key === 'battle_prefix' ? 'battle_files' : 'battle_files_when']);
+      }
+    }
+  }
+  for (const f of forms) {
+    const why = form_finish(f);
+    if (why && !f.bad) r.log(f.line, 'limits file line %d: form %s: %s', f.line, f.name, why);
+    if (!why && !f.bad) {
+      for (const [ident, prefix, label] of prefixes) {
+        const two = f.files === prefix ? 'model_files' : f.scripts === prefix ? 'model_script' : null;
+        if (two) {
+          r.log(f.line, 'limits file line %d: form %s: %s %s is also character %d\'s %s: the form would load that character\'s files; give the form two letters of its own',
+                f.line, f.name, two, prefix, ident, label);
+          f.bad = true;
+          break;
+        }
+      }
+    }
+    if (why) f.bad = true;
+  }
+  for (const ident of [...chars.keys()].sort((a, b) => a - b)) {
+    const cc = chars.get(ident);
+    if (!cc.own_limits) continue;
+    for (const i of [...cc.defined_limits.keys()].sort((a, b) => a - b)) {
+      const lim = cc.defined_limits.get(i);
+      const name = lim.form;
+      if (!name) continue;
+      const form = forms.find(f => f.name === name) || null;
+      let why;
+      if (form === null) {
+        why = 'there is no section [form ' + name + '] in this file';
+      } else if (form.bad) {
+        why = 'that form is not usable (its section, line ' + form.line + ', had a problem)';
+      } else if (lim.state) {
+        why = 'it has state = ' + lim.state + ' too: a transforming limit cannot leave a state';
+      } else if (cc.states.length) {
+        why = 'character ' + ident + ' has a state ([' + ident + ' state ' + cc.states[0] + '], line ' + cc.state_lines[0] +
+              '): a form and a state are not held together';
+      } else if (lim.additional_effect === null) {
+        // the base's additional effect (the exe's limit record) is not forecast; the checks after it are the file's:
+        // when one of them fails the DLL leaves the limit out whatever the base (said as the tool's)
+        const at = lim.script.length ? form_ac_operand(lim.script) : -3;
+        if (at >= 0) continue;
+        r.note(lim.line, '[' + ident + ' ' + (Math.floor(i / 3) + 1) + '-' + (i % 3 + 1) + '] form = ' + name +
+               ': the DLL leaves this limit out: ' +
+               (at === -3 ? 'it has no script of its own' : at === -1 ? 'its script has no ac command'
+                 : 'a command of its script runs past the script\'s end before any ac') +
+               ' (and its additional effect, from its base, must be 3)');
+        continue;
+      } else if (lim.additional_effect !== 3) {
+        why = 'it needs additional_effect 3 (the game\'s transformation: a base such as 173, or the key); this limit\'s is ' + lim.additional_effect;
+      } else if (!lim.script.length) {
+        why = 'it needs a script of the limit\'s own with an ac command (ac 00 ... a2 11); it has none';
+      } else {
+        const at = form_ac_operand(lim.script);
+        if (at >= 0) continue;
+        why = at === -1 ? 'its script has no ac command (ac 00 stores the form\'s number before a2 loads its model)'
+          : 'a command of its script runs past the script\'s end before any ac';
+      }
+      r.log(lim.line, 'limits file line %d: [%d %d-%d] form = %s: %s: the limit is LEFT OUT (not learned, not in the menu)',
+            lim.line, ident, Math.floor(i / 3) + 1, i % 3 + 1, name, why);
+    }
+  }
 }
 
 // ---- the reader ----
@@ -502,10 +682,11 @@ export class Character {
     this.id = ident;
     this.own_limits = false;
     this.limit_set = '';
-    this.defined_limits = new Map();     // index 0-11 -> [start_line, state name, form name]
+    this.defined_limits = new Map();     // index 0-11 -> {line, state, form, script, additional_effect}
     this.states = [];                    // names, in their slots
-    this.state_lines = [];               // the line of each one's section
+    this.state_lines = [];               // their sections' lines
     this.limit_item = 0;
+    this.limit_item_name = 'Limit item';    // encode_text(each->limit_item_name, "Limit item"), then the key's
   }
 }
 
@@ -575,8 +756,8 @@ export function check(r) {
   let c = null;
   let owner = null;
   let state_section = null;
-  let form_section = null;
-  const forms = [];    // [form NAME] sections in their order: {name, line, bad, stem, files, scripts}
+  let form_section = null;     // the lines being read are a form's: [form NAME]
+  const forms = [];
   let in_test = false;
   let lim = null;      // the limit being read: its draft
 
@@ -590,7 +771,22 @@ export function check(r) {
       r.log(d.line, 'limits file line %d: character %d limit %d-%d has prop_offset, prop_turn, prop_scale, prop_frames or prop_animation but no prop: they do nothing',
             d.line, who.id, d.level, d.position);
     }
-    who.defined_limits.set((d.level - 1) * 3 + d.position - 1, [d.line, d.state, d.form]);
+    if (d.every_target) {
+      // (every target) only `all` entries are kept: a one-target entry, a bare hit or a one-target native effect is
+      // refused, each with its number in the list as written (the C renumbers the kept ones afterwards)
+      d.seq.forEach((e, i) => {
+        if (e.kind === SEQ_HIT || !e.all) {
+          r.log(d.line, 'limits file line %d: character %d limit %d-%d has hits_on_every_target: its spell_effects entry %d (%s, frame %d) is refused: such a limit takes `all` entries only',
+                d.line, who.id, d.level, d.position, i + 1,
+                e.kind === SEQ_HIT ? 'a bare hit' : e.kind === SEQ_NATIVE ? 'a native effect on one target' : 'an effect on one target',
+                e.frame);
+        }
+      });
+    }
+    const sd = d.spell._spell_draft;
+    const effect = sd !== undefined && sd !== null && sd.is_set[REC_ADDITIONAL_EFFECT] ? sd.value[REC_ADDITIONAL_EFFECT] : null;
+    who.defined_limits.set((d.level - 1) * 3 + d.position - 1,
+                           { line: d.line, state: d.state, form: d.form, script: d.script, additional_effect: effect });
     limits_defined += 1;
   };
 
@@ -610,20 +806,9 @@ export function check(r) {
       let [ok, p, ident] = parse_number(s, start + 1, stop);
       if (in_test) {
         // nothing
-      } else if (stop - start > 6 && word_is(s, start + 1, start + 5, 'form') && is_space(s[start + 5])) {
-        // form_section_start: [form NAME], a model a limit may turn its user into; no character's
-        const [name, name_end] = trim(s, start + 5, stop - 1);
-        const lower = s[stop - 1] === ']' ? form_name(s, name, name_end) : null;
-        if (lower === null) {
-          problem = 'a form\'s section looks like [form NAME]: the word form, a name of 1 to 15 letters, digits or _';
-        } else if (forms.some(f => f.name === lower)) {
-          problem = 'this form is already defined above: this section is passed over';
-        } else if (forms.length === FORM_MAX) {
-          problem = 'too many forms (16 at most): this section is passed over';
-        } else {
-          form_section = { name: lower, line: n, bad: false, stem: false, files: false, scripts: false };
-          forms.push(form_section);
-        }
+      } else if (is_form_header(s, start, stop)) {
+        // [form NAME]: a model a limit may turn its user into; no character's
+        [problem, form_section] = form_section_start(s, start + 5, stop, n, forms);
       } else if (!ok || !roster_character(ident < 0x80000000 ? ident : -1)) {
         problem = 'a section starts with the ID of a character defined in the character file: [12] or [12 1-1]';
       } else {
@@ -666,7 +851,7 @@ export function check(r) {
             problem = 'this limit is already defined';
           } else {
             lim = { level: s.charCodeAt(p) - 48, position: s.charCodeAt(p + 2) - 48, line: n, base: -1, state: '',
-                    form: '', prop: false, placing: false, spell: {} };
+                    form: '', script: [], seq: [], every_target: false, prop: false, placing: false, spell: {} };
             owner = c;
           }
         }
@@ -708,9 +893,8 @@ export function check(r) {
         problem = 'expected key = value';
       } else {
         const [key, key_end] = trim(s, start, equals);
-        let value;
-        [value, stop] = trim(s, equals + 1, stop);
-        problem = form_key(form_section, s, key, key_end, value, stop);
+        const [value, vstop] = trim(s, equals + 1, stop);
+        problem = form_key(form_section, s, key, key_end, value, vstop);
       }
       if (problem) form_section.bad = true;
     } else if (!c) {
@@ -736,42 +920,21 @@ export function check(r) {
     const cc = chars.get(ident);
     if (!cc.own_limits) continue;
     for (const i of [...cc.defined_limits.keys()].sort((a, b) => a - b)) {
-      const [line, name] = cc.defined_limits.get(i);
+      const { line, state: name } = cc.defined_limits.get(i);
       if (name && !cc.states.includes(name)) {
         r.log(line, 'limits file: character %d limit %d-%d: state = %s, but there is no section [%d state %s]: the limit works without a state',
               ident, Math.floor(i / 3) + 1, i % 3 + 1, name, ident, name);
       }
     }
   }
-  // finish_forms: each form's own problem, then each limit's form (only the checks that need neither the game nor the
-  // kernel; the order is the DLL's, so the first reason is the one it gives)
-  for (const f of forms) {
-    const why = form_finish(f);
-    if (why && !f.bad) r.log(f.line, 'limits file line %d: form %s: %s', f.line, f.name, why);
-    if (why) f.bad = true;
-  }
-  for (const ident of [...chars.keys()].sort((a, b) => a - b)) {
-    const cc = chars.get(ident);
-    if (!cc.own_limits) continue;
-    for (const i of [...cc.defined_limits.keys()].sort((a, b) => a - b)) {
-      const [line, state, name] = cc.defined_limits.get(i);
-      if (!name) continue;
-      const f = forms.find(x => x.name === name);
-      let why;
-      if (f === undefined) why = `there is no section [form ${name}] in this file`;
-      else if (f.bad) why = `that form is not usable (its section, line ${f.line}, had a problem)`;
-      else if (state) why = `it has state = ${state} too: a transforming limit cannot leave a state`;
-      else if (cc.states.length) {
-        why = `character ${ident} has a state ([${ident} state ${cc.states[0]}], line ${cc.state_lines[0]}): a form and a state are not held together`;
-      } else continue;
-      r.log(line, 'limits file line %d: [%d %d-%d] form = %s: %s: the limit is LEFT OUT (not learned, not in the menu)',
-            line, ident, Math.floor(i / 3) + 1, i % 3 + 1, name, why);     // (the DLL's count of limits defined stays)
-    }
-  }
+  finish_forms(r, forms, chars);
   r.shared.set('limits_defined', limits_defined);
   const items = new Map();
   for (const [k, v] of chars) if (v.limit_item) items.set(k, v.limit_item);
   r.shared.set('limit_items', items);
+  const names = new Map();
+  for (const [, v] of chars) if (v.limit_item) names.set(v.limit_item, v.limit_item_name);
+  r.shared.set('limit_item_names', names);
   if (!knows_characters) r.note(0, 'the character file\'s sections are not known here: every ID 12-43 is taken as defined');
 }
 
@@ -823,6 +986,7 @@ export function character_key(r, c, chars, items_defined, s, key, key_end, value
     c.limit_item = n;
   } else if (word_is(s, key, key_end, 'limit_item_name')) {
     if (stop - value > 24) return 'limit_item_name: at most 24 characters';
+    c.limit_item_name = s.slice(value, stop);
   } else if (word_is(s, key, key_end, 'limit_item_description')) {
     // nothing
   } else if (word_is(s, key, key_end, 'limit_item_learned') || word_is(s, key, key_end, 'limit_item_not_yet') ||
@@ -885,8 +1049,11 @@ export function limit_key(d, s, key, key_end, value, stop, apply_key) {
     let q = value;
     let length = 0;
     let problem = null;
+    const own = word_is(s, key, key_end, 'script');      // (forms) the limit's own script: its bytes are kept
+    const script = [];
     while (q < stop && !problem) {
       let digits = 0;
+      let v = 0;
       while (q < stop && is_space(s[q])) q += 1;
       if (q === stop) break;
       while (q < stop && !is_space(s[q])) {
@@ -894,16 +1061,23 @@ export function limit_key(d, s, key, key_end, value, stop, apply_key) {
         const o = s.charCodeAt(q);
         const dd = inRange(c, '0', '9') ? o - 48 : inRange(c, 'a', 'f') ? o - 87 : inRange(c, 'A', 'F') ? o - 55 : -1;
         if (dd < 0 || digits === 2) problem = 'a script is a list of bytes in hexadecimal, two digits each: fc 00 e0 ea ...';
+        v = (v * 16 + dd) & 0xff;
         q += 1;
         digits += 1;
       }
       if (!problem && length === LIMIT_SCRIPT_MAX) problem = 'a script may be up to 128 bytes';
-      if (!problem) length += 1;
+      if (!problem) {
+        length += 1;
+        script.push(v);
+      }
     }
     if (!problem && !length) problem = 'the script is empty';
+    if (own) d.script = problem ? [] : script;
     return problem;
   } else if (word_is(s, key, key_end, 'spell_effects')) {
-    return spell_effects(s, value, stop);
+    let problem;
+    [problem, d.seq] = spell_effects(s, value, stop);
+    return problem;
   } else if (word_is(s, key, key_end, 'hit_elements')) {
     let q = value;
     let count = 0;
@@ -916,6 +1090,13 @@ export function limit_key(d, s, key, key_end, value, stop, apply_key) {
       count += 1;
       q = piece_end < stop ? piece_end + 1 : stop;
     }
+  } else if (word_is(s, key, key_end, 'status2')) {
+    // a second status change of the limit: the names as for `status`; none = no second change
+    const mask = parse_flags(s, value, stop, STATUS_FLAGS, 0xffffffff);
+    if (mask === null) return STATUS2_FAULT;
+    if (mask & 0x80000000) return 'status2 cannot hold imprisoned (the game reads that bit of a status list as something else)';
+  } else if (word_is(s, key, key_end, 'status2_mode')) {
+    if (!['inflict', 'cure', 'toggle'].some(m => word_is(s, value, stop, m))) return 'status2_mode must be inflict, cure or toggle';
   } else if (word_is(s, key, key_end, 'state')) {
     if (word_is(s, value, stop, 'none')) {
       d.state = '';
@@ -927,6 +1108,7 @@ export function limit_key(d, s, key, key_end, value, stop, apply_key) {
       }
     }
   } else if (word_is(s, key, key_end, 'form')) {
+    // NAME: the [form NAME] its user turns into (its section may come after the limit's)
     if (word_is(s, value, stop, 'none')) {
       d.form = '';
     } else {
@@ -1000,6 +1182,11 @@ export function limit_key(d, s, key, key_end, value, stop, apply_key) {
     if (position < 2 || level > 3 || !ok || p !== stop || n > 65534) {
       return 'uses applies to the second and third limits of levels 1 to 3: a number up to 65534';
     }
+  } else if (word_is(s, key, key_end, 'hits_on_every_target')) {
+    // (every target) yes: each hit of the limit goes to every target of its turn
+    const on = parse_yes_no(s, value, stop);
+    if (on === null) return 'expected yes or no';
+    d.every_target = on !== 0;
   } else if (word_is(s, key, key_end, 'learned')) {
     if (parse_yes_no(s, value, stop) === null) return 'expected yes or no';
   } else if (word_is(s, key, key_end, 'materia')) {
@@ -1011,26 +1198,40 @@ export function limit_key(d, s, key, key_end, value, stop, apply_key) {
   return null;
 }
 
-// spell_effects = [limit | effect] number:frame [all] [visual] [skip N], ... or hit:frame (load_limits 27286).
+// spell_effects = [limit | effect] number:frame [all] [visual] [skip N] [room N], ... or hit:frame (load_limits 32728):
+// [the problem or null, the entries [{kind, all, frame, room}]; none after a problem, as the C's count 0].
 export function spell_effects(s, value, stop) {
   let q = value;
   let is_limit = false;
   let is_skip = false;
   let is_native = false;
-  const flags = [];      // per entry: the kind (null, SEQ_LIMIT, SEQ_NATIVE, SEQ_HIT)
+  let is_room = false;
+  let entries = [];      // per entry: kind (null, SEQ_LIMIT, SEQ_NATIVE, SEQ_HIT), all, frame, room
   let problem = null;
   while (!problem) {
     const w = next_word(s, q, stop);
     if (w === null) break;
     let word_end;
     [q, word_end] = w;
-    const count = flags.length;
-    if (count && flags[flags.length - 1] === SEQ_HIT && !is_limit && !is_native &&
+    const count = entries.length;
+    const last = count ? entries[count - 1].kind : null;
+    if (count && last === SEQ_HIT && !is_limit && !is_native &&
         (word_is(s, q, word_end, 'all') || word_is(s, q, word_end, 'visual') || word_is(s, q, word_end, 'skip'))) {
       problem = 'spell_effects: a `hit:frame` entry (a bare hit, no effect) takes nothing after it: no all, visual or skip';
-    } else if (count && flags[flags.length - 1] === SEQ_NATIVE && !is_limit && !is_native &&
+    } else if (count && last === SEQ_NATIVE && !is_limit && !is_native &&
         (word_is(s, q, word_end, 'visual') || word_is(s, q, word_end, 'skip'))) {
       problem = 'spell_effects: an `effect N:frame` entry (a native effect) takes `all` only, not visual or skip';
+    } else if (is_room) {
+      // (room) the free slots of the list of 100 this entry waits for
+      const [ok, q2, slots] = parse_number(s, q, word_end);
+      if (!ok || q2 !== word_end || slots < 1 || slots > SEQ_ROOM_MAX) {
+        problem = 'spell_effects: `room` must be followed by a number of free slots, 1 to 100';
+      } else {
+        entries[count - 1].room = slots;
+      }
+      is_room = false;
+    } else if (word_is(s, q, word_end, 'room') && count && !is_limit && !is_native && last !== SEQ_NATIVE && last !== SEQ_HIT) {
+      is_room = true;     // (room) a game effect's entry only: not a bare hit or a native effect
     } else if (is_skip) {
       const [ok, q2, frames] = parse_number(s, q, word_end);
       if (!ok || q2 !== word_end || frames > 255) problem = 'spell_effects: `skip` must be followed by a number of frames, 0 to 255';
@@ -1041,7 +1242,9 @@ export function spell_effects(s, value, stop) {
       is_limit = true;
     } else if (word_is(s, q, word_end, 'effect') && !is_limit && !is_native) {
       is_native = true;
-    } else if ((word_is(s, q, word_end, 'all') || word_is(s, q, word_end, 'visual')) && count && !is_limit && !is_native) {
+    } else if (word_is(s, q, word_end, 'all') && count && !is_limit && !is_native) {
+      entries[count - 1].all = true;
+    } else if (word_is(s, q, word_end, 'visual') && count && !is_limit && !is_native) {
       // nothing
     } else if (!is_limit && !is_native && word_end - q >= 3 && word_is(s, q, q + 3, 'hit') &&
                (word_end - q === 3 || s[q + 3] === ':')) {
@@ -1050,19 +1253,20 @@ export function spell_effects(s, value, stop) {
         problem = 'spell_effects is up to 24 of  [limit | effect] number:frame [all] [visual], or hit:frame  (0x1b:40, limit 178:60 all visual, effect 0x200:10 all, hit:70)';
       } else {
         let bad = word_end - q === 3;
+        let frame;
         if (!bad) {
           let ok;
-          let frame;
           [ok, q, frame] = parse_number(s, q + 4, word_end);
           bad = !ok || q !== word_end || frame > 2000;
         }
         if (bad) problem = 'spell_effects: a bare hit is hit:frame, the frame 0 to 2000 (hit:70)';
-        else flags.push(SEQ_HIT);
+        else entries.push({ kind: SEQ_HIT, all: false, frame, room: 0 });
       }
     } else {
       let bad = count === LIMIT_SEQ_MAX;
       let ok;
       let effect;
+      let frame;
       if (!bad) {
         [ok, q, effect] = parse_number(s, q, word_end);
         bad = !ok;
@@ -1074,7 +1278,6 @@ export function spell_effects(s, value, stop) {
       if (!bad) bad = q === word_end || s[q] !== ':';
       if (!bad) {
         q += 1;
-        let frame;
         [ok, q, frame] = parse_number(s, q, word_end);
         bad = !ok || q !== word_end || frame > 2000;
       }
@@ -1083,31 +1286,33 @@ export function spell_effects(s, value, stop) {
           ? 'spell_effects: `effect` is followed by a native effect\'s number (0x100 up, an [effect N] section with play =) and its frame: effect 0x200:0 all'
           : 'spell_effects is up to 24 of  [limit | effect] number:frame [all] [visual], or hit:frame  (0x1b:40, limit 178:60 all visual, effect 0x200:10 all, hit:70)';
       } else {
-        flags.push(is_limit ? SEQ_LIMIT : is_native ? SEQ_NATIVE : null);
+        entries.push({ kind: is_limit ? SEQ_LIMIT : is_native ? SEQ_NATIVE : null, all: false, frame, room: 0 });
         is_limit = false;
         is_native = false;
       }
     }
     q = word_end;
   }
+  if (!problem && is_room) problem = 'spell_effects: `room` must be followed by a number of free slots';
   if (problem || is_limit || is_skip || is_native) {
     if (!problem) {
       problem = is_skip ? 'spell_effects: `skip` must be followed by a number of frames'
         : is_native ? 'spell_effects: `effect` must be followed by number:frame'
           : 'spell_effects: `limit` must be followed by number:frame';
     }
+    entries = [];
   }
-  return problem;
+  return [problem, entries];
 }
 
-// [12] character, [12 L-P] limit, [12 L-P set] set_limit, [12 state NAME] state, [form NAME] form, [test] test;
+// [12] character, [12 L-P] limit, [12 L-P set] set_limit, [12 state NAME] state, [test] test, [form NAME] form;
 // null: refused.
 // (Whether the ID is a character the character file defines is not known here.)
 export function section_kind(header) {
   const s = header;
   const [start, stop] = trim(s, 0, s.length);
   if (stop - start === 6 && word_is(s, start + 1, stop - 1, 'test') && s[stop - 1] === ']') return 'test';
-  if (stop - start > 6 && word_is(s, start + 1, start + 5, 'form') && is_space(s[start + 5])) {
+  if (is_form_header(s, start, stop)) {
     const [a, b] = trim(s, start + 5, stop - 1);
     return s[stop - 1] === ']' && form_name(s, a, b) ? 'form' : null;
   }

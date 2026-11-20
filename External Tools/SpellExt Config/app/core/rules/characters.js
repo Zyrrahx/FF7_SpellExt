@@ -1,11 +1,16 @@
 // FF7_SpellExt_Characters.ini: port of sxcfg/rules/characters.py. load_characters (spellext.c 17498),
 // apply_character_key (17276), curve_from_targets (17169), character_ai_key (18144), character_portrait_key (17657 of the
-// source with the game portrait); and new_character_by_name (35141), the scan of this file's names that the weapon and
+// source with the game portrait), forget_flag_parse (19327 of the source of 2026-11-13); and new_character_by_name (35141), the scan of this file's names that the weapon and
 // gear readers make (they read before the characters are set up).
 //
 // Shared state written (r.shared, a Map):
-//   'characters'   Map {id: {name, base (-1 none), copy_of (number or null), line, ai_like, ai_file}} for every
-//                  section the reader takes ([12]..[43], first of each ID), for the limits port (order 90).
+//   'characters'   Map {id: {name, base (-1 none), copy_of (number or null), line, ai_like, ai_file, battle_prefix
+//                  (battle_files in upper case, '' none)}} for every section the reader takes ([12]..[43], first of each
+//                  ID), for the limits port (order 90). (portrait panel) Also portrait (the name as written, '' none),
+//                  portrait_form (0 as written, 1 game:, 2 file:), portrait_number (before the file check: -1 none, -2
+//                  file:), portrait_fit (1/0), portrait_refused (the problem of the last portrait line when it was
+//                  refused, else ''), battle_model (-1 none), base_used (0-8: base, else battle_model when that is 0-8,
+//                  else 0), base_from ('base', 'battle_like' or 'default').
 // Exported for other ports:
 //   character_names(text)            Map {id: name} as new_character_by_name reads them
 //   new_character_by_name(text, w)   the ID a one-word name stands for, or -1
@@ -112,6 +117,100 @@ function _is_alpha(ch) {
 }
 
 const isAlnum_ = ch => (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch === '_';
+
+const FORGET_FORMAT = 'forget_flag must be BANK:BYTE.BIT (such as 3:1.4) or none';
+const FORGET_BASES = new Map([[1, 0], [3, 0x100], [11, 0x200], [13, 0x300], [15, 0x400]]);
+
+// forget_flag_parse (spellext.c 19327): null, or the problem. Bank 1, 3, 11, 13 or 15 (or B, D, F; C and E are banks
+// 12 and 14, refused by the bank's message), byte 0-255, bit 0-7; bank 11 bytes 192-255 and bank 3 bytes 9-11 are
+// refused.
+export function forget_flag_parse(s, p, end) {
+  if (end - p === 4 && word_is(s, p, end, 'none')) return null;     // (p[k] | 0x20 == the letter: only its two cases)
+  let bank = 0, byte = 0, digits = 0;
+  const low = p < end ? s.charCodeAt(p) | 0x20 : 0;
+  if (p < end && low >= 0x62 && low <= 0x66 && p + 1 < end && s[p + 1] === ':') {
+    bank = 11 + low - 0x62;
+    p += 1;
+    digits = 1;
+  } else {
+    while (p < end && s[p] >= '0' && s[p] <= '9' && digits < 3) {
+      bank = bank * 10 + s.charCodeAt(p) - 48;
+      p += 1;
+      digits += 1;
+    }
+  }
+  if (!digits || p >= end || s[p] !== ':') return FORGET_FORMAT;
+  p += 1;
+  const base = FORGET_BASES.has(bank) ? FORGET_BASES.get(bank) : -1;
+  if (base < 0) {
+    return 'forget_flag: the bank must be 1, 3, 11 (B), 13 (D) or 15 (F), the save\'s banks as a field script names them for its bits';
+  }
+  digits = 0;
+  while (p < end && s[p] >= '0' && s[p] <= '9' && digits < 4) {
+    byte = byte * 10 + s.charCodeAt(p) - 48;
+    p += 1;
+    digits += 1;
+  }
+  if (!digits || p >= end || s[p] !== '.') return FORGET_FORMAT;
+  p += 1;
+  if (byte > 255) return 'forget_flag: the byte must be 0 to 255';
+  if (p + 1 !== end || !(s[p] >= '0' && s[p] <= '7')) return 'forget_flag: the bit must be 0 to 7';
+  if (base === 0x200 && byte >= 192) {
+    return 'forget_flag: bytes 192-255 of bank 11 hold a character\'s record (the DLL\'s own place): not a flag';
+  }
+  if (base === 0x100 && byte >= 9 && byte <= 11) return 'forget_flag: bytes 9-11 of bank 3 are the field\'s copy of the party: not a flag';
+  return null;
+}
+
+export const OUTFIT_FIELD = 0;
+export const OUTFIT_BATTLE = 1;
+
+// outfit_when_parse (the OUTFIT PURE block of spellext.c): the value of `field_model_when` (OUTFIT_FIELD) or
+// `battle_files_when` (OUTFIT_BATTLE): null, or the problem, which begins with the key's name. `none`, or
+// BANK:BYTE.BIT (forget_flag's) and then four characters (letters and digits) or two letters.
+export function outfit_when_parse(kind, s, p, end) {
+  const key = kind === OUTFIT_FIELD ? 'field_model_when: ' : 'battle_files_when: ';
+  const want = kind === OUTFIT_FIELD ? 4 : 2;
+  while (p < end && (s[p] === ' ' || s[p] === '\t')) p += 1;
+  while (end > p && (s[end - 1] === ' ' || s[end - 1] === '\t' || s[end - 1] === '\r')) end -= 1;
+  if (end - p === 4 && word_is(s, p, end, 'none')) return null;
+  let bit_end = p;
+  while (bit_end < end && s[bit_end] !== ' ' && s[bit_end] !== '\t') bit_end += 1;
+  let word = bit_end;
+  while (word < end && (s[word] === ' ' || s[word] === '\t')) word += 1;
+  if (bit_end === p || word === end) {
+    return key + 'expected BANK:BYTE.BIT (such as 3:62.0) and then ' +
+           (kind === OUTFIT_FIELD ? 'four characters (ABCD for ABCD.HRC)' : 'two letters (such as zs)') + ', or none';
+  }
+  const problem = forget_flag_parse(s, p, bit_end);
+  if (problem !== null) return key + 'the bit: ' + problem;
+  if (bit_end - p === 4 && word_is(s, p, bit_end, 'none')) {
+    return key + 'a bit is needed before the letters (to clear the key write none alone)';
+  }
+  if (end - word !== want) {
+    return key + (kind === OUTFIT_FIELD ? 'the skeleton must be four characters (ABCD for ABCD.HRC)' :
+                                           'the files must be two letters (such as zs)');
+  }
+  for (let k = 0; k < want; k++) {
+    let ch = s[word + k];
+    if (ch >= 'a' && ch <= 'z') ch = ch.toUpperCase();
+    if (!((ch >= 'A' && ch <= 'Z') || (kind === OUTFIT_FIELD && ch >= '0' && ch <= '9'))) {
+      return key + (kind === OUTFIT_FIELD ? 'a skeleton\'s name may only use letters and digits' :
+                                             'the files\' letters may only be letters');
+    }
+  }
+  return null;
+}
+
+// The letters an accepted outfit_when_parse value gives, in upper case ('' for none).
+export function outfit_when_letters(s, p, end) {
+  while (p < end && (s[p] === ' ' || s[p] === '\t')) p += 1;
+  while (end > p && (s[end - 1] === ' ' || s[end - 1] === '\t' || s[end - 1] === '\r')) end -= 1;
+  if (end - p === 4 && word_is(s, p, end, 'none')) return '';
+  while (p < end && s[p] !== ' ' && s[p] !== '\t') p += 1;
+  while (p < end && (s[p] === ' ' || s[p] === '\t')) p += 1;
+  return s.slice(p, end).toUpperCase();
+}
 
 export function apply_character_key(c, s, key, key_end, value, end) {
   let p = value;
@@ -226,7 +325,13 @@ export function apply_character_key(c, s, key, key_end, value, end) {
     if (end - value !== 2 || !lowA(value) || !lowA(value + 1)) {
       return 'battle_files must be two letters, the prefix of the model\'s files (for example sn for snaa, snab ...)';
     }
+    c.battle_prefix = String.fromCharCode(s.charCodeAt(value) & ~0x20) + String.fromCharCode(s.charCodeAt(value + 1) & ~0x20);
     return null;
+  }
+  if (word_is(s, key, key_end, 'battle_files_when')) {
+    const problem = outfit_when_parse(OUTFIT_BATTLE, s, value, end);
+    if (problem === null) c.battle_when_prefix = outfit_when_letters(s, value, end);     // (kept for finish_forms' clash test)
+    return problem;
   }
   if (word_is(s, key, key_end, 'body_blend')) {
     return parse_yes_no(s, value, end) === null ? 'expected yes or no' : null;
@@ -410,10 +515,29 @@ export function character_portrait_key(s, value, stop) {
   return null;
 }
 
+// (portrait panel) character_portrait_key's result in full: [problem, name, form, number]. A refused line gives the
+// problem with name '' (the DLL clears the portrait), form 0 and number -1; otherwise problem null. `number` is what the
+// DLL has before its file check: -2 for file:, else game_portrait_number (-1: none).
+export function parse_portrait(s, value, stop) {
+  let form = 0;
+  if (stop - value >= 5 && (word_is(s, value, value + 5, 'game:') || word_is(s, value, value + 5, 'file:'))) {
+    form = s[value] === 'g' || s[value] === 'G' ? 1 : 2;
+    value += 5;
+  }
+  const length = stop - value;
+  if (length < 1 || length > 12) return [PORTRAIT_LENGTH, '', 0, -1];
+  for (let k = 0; k < length; k++) {
+    if (!isAlnum_(s[value + k])) return [PORTRAIT_LETTERS, '', 0, -1];
+  }
+  const number = form === 2 ? -2 : game_portrait_number(s, value, stop);
+  if (form === 1 && number < 0) return [PORTRAIT_GAME, '', 0, -1];
+  return [null, s.slice(value, stop), form, number];
+}
+
 function _new_character(ident, line) {
-  return { id: ident, line, base: -1, battle_model: -1, name: 'New', copy_of: null,
+  return { id: ident, line, base: -1, battle_model: -1, name: 'New', copy_of: null, battle_prefix: '', battle_when_prefix: '',
            own_curve_set: new Array(9).fill(false), curve_set: new Array(9).fill(false), ai_keys_here: 0, ai_file: '',
-           ai_like: 0 };
+           ai_like: 0, portrait: '', portrait_form: 0, portrait_number: -1, portrait_fit: 1, portrait_refused: '' };
 }
 
 function _copy(c) {
@@ -467,6 +591,8 @@ export function check(r) {
           if (!ok || p !== stop || v > 3) problem = 'party_slot must be 1, 2 or 3 (or 0 for none)';
         } else if (word_is(s, key, key_end, 'keep_seat')) {
           if (parse_yes_no(s, value, stop) === null) problem = 'expected yes or no';
+        } else if (word_is(s, key, key_end, 'forget_flag')) {
+          problem = forget_flag_parse(s, value, stop);     // (copy_of sets it back to none: nothing kept here)
         } else if (word_is(s, key, key_end, 'copy_of')) {
           [ok, p, v] = parse_number(s, p, stop);
           const frm = ok && p === stop && chars.has(v) ? chars.get(v) : null;
@@ -479,6 +605,7 @@ export function check(r) {
             d.id = own_id;
             d.line = own_line;
             d.copy_of = v;
+            d.portrait_refused = '';          // (portrait panel) a line of the source is not a line of this section
             d.ai_keys_here = 0;
             for (const k of Object.keys(current)) delete current[k];
             Object.assign(current, d);
@@ -497,7 +624,11 @@ export function check(r) {
           if (problem !== UNKNOWN) {
             // the key was one of apply_character_key's
           } else if (word_is(s, key, key_end, 'portrait')) {
-            problem = character_portrait_key(s, value, stop);
+            let pf, pn;
+            [problem, current.portrait, pf, pn] = parse_portrait(s, value, stop);
+            current.portrait_form = pf;
+            current.portrait_number = pn;
+            current.portrait_refused = problem || '';
           } else if (word_is(s, key, key_end, 'field_model')) {
             problem = null;
             const length = stop - value;
@@ -515,11 +646,15 @@ export function check(r) {
                 }
               }
             }
+          } else if (word_is(s, key, key_end, 'field_model_when')) {
+            problem = outfit_when_parse(OUTFIT_FIELD, s, value, stop);
           } else if (word_is(s, key, key_end, 'ai_like') || word_is(s, key, key_end, 'ai')) {
             problem = character_ai_key(current, word_is(s, key, key_end, 'ai_like'), s, value, stop);
           } else if (word_is(s, key, key_end, 'portrait_fit')) {
             problem = null;
-            if (!(word_is(s, value, stop, 'yes') || word_is(s, value, stop, 'no'))) problem = 'expected yes or no';
+            if (word_is(s, value, stop, 'yes')) current.portrait_fit = 1;
+            else if (word_is(s, value, stop, 'no')) current.portrait_fit = 0;
+            else problem = 'expected yes or no';
           } else if (word_is(s, key, key_end, 'join')) {
             problem = null;
             if (!(word_is(s, value, stop, 'load') || word_is(s, value, stop, 'script'))) {
@@ -536,6 +671,8 @@ export function check(r) {
   // After the file: a character without base is built from its own sheet (the DLL logs it as a note).
   for (const ident of [...chars.keys()].sort((a, b) => a - b)) {
     const c = chars.get(ident);
+    c.base_used = c.base >= 0 ? c.base : c.battle_model >= 0 && c.battle_model <= 8 ? c.battle_model : 0;
+    c.base_from = c.base >= 0 ? 'base' : c.battle_model >= 0 && c.battle_model <= 8 ? 'battle_like' : 'default';
     if (c.base < 0) {
       const base = c.battle_model >= 0 && c.battle_model <= 8 ? c.battle_model : 0;
       let borrowed = 0;
@@ -546,7 +683,13 @@ export function check(r) {
   }
   const out = new Map();
   for (const [i, c] of chars) {
-    out.set(i, { name: c.name, base: c.base, copy_of: c.copy_of, line: c.line, ai_like: c.ai_like, ai_file: c.ai_file });
+    out.set(i, { name: c.name, base: c.base, copy_of: c.copy_of, line: c.line, ai_like: c.ai_like, ai_file: c.ai_file,
+                 battle_prefix: c.battle_prefix,
+                 // (the outfit keys) outfit_check_keys drops battle_files_when when there is no battle_files or it names the same files
+                 battle_when_prefix: c.battle_prefix && c.battle_when_prefix !== c.battle_prefix ? c.battle_when_prefix : '',
+                 portrait: c.portrait, portrait_form: c.portrait_form,
+                 portrait_number: c.portrait_number, portrait_fit: c.portrait_fit, portrait_refused: c.portrait_refused,
+                 battle_model: c.battle_model, base_used: c.base_used, base_from: c.base_from });
   }
   r.shared.set('characters', out);
 }

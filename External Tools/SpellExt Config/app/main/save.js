@@ -7,7 +7,8 @@
 import fs from 'node:fs';
 import nodePath from 'node:path';
 import * as safety from '../core/safety.js';
-import { gate, backups_dir, check_write, resolve_in, PathRefused } from './paths.js';
+import { gate, backups_dir, check_write, resolve_in, no_link, PathRefused } from './paths.js';
+import { is_en_path } from '../core/document.js';
 
 export const RENAME_TRIES = 10;
 export const RENAME_PAUSE_MS = 100;
@@ -38,8 +39,10 @@ export function precheck(ws, rel, overwrite) {
     if (readonly_rel(rel)) return rel + ' is shown, not edited, here';
     if (!ws.docs.has(rel)) return rel + ' is not open';
     if (!ws.writable) return 'the config folder is not writable: read-only mode';
-    const [, abs] = gate(ws, rel, { write: true });
+    const [krel, abs] = gate(ws, rel, { write: true });
     safety.check_writable_path(ws.config_dir, abs);
+    // (stage D1, review C2 minor 1) a scene or enemy file is written through no link (workspace.py save)
+    if (is_en_path(krel)) no_link(fs.realpathSync.native(ws.config_dir), krel);
     if (!overwrite && ws.changed_on_disk(rel)) {
       return rel + ' changed on disk since it was opened: reload it (your edits would be lost) or save with overwrite';
     }
@@ -154,8 +157,9 @@ export function save_files(ws, rels, opts) {
   }
   const root = fs.realpathSync.native(ws.config_dir);
   const items = rels.map(rel => {
-    const [, abs] = gate(ws, rel, { write: true });
-    return { rel, abs, data: ws.docs.get(rel).doc.serialize() };
+    const [krel, abs] = gate(ws, rel, { write: true });
+    // (stage D1) a scene or enemy file: its plain joined path (the precheck refused a link on the way)
+    return { rel, abs: is_en_path(krel) ? no_link(root, krel) : abs, data: ws.docs.get(rel).doc.serialize() };
   });
   for (const a of ais) {
     for (const [ext, data] of [['.txt', Buffer.from(a.text, 'latin1')], ['.ai', Buffer.from(a.bytes)]]) {

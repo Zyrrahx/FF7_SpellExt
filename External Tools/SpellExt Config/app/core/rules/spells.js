@@ -7,6 +7,11 @@
 // FF7_SpellExt_Spells.ini       load_spells 13310 with read_spell_file 13213 (FF7_SpellExt_Spells_Test.ini appended),
 //                               apply_key 12857, parse_flags 9890, finish_spell 13124, start_draft 13164,
 //                               warn_reflect_with_hits 9916, apply_flag_changes 9926
+//                               (`script =`: apply_key 15821 and spell_script_value_problem 31412 of the
+//                               source 8f77bb39; the reflect rule of spell_script_rule 31427 as the tool's note)
+//                               (`script_bytes =`, `script_bytes_model =`: Option B: apply_key's two branches,
+//                               spell_bytes_problem, spell_bytes_refused_command, spell_bytes_say and finish_spell's
+//                               part of the source b82c45d6; the checks at the cast are the game's, not forecast)
 //
 // Shared state (Reading.shared, a Map), written by an earlier reader of the same kernel load and read by a later one:
 //   'effect_copies'   Map {number: usable} for every [effect N] section the effects file defines, usable as far as the
@@ -19,8 +24,10 @@
 // whether a renamed name is one of the base's files, whether the copy's files are found, whether a sound number's
 // dword is usable in the running exe, and the summary lines (counts) each reader ends with.
 import { lines, trim, parse_number, word_is, next_word, parse_yes_no, is_space, hex_digit } from '../grammar.js';
-import { register } from '../validate.js';
+import { register, Problem, cfmt } from '../validate.js';
 import { pyFind, pyLower, PyIndexError } from '../py.js';
+// (limits.js imports this module too: these two are only used inside functions, so the cycle is safe)
+import { FORM_OPERANDS, state_bytes } from './limits.js';
 
 export const SPELL_FILE = 'FF7_SpellExt_Spells.ini';
 export const SPELL_TEST_FILE = 'FF7_SpellExt_Spells_Test.ini';
@@ -63,6 +70,54 @@ export const REC_ADDITIONAL_MODIFIER = 0x13;
 export const REC_STATUS = 0x14;
 export const REC_ELEMENT = 0x18;
 export const REC_SPECIAL = 0x1a;
+
+export const SPELL_SCRIPT_REFLECT_MAX = 0x1f;    // the highest slot a reflectable spell may name (an enemy model has 32)
+export const SPELL_SPECIAL_NO_REFLECT = 0x200;   // the record's special word (stored inverted): set = cannot be reflected
+export const SCRIPT_REFUSED = 'script must be 0x1c-0x21, 0x23, 0x25, 0x27, 0x29, 0x2b or 0x2d (0x%lx: %s); ' +
+                              'the spell is kept without it';
+
+// script_bytes (Option B): the caster's own script carried by the spell, lent into its slot 0x1d / 0x1f for one cast
+export const SPELL_BYTES_MAX = 128;       // as a limit's `script` (the DLL's copy is 256 bytes: the position is a byte)
+export const SPELL_BYTES_SPELLS = 64;     // spells that may carry script_bytes (the DLL's table); the 65th is kept without it
+// the commands a cast may use (spell_bytes_allowed): those of the game's own cast scripts, and the hold c9 / ca;
+// animation bytes 00-2b besides
+export const SPELL_BYTES_CAST = Object.freeze([0xe8, 0xec, 0xea, 0xfc, 0xed, 0xfa, 0xe5, 0xe6, 0xa4, 0xa5, 0xf4, 0xf3,
+  0xc9, 0xca, 0xee]);
+export const SPELL_BYTES_BYTES_MAX = "a spell's script_bytes may be up to 128 bytes";
+export const SPELL_BYTES_LIMIT_KEY = "script_bytes is a spell file key: a limit has `script`";
+export const SPELL_BYTES_MODEL_LIMIT_KEY = "script_bytes_model is a spell file key";
+export const SPELL_BYTES_REFUSED = "script_bytes: %s; the spell is kept without it";
+export const SPELL_BYTES_BOTH = "spell file line %d: spell %d has script_bytes and script: script (0x%x) is not used";
+export const SPELL_BYTES_FULL = "spell file line %d: spell %d: script_bytes not used: only %d spells may carry it";
+export const SPELL_BYTES_MODEL_UNUSED = "spell file line %d: spell %d: script_bytes_model is not used: the spell has no script_bytes";
+export const SPELL_BYTES_MODEL = "script_bytes_model is the caster's script file in the battle archive's naming, its two letters " +
+  "or its name (xy or XYAB), or none";
+export const SPELL_BYTES_SHORT = "a cast is at least 3 bytes (e8, ec, ee)";
+export const SPELL_BYTES_FIRST = "a cast starts with e8, the preload of the spell's effect files";
+export const SPELL_BYTES_B6_AA = "b6 NN aa are an enemy's (a 60-list task and the camera's hold, no party script uses them): write " +
+  "NN as a plain animation byte and drop aa";
+export const SPELL_BYTES_RELOAD = "XX reloads the model (a2 / ac)";
+export const SPELL_BYTES_JUMP = "XX jumps (to a mark of the script)";
+export const SPELL_BYTES_NEVER = "XX never finishes (fe c0 / ff): the battle would wait on it";
+export const SPELL_BYTES_F1 = "f1 holds the script on its own byte after the action: the slot is put back under it";
+export const SPELL_BYTES_W9E = "9e waits on the target and the effects: no game cast does, and a 9e end once locked a battle";
+export const SPELL_BYTES_OTHER = "XX is not one of the commands the game's own cast scripts use (e8 ec ea fc ed fa e5 e6 a4 a5 f4 " +
+  "f3 c9 ca ee)";
+export const SPELL_BYTES_OPERANDS = "the operands of XX run past the end";
+export const SPELL_BYTES_PACK = "animation XX is a limit pack's (2c-33): a spell loads no pack";
+export const SPELL_BYTES_PAST_2B = "animation XX is past 2b: only the body animations that have a weapon track in the party layout, " +
+  "00-2b";
+export const SPELL_BYTES_CA_FIRST = "ca jumps to just after a c9: there is none before it";
+export const SPELL_BYTES_EE_EARLY = "ee before the last byte: a cast ends with ee, once";
+export const SPELL_BYTES_EE_LAST = "the last command is not ee: a cast ends with ee, once";
+export const SPELL_BYTES_E8_TWICE = "e8 more than once: a cast has one preload";
+export const SPELL_BYTES_EC_TWICE = "ec more than once: a cast has one effect step";
+export const SPELL_BYTES_EC_NONE = "no ec: a cast has one effect step";
+export const SPELL_BYTES_C9_OPERAND = "a byte c9 inside a command's operand (f4 c9) comes before the hold's c9: ca would jump there";
+export const SPELL_BYTES_NO_WAIT = "nothing between c9 and ca waits a frame: while the effect loads the hold would repeat for ever " +
+  "within one frame (the game's own: c9 f4 01 f3 ca, or c9 07 ca)";
+export const SPELL_BYTES_EC_HOLD = "ec inside the hold: the effect step could run again";
+export const SPELL_BYTES_ED = "ed steps the caster forward, one step more each cast: only fa puts it home (an fa after it)";
 
 const isLetterDigit = c => (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9');
 
@@ -510,6 +565,10 @@ export class SpellDraft {
     this.status_chance = -1;
     this.flag_add = [0, 0, 0, 0];
     this.flag_remove = [0, 0, 0, 0];
+    this.script = 0;              // `script =` (0: not given), the DLL's spell.script
+    this.script_line = 0;         // the line that set it (for the tool's reflect note)
+    this.script_bytes = null;     // `script_bytes =`: the accepted bytes (an array), or null
+    this.script_bytes_model = ''; // `script_bytes_model =`: two letters, upper case ('' = not given)
   }
 
   // Python's list assignment: an offset past the record is an IndexError (reached by dword_ffffffff, whose offset + size
@@ -521,6 +580,98 @@ export class SpellDraft {
       this.is_set[offset + i] = true;
     }
   }
+}
+
+// spell_script_value_problem: null if `value` may be a spell's `script`, else why not.
+export function spell_script_value_problem(value) {
+  if (value < 0x1c) {
+    return '0-0x1b are the idles, the KO pose, the reactions the game plays by itself, Defend, Attack and the Cut turns';
+  }
+  if (value >= 0x22 && value <= 0x2c && !(value & 1)) {
+    return 'the game plays the next number when the cast has several targets (008ff1e8): name that one or another';
+  }
+  if (value <= 0x2d) return null;
+  if (value <= 0x3b && value !== 0x33) {
+    return 'the game plays its own script there for every model (0x2e-0x32, 0x34-0x3b); 0x34 also skips the ' +
+           'silence and frog checks';
+  }
+  return "0x33 is the reaction none; 0x3c-0x49 are limits and follow-ups, written by the DLL at a limit's set-up; a model has 74";
+}
+
+// spell_bytes_say: `text` with its first XX replaced by `value` in hexadecimal (two digits).
+export function spell_bytes_say(text, value) {
+  const i = text.indexOf('XX');
+  if (i < 0) return text;
+  const digits = '0123456789abcdef';
+  return text.slice(0, i) + digits[value >> 4 & 15] + digits[value & 15] + text.slice(i + 2);
+}
+
+// spell_bytes_refused_command: why command byte `op` is not one of a cast's (the likely mistakes by name).
+export function spell_bytes_refused_command(op) {
+  if (op === 0xb6 || op === 0xaa) return SPELL_BYTES_B6_AA;
+  if (op === 0xa2 || op === 0xac) return spell_bytes_say(SPELL_BYTES_RELOAD, op);
+  if (op === 0xc1 || op === 0xb3 || op === 0xce) return spell_bytes_say(SPELL_BYTES_JUMP, op);
+  if (op === 0xfe || op === 0xff) return spell_bytes_say(SPELL_BYTES_NEVER, op);
+  if (op === 0xf1) return SPELL_BYTES_F1;
+  if (op === 0x9e) return SPELL_BYTES_W9E;
+  return spell_bytes_say(SPELL_BYTES_OTHER, op);
+}
+
+// spell_bytes_problem: null if the bytes `b` (an array) may be a spell's script_bytes, else why not. Walked command by
+// command with form_operands.
+export function spell_bytes_problem(b) {
+  const length = b.length;
+  if (length < 3) return SPELL_BYTES_SHORT;
+  if (length > SPELL_BYTES_MAX) return SPELL_BYTES_BYTES_MAX;
+  if (b[0] !== 0xe8) return SPELL_BYTES_FIRST;
+  const at = [];                 // where each command (or animation byte) starts
+  let e8 = 0, ec = 0, c9 = 0, first_ca = -1, last_ca = -1;
+  for (let i = 0; i < length;) {
+    const op = b[i];
+    let n = 1;
+    if (op < 0x8e) {
+      if (op >= 0x2c && op <= 0x33) return spell_bytes_say(SPELL_BYTES_PACK, op);
+      if (op > 0x2b) return spell_bytes_say(SPELL_BYTES_PAST_2B, op);
+    } else {
+      if (!SPELL_BYTES_CAST.includes(op)) return spell_bytes_refused_command(op);
+      n += FORM_OPERANDS[op - 0x8e];
+      if (i + n > length) return spell_bytes_say(SPELL_BYTES_OPERANDS, op);
+      e8 += op === 0xe8 ? 1 : 0;
+      ec += op === 0xec ? 1 : 0;
+      c9 += op === 0xc9 ? 1 : 0;
+      if (op === 0xca) {
+        if (!c9) return SPELL_BYTES_CA_FIRST;
+        if (first_ca < 0) first_ca = i;
+        last_ca = i;
+      }
+      if (op === 0xee && i !== length - 1) return SPELL_BYTES_EE_EARLY;
+    }
+    at.push(i);
+    i += n;
+  }
+  const last = at[at.length - 1];
+  if (b[last] !== 0xee || last !== length - 1) return SPELL_BYTES_EE_LAST;
+  if (e8 !== 1) return SPELL_BYTES_E8_TWICE;
+  if (ec !== 1) return ec ? SPELL_BYTES_EC_TWICE : SPELL_BYTES_EC_NONE;
+  if (first_ca >= 0) {
+    // ca (while an effect loads) searches the bytes from 0 for the first BYTE c9, operands included
+    const first_c9 = b.indexOf(0xc9);
+    if (!at.includes(first_c9)) return SPELL_BYTES_C9_OPERAND;
+    let waits = false, armed = false;
+    for (const k of at) {
+      const op = b[k];
+      if (k <= first_c9 || k >= first_ca) continue;
+      if (op <= 0x2b) waits = true;
+      else if (op === 0xf4) armed = b[k + 1] >= 1;
+      else if (op === 0xf3 && armed) waits = true;
+    }
+    if (!waits) return SPELL_BYTES_NO_WAIT;
+    if (at.some(k => b[k] === 0xec && first_c9 < k && k < last_ca)) return SPELL_BYTES_EC_HOLD;
+  }
+  for (let j = 0; j < at.length; j++) {
+    if (b[at[j]] === 0xed && !at.slice(j + 1).some(m => b[m] === 0xfa)) return SPELL_BYTES_ED;
+  }
+  return null;
 }
 
 // apply_key: null, or what was wrong (the DLL's string). The limits file's reader calls it too (spellext.c 26989),
@@ -674,6 +825,47 @@ export function apply_key(d, s, key, key_end, value, end, shared, spell_file_rea
     }
     return null;
   }
+  if (word_is(s, key, key_end, 'script')) {
+    // the caster's model script; a refused value leaves the key as it was
+    if (word_is(s, value, end, 'none')) {
+      d.script = 0;
+      return null;
+    }
+    [ok, p, number] = parse_number(s, p, end);
+    if (!ok || p !== end) {
+      return 'script must be a model script number (0x1c-0x21, 0x23, 0x25, 0x27, 0x29, 0x2b or 0x2d), or none';
+    }
+    const why = spell_script_value_problem(number);
+    if (why !== null) return cfmt(SCRIPT_REFUSED, number, why);
+    d.script = number;
+    return null;
+  }
+  if (word_is(s, key, key_end, 'script_bytes')) {
+    // the caster's own script as bytes (Option B); a refused value leaves the key as it was
+    if (!spell_file_reading) return SPELL_BYTES_LIMIT_KEY;
+    if (word_is(s, value, end, 'none')) {
+      d.script_bytes = null;
+      return null;
+    }
+    let [why, b] = state_bytes(s, SPELL_BYTES_MAX, value, end);
+    if (why === null) why = spell_bytes_problem(b);
+    if (why !== null) return cfmt(SPELL_BYTES_REFUSED, why);
+    d.script_bytes = b;
+    return null;
+  }
+  if (word_is(s, key, key_end, 'script_bytes_model')) {
+    // the bytes play only on a caster whose script file is XY..AB (its two letters, or the whole name)
+    const letter = k => { const c = s.charCodeAt(k) | 0x20; return c >= 0x61 && c <= 0x7a; };
+    const whole = end - value === 4 && (s.charCodeAt(value + 2) | 0x20) === 0x61 && (s.charCodeAt(value + 3) | 0x20) === 0x62;
+    if (!spell_file_reading) return SPELL_BYTES_MODEL_LIMIT_KEY;
+    if (word_is(s, value, end, 'none')) {
+      d.script_bytes_model = '';
+      return null;
+    }
+    if ((end - value !== 2 && !whole) || !letter(value) || !letter(value + 1)) return SPELL_BYTES_MODEL;
+    d.script_bytes_model = String.fromCharCode(s.charCodeAt(value) & ~0x20, s.charCodeAt(value + 1) & ~0x20);
+    return null;
+  }
   if (word_is(s, key, key_end, 'list')) {
     if (word_is(s, value, end, 'summon') || word_is(s, value, end, 'magic')) return null;
     return 'list must be magic or summon';
@@ -781,9 +973,57 @@ export function finish_spell(r, d, used, where) {
                  'spell', d.id, d.line, rec[REC_ADDITIONAL_MODIFIER]);
     }
   }
+  spell_bytes_take(r, d, where);
+  script_reflect_note(r, d, where);
   used.add(d.id);
   if (!r.shared.has('spells_loaded')) r.shared.set('spells_loaded', []);
   r.shared.get('spells_loaded').push(d.id);
+}
+
+// finish_spell's part for script_bytes (a spell that loads): its entry in the DLL's table of 64 (the 65th is kept
+// without it, one line); with `script` as well, the bytes are used and `script` is not (one line); a
+// script_bytes_model without script_bytes is not used (one line).
+export function spell_bytes_take(r, d, where) {
+  const [f, ln] = where(d.line);
+  if (!r.shared.has('spells_with_bytes')) r.shared.set('spells_with_bytes', []);
+  const carried = r.shared.get('spells_with_bytes');
+  if (d.script_bytes !== null && carried.length >= SPELL_BYTES_SPELLS) {
+    r.log_with({ file: f }, ln, SPELL_BYTES_FULL, d.line, d.id, SPELL_BYTES_SPELLS);
+    d.script_bytes = null;
+  } else if (d.script_bytes !== null) {
+    if (d.script) {
+      r.log_with({ file: f }, ln, SPELL_BYTES_BOTH, d.line, d.id, d.script);
+      d.script = 0;
+    }
+    carried.push(d.id);
+  } else if (d.script_bytes_model) {
+    r.log_with({ file: f }, ln, SPELL_BYTES_MODEL_UNUSED, d.line, d.id);
+  }
+}
+
+// Whether the loaded spell can be reflected (its special word's bit 0x0200 clear; the word is stored inverted), as far
+// as the file decides it: true or false, or null when the base's bytes decide (not forecast). The sum of finish_spell
+// (apply_flag_changes), for the one bit.
+export function final_reflectable(d) {
+  const add = d.flag_add[3] & SPELL_SPECIAL_NO_REFLECT;
+  const remove = d.flag_remove[3] & SPELL_SPECIAL_NO_REFLECT;
+  let flag;
+  if (d.is_set[REC_SPECIAL + 1]) flag = !((d.value[REC_SPECIAL + 1] << 8) & SPELL_SPECIAL_NO_REFLECT);
+  else if (add || remove) flag = false;             // the base's bit, overruled by the change
+  else return null;
+  return !!((flag || add) && !remove);
+}
+
+export const SCRIPT_REFLECT_NOTE = "script = 0x%x on spell %d: the spell can be reflected, so the DLL will not use this " +
+  "script at the cast (the command's own plays, and the log says why): a reflectable spell may name 0x1c-0x1f only, " +
+  'or add special = -reflectable';
+
+// The tool's own note (the DLL logs nothing at reading): a reflectable spell's `script` above 0x1f is not used at the
+// cast (spell_script_rule: a bounce gives the number to the reflector, and an enemy's model has 32).
+export function script_reflect_note(r, d, where) {
+  if (d.script <= SPELL_SCRIPT_REFLECT_MAX || !final_reflectable(d)) return;
+  const [f, ln] = where(d.script_line);
+  r.problems.push(new Problem(f || r.file, ln, null, cfmt(SCRIPT_REFLECT_NOTE, d.script, d.id), 'tool'));
 }
 
 export function check_spells(r) {
@@ -811,6 +1051,7 @@ export function check_spells(r) {
   const where = line => (test_first && line >= test_first ? [SPELL_TEST_FILE, line - test_first + 1] : [null, line]);
 
   r.shared.set('spells_loaded', []);
+  r.shared.set('spells_with_bytes', []);
   const used = new Set();
   let d = null;
   for (const ln of lines(s)) {
@@ -837,6 +1078,7 @@ export function check_spells(r) {
         const [ks, ke] = trim(s, start, equals);
         const [vs, ve] = trim(s, equals + 1, stop);
         problem = apply_key(d, s, ks, ke, vs, ve, r.shared);
+        if (problem === null && d.script && word_is(s, ks, ke, 'script')) d.script_line = n;
       }
     }
     if (problem) {

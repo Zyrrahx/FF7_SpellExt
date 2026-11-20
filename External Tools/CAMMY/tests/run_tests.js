@@ -6,7 +6,8 @@
 'use strict';
 const fs = require('fs'), path = require('path');
 const C = require('../cammy_core.js');
-const BATTLE = process.argv[2] || '/run/media/binah/Data/SteamLibrary/steamapps/common/FINAL FANTASY VII/data/lang-en/battle';
+const BATTLE = process.argv[2];
+if (!BATTLE) { console.log('usage: node tests/run_tests.js <the game\'s battle folder, e.g. .../FINAL FANTASY VII/data/lang-en/battle>'); process.exit(2); }
 let checks = 0, failed = 0;
 function ok(cond, what) { checks++; if (!cond) { failed++; if (failed <= 30) console.log('FAILED: ' + what); } }
 const same = (a, b) => C.sameScript(a, b);

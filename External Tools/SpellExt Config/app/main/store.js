@@ -1,14 +1,18 @@
 // The app's own settings (design 1.8): settings.json in Electron's userData folder, or beside the app's resources
 // folder when a file portable.txt is there. Plain functions (no Electron): main.js hands in the folder.
 //
-// { last_folder, recent: [{path, last_opened}], kernel, confirm_save, live_auto, open_last, window: {x,y,width,height} }
+// { last_folder, recent: [{path, last_opened}], kernel, confirm_save, live_auto, open_last, window: {x,y,width,height},
+//   scene_bin, battle_lgp, menu_lgp }   (formation diagrams, model preview, portraits: a scene.bin, a battle.lgp, a menu archive read in place of the game
+//   folder's; null: the game folder's)
+// (review F1, minor 4) A settings.json that is there but cannot be read, or is not a JSON object, is never written over
+// (its keys would be lost): write() refuses with EUNREADABLE, and `problem` says why.
 // Written with a .tmp opened 'wx' and a rename, as the config files are.
 import fs from 'node:fs';
 import nodePath from 'node:path';
 
 export const RECENT_KEPT = 5;
 export const DEFAULTS = Object.freeze({ last_folder: null, recent: [], kernel: null, confirm_save: true, live_auto: false,
-                                        open_last: false, window: null });
+                                        open_last: false, window: null, scene_bin: null, battle_lgp: null, menu_lgp: null });
 
 // The folder settings.json lives in: beside `resources` when portable.txt is there, else `user_data`.
 export function settings_dir(user_data, resources_path) {
@@ -25,14 +29,30 @@ export class Store {
     this.path = nodePath.join(dir, 'settings.json');
     this.data = Object.assign({}, DEFAULTS, { recent: [] });
     this.problem = null;
+    this.unreadable = false;
     try {
       const got = JSON.parse(fs.readFileSync(this.path, 'utf8'));
       if (got && typeof got === 'object' && !Array.isArray(got)) {
         for (const k of Object.keys(DEFAULTS)) if (k in got) this.data[k] = got[k];
         if (!Array.isArray(this.data.recent)) this.data.recent = [];
+        // (review F2, minor 4) a game file of the settings that is not a path is said, not passed over
+        const bad = ['scene_bin', 'battle_lgp', 'menu_lgp'].filter(k => this.data[k] !== null && this.data[k] !== undefined && typeof this.data[k] !== 'string');
+        for (const k of bad) this.data[k] = null;
+        if (bad.length) this.problem = bad.map(k => k + ' in settings.json is not a path: not used, the game folder\'s file is read').join('; ');
+      } else {
+        this.unreadable = true;
+        this.problem = 'settings.json is not a JSON object; defaults used, and it is not written over';
       }
     } catch (e) {
-      if (e.code !== 'ENOENT') this.problem = 'settings.json could not be read (' + (e.code || e.name) + '); defaults used';
+      // a file that is there and cannot be read or parsed is kept (unreadable); no file (ENOENT, or a folder that cannot
+      // hold one: ENOTDIR) is the defaults, written at the first change as before
+      if (e.code !== 'ENOENT') {
+        let there = false;
+        try { there = fs.statSync(this.path).isFile(); } catch (err) { there = false; }
+        this.unreadable = there;
+        this.problem = 'settings.json could not be read (' + (e.code || e.name) + '); defaults used' +
+          (there ? ', and it is not written over' : '');
+      }
     }
   }
 
@@ -57,6 +77,10 @@ export class Store {
   }
 
   write() {
+    if (this.unreadable) {
+      throw Object.assign(new Error('settings.json is not written: it could not be read (fix it or rename it; the change ' +
+                                    'holds until the app closes)'), { code: 'EUNREADABLE' });
+    }
     fs.mkdirSync(this.dir, { recursive: true });
     const tmp = this.path + '.tmp';
     try { fs.unlinkSync(tmp); } catch (e) { if (e.code !== 'ENOENT') throw e; }

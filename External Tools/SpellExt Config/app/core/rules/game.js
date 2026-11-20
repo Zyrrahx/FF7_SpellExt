@@ -1,7 +1,8 @@
-// FF7_SpellExt_Game.ini: port of sxcfg/rules/game.py. load_game_settings (spellext.c 37832) and its helpers
-// box_key_line (6910), fields_key_line (19172) with fields_parse_signed (19145), bl_key_line (37673), test_battle_value
-// (37763), wide_items_key (5201), wide_rows_key (5215), parse_yes_no (35278), enemies_key_line and battle_menu_key_line
-// (source e009e261: 43014, 46293).
+// FF7_SpellExt_Game.ini: port of sxcfg/rules/game.py. load_game_settings (spellext.c 50962) and its helpers
+// box_key_line (7961), fields_key_line (23712) with fields_parse_signed, bl_key_line (45925), test_battle_value
+// (46028), test_party_damage_value (11514), enemies_key_line (46137), battle_menu_key_line (49592), shop_item_number_ok
+// (44739), wide_items_key, wide_rows_key, parse_yes_no. After the file: test_battle_settle's refusal of a DLL scene's
+// battle with enemies off (46102), as a note (it is read at start-up: a later Re-init keeps the run's enemies).
 import { lines, trim, parse_number, word_is, next_word, parse_yes_no, is_space } from '../grammar.js';
 import { register } from '../validate.js';
 import { pyFind } from '../py.js';
@@ -31,7 +32,8 @@ export const FIELD_BUFFER_MOST = 0x04000000;
 export const FIELDS_FILE_NAME_MAX = 64;
 export const FIELDS_FALLBACK_LOW = 65;
 export const FIELDS_FALLBACK_HIGH = 786;
-export const TEST_BATTLE_LAST = 16383;   // (enemies) 1024-16383: a DLL scene's battle; scene:formation up to 4095:3
+export const TEST_BATTLE_LAST = 16383, TEST_BATTLE_GAME_LAST = 1023;
+export const TEST_PARTY_DAMAGE_MAX = 9999999;
 
 export function wide_item_number(n) {
   return WIDE_ITEM_FIRST <= n && n <= WIDE_ITEM_LAST;
@@ -39,6 +41,12 @@ export function wide_item_number(n) {
 
 export function gear_wide_kind(n) {
   return (n < WIDE_GEAR_FIRST || n > WIDE_GEAR_LAST) ? -1 : Math.floor((n - WIDE_GEAR_FIRST) / GEAR_WIDE_BAND);
+}
+
+// shop_item_number_ok (44739): an item entry of shop_add and of the shop file's add: 0-511, a wide item's number
+// 1024-9999, or a piece of wide gear's 10000-27999 (the band only: the definitions are looked at later).
+export function shop_item_number_ok(n) {
+  return n <= 511 || wide_item_number(n) || (n <= WIDE_GEAR_LAST && gear_wide_kind(n) >= 0);
 }
 
 export const BOX_KEYS = Object.freeze([
@@ -195,14 +203,24 @@ export function test_battle_value(s, value, stop) {
   return first * 4 + formation;
 }
 
-export function enemies_key_line(s, start, key_end, value, stop) {
-  if (!word_is(s, start, key_end, 'enemies')) return [0, null];
-  if (['on', 'yes', 'off', 'no'].some(w => word_is(s, value, stop, w))) return [1, null];
-  return [-1, 'enemies must be on or off: off is used'];
+// test_party_damage_value (11514): the amount (0: off), or null on a mistake.
+export function test_party_damage_value(s, value, stop) {
+  if (word_is(s, value, stop, 'off') || word_is(s, value, stop, 'no')) return 0;
+  if (stop - value > 9) return null;     // (ten decimal digits or more could wrap the 32-bit reading)
+  const [ok, p, n] = parse_number(s, value, stop);
+  if (!ok || p !== stop || n > TEST_PARTY_DAMAGE_MAX) return null;
+  return n;
 }
 
-// battle_menu_key_line: key, the two words, the fault; the four on/off keys also take yes and no
-export const BATTLE_MENU_KEYS = [
+// enemies_key_line (46137): [0 not this key, 1 read, -1 a mistake; the fault; the value asked (1 on, 0 off)].
+export function enemies_key_line(s, start, key_end, value, stop) {
+  if (!word_is(s, start, key_end, 'enemies')) return [0, null, 0];
+  if (word_is(s, value, stop, 'on') || word_is(s, value, stop, 'yes')) return [1, null, 1];
+  if (word_is(s, value, stop, 'off') || word_is(s, value, stop, 'no')) return [1, null, 0];
+  return [-1, 'enemies must be on or off: off is used', 0];
+}
+
+export const BATTLE_MENU_KEYS = Object.freeze([
   ['battle_menu', 'on', 'off', 'battle_menu must be on or off: on is used'],
   ['battle_menu_test', 'on', 'off', 'battle_menu_test must be on or off: on is used'],
   ['battle_menu_rewards', 'on', 'off', 'battle_menu_rewards must be on or off: battle_menu_test decides'],
@@ -210,20 +228,31 @@ export const BATTLE_MENU_KEYS = [
   ['battle_menu_restore', 'party', 'off', 'battle_menu_restore must be party or off: battle_menu_test decides'],
   ['battle_menu_fast', 'on', 'off', 'battle_menu_fast must be on or off: off is used'],
   ['battle_menu_locked', 'refuse', 'allow', 'battle_menu_locked must be allow or refuse: allow is used'],
-];
+]);
 
+// battle_menu_key_line (49592): [0 not this block's key, 1 read, -1 a mistake; the fault]. yes and no are also taken
+// by battle_menu, battle_menu_test, battle_menu_rewards and battle_menu_fast (the C's i 0, 1, 2, 5).
 export function battle_menu_key_line(s, start, key_end, value, stop) {
-  const i = BATTLE_MENU_KEYS.findIndex(k => word_is(s, start, key_end, k[0]));
+  let i = -1;
+  for (let k = 0; k < BATTLE_MENU_KEYS.length; k++) {
+    if (word_is(s, start, key_end, BATTLE_MENU_KEYS[k][0])) {
+      i = k;
+      break;
+    }
+  }
   if (i < 0) return [0, null];
   const [, yes, no, fault] = BATTLE_MENU_KEYS[i];
-  const words = [yes, no].concat([0, 1, 2, 5].includes(i) ? ['yes', 'no'] : []);
-  if (words.some(w => word_is(s, value, stop, w))) return [1, null];
+  const plain = i === 0 || i === 1 || i === 2 || i === 5;
+  if (word_is(s, value, stop, yes) || (plain && word_is(s, value, stop, 'yes'))) return [1, null];
+  if (word_is(s, value, stop, no) || (plain && word_is(s, value, stop, 'no'))) return [1, null];
   return [-1, fault];
 }
 
 export function check(r) {
   const s = r.text;
   let shop_add_total = 0;
+  let test_battle = -1, test_battle_line = 0;     // (test_battle_settle) the reading's last word on it
+  let enemies_asked = 0;
   for (const ln of lines(s)) {
     let start = ln.start;
     let stop = ln.stop;
@@ -325,10 +354,10 @@ export function check(r) {
           }
           let ident;
           [ok, p, ident] = parse_number(s, p, word_end);
-          bad = !ok || (ident > (materia ? 254 : 511) && (materia || !wide_item_number(ident))) || p !== word_end;
+          bad = !ok || (materia ? ident > 254 : !shop_item_number_ok(ident)) || p !== word_end;
         }
         if (bad || count_entries === SHOP_ADD_MAX) {
-          r.log(n, 'game file line %d: shop_add takes entries like 37:243 (shop 0 to 79, item ID 0 to 511 or a wide item\'s number 1024 to 9999) or 37:m49 (a materia ID)', n);
+          r.log(n, 'game file line %d: shop_add takes entries like 37:243 (shop 0 to 79, item ID 0 to 511, a wide item\'s number 1024 to 9999 or a wide weapon, armour or accessory\'s number 10000 to 27999) or 37:m49 (a materia ID)', n);
           break;
         }
         count_entries += 1;
@@ -336,8 +365,15 @@ export function check(r) {
       }
       shop_add_total = count_entries;
     } else if (word_is(s, start, key_end, 'test_battle')) {
-      if (test_battle_value(s, value, stop) === null) {
+      test_battle = test_battle_value(s, value, stop);
+      test_battle_line = n;
+      if (test_battle === null) {
+        test_battle = -1;
         r.log(n, 'game file line %d: test_battle takes a battle number 1 to 16383 (like 16; 1024 and up: a DLL scene\'s, with enemies = on), or scene:formation (like 4:0; scene 0 to 4095, formation 0 to 3), or off: the line gives nothing', n);
+      }
+    } else if (word_is(s, start, key_end, 'test_party_damage')) {
+      if (test_party_damage_value(s, value, stop) === null) {
+        r.log(n, 'game file line %d: test_party_damage takes a number 1 to %d (like 9999), or off: the line gives nothing', n, TEST_PARTY_DAMAGE_MAX);
       }
     } else if (word_is(s, start, key_end, 'seats')) {
       let v;
@@ -360,6 +396,10 @@ export function check(r) {
       if (stop - value > 6 || !ok || p !== stop || !(rows === 320 || (rows >= WIDE_V2_ROWS && rows <= WIDE_ROWS_MAX && !(rows & 1)))) {
         r.log(n, 'game file line %d: wide_rows must be 320 or an even number from 510 to %d: 510 is used', n, WIDE_ROWS_MAX);
       }
+    } else if (word_is(s, start, key_end, 'wide_throw')) {
+      if (!['on', 'off'].some(w => word_is(s, value, stop, w))) {
+        r.log(n, 'game file line %d: wide_throw must be on or off: on is used', n);
+      }
     } else if (word_is(s, start, key_end, 'test_fill_rows')) {
       let rows;
       [ok, p, rows] = parse_number(s, value, stop);
@@ -373,7 +413,9 @@ export function check(r) {
     } else {
       let handled = false;
       for (const helper of [box_key_line, fields_key_line, bl_key_line, enemies_key_line, battle_menu_key_line]) {
-        const [answer, fault] = helper(s, start, key_end, value, stop);
+        const got = helper(s, start, key_end, value, stop);
+        const [answer, fault] = got;
+        if (helper === enemies_key_line && answer) enemies_asked = got[2];       // (a mistake: off)
         if (answer !== 0) {
           if (answer < 0) r.log(n, 'game file line %d: %s', n, fault);
           handled = true;
@@ -398,6 +440,11 @@ export function check(r) {
         }
       }
     }
+  }
+  // test_battle_settle (after the file; enemies is the run's, taken at start-up: forecast from this file)
+  if (test_battle > TEST_BATTLE_GAME_LAST && !enemies_asked) {
+    r.log_with({ kind: 'note' }, test_battle_line, 'test_battle = %ld (scene %ld, formation %ld) is a DLL scene\'s battle (1024 and up): it needs enemies = on in the game file (read at start-up); test_battle is off',
+               test_battle, test_battle >> 2, test_battle & 3);
   }
 }
 

@@ -6,6 +6,10 @@
 // weapons).
 // (Kernel overrides) a section [128] to [255] changes that game weapon: read with the keys of a new one (base and
 // give_on_load refused), not put in weapons_defined; the game decides "the weapon table was not moved" (not forecast).
+// (Custom icons) `icon = file:NAME.png|tex` beside the icon words (gearcommon.ci_file_problem, ci_take). The "throw = yes is
+// not possible" line is the DLL's only while wide_items is not on (gearcommon.wide_items_on); with it on the DLL's other
+// line ("it cannot be thrown in this run (wide throw is not on ...)") depends on the Throw gate, which is decided at
+// start-up, and is not forecast.
 // Not forecast (the game decides): a wide weapon refused for want of memory; a kernel base's own record (its equip
 // mask, which with no name, no roster and no `equip` decides "already used": taken as non-zero).
 import { lines, trim, parse_number, word_is, next_word, parse_yes_no, hex_digit } from '../grammar.js';
@@ -33,6 +37,9 @@ export class Draft {
     this.throwable = -1;
     this.roster = 0;
     this.name_set = false;
+    this.icon_file = '';            // (custom icons) icon = file:NAME: the name checked; '' none
+    this.icon_line = 0;             // the line of the key that gave it
+    this.cur_line = 0;              // the line apply_weapon_key is reading
     this.mask_set = new Map();      // offset -> byte written by `equip` or a raw key, for the equip mask's two bytes
   }
 }
@@ -73,10 +80,19 @@ export function apply_weapon_key(d, s, key, key_end, value, end, shared) {
     const b = gc.parse_kernel_weapon(s, value, end);
     if (b === null || b >= WEAPON_COUNT_ORIGINAL) return 'throw_like must be a kernel weapon: 0 to 127, or its item ID 128 to 255';
   } else if (word_is(s, key, key_end, 'icon')) {
+    if (gc.icon_is_file(s, value, end)) {
+      // (custom icons) a picture, beside the icon words (a section may give both): shown when it can be
+      const [problem, name] = gc.ci_file_problem(s, value, end);
+      if (problem === null) {
+        d.icon_file = name;
+        d.icon_line = d.cur_line;
+      }
+      return problem;
+    }
     if (!ICON_NAMES.some(w => word_is(s, value, end, w))) {
       const b = gc.parse_kernel_weapon(s, value, end);
       if (b === null || b >= WEAPON_COUNT_ORIGINAL) {
-        return 'icon must be sword, glove, gunarm, headdress, staff, spear, shuriken, megaphone, gun, armour, accessory, item, or a kernel weapon';
+        return gc.ICON_WORDS;
       }
     }
   } else if (word_is(s, key, key_end, 'price')) {
@@ -146,6 +162,7 @@ export function finish_weapon(r, d, used) {
   if (d === null) return 0;
   if (gc.is_kernel_gear_item(0, d.id)) {
     used.kernel.add(d.id);        // (kernel overrides) finish_kernel_weapon: that game weapon's own entry
+    gc.ci_take(r, d.icon_file, 'weapon', d.icon_line);
     return 1;
   }
   if (d.base < 0) {
@@ -154,10 +171,12 @@ export function finish_weapon(r, d, used) {
   }
   if (d.id >= gc.WIDE_GEAR_FIRST) {
     // the game decides: "*** wide weapon %d is NOT defined: no memory ..." (not forecast)
-    if (d.throwable === 1) {
+    if (d.throwable === 1 && !gc.wide_items_on(r.shared)) {
+      // (wide throw) with wide_items on the DLL says nothing here (the Throw gate's own line, not forecast)
       r.log(d.line, 'weapon file line %d: wide weapon %d: throw = yes is not possible for a weapon numbered from 10000 in this version: it cannot be thrown', d.line, d.id);
     }
     used.wide.add(d.id);
+    gc.ci_take(r, d.icon_file, 'weapon', d.icon_line);
     return 1;
   }
   // weapon_names[w][0] != 0xff || weapon_roster_equip[w] || the record's equip mask: what the next section of the
@@ -167,6 +186,7 @@ export function finish_weapon(r, d, used) {
   const mask_nonzero = (m0 === null || m1 === null) ? true : (m0 | m1) !== 0;
   if (d.name_set || d.roster || mask_nonzero) used.fixed.add(d.id);
   used.fixed_loaded.add(d.id);
+  gc.ci_take(r, d.icon_file, 'weapon', d.icon_line);
   return 1;
 }
 
@@ -220,6 +240,7 @@ export function check(r) {
       } else {
         const [ks, ke] = trim(s, start, equals);
         const [vs, ve] = trim(s, equals + 1, stop);
+        d.cur_line = n;
         problem = apply_weapon_key(d, s, ks, ke, vs, ve, r.shared);
       }
     }

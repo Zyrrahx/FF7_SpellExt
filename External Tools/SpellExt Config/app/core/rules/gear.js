@@ -79,6 +79,10 @@ export class Draft {
     this.id = ident;
     this.line = line;
     this.base = -1;
+    this.icon = '';                // (custom icons) icon = file:NAME: its name, the key's line, the line being read
+    this.icon_line = 0;
+    this.cur_line = 0;
+    this.name = '?';               // a new piece's name starts as "?" (encode_text(draft.name, "?")); the last `name` line's
   }
 }
 
@@ -108,6 +112,7 @@ export function apply_gear_key(d, kind, s, key, key_end, value, end, shared) {
   const base_count = KINDS[kind][5];
   if (word_is(s, key, key_end, 'name')) {
     if (end - value > 31) return 'a name has at most 31 characters';
+    d.name = s.slice(value, end);
   } else if (word_is(s, key, key_end, 'description')) {
     // nothing
   } else if (word_is(s, key, key_end, 'base')) {
@@ -131,6 +136,14 @@ export function apply_gear_key(d, kind, s, key, key_end, value, end, shared) {
     }
   } else if (word_is(s, key, key_end, 'element')) {
     if (gc.parse_flags(s, value, end, gc.ELEMENT_FLAGS, 0xffff) === null) return 'unknown element name';
+  } else if (word_is(s, key, key_end, 'icon')) {
+    // (custom icons) icon = file:NAME.png | file:NAME.tex (the armour, accessory and item files; no icon words here)
+    const [problem, name] = gc.ci_file_problem(s, value, end);
+    if (problem === null) {
+      d.icon = name;
+      d.icon_line = d.cur_line;
+    }
+    return problem;
   } else if (kind !== ITEM && word_is(s, key, key_end, 'element_effect')) {
     if (!parse_named(s, value, end, ELEMENT_EFFECT_NAMES, 2)) return 'element_effect must be absorb, nullify, halve or none';
   } else if (kind !== ITEM && word_is(s, key, key_end, 'bonus')) {
@@ -182,6 +195,7 @@ export function finish_gear(r, kind, d, used) {
   const what = KINDS[kind][0];
   if (kind !== ITEM && gc.is_kernel_gear_item(kind + 1, d.id)) {
     used.kernel.add(d.id);        // (kernel overrides) finish_kernel_gear: that game piece's own entry
+    gc.ci_take(r, d.icon, what, d.icon_line);
     return 1;
   }
   if (d.base < 0) {
@@ -191,7 +205,11 @@ export function finish_gear(r, kind, d, used) {
   // the game decides: the wide definitions' "*** wide ... is NOT defined: no memory ..." lines
   if (kind !== ITEM && d.id >= gc.WIDE_GEAR_FIRST) used.wide.add(d.id);
   else if (kind === ITEM && d.id >= gc.ITEM_COUNT_EXTENDED) used.wide.add(d.id);
-  else used.fixed.add(d.id);     // the draft's name is "?" at least: names[n][0] != 0xff from now on
+  else {
+    used.fixed.add(d.id);        // the draft's name is "?" at least: names[n][0] != 0xff from now on
+    if (kind === ITEM) used.names.set(d.id, d.name);
+  }
+  gc.ci_take(r, d.icon, what, d.icon_line);
   return 1;
 }
 
@@ -225,7 +243,7 @@ export function make_check(kind) {
 
   return function check(r) {
     const s = r.text;
-    const used = { fixed: new Set(), wide: new Set(), kernel: new Set() };
+    const used = { fixed: new Set(), wide: new Set(), kernel: new Set(), names: new Map() };
     let d = null;
     for (const ln of lines(s)) {
       const start = ln.start;
@@ -274,6 +292,7 @@ export function make_check(kind) {
         } else {
           const [ks, ke] = trim(s, start, equals);
           const [vs, ve] = trim(s, equals + 1, stop);
+          d.cur_line = n;
           problem = apply_gear_key(d, kind, s, ks, ke, vs, ve, r.shared);
         }
       }
@@ -281,6 +300,7 @@ export function make_check(kind) {
     }
     finish_gear(r, kind, d, used);
     r.shared.set(SHARED_KEY[kind], new Set([...used.fixed, ...used.wide]));
+    if (kind === ITEM) r.shared.set('item_names', used.names);     // (the scene build's item names: item_names[n] of the DLL)
   };
 }
 

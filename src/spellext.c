@@ -268,7 +268,9 @@ struct spell {
     BYTE is_summon;                     /* `list = summon`: sits in the Summon list, with uses */
     BYTE plain_summon;                  /* `party_vanishes = no`: cast without the summon presentation */
     BYTE order_group;                   /* `order`: 1 restore, 2 attack, 3 indirect; 0 = worked out from the record */
-    BYTE unused[3];
+    BYTE script;                        /* `script`: the caster's model script for it (a party member); 0 = not given */
+    BYTE bytes_entry;                   /* `script_bytes`: 1 + its entry of spell_bytes; 0 = not given */
+    BYTE unused[1];
     DWORD fixed_damage;                 /* `fixed_damage`: every hit does exactly this much; 0 = not set */
     WORD animation_copy;                /* `animation = 0x100` and up: an effect copy of the effects file (the record
                                            holds its base's number); 0 = none */
@@ -918,6 +920,11 @@ static struct {
        at once by steps in this call and in the one before */
     int held_frames, hold_said, hold_end_said, hits_now, hits_last;
     int ring_held, ring_end_said, hold60_said;  /* (24 steps) the ring rule's frames held and its budget line; the list-of-60 line */
+    /* (visual children) limit_seq_task's slot (-1: none; a task in another slot ends), the frames visual_watch_task
+       followed the tasks of `visual` steps after the last step, its "list of 60 full" line, and the lines of
+       thrown-away hits written; each `visual` step's start frame and targets (0: not started), for the room rule */
+    int task_slot, watch_frames, watch_said, watch_dropped;
+    int visual_started[LIMIT_SEQ_STEPS], visual_targets[LIMIT_SEQ_STEPS];
 } limit_seq;
 static struct { int count; WORD element[LIMIT_SEQ_STEPS]; int actor, hits; } limit_elements;
 /* A native effect's hits of a limit's `effect` step (native_hits): which hit of the limit they are, set only around
@@ -927,6 +934,312 @@ static struct { int count; WORD element[LIMIT_SEQ_STEPS]; int actor, hits; } lim
 #define NATIVE_HIT_ALL          (-1)         /* an `all` step: event 4 per target, as the game queues it */
 static int native_hit_forced = NATIVE_HIT_NONE;
 
+/* (visual children) A `visual` step's effect may show its hit from a task that one of its set-up's tasks starts LATER:
+   Bolt's set-up starts the per-target dispatcher FUN_005bfd93, whose routine FUN_005b8ef6 starts FUN_005b8f7d for each
+   target, and that task shows the hit on its frame 0 (battle_queue_show_hit_005c0158). Such a task is known by its
+   data's word 0: FUN_005bec50 writes the running task's slot there (00bf23b8; exe 005beca3-005becaa), and a task
+   started inside the list's pass takes the first free slot AT OR AFTER the running one (005bec7f-005bec8c), which is
+   taken by the running task itself, so its creator's slot is lower than its own. The list is looked at once a frame
+   (limit_seq_task while it runs, then visual_watch_task) and at every show-hit call: a task new since the last look
+   (its routine not the one seen there) whose word 0 names a lower marked slot is marked too; a free slot loses its
+   mark. A show-hit call made while a marked task runs is thrown away.
+   Slots below VISUAL_WATCH_FLOOR are never taken as creators: many effects write the TARGET's or the actor's number
+   (0-9) into a new task's word 0 at once (Comet's FUN_005a6ce6: FUN_005bec50, then `mov 0x8(%ebp),%dx; mov %dx,(%ecx)`;
+   Full Cure, Break, enemy effect 0x96 and some limits), and tasks made outside the pass get 0. So that a real chain
+   never starts below it, limit_seq_task of a limit with a `visual` step is made at slot VISUAL_WATCH_FLOOR or above
+   (the ec hook): the set-up's tasks are then above it, and their tasks above them. Word 0 is the creator's only until
+   the task or its creator writes it: a task whose word 0 was written with the number (10-99) of a lower marked slot
+   before the first look is marked wrongly (none such found among the show-hit tasks and their creators), and one whose
+   was overwritten is missed (its hit is shown). Tasks of the lists of 60 and 10, and a slot freed and taken by a task
+   with the same routine between two looks, are not seen. */
+#define ADDR_SEQ_TASK_DATA      0x00bfb718u  /* the list of 100's data, 0x20 bytes a task: word 0 its creator's slot (FUN_005bec50) */
+#define LIMIT_SEQ_WATCH_MAX     900          /* frames visual_watch_task follows the marked tasks after the last step, at most */
+/* ---- VISUAL WATCH PURE begin (no game memory, no Windows: its stage's test folder) ---- */
+#define VISUAL_WATCH_SLOTS      100
+#define VISUAL_WATCH_WORDS      16           /* shorts in a task's data (0x20 bytes) */
+#define VISUAL_WATCH_FLOOR      10           /* creators are looked for from this slot up (a target's number is below it) */
+/* A `visual` step starts only when the list of 100 has LIMIT_SEQ_VISUAL_FREE free slots (the battle's other tasks, the
+   hit display's) plus LIMIT_SEQ_VISUAL_PER for each of its targets and for each target of an earlier `visual` step
+   whose tasks may still be growing. Bolt's, read from the decompile: the dispatcher hands out one target every 2
+   frames (FUN_005b8eda: interval 2); a target's FUN_005b8f7d lives 16 frames, starts FUN_005b9295 (9 frames) and
+   FUN_005b9141 (17) on frame 0 and a FUN_005b935d (8) on each of frames 2-15: 10 at once at most, from about its
+   frame 9 on. So target i of a step started d frames ago may still grow while 2i + LIMIT_SEQ_VISUAL_RISE > d. A rule
+   of thumb for other effects, not a proof: an effect that starts more tasks a target can still fill the list. */
+#define LIMIT_SEQ_VISUAL_FREE   16
+#define LIMIT_SEQ_VISUAL_PER    10
+#define LIMIT_SEQ_VISUAL_RISE   10
+struct visual_watch {
+    DWORD seen[VISUAL_WATCH_SLOTS];          /* each slot's routine at the last look, 0 free */
+    BYTE mark[VISUAL_WATCH_SLOTS];           /* 1: a task of a `visual` step, or one such a task started */
+    int marked;                              /* slots marked */
+};
+
+/* Nothing marked; fns (or none) taken as seen. */
+static void visual_watch_clear(struct visual_watch *w, const DWORD *fns)
+{
+    int s;
+
+    for (s = 0; s < VISUAL_WATCH_SLOTS; s++) {
+        w->mark[s] = 0;
+        w->seen[s] = fns ? fns[s] : 0;
+    }
+    w->marked = 0;
+}
+
+/* A task a step's set-up started at slot s (routine fn): marked if the step is `visual`; seen either way, so that its
+   word 0 is never read as a creator's (the per-target dispatcher counts its targets there). */
+static void visual_watch_note(struct visual_watch *w, int s, DWORD fn, int visual)
+{
+    if (s < 0 || s >= VISUAL_WATCH_SLOTS)
+        return;
+    w->marked += (visual ? 1 : 0) - w->mark[s];
+    w->mark[s] = visual ? 1 : 0;
+    w->seen[s] = fn;
+}
+
+/* One look at the list: fns its 100 routines (0 free), data its 100 tasks' data (VISUAL_WATCH_WORDS shorts each), own
+   the routine never marked (limit_seq_task's). Slots in rising order, so a creator (always lower) is judged before
+   the tasks it started; a creator whose slot was taken by a new task since the last look counts if either was
+   marked. Returns the slots marked now. */
+static int visual_watch_look(struct visual_watch *w, const DWORD *fns, const short *data, DWORD own)
+{
+    BYTE was[VISUAL_WATCH_SLOTS];
+    int s, c;
+
+    for (s = 0; s < VISUAL_WATCH_SLOTS; s++)
+        was[s] = w->mark[s];
+    for (s = 0; s < VISUAL_WATCH_SLOTS; s++) {
+        DWORD f = fns[s];
+
+        if (!f || f == w->seen[s])
+            continue;               /* free, or the task seen at the last look: its mark stands */
+        c = data[s * VISUAL_WATCH_WORDS];
+        w->mark[s] = f != own && c >= VISUAL_WATCH_FLOOR && c < s && (w->mark[c] || was[c]);
+    }
+    w->marked = 0;
+    for (s = 0; s < VISUAL_WATCH_SLOTS; s++) {
+        if (!fns[s])
+            w->mark[s] = 0;
+        w->seen[s] = fns[s];
+        w->marked += w->mark[s];
+    }
+    return w->marked;
+}
+
+/* The free slots a `visual` step on `targets` targets wants at `frame`: count earlier steps, started[k] the frame
+   step k started (any value when targets_of[k] is 0) and targets_of[k] its targets (0: not a `visual` step that
+   started). */
+static int visual_step_need(int targets, int frame, const int *started, const int *targets_of, int count)
+{
+    int k, i, growing = 0;
+
+    for (k = 0; k < count; k++)
+        for (i = 0; i < targets_of[k]; i++)
+            if (2 * i + LIMIT_SEQ_VISUAL_RISE > frame - started[k])
+                growing++;
+    return LIMIT_SEQ_VISUAL_FREE + LIMIT_SEQ_VISUAL_PER * (targets + growing);
+}
+/* ---- VISUAL WATCH PURE end ---- */
+static struct visual_watch visual_watch;
+static int visual_watch_on;                 /* a `visual` step of this limit noted a task: the list is looked at */
+static WORD visual_watch_serial;            /* the watch's number: a visual_watch_task of an older one ends */
+static int visual_watch_new_state;          /* FUN_005bed92's first bytes: 0 not looked at, 1 fine, -1 not */
+static void __cdecl limit_seq_task(void);
+
+static void visual_watch_reset(void)
+{
+    visual_watch_clear(&visual_watch, (const DWORD *)ADDR_EFFECT_TASK_FNS);
+    visual_watch_on = 0;
+    visual_watch_serial++;
+}
+
+static int visual_watch_update(void)
+{
+    if (!visual_watch_on)
+        return 0;
+    return visual_watch_look(&visual_watch, (const DWORD *)ADDR_EFFECT_TASK_FNS, (const short *)ADDR_SEQ_TASK_DATA,
+                             (DWORD)limit_seq_task);
+}
+
+/* (visual children) After the limit's last step: the tasks of its `visual` steps still running are looked at once a
+   frame from the list of 60 (nothing waits on it: limit_seq_task, in the list of 100, ends at its last step as it did
+   before, so a task that waits to be the last of that list, FUN_005d3601 `count < 2`, is not held). Ends when none is
+   marked, when a newer watch began (its serial, word 2), when the sequence was forgotten, or after
+   LIMIT_SEQ_WATCH_MAX frames (with a line: a hit they show later is shown). Not run while paused (FUN_0042d992 runs
+   the list of 60 only when 009ad1ac, (00dc0e6c == 0), is set). */
+static void __cdecl visual_watch_task(void)
+{
+    int index = *(const short *)ADDR_HIT_LIST60_INDEX;
+    short *task;
+
+    if (index < 0 || index >= 60)
+        return;
+    task = (short *)(ADDR_WATCHER_TASK_DATA + index * 0x20);
+    if ((WORD)task[2] != visual_watch_serial) {
+        *task = -1;                     /* an older watch's */
+        return;
+    }
+    if (*(const BYTE *)0x00dc0e6cu)     /* effects paused */
+        return;
+    if (!limit_seq.count || !visual_watch_update()) {
+        visual_watch_reset();
+        *task = -1;
+        return;
+    }
+    if (++limit_seq.watch_frames >= LIMIT_SEQ_WATCH_MAX) {
+        log_line("limit spell effects: %d task(s) of `visual` steps still running %d frames after the last step: no longer watched (a hit they show is shown)",
+                 visual_watch.marked, LIMIT_SEQ_WATCH_MAX);
+        visual_watch_reset();
+        *task = -1;
+    }
+}
+
+/* Starts visual_watch_task (the list of 60), FUN_005bed92 checked first (55 8b ec 51 66 c7, or another module's jump)
+   and called only with a free slot at or after the running one (it calls four empty routines and gives -1 without).
+   FALSE: not started (said, once a limit). */
+static BOOL visual_watch_task_start(void)
+{
+    static const BYTE first[6] = { 0x55, 0x8b, 0xec, 0x51, 0x66, 0xc7 };
+    const BYTE *at = (const BYTE *)FN_NEW_WATCHER_TASK;
+    const DWORD *fns = (const DWORD *)ADDR_HIT_LIST60_FNS;
+    int i, from = *(const short *)ADDR_HIT_LIST60_INDEX;
+    short slot;
+
+    if (!visual_watch_new_state) {
+        visual_watch_new_state = 1;
+        for (i = 0; i < 6 && at[0] != 0xe9; i++)
+            if (at[i] != first[i]) {
+                log_line("limit spell effects: %08lx does not start as expected (byte %d is %02x): the tasks of `visual` steps are not followed after the last step",
+                         FN_NEW_WATCHER_TASK, i, at[i]);
+                visual_watch_new_state = -1;
+                break;
+            }
+    }
+    if (visual_watch_new_state < 0)
+        return FALSE;
+    for (i = from < 0 ? 0 : from; i < 60 && fns[i]; i++)
+        ;
+    slot = i < 60 ? ((short (__cdecl *)(DWORD))FN_NEW_WATCHER_TASK)((DWORD)visual_watch_task) : -1;
+    if (slot < 0 || slot >= 60 || fns[slot] != (DWORD)visual_watch_task) {
+        if (!limit_seq.watch_said)
+            log_line("limit spell effects: no free task in the list of 60: the %d task(s) of `visual` steps still running are not followed (a hit they show is shown)",
+                     visual_watch.marked);
+        limit_seq.watch_said = 1;
+        return FALSE;
+    }
+    ((short *)(ADDR_WATCHER_TASK_DATA + slot * 0x20))[2] = (short)visual_watch_serial;
+    return TRUE;
+}
+
+/* ---- HITS ON EVERY TARGET ------------------------------------------------------------------
+   `hits_on_every_target = yes` on a limit: each of its N hits in a turn (additional_effect 0, additional_modifier N)
+   goes to EVERY target of the turn, not to one of them at random. The hit loop FUN_005d9940 picks one target for each
+   hit while action[0x2c] is set (005d9db8-005d9dd6: `push eax; call FUN_005c80b5; add esp, 4`, the result written
+   to action[6]); the call at 005d9dc8 is hooked (every_target_pick_hook) and, for such a limit's own action, gives the
+   mask back whole. The loop then hits each target of action[6] (005d9de2-005d9e1a), so the record holds N x T results
+   in hit order: hit 1 on each target, hit 2 on each, ... (T = the targets of the turn).
+     - `hit_elements` go by hit: the element of hit k = results so far / T (hit_target_hook).
+     - spell_effects `all` steps show their own hit: a show call (FUN_005c0158(target), event 4) made while such a
+       limit plays shows, as event 10, the first result on that target not yet shown (state_show_queue); with steps
+       whose effects do not overlap that is the k-th result on it for the k-th step that shows results.
+     - A target left dead by a result already shown is DYING: a later result on it shows its number only
+       (state_show_number, as a state's turn does), with no second reaction or death; and later `all` steps are
+       given the targets less the dying ones (an effect is not drawn on an enemy that is fading away); a step with
+       none left is passed over (one line). The damage of those results was done when the action was worked out.
+   `room N` after a spell_effects entry (a game effect: a spell's or a `limit`): the step starts only while the list of
+   100 has N free slots at or after limit_seq_task's (FUN_005bec50 gives no lower one); until then it WAITS, and the
+   limit's clock stands still with it (the later steps keep their distance from it). After LIMIT_ROOM_WAIT_MAX frames
+   of waiting the effect is passed over and its hit shown at once, as the ninth-step rule does. One line when it
+   waits, one when it starts or is passed over. Without the key and without `room` nothing here changes anything. */
+/* ---- EVERY TARGET PURE begin (no game memory, no Windows: the native test beside this change, dll/test) ---- */
+#define EVERY_TARGET_RESULTS    0x4e         /* results of a record followed (00c05e68 holds 78) */
+#define EVERY_TARGET_MAX        64           /* hits x targets of one turn at most; more: the game's own pick (one line) */
+#define LIMIT_ROOM_WAIT_MAX     300          /* frames a `room` step waits at most */
+#define LIMIT_ROOM_GO           0
+#define LIMIT_ROOM_HOLD         1
+#define LIMIT_ROOM_PASS         2
+
+/* Targets in a mask (actors 0-9). */
+static int every_target_count(unsigned mask)
+{
+    int n = 0, t;
+
+    for (t = 0; t < 10; t++)
+        n += (int)((mask >> t) & 1u);
+    return n;
+}
+
+/* Whether a turn of `hits` hits at `targets` targets is given every target: at least one target, and no more than
+   EVERY_TARGET_MAX results in all (0 or 1 hit: one). */
+static int every_target_fits(int targets, int hits)
+{
+    if (hits < 1)
+        hits = 1;
+    return targets >= 1 && targets <= 10 && hits <= EVERY_TARGET_MAX && targets * hits <= EVERY_TARGET_MAX;
+}
+
+/* The result to show on `target`: the first of the record's `results` (their targets in `targets`) on it that is not
+   yet shown; -1: none. */
+static int every_target_pick(const BYTE *targets, int results, const BYTE *shown, int target)
+{
+    int i;
+
+    if (results > EVERY_TARGET_RESULTS)
+        results = EVERY_TARGET_RESULTS;
+    for (i = 0; i < results; i++)
+        if (!shown[i] && targets[i] == (BYTE)target)
+            return i;
+    return -1;
+}
+
+/* The `hit_elements` entry of the result made after `results` others, at `per_hit` targets a hit; `count` entries
+   (the last goes on). */
+static int every_target_element(int results, int per_hit, int count)
+{
+    int k = per_hit > 0 ? results / per_hit : results;
+
+    return k < count ? k : count - 1;
+}
+
+/* `room N`: go, hold (wait a frame more) or pass over, with `room` free slots now and `waited` frames waited so far. */
+static int limit_room_decide(int need, int room, int waited)
+{
+    if (need <= 0 || room >= need)
+        return LIMIT_ROOM_GO;
+    return waited < LIMIT_ROOM_WAIT_MAX ? LIMIT_ROOM_HOLD : LIMIT_ROOM_PASS;
+}
+
+/* Whether a show call is such a limit's own: armed (`on`) for party seat `actor`, with spell effects (`steps`), the
+   display's acting actor (00be1170) that seat, and that seat's command (00be119b, copied from the display record by
+   FUN_0042d227) a limit's, 0x14. The armed state outlives its limit (an Item, handlers 02 0d 09, does not pass
+   handler 0x0c, which disarms it): the command keeps it to the limit's own display. */
+static int every_target_showing_for(int on, int steps, int actor, int effect_actor, int command)
+{
+    return on && steps && actor >= 0 && actor <= 2 && effect_actor == actor && command == 0x14;
+}
+
+/* A battle starts: nothing of the last one's limit is followed, and no `room` wait is left over. */
+static void every_target_forget(int *on, int *per_hit, int *room_waited, int *room_pass, int *room_held)
+{
+    *on = *per_hit = 0;
+    *room_waited = *room_pass = *room_held = 0;
+}
+/* ---- EVERY TARGET PURE end ---- */
+static BOOL every_target_showing(void);         /* such a limit is being played (the game's side, after state_show_number) */
+static short *every_target_show(int target);    /* the event for a show call on `target` while it is */
+static unsigned every_target_alive(unsigned mask);  /* the mask less the targets already dying */
+static int limit_room_hold(void);               /* `room`: whether step limit_seq.next waits (limit_seq_task's loop) */
+static struct {
+    BYTE need[LIMIT_SEQ_STEPS];                 /* each step's `room` (0 = none) */
+    int waited;                                 /* frames the step due has waited */
+    int pass;                                   /* step + 1 passed over for want of room (its hit shown at once) */
+    int held;                                   /* this call held a step: the limit's clock stands still */
+} limit_room;
+
+static int every_target_element_for(int attacker, int results, int count);    /* (every target) hit_target_hook */
+
+/* (every target: the attribute) every_target_show needs the caller's frame, FUN_005c0158's: see below */
+__attribute__((optimize("no-omit-frame-pointer", "no-tree-loop-distribute-patterns")))   /* (the second: no memmove from its loop; this DLL has no C library) */
 static short *__cdecl show_hit_event_hook(int type)
 {
     short *event;
@@ -944,6 +1257,22 @@ static short *__cdecl show_hit_event_hook(int type)
                 (fn == limit_seq.task_fn[k][0] || fn == limit_seq.task_fn[k][1] ||
                  fn == limit_seq.task_fn[k][2] || fn == limit_seq.task_fn[k][3]))
                 return thrown_away;
+        /* (visual children) or by a task one of them started, looked at now: it may show its hit on its first frame */
+        if (fn && visual_watch_update() && visual_watch.mark[now]) {
+            if (limit_seq.watch_dropped < 3) {
+                limit_seq.watch_dropped++;      /* (three a limit) */
+                log_line("limit spell effects: a hit shown by task %d (%08lx), started by a `visual` step's task, thrown away%s",
+                         now, fn, limit_seq.watch_dropped == 3 ? " (no more lines of it for this limit)" : "");
+            }
+            return thrown_away;
+        }
+    }
+    if (type == 4 && native_hit_forced < 0 && every_target_showing()) {
+        /* (every target) the caller is FUN_005c0158 (its two calls, 005c0175 / 005c0184, are the ones hooked): the
+           target is its argument, [ebp + 8] of its frame (it writes it into the event after this returns) */
+        const BYTE *caller = *(const BYTE *const *)__builtin_frame_address(0);
+
+        return every_target_show(*(const int *)(caller + 8));
     }
     if (native_hit_forced == NATIVE_HIT_ALL)
         return ((short *(__cdecl *)(int))FN_QUEUE_EFFECT_EVENT)(type);
@@ -1070,14 +1399,21 @@ static void __cdecl limit_seq_task(void)
     short *task = (short *)(0x00bfb718u + *(const short *)0x00bf23b8u * 0x20);
     int started;
 
+    if (*(const short *)0x00bf23b8u != limit_seq.task_slot) {
+        *task = -1;                     /* (visual children) an older limit's task: a new one was set up */
+        return;
+    }
     if (!limit_seq.count) {
+        visual_watch_reset();
+        limit_seq.task_slot = -1;
         *task = -1;
         return;
     }
     if (*(const BYTE *)0x00dc0e6cu)     /* effects paused */
         return;
+    visual_watch_update();              /* (visual children) the tasks started since the last look */
     for (started = 0; started < LIMIT_SEQ_PER_FRAME && limit_seq.next < limit_seq.count && limit_seq.frame >= limit_seq.at[limit_seq.next] &&
-                      !limit_seq_hold();
+                      !limit_seq_hold() && !limit_room_hold();   /* (room) */
          started++) {
         int hit = limit_seq.next++, target = ((const BYTE *)ADDR_HIT_TARGETS)[hit];
         int flags = limit_seq.flags[hit], all = flags & SEQ_ALL;
@@ -1123,13 +1459,13 @@ static void __cdecl limit_seq_task(void)
                      limit_seq.effect[hit]);
             continue;
         }
-        if (hit >= LIMIT_SEQ_OLD_STEPS && limit_seq_tasks_room() < LIMIT_SEQ_TASKS_FREE) {
+        if ((hit >= LIMIT_SEQ_OLD_STEPS && limit_seq_tasks_room() < LIMIT_SEQ_TASKS_FREE) || limit_room.pass == hit + 1) {   /* (room) */
             /* its damage is taken already: its hit shown at once, as a native step's whose effect cannot play, with two
                free 100-list slots a target (FUN_0042e0b9's task, and a killing hit's death task, FUN_00425890: both
                unchecked) for it and for every hit shown at once in this call, and one for each of the last call's
                (its hit tasks are made, their death tasks may still be): the room does not change during the call, as
                the hit tasks are made only at the next frame's drain; never a `visual` step's */
-            unsigned shown = all ? (unsigned)saved & 0x3ffu : 1u << target, t;
+            unsigned shown = all ? every_target_alive((unsigned)saved) & 0x3ffu : 1u << target, t;    /* (every target) */
             int n = 0;
 
             for (t = 0; t < 10; t++)
@@ -1147,23 +1483,61 @@ static void __cdecl limit_seq_task(void)
                      n > 0 ? ", its hit shown at once" : n < 0 ? " (for show only)" : ", its hit not shown");
             continue;
         }
+        if (flags & SEQ_VISUAL) {
+            /* (visual children) its tasks start more tasks later (Bolt: 10 a target at once), and an effect's routines
+               write through FUN_005bec50's -1 when the list is full: a show-only step starts only with the room of
+               visual_step_need (a rule of thumb taken from Bolt; see LIMIT_SEQ_VISUAL_FREE), counted from limit_seq_task's
+               slot up (FUN_005bec50 gives no lower one). Passed over, only its drawing is lost: it shows no result */
+            unsigned on = all ? (unsigned)saved & 0x3ffu : 1u << target, t;
+            int n = 0, need, room = limit_seq_tasks_room();
+
+            for (t = 0; t < 10; t++)
+                n += (on >> t) & 1;
+            need = visual_step_need(n, limit_seq.frame, limit_seq.visual_started, limit_seq.visual_targets, hit);
+            if (room < need) {
+                log_line("limit spell effects: frame %d, step %d: %d free slot(s) in the list of 100, %d wanted; %s effect %02x (for show only) passed over: not drawn (it shows no result)",
+                         limit_seq.frame, hit, room, need, (flags & SEQ_LIMIT) ? "limit" : "spell", limit_seq.effect[hit]);
+                continue;
+            }
+            limit_seq.visual_started[hit] = limit_seq.frame;
+            limit_seq.visual_targets[hit] = n;
+        }
+        if (all && every_target_showing()) {
+            /* (every target) a target already dying is not given to a later step's effect */
+            unsigned alive = every_target_alive((unsigned)saved) & 0x3ffu;
+
+            if (!alive) {
+                log_line("limit spell effects: frame %d, step %d: every target is already dying; effect %02x passed over",
+                         limit_seq.frame, hit, limit_seq.effect[hit]);
+                continue;
+            }
+            *mask = (WORD)alive;
+        }
         if (!all) {
-            limit_seq.hit = hit;
-            if (limit_seq.pending_count < LIMIT_SEQ_STEPS)
-                limit_seq.pending[limit_seq.pending_count++] = hit;
+            if (!(flags & SEQ_VISUAL)) {
+                /* (visual children) a show-only step shows no hit: not the hit of a later step's type-4 calls, nor in
+                   `pending`, where it would be taken by the next one-target step's first call */
+                limit_seq.hit = hit;
+                if (limit_seq.pending_count < LIMIT_SEQ_STEPS)
+                    limit_seq.pending[limit_seq.pending_count++] = hit;
+            }
             *mask = (WORD)(1 << target);    /* the effect looks at the action's target mask in places: this hit's alone */
         }
         copy_bytes((BYTE *)before, (const BYTE *)ADDR_EFFECT_TASK_FNS, sizeof before);
         if (!(flags & SEQ_LIMIT))
             effect_copies_before_routine(limit_seq.effect[hit]);   /* a magic effect: its own files, not a copy's left loaded */
         ((void (__cdecl *)(int, int))fn)((short)*mask, limit_seq.actor);
-        for (k = 0; k < 100 && noted < 4; k++) {
+        for (k = 0; k < 100; k++) {
             DWORD started = ((const DWORD *)ADDR_EFFECT_TASK_FNS)[k];
 
             if (started && started != before[k] && started != (DWORD)limit_seq_task) {
-                limit_seq.task_fn[hit][noted++] = started;
-                if (limit_seq.skip[hit])
-                    *(short *)(0x00bfb71au + k * 0x20) = limit_seq.skip[hit];
+                if (noted < 4) {
+                    limit_seq.task_fn[hit][noted++] = started;
+                    if (limit_seq.skip[hit])
+                        *(short *)(0x00bfb71au + k * 0x20) = limit_seq.skip[hit];
+                }
+                /* (visual children) every task the set-up started: marked if the step is `visual`, seen either way */
+                visual_watch_note(&visual_watch, k, started, flags & SEQ_VISUAL);
             }
         }
         *mask = saved;
@@ -1180,9 +1554,16 @@ static void __cdecl limit_seq_task(void)
     }
     limit_seq.hits_last = limit_seq.hits_now;
     limit_seq.hits_now = 0;
-    limit_seq.frame++;
+    if (!limit_room.held)
+        limit_seq.frame++;          /* (room) a step waiting for room holds the clock: the later steps keep their distance */
+    limit_room.held = 0;
     if (limit_seq.next >= limit_seq.count) {
         limit_seq.running = 0;          /* the hooks stay answering until the next action is set up */
+        /* (visual children) this task ends at its last step, as before; the tasks of `visual` steps still running are
+           followed from the list of 60, which nothing waits on (visual_watch_task) */
+        if (!visual_watch.marked || !visual_watch_task_start())
+            visual_watch_reset();
+        limit_seq.task_slot = -1;
         *task = -1;
     }
 }
@@ -1412,7 +1793,37 @@ static void __cdecl summon_effect_hook(int actor_arg)
         ((void (__cdecl *)(int))FN_START_EFFECT)(actor_arg);
         limit_seq.frame = 0;
         limit_seq.hit = -1;
-        if (((short (__cdecl *)(DWORD))0x005bec50u)((DWORD)limit_seq_task) >= 0)
+        if (visual_watch_on) {
+            /* (visual children) made at slot VISUAL_WATCH_FLOOR or above, so that every task of its `visual` steps is
+               above the floor too (FUN_005bec50 takes the first free slot at or after the running index 00bf23b8, at
+               005bec7f-005bec8c): the index is put up for this call alone, and only when there is such a free slot
+               (with none FUN_005bec50 calls four empty routines and gives -1) */
+            short run = *(const short *)ADDR_EFFECT_TASK_INDEX;
+            int k = run < VISUAL_WATCH_FLOOR ? VISUAL_WATCH_FLOOR : run;
+
+            while (k < 100 && ((const DWORD *)ADDR_EFFECT_TASK_FNS)[k])
+                k++;
+            if (k < 100) {
+                *(short *)ADDR_EFFECT_TASK_INDEX = (short)(run < VISUAL_WATCH_FLOOR ? VISUAL_WATCH_FLOOR : run);
+                limit_seq.task_slot = ((short (__cdecl *)(DWORD))0x005bec50u)((DWORD)limit_seq_task);
+                *(short *)ADDR_EFFECT_TASK_INDEX = run;
+            } else {
+                limit_seq.task_slot = -1;
+            }
+            if (limit_seq.task_slot < VISUAL_WATCH_FLOOR || limit_seq.task_slot >= 100 ||
+                ((const DWORD *)ADDR_EFFECT_TASK_FNS)[limit_seq.task_slot] != (DWORD)limit_seq_task) {
+                /* none at 10 or above (or another module's routine gave another): made where the game puts it; the
+                   tasks a `visual` step's tasks start below slot 10 are then not followed (their hits are shown) */
+                log_line("limit spell effects: no free slot from %d up in the list of 100 (slot %d): the tasks started by a `visual` step's tasks below it are not followed",
+                         VISUAL_WATCH_FLOOR, limit_seq.task_slot);
+                if (limit_seq.task_slot < 0 || limit_seq.task_slot >= 100 ||
+                    ((const DWORD *)ADDR_EFFECT_TASK_FNS)[limit_seq.task_slot] != (DWORD)limit_seq_task)
+                    limit_seq.task_slot = ((short (__cdecl *)(DWORD))0x005bec50u)((DWORD)limit_seq_task);
+            }
+        } else {
+            limit_seq.task_slot = ((short (__cdecl *)(DWORD))0x005bec50u)((DWORD)limit_seq_task);
+        }
+        if (limit_seq.task_slot >= 0)
             limit_seq.running = 1;
         return;
     }
@@ -1433,6 +1844,10 @@ static void __cdecl summon_effect_hook(int actor_arg)
    with an ID that makes it read the record straight from `spells`, and
    the real ID is put back afterwards. */
 static void note_limit_action(int actor, int command, int id);
+static void spell_script_apply(int *action, int spell);  /* ("A spell's caster script", after the actor's script table) */
+static void spell_bytes_apply(int *action, int spell);   /* ("A spell's caster script bytes", after it) */
+static void spell_bytes_put_back(void);
+static void spell_bytes_forget(void);
 
 static void __cdecl action_setup_hook(void)
 {
@@ -1442,6 +1857,7 @@ static void __cdecl action_setup_hook(void)
     int index = record ? index_reaching(record) : 0;
 
     atb_dex_follow();           /* (an enemy's action reaches no slot_match_hook) */
+    spell_bytes_put_back();     /* script_bytes: the last action's lent cast slots go back (its display is over) */
     /* the last action's display is over: an action's clock ends; this actor rests at its home spot */
     camera_clock_stop("the next action was set up");
     camera_home_latch(action[ACT_ACTOR]);
@@ -1499,6 +1915,11 @@ static void __cdecl action_setup_hook(void)
             summon_show_actor = action[ACT_ACTOR];
         }
     }
+    /* `script = N`: the caster's model script, once the game and the summon block above have chosen theirs
+       (nothing after this in the set-up writes it) */
+    spell_script_apply(action, ext_index(id));
+    /* `script_bytes`: the caster's own script lent into that slot for this action (action[8] is not changed) */
+    spell_bytes_apply(action, ext_index(id));
     if (action[0xe] > 0 && action[ACT_SLOT] >= 0 && action[ACT_SLOT] < 96 && action[ACT_ACTOR] >= 0 &&
         action[ACT_ACTOR] < 3) {
         /* the game took the cost from the slot's byte; a zero (no charge) is left alone */
@@ -3397,6 +3818,7 @@ struct wide_item {
     DWORD price;
     BYTE record[ITEM_RECORD_SIZE];
     BYTE name[32], description[96];
+    WORD icon;                               /* (custom icons) icon = file:...: the file's place + 1 (custom_icon_of); 0 the game's icon */
 };
 static struct wide_item *wide_items;        /* the catalogue: reserved once for the whole band */
 static int wide_item_count, wide_item_room; /* definitions; definitions the committed memory holds */
@@ -3517,6 +3939,18 @@ static void wide_admit_hold(const char *moment);
 static void wide_items_report(void);
 /* ==== WIDE ITEMS (the wide item list, stage 2), the catalogue: end ==== */
 
+/* (Wide throw) The Throw tables (defined with them, further down), what the kernel had in them, and
+   THE ONE VARIABLE of wide throw: 1 once the Throw set-up is the DLL's (wide_throw_gate), never
+   cleared. While it is 0 a wide weapon is never thrown, exactly as before. */
+static short throw_effects[WEAPON_COUNT_EXTENDED];
+static DWORD throw_models[WEAPON_COUNT_EXTENDED];
+static short kernel_throw_effect(int w);
+static DWORD kernel_throw_model(int w);
+static int wide_throw_live;
+static int wide_throw_said;                 /* 1 once wide_throw_gate has decided (and said so) */
+static int wide_throw_asked = 1;            /* the key `wide_throw`: 1 on (the default), 0 off; taken at the first reading only */
+static LONG throw_tables_live;              /* both Throw tables are the DLL's (move_throw_effects) */
+
 /* ==== THE BOX (stage B5), wide gear: the catalogue and the lent slots: begin ====
 
    WEAPONS, ARMOUR AND ACCESSORIES NUMBERED FROM 10000 UP (the design's section 6, form A):
@@ -3529,7 +3963,8 @@ static void wide_items_report(void);
 
    (Wide gear in the item list, stages 1 and 2.) A wide piece lives IN THE ITEM LIST (a row of
    number and quantity, exactly as a wide item's: greyed in the Item menu, dimmed in a battle's
-   Item list, never thrown, not sold in this version), IN THE BOX (box = on routes it there; box =
+   Item list, sold in a shop only with sell = yes (the wide shop); never thrown but a wide weapon with throw = yes while wide
+   throw is on: WIDE THROW, further down), IN THE BOX (box = on routes it there; box =
    auto only when the item list has no row for it), or ON A CHARACTER. The game knows a worn piece
    by ONE BYTE of the character's record, which is an index into the kind's table. A wide piece is
    therefore LENT A SLOT while it is worn or offered in the Equip menu's list:
@@ -3554,10 +3989,12 @@ struct wide_gear {
     WORD number;
     BYTE kind;                               /* 0 weapon, 1 armour, 2 accessory (as the Equip menu counts them) */
     BYTE given;                              /* give_on_load = yes */
-    BYTE icon, base, spare[2];               /* a weapon: the kernel weapon whose icon it shows; the game's piece it starts as */
+    BYTE icon, base;                         /* a weapon: the kernel weapon whose icon it shows; the game's piece it starts as */
+    BYTE throw_like, throws;                 /* (wide throw) a weapon: the kernel weapon whose thrown model and effect it has when thrown (0xff: its base's); 1: throw = yes (or a base that can be thrown) */
     DWORD price, roster_equip;               /* roster_equip: the file's characters its `equip` list names (parse_equip) */
     BYTE record[WEAPON_RECORD_SIZE];         /* 0x2c bytes of a weapon, 0x24 of an armour, 0x10 of an accessory */
     BYTE name[32], description[96];
+    WORD custom_icon;                        /* (custom icons) icon = file:...: the file's place + 1 (custom_icon_of); 0 the game's icon */
 };
 static struct wide_gear *wide_gears;        /* the catalogue: reserved once for the three bands */
 static int wide_gear_count, wide_gear_room;
@@ -3637,15 +4074,42 @@ static struct wide_gear *wide_gear_new(int number)
     return g;
 }
 
-/* The restriction word of a wide piece (bit 0 set: cannot be sold; bit 3: cannot be thrown, which
-   is every wide weapon in this version: Throw takes its weapon's record by number - 0x80).
+/* (Wide throw) Can this wide piece be thrown in this run: a WEAPON whose section says throw = yes
+   (or whose base can be thrown), while the Throw set-up is the DLL's (wide_throw_live)? Never
+   armour or an accessory; never while wide throw is not on. (Its record keeps bit 3 set, as
+   before: the Throw path reads the battle's copy, never the record's word.) */
+static BOOL gear_wide_throwable(const struct wide_gear *g)
+{
+    return g && g->kind == 0 && wide_throw_live && g->throws;
+}
+
+/* The restriction word of a wide piece (bit 0 set: cannot be sold; bit 3: cannot be thrown: every
+   wide piece but a wide weapon gear_wide_throwable allows, which Throw takes through a lent slot).
    (Wide gear in the item list) bits 1 and 2 (not in a battle, not in the menu) are set for every
    wide piece, as the kernel's own gear words have them: its row in the Item menu is greyed and OK
-   buzzes; and bit 0, so that a shop's sell list never offers it in this version (the sell panel of
-   a number from 10000 up is not traced). */
+   buzzes. (Wide shop, stage 2) bit 0 is the record's own: the section's `sell` key, else its base's
+   (finish_wide_weapon, finish_wide_gear), so a shop's sell list offers a piece with sell = yes for
+   half its price. Of this word's readers only the shop's five calls of item_restrictions_hook test
+   bit 0 (the sell list's greying at 0071c017 / 0071c122 / 0071d6e6 / 0071d7f1, OK at 0071dc57); random
+   Throw reads the record's bit through gear_wide_battle_flags, the box bit 3. */
 static unsigned gear_wide_restrictions(const struct wide_gear *g)
 {
-    return *(const WORD *)(g->record + (g->kind == 0 ? WEAPON_RESTRICTIONS : g->kind == 1 ? ARMOUR_RESTRICTIONS : ACCESSORY_RESTRICTIONS)) | 0x0fu;
+    return (*(const WORD *)(g->record + (g->kind == 0 ? WEAPON_RESTRICTIONS : g->kind == 1 ? ARMOUR_RESTRICTIONS : ACCESSORY_RESTRICTIONS)) & ~0x08u) | 0x06u | (gear_wide_throwable(g) ? 0u : 0x08u);     /* (wide throw) bit 3 from gear_wide_throwable alone: the record's word always has it; (wide shop) bit 0 the record's */
+}
+
+/* (Wide throw) The target and use bytes of a wide piece's row in the battle's copy of the item
+   list: a wide weapon that can be thrown gets its record's, as a weapon 320-383 does (bit 0 its
+   record's sell bit, bit 1 always set: never an Item; bit 3 clear: Throw offers it); anything
+   else target 0, use 0x0b, no use at all (as before wide throw). */
+static void gear_wide_battle_flags(const struct wide_gear *g, BYTE *target, BYTE *use)
+{
+    if (gear_wide_throwable(g)) {
+        *target = g->record[0];
+        *use = (BYTE)((g->record[WEAPON_RESTRICTIONS] & 0x01) | 0x02);
+    } else {
+        *target = 0;
+        *use = 0x0b;
+    }
 }
 
 /* The name or the description of a wide gear number; for one NOTHING defines now (a piece of a
@@ -3746,6 +4210,8 @@ static void gear_slot_blank(int kind, int slot)
     if (kind == 0) {
         record[WEAPON_EQUIP_MASK] = record[WEAPON_EQUIP_MASK + 1] = 0;
         gear_weapon_mirror(slot);
+        throw_effects[slot] = 0;        /* (wide throw) nothing is thrown through a free slot: no effect, no model (as the tables hold for 128-191 from the start) */
+        throw_models[slot] = 0;
     } else if (kind == 1) {
         record[ARMOUR_EQUIP_MASK] = record[ARMOUR_EQUIP_MASK + 1] = 0;
         for (i = 0; i < 8; i++)
@@ -3778,6 +4244,14 @@ static void gear_slot_fill(int kind, int slot)
     }
     if (kind == 0)
         gear_weapon_mirror(slot);
+    if (kind == 0 && wide_throw_live) {
+        /* (wide throw) what Throw shows for the slot's piece: its throw_like's effect and model, or its base's,
+           as a weapon 320-383 has them (finish_weapon); one nothing defines now has weapon 0's record: weapon 0's */
+        int like = g ? (g->throw_like != 0xff ? g->throw_like : g->base) : 0;
+
+        throw_effects[slot] = kernel_throw_effect(like);
+        throw_models[slot] = kernel_throw_model(like);
+    }
 }
 
 /* A slot for a wide number of the kind: the one it has, else a free one (its record filled).
@@ -3848,12 +4322,15 @@ static const DWORD weapon_operands[] = {
     0x0071a41e, 0x0071a4d6, 0x0071a4fa, 0x0071b46e, 0x0071b49d, 0x0071cb69, 0x0071cb95,
 };
 
+static void custom_icons_forget(void);     /* (custom icons) defined after the loose files */
+
 /* Copies the freshly loaded kernel weapons into the DLL's table. */
 static void refresh_weapon_table(void)
 {
     int i;
 
     wide_gears_forget();        /* (the box, stage B5) no wide piece is defined until the three gear files are read (this routine comes first of the four); nothing with none defined */
+    custom_icons_forget();      /* (custom icons) no section of the four files names an icon file; every icon texture freed */
     /* After the first load the kernel loader fills the DLL's table directly
        (see move_weapon_table), and the game's own table is no longer current. */
     if (*(DWORD *)ADDR_KERNEL_WEAPON_POINTER != (DWORD)weapon_table)
@@ -3995,7 +4472,7 @@ static unsigned __cdecl item_restrictions_hook(int id)
     if (id >= ITEM_COUNT_EXTENDED) {
         /* (wide items) a wide item's own record; any other number from 512 up: no use at all */
         const struct wide_item *w = wide_item(id);
-        const struct wide_gear *g = wide_gear(id);      /* (the box, stage B5) a wide piece's own record: never thrown; NULL for every number below 10000 and while none is defined */
+        const struct wide_gear *g = wide_gear(id);      /* (the box, stage B5) a wide piece's own record: thrown only as gear_wide_throwable says (wide throw); NULL for every number below 10000 and while none is defined */
 
         if (g)
             return gear_wide_restrictions(g);
@@ -4270,11 +4747,26 @@ static void __cdecl battle_inventory_hook(void)
 
             entry[3] = w ? w->record[0x0c] : 0;
             entry[4] = w ? w->record[ITEM_RESTRICTIONS] & 0x0b : 0x0b;
+            if (!w && wide_gear(id))
+                gear_wide_battle_flags(wide_gear(id), &entry[3], &entry[4]);       /* (wide throw) a wide weapon that can be thrown: its record's, so that Throw offers it; any other wide piece 0 / 0x0b as before */
         }
     }
     if (box_live)
         box_battle_note(wide_battle_at, battle_rows());     /* (the box, stage B3, R8) what the party carries into the battle; reads only; nothing with the box LOCKED or off */
 }
+
+/* CUSTOM ICONS LISTS BEGIN (the lists that draw a custom icon: the first argument of custom_icon_draw) */
+#define CI_LIST_ITEM_MENU       0            /* the Item menu's list: 00715910 (item_icon_hook_a) */
+#define CI_LIST_SHOP            1            /* the shop's buy and sell lists: 0071b8d4, 0071c16c (item_icon_hook_c) */
+#define CI_LIST_BATTLE          2            /* the battle's Item, W-Item and Throw list: 006ded7f (item_icon_hook_e) */
+#define CI_LIST_BOX             3            /* the DLL's box screen (box_list_page) */
+#define CI_LIST_ITEM_MENU_SMALL 4            /* (S5) the half-size display mode's copies: the Item menu's 007162cd (item_icon_hook_b), */
+#define CI_LIST_SHOP_SMALL      5            /* the shop's 0071cfc2, 0071d83b (item_icon_hook_d), */
+#define CI_LIST_BATTLE_SMALL    6            /* the battle's 006df188 (item_icon_hook_f); from here on, a list is drawn half size */
+#define CI_LISTS                7
+static BOOL custom_icon_draw(int list, int number, int x, int y, DWORD depth);  /* (custom icons) defined after the loose files */
+/* CUSTOM ICONS LISTS END */
+static void custom_icons_forget(void);
 
 /* (weapon icon) The number whose icon a weapon's icon value shows: the kernel weapon's, or the first armour's,
    accessory's or item's (the game's routines take the kind's icon from the number's range alone). */
@@ -4306,17 +4798,52 @@ static int icon_item_id(int id)
     return is_new_weapon_item(id) ? weapon_icon_item_id(weapon_icon[id - NEW_WEAPON_FIRST_ITEM]) : id;
 }
 
-#define ICON_HOOK(name, fn) \
-    static void __cdecl name(int x, int y, int id, int a, int b) \
-    { \
-        ((void (__cdecl *)(int, int, int, int, int))(fn))(x, y, icon_item_id(id), a, b); \
-    }
-ICON_HOOK(item_icon_hook_a, 0x00717691u)
-ICON_HOOK(item_icon_hook_b, 0x007177a8u)
-ICON_HOOK(item_icon_hook_c, 0x0071e1e7u)
-ICON_HOOK(item_icon_hook_d, 0x0071e2feu)
-ICON_HOOK(item_icon_hook_e, 0x006deef0u)    /* battle item list, two copies */
-ICON_HOOK(item_icon_hook_f, 0x006df2f6u)
+/* CUSTOM ICONS HOOKS BEGIN (custom icons) The lists' calls of the game's icon routines (the full-size display
+   mode's a, c, e and the half-size mode's b, d, f): an item whose section names an icon file shows that picture
+   (custom_icon_draw); otherwise, or when it cannot, the game's routine with the number icon_item_id gives (a
+   new weapon shows a kernel weapon's icon, and so on), as before. */
+static void __cdecl item_icon_hook_a(int x, int y, int id, int a, int b)       /* the Item menu's list: its one call of FUN_00717691, 00715910 */
+{
+    if (custom_icon_draw(CI_LIST_ITEM_MENU, id, x, y, (DWORD)b))
+        return;
+    ((void (__cdecl *)(int, int, int, int, int))0x00717691u)(x, y, icon_item_id(id), a, b);
+}
+
+static void __cdecl item_icon_hook_c(int x, int y, int id, int a, int b)       /* the shop: FUN_0071e1e7's calls 0071b8d4 (buy list), 0071c16c (sell list) */
+{
+    if (custom_icon_draw(CI_LIST_SHOP, id, x, y, (DWORD)b))
+        return;
+    ((void (__cdecl *)(int, int, int, int, int))0x0071e1e7u)(x, y, icon_item_id(id), a, b);
+}
+
+static void __cdecl item_icon_hook_e(int x, int y, int id, int a, int b)       /* the battle's Item, W-Item and Throw list: FUN_006deef0's call 006ded7f */
+{
+    if (custom_icon_draw(CI_LIST_BATTLE, id, x, y, (DWORD)b))
+        return;
+    ((void (__cdecl *)(int, int, int, int, int))0x006deef0u)(x, y, icon_item_id(id), a, b);
+}
+
+static void __cdecl item_icon_hook_b(int x, int y, int id, int a, int b)       /* (S5) the Item menu's list, half size: FUN_007177a8's call 007162cd */
+{
+    if (custom_icon_draw(CI_LIST_ITEM_MENU_SMALL, id, x, y, (DWORD)b))
+        return;
+    ((void (__cdecl *)(int, int, int, int, int))0x007177a8u)(x, y, icon_item_id(id), a, b);
+}
+
+static void __cdecl item_icon_hook_d(int x, int y, int id, int a, int b)       /* (S5) the shop, half size: FUN_0071e2fe's calls 0071cfc2 (buy list), 0071d83b (sell list) */
+{
+    if (custom_icon_draw(CI_LIST_SHOP_SMALL, id, x, y, (DWORD)b))
+        return;
+    ((void (__cdecl *)(int, int, int, int, int))0x0071e2feu)(x, y, icon_item_id(id), a, b);
+}
+
+static void __cdecl item_icon_hook_f(int x, int y, int id, int a, int b)       /* (S5) the battle's item list, half size: FUN_006df2f6's call 006df188 */
+{
+    if (custom_icon_draw(CI_LIST_BATTLE_SMALL, id, x, y, (DWORD)b))
+        return;
+    ((void (__cdecl *)(int, int, int, int, int))0x006df2f6u)(x, y, icon_item_id(id), a, b);
+}
+/* CUSTOM ICONS HOOKS END */
 
 /* Testing aid (`give_on_load = yes` in the weapon file): puts one of the
    weapon in the stock of a loaded save, unless the save already has it in
@@ -4475,6 +5002,7 @@ static BOOL repoint_operand(DWORD address, DWORD expected, void *replacement, co
 static void move_throw_effects(void)
 {
     int i;
+    BOOL effects, models;
 
     if (InterlockedExchange(&throw_effects_moved, 1))
         return;
@@ -4482,8 +5010,9 @@ static void move_throw_effects(void)
         throw_effects[i] = i < WEAPON_COUNT_ORIGINAL ? ((const short *)ADDR_THROW_EFFECTS)[i] : 0;
         throw_models[i] = i < WEAPON_COUNT_ORIGINAL ? ((const DWORD *)ADDR_THROW_MODELS)[i] : 0;
     }
-    repoint_operand(ADDR_THROW_OPERAND, ADDR_THROW_EFFECTS, throw_effects, "throw effect table");
-    repoint_operand(ADDR_THROW_MODEL_OPERAND, ADDR_THROW_MODELS, throw_models, "throw model table");
+    effects = repoint_operand(ADDR_THROW_OPERAND, ADDR_THROW_EFFECTS, throw_effects, "throw effect table");
+    models = repoint_operand(ADDR_THROW_MODEL_OPERAND, ADDR_THROW_MODELS, throw_models, "throw model table");
+    throw_tables_live = effects && models;      /* (wide throw) a lent slot's effect and model are read only then */
 }
 
 /* A driver that replaces the game's routines (FFNx) takes the addresses of
@@ -5289,7 +5818,8 @@ static void battle_gain_entry(int id)
         /* (wide items) a wide item is added to the battle's items (the game threw the number away); any other
            number from 1024 up is gained by NOBODY and said so. (Wide gear in the item list) a piece of WIDE GEAR stolen
            or morphed goes into the battle's items too, as a thing of no use (target 0, use 0x0b: dimmed in Item and
-           W-Item, never thrown, as battle_inventory_hook flags it); the battle's end writes it into the item list */
+           W-Item, never thrown, as battle_inventory_hook flags it; (wide throw) a wide weapon that can be thrown gets
+           its record's, as there); the battle's end writes it into the item list */
         if (!wide_thing_usable(id)) {
             log_line("*** battle gain: number %d NOT gained: %s. Nothing is added and nothing else is given in its place ***", id,
                      receive_refusal(id) ? receive_refusal(id) : "the items file does not define it");      /* (receive) wide gear's reasons too */
@@ -5303,8 +5833,7 @@ static void battle_gain_entry(int id)
         return;                         /* as the game left it: thrown away (0x180 and more) or added with no flags */
     /* the flags, as the game's routine sets them for its own kinds and battle_inventory_hook for these */
     if (gear) {
-        target = 0;                     /* (wide gear in the item list) no use: as battle_inventory_hook flags a number from 512 up the items file does not define */
-        use = 0x0b;
+        gear_wide_battle_flags(wide_gear(id), &target, &use);       /* (wide gear in the item list) no use: as battle_inventory_hook flags a number from 512 up the items file does not define; (wide throw) a wide weapon that can be thrown: its record's, as there */
     } else if (kind == 1) {
         const BYTE *record = weapon_table + (id - ITEM_ID_WEAPON_BASE) * WEAPON_RECORD_SIZE;
 
@@ -6916,6 +7445,7 @@ static BOOL gear_wide_taken(DWORD word, DWORD caller, DWORD *answer);
 static void gear_wide_gate(void);       /* (with the Equip menu's start-up line, among the sites) */
 static void gear_wide_loaded(void);
 static void gear_worn_after_load(void); /* (the three are with the companion's code) */
+static void forget_flags_poll(const char *moment);     /* (`forget_flag`) with the worn pieces' code */
 static int character_wide_defer;        /* (a sheet's wide piece) set by load_accepted_hook while it makes the characters: their wide pieces are put on after the save's WORN entries */
 static void character_wide_wear_pending(const char *moment);
 static void gear_worn_save_begin(void);
@@ -9081,6 +9611,7 @@ static void __cdecl load_accepted_hook(int argument)
         gear_worn_after_load();     /* (the box, stage B5, A14) the wide pieces the save's characters wore: lent a slot and worn again, or boxed, or carried; before the game rebuilds the party's figures (007224ab, after the Load menu closes); never unless wide gear is at work */
     else
         character_wide_wear_pending("a load");     /* (a sheet's wide piece) wide gear is not at work: each wish's one line, the stand-in stays */
+    forget_flags_poll("the end of a load");       /* (`forget_flag`) a save made with the bit on: settled now, after the save's wide pieces are worn again */
     wide_give_on_load();            /* (wide items) the testing aids for wide numbers, after the companion's item list was taken */
     wide_test_fill();               /* (stage 3) the testing aid test_fill_rows; nothing without the key */
     wide_sync("a load accepted (after the characters)");    /* (the switch) a limit item given at this load was put after the last look: the picture after it; nothing unless the switch is on */
@@ -9389,6 +9920,840 @@ static BOOL resolve_loose_file(const char *name, char *path)
     }
     return TRUE;
 }
+
+/* ==== CUSTOM ICONS (stages S1-S6): an item's own picture in the item lists: begin ====
+
+   `icon = file:NAME.png` (or file:NAME.tex) in a section shows the picture SpellExtConfig\files\icons\NAME in
+   place of the game's item icon. NAME may name sub-folders (potions/blue.png). Design and the user's
+   decisions: tools/work/custom_icons/DESIGN.md. The sections that take it:
+     items file        new items [105]-[127], [448]-[511]; wide items [1024]-[9999]
+     weapons file      the game's own [128]-[255], new [320]-[383], wide [10000]-[15999] (beside the file's
+                       own icon words, which keep their meaning: they are the icon shown when the file cannot be)
+     armour file       the game's own [256]-[287], new [384]-[415], wide [16000]-[21999]
+     accessories file  the game's own [288]-[319], new [416]-[447], wide [22000]-[27999]
+   Drawn in the full-size display mode's lists: the Item menu (00715910), the shop's buy and sell lists
+   (0071b8d4, 0071c16c), the battle's Item, W-Item and Throw list (006ded7f) and the DLL's box screen; and in
+   the game's half-size display mode's copies of the three (007162cd, 0071cfc2 + 0071d83b, 006df188: stage S5,
+   16 x 16 units at the mode's offset [00dc105c], [00dc1060], as FUN_006fcd45). Every one of them is handed
+   the whole number of a row: 0-511, a wide item's 1024-9999 or a wide piece's 10000-27999 (with wide items
+   on, the Item menu's and the sell list's reads of the list are the DLL's dword rows, `and 0xffff`; the buy
+   list's is the shop entry's dword; the battle's is its 16-bit row; the box's its own number).
+   - A PNG is made into a paletted .tex with transparency (px_png_to_icon_tex: square, 32, 64 or 128 a side;
+     hard edges, alpha below 128 not drawn) in SpellExtConfig\cache\sxicon_NAME.tex, given the PNG's own time,
+     and made again whenever the PNG's time is not the cached file's (checked once a session). A .tex is
+     loaded as it is (its header checked against its length first).
+   - The texture is loaded with the game's own loader (FUN_006710ac, as the new characters' portraits) the
+     first time the icon is drawn, and its quad written by the DLL (custom_icon_draw) in the call that would
+     have drawn the game's icon.
+   - It is RENDERED where the game renders its icon sheet's last quarter [00dc0fd4], right after it, so it is
+     clipped where the game's icons are and stays under what is drawn later: behind the calls of FUN_0066e641
+     at 006fa1c1 and 006fa3d9 (the layer flushes FUN_006fa12f / FUN_006fa347, which the Item menu and the
+     shop call around their lists), 006cca92 (the main menu's end of frame) and 006dc2b5 (FUN_006dc1eb, the
+     battle menu's render, called before each battle window is drawn), and emptied after, as those empty the
+     game's own. The four are followed together or not at all: without them the DLL draws no icon and the
+     game's are shown (one log line). One more, 006cef35 (FUN_006cee84, an extra pass of the battle loop that
+     renders the sheet without emptying it), is followed as the game does there (rendered, not emptied); a
+     miss there is logged and the feature stays on. The half-size mode's sheet [00dc104c] is followed the
+     same way at its four renders (006ccacc, 006fda03, 006fdb32, 006dc579), together or not at all, on their
+     own: a miss there leaves that mode with the game's icons and the full-size mode as it is.
+   - Its life follows the game's sheet: after each of the game's three calls of FUN_006c1468 (the menu's
+     textures made again: start-up 006c0f68, menu start 006cd3db, menu end 006cd62d) every icon texture is
+     freed, to be loaded again when next drawn. So an icon loaded in a battle lives until the next menu start,
+     as the sheet it stands beside. At most CI_LOADED_MAX are loaded; for a new one the least recently drawn is
+     freed, never one drawn since the last render nor in the graphics frame now being made (the object's own
+     frame clock, [[object + 0x30]], the one FUN_0066e641 and FUN_0066e272 go by). A list that shows more
+     different files than that at once shows the game's icon for the rest (one log line).
+   - "Re-init .ini files" (and every reading of the four files) forgets every section's icon and frees every
+     texture, so changed `icon =` lines and changed pictures are seen at once; a texture drawn in the graphics
+     frame now being made is not freed then but RETIRED: still rendered where it was queued, freed once its
+     frame clock has moved on (at the next draw or sheet load).
+   - Missing or bad file, or the loader refuses it: that item shows its kind's game icon (today's path) and
+     the log says why, once per file per session. A list whose icons another mod has moved off the screen or
+     whose call another mod has changed (Enhanced Stock UI's "Expanded Icons") gets no custom icon: one line.
+   Nothing here names a character; nothing is saved: the key lives in memory, read with the files. */
+
+#define CI_FOLDER               "files\\icons\\"   /* under SpellExtConfig */
+#define CI_FILE_ROOM            64           /* a file's name under files\icons (with its sub-folders): at most 63 characters */
+#define CI_FILES_MAX            1024         /* different files the sections may name */
+#define CI_LOADED_MAX           64           /* icon textures loaded at once */
+#define CI_DRAW_SIZE            32           /* on the screen, menu units: the game's icon (16 x 16 of the sheet drawn doubled) */
+#define CI_SCREEN_RIGHT         0x280        /* an x from here up is past the menu's 640 units: off the screen */
+#define CI_SCREEN_HIDDEN_LEFT   (-0x80)      /* an x this far left or further (Enhanced Stock UI's push of 0x80 = -128) */
+#define CI_FOLDERS_MAX          32           /* different folders textures were loaded from (the game may keep the folder's pointer) */
+#define CI_DRAW_SIZE_SMALL      16           /* the half-size display mode's (FUN_006fcd45 draws the 16 x 16 piece as it is) */
+#define CI_RETIRED_MAX          (2 * CI_LOADED_MAX)     /* textures freed by a reading of the files while drawn in this graphics frame */
+#define CI_RENDERS_CORE         4            /* render calls followed together or not at all (the full-size mode's: [0]-[3]) */
+#define CI_RENDER_EXTRA         4            /* [4]: one more, followed on its own */
+#define CI_RENDERS_SMALL_FIRST  5            /* [5]-[8]: the half-size mode's, followed together or not at all, on their own */
+#define CI_RENDERS              9
+#define CI_DRAWS                8            /* the game's calls of its icon routines that the hooks a-f have */
+#define CI_FN_RENDER_OBJECT     0x0066e641u  /* FUN_0066e641(object, game) */
+#define CI_FN_SHEET_LOAD        0x006c1468u  /* FUN_006c1468(hi): the menu's textures freed and loaded again */
+
+#define CI_MENU_DRAWING()                       ((int (__cdecl *)(void))0x006cdbf2u)()
+#define CI_ADD_QUADS(object)                    ((int (__cdecl *)(int, DWORD))0x0066e272u)(1, (object))
+#define CI_RENDER(object, game)                 ((void (__cdecl *)(DWORD, int))CI_FN_RENDER_OBJECT)((object), (game))
+#define CI_EMPTY(object)                        ((void (__cdecl *)(DWORD))0x0066e62cu)(object)
+#define CI_FREE(slot)                           ((void (__cdecl *)(DWORD *))0x00671082u)(slot)
+#define CI_CALL_NEXT_RENDER(next, object, game) ((void (__cdecl *)(DWORD, int))(next))((object), (game))
+#define CI_CALL_NEXT_SHEET(next, hi)            ((void (__cdecl *)(int))(next))(hi)
+#define CI_CODE(site)                           ((const BYTE *)(site))
+#define CI_PATCH(site, target, hook, next)      patch_call_chained((site), (target), (hook), (next))
+#define CI_WRITE_REL(site, rel)                 ci_write_rel((site), (rel))
+#define CI_LOAD(e)                              ci_load_texture(e)
+#define CI_LOG                                  log_line
+#define CI_NAMES_EQUAL(a, b)                    (!lstrcmpiA((a), (b)))
+#define CI_DRAW_HOOK(list)                      ((list) == CI_LIST_ITEM_MENU ? (DWORD)item_icon_hook_a : (list) == CI_LIST_SHOP ? (DWORD)item_icon_hook_c : \
+                                                 (list) == CI_LIST_BATTLE ? (DWORD)item_icon_hook_e : (list) == CI_LIST_ITEM_MENU_SMALL ? (DWORD)item_icon_hook_b : \
+                                                 (list) == CI_LIST_SHOP_SMALL ? (DWORD)item_icon_hook_d : (DWORD)item_icon_hook_f)
+#define CI_GRAPHICS_FRAME(object)               (**(const DWORD *const *)((object) + 0x30))     /* the clock FUN_0066e641 renders by */
+#define CI_SMALL_X                              (*(const int *)0x00dc105cu)     /* the half-size mode's offset (FUN_006cd3b0 sets it) */
+#define CI_SMALL_Y                              (*(const int *)0x00dc1060u)
+
+struct custom_icon;
+static DWORD ci_load_texture(struct custom_icon *e);
+static BOOL ci_write_rel(DWORD site, DWORD rel);
+
+/* CUSTOM ICONS PURE BEGIN (extracted whole by tools/work/custom_icons/build_s456/test/unit/extract.py and
+   compiled natively with stubs for the CI_ macros above) */
+struct custom_icon {
+    char file[CI_FILE_ROOM];                /* as the key gave it, with '\\' between folders */
+    DWORD texture;                          /* the game's texture object; 0 while not loaded */
+    DWORD used;                             /* ci_clock when last drawn: the cap frees the least recent */
+    DWORD frame;                            /* ci_frame when last drawn: never freed before the render after it */
+    DWORD drawn_at;                         /* the texture's frame clock when last drawn: never freed in that graphics frame */
+    WORD width, height;                     /* the texture's */
+    BYTE failed;                            /* 1: not usable in this session (said once in the log) */
+    BYTE converted;                         /* 1: the PNG's cached .tex was checked (and made) in this session */
+    BYTE told;                              /* 1: its first load in this session is in the log */
+};
+static struct custom_icon custom_icons[CI_FILES_MAX];
+static int custom_icon_count;               /* files named by the sections read */
+static int custom_icons_loaded;             /* of them, textures loaded now */
+static int custom_icon_sections;            /* sections that name one (for the log) */
+static WORD custom_icon_of_id[ITEM_COUNT_EXTENDED];     /* item number 0-511 -> its file's place + 1; 0: the game's icon */
+static int ci_live;                         /* 1: the four render calls are followed; the DLL draws the icons */
+static int ci_small_live;                   /* 1: and the half-size mode's four too: its lists draw them as well */
+static int ci_sheet_followed;               /* the game's sheet loads followed (0 to 3) */
+static int ci_others_followed;              /* the other render call followed (0 or 1) */
+static int ci_draw_sites_ours;              /* the draw calls that are this DLL's (0 to CI_DRAWS; the log) */
+static DWORD ci_frame, ci_clock;
+static DWORD ci_render_next[CI_RENDERS], ci_sheet_next[3];
+static BYTE ci_offscreen_told[CI_LISTS];
+static int ci_cap_told;                     /* 1: "more than CI_LOADED_MAX at once" is in the log (once a session) */
+static struct { DWORD texture, drawn_at; } ci_retired[CI_RETIRED_MAX];      /* freed by a reading while drawn in this graphics frame */
+static int ci_retired_count;
+static const char *const ci_list_names[CI_LISTS] = {
+    "the Item menu's list", "the shop's buy and sell lists", "the battle's Item, W-Item and Throw list", "the box screen",
+    "the Item menu's list (half-size mode)", "the shop's buy and sell lists (half-size mode)", "the battle's Item, W-Item and Throw list (half-size mode)",
+};
+
+/* The value of `icon =` in the items file: file:NAME.png or file:NAME.tex. Copies NAME (with '\\' between
+   folders) to out (CI_FILE_ROOM) and returns NULL, or returns why the line is not read (out unchanged). */
+static const char *ci_file_problem(const char *value, const char *end, char *out)
+{
+    static const char prefix[] = "file:";
+    char name[CI_FILE_ROOM];
+    const char *p = value;
+    int n = 0, i, part = 0;
+
+    for (i = 0; prefix[i]; i++, p++)
+        if (p >= end || (*p | 0x20) != prefix[i])
+            return "icon takes file:NAME.png or file:NAME.tex, a picture in SpellExtConfig\\files\\icons (sub-folders may be given: file:potions/blue.png). The line is not read";
+    while (p < end && (*p == ' ' || *p == '\t'))
+        p++;
+    if (end - p >= CI_FILE_ROOM)
+        return "the icon file's name is too long: at most 63 characters with its folders. The line is not read";
+    if (end - p < 5)
+        return "the icon file needs a name and the ending .png or .tex. The line is not read";
+    for (; p < end; p++) {
+        char c = *p == '/' ? '\\' : *p;
+
+        if ((unsigned char)c < 0x20 || (unsigned char)c > 0x7e || c == ':' || c == '*' || c == '?' || c == '"' ||
+            c == '<' || c == '>' || c == '|' || c == '~')
+            return "the icon file's name has a character a file name cannot have here (: * ? \" < > | ~). The line is not read";
+        if (c == '\\') {
+            if (!part || (part == 2 && name[n - 1] == '.' && name[n - 2] == '.'))
+                return "the icon file's folders must be inside SpellExtConfig\\files\\icons (no empty folder name, no .., no leading /). The line is not read";
+            part = 0;
+        } else
+            part++;
+        name[n++] = c;
+    }
+    name[n] = 0;
+    if ((name[n - 4] != '.' || ((name[n - 3] | 0x20) != 'p' || (name[n - 2] | 0x20) != 'n' || (name[n - 1] | 0x20) != 'g'))
+        && (name[n - 4] != '.' || ((name[n - 3] | 0x20) != 't' || (name[n - 2] | 0x20) != 'e' || (name[n - 1] | 0x20) != 'x')))
+        return "the icon file must be a .png or a .tex. The line is not read";
+    if (part < 5)
+        return "the icon file needs a name before .png or .tex. The line is not read";
+    for (i = 0; i <= n; i++)
+        out[i] = name[i];
+    return NULL;
+}
+
+/* The place + 1 of a file in the list of icon files (added if new; names compared without case), or 0
+   when the list is full. */
+static int ci_register(const char *file)
+{
+    struct custom_icon *e;
+    int k, i;
+
+    for (k = 0; k < custom_icon_count; k++)
+        if (CI_NAMES_EQUAL(custom_icons[k].file, file))
+            return k + 1;
+    if (custom_icon_count == CI_FILES_MAX)
+        return 0;
+    e = &custom_icons[custom_icon_count];
+    for (i = 0; i < (int)sizeof *e; i++)
+        ((BYTE *)e)[i] = 0;
+    for (i = 0; file[i] && i < CI_FILE_ROOM - 1; i++)
+        e->file[i] = file[i];
+    return ++custom_icon_count;
+}
+
+/* The icon file a finished section names (icon: "" for none): its place + 1 in the list, or 0 (none, or the
+   list is full: said in the log, and the piece shows the game's icon). what: "item", "weapon", "armour" or
+   "accessory" (the file's word in the log), line: the section's line. */
+static WORD ci_take(const char *icon, const char *what, int line)
+{
+    int k;
+
+    if (!icon[0])
+        return 0;
+    custom_icon_sections++;
+    k = ci_register(icon);
+    if (!k)
+        CI_LOG("%s file line %d: icon = file:%s is not used: %d different icon files are named already: the game's icon is shown",
+               what, line, icon, CI_FILES_MAX);
+    return (WORD)k;
+}
+
+/* After the four files are read: one line, when any section names an icon file. */
+static void custom_icons_report(void)
+{
+    if (custom_icon_sections)
+        CI_LOG("custom icons: %d section(s) of the weapon, armour, accessory and item files name %d icon file(s) in SpellExtConfig\\%s%s",
+               custom_icon_sections, custom_icon_count, CI_FOLDER,
+               ci_live ? "" : ": NOT drawn in this run (see the \"custom icons OFF\" line): the game's icons are shown");
+}
+
+/* The cached texture's file name for a PNG icon: sxicon_ + NAME with '~' for each folder separator and
+   .tex for .png (potions\blue.png -> sxicon_potions~blue.tex). Room: 7 + 63 + 1. */
+static void ci_cache_name(const char *file, char *out)
+{
+    static const char prefix[] = "sxicon_";
+    int i, n = 0;
+
+    for (i = 0; prefix[i]; i++)
+        out[n++] = prefix[i];
+    for (i = 0; file[i]; i++)
+        out[n++] = file[i] == '\\' ? '~' : file[i];
+    out[n - 3] = 't', out[n - 2] = 'e', out[n - 1] = 'x';
+    out[n] = 0;
+}
+
+/* The icon file (place + 1) a number's section names, or 0: 0-511 by the table, a wide item's or a wide
+   piece's from its definition (none with nothing defining it now). */
+static int custom_icon_of(int number)
+{
+    const struct wide_item *w;
+    const struct wide_gear *g;
+    int k;
+
+    if (number >= 0 && number < ITEM_COUNT_EXTENDED)
+        k = custom_icon_of_id[number];
+    else if ((w = wide_item(number)) != NULL)
+        k = w->icon;
+    else
+        k = (g = wide_gear(number)) != NULL ? g->custom_icon : 0;
+    return k > 0 && k <= custom_icon_count ? k : 0;
+}
+
+/* Was this texture drawn in the graphics frame now being made (its frame clock has not moved since)? Its quad
+   may then still be rendered in this frame (or has been): it is not freed now. */
+static BOOL ci_drawn_this_frame(DWORD texture, DWORD drawn_at)
+{
+    return CI_GRAPHICS_FRAME(texture) == drawn_at;
+}
+
+/* Frees the texture drawn least recently, not since the last render nor in this graphics frame. FALSE if
+   every loaded one was. */
+static BOOL ci_evict(void)
+{
+    struct custom_icon *best = NULL;
+    int k;
+
+    for (k = 0; k < custom_icon_count; k++)
+        if (custom_icons[k].texture && custom_icons[k].frame != ci_frame && !ci_drawn_this_frame(custom_icons[k].texture, custom_icons[k].drawn_at) &&
+            (!best || custom_icons[k].used < best->used))
+            best = &custom_icons[k];
+    if (!best)
+        return FALSE;
+    CI_FREE(&best->texture);
+    best->texture = 0;
+    custom_icons_loaded--;
+    return TRUE;
+}
+
+/* Frees the retired textures whose graphics frame is over (with every: all of them). */
+static void ci_free_retired(int every)
+{
+    int k, kept = 0;
+
+    for (k = 0; k < ci_retired_count; k++)
+        if (every || !ci_drawn_this_frame(ci_retired[k].texture, ci_retired[k].drawn_at))
+            CI_FREE(&ci_retired[k].texture);
+        else
+            ci_retired[kept++] = ci_retired[k];
+    ci_retired_count = kept;
+}
+
+/* Every icon texture freed (they are loaded again when next drawn), the retired ones too; what failed stays
+   failed. (After the game's own sheet is made again: what was drawn on the sheet before is gone with it.) */
+static void ci_free_all(void)
+{
+    int k;
+
+    for (k = 0; k < custom_icon_count; k++)
+        if (custom_icons[k].texture) {
+            CI_FREE(&custom_icons[k].texture);
+            custom_icons[k].texture = 0;
+        }
+    custom_icons_loaded = 0;
+    ci_free_retired(1);
+}
+
+/* Before the weapon file is read (again; the first of the four, at start-up and at "Re-init .ini files"): no
+   section names an icon; every texture freed, but one drawn in this graphics frame is retired (rendered where
+   it was queued, freed when its frame is over), so a reading in the middle of a frame frees nothing that
+   frame still uses. */
+static void custom_icons_forget(void)
+{
+    int i;
+
+    ci_free_retired(0);
+    for (i = 0; i < custom_icon_count; i++)
+        if (custom_icons[i].texture) {
+            if (ci_drawn_this_frame(custom_icons[i].texture, custom_icons[i].drawn_at) && ci_retired_count < CI_RETIRED_MAX) {
+                ci_retired[ci_retired_count].texture = custom_icons[i].texture;
+                ci_retired[ci_retired_count++].drawn_at = custom_icons[i].drawn_at;
+            } else
+                CI_FREE(&custom_icons[i].texture);
+            custom_icons[i].texture = 0;
+        }
+    custom_icons_loaded = 0;
+    custom_icon_count = 0;
+    custom_icon_sections = 0;
+    for (i = 0; i < ITEM_COUNT_EXTENDED; i++)
+        custom_icon_of_id[i] = 0;
+}
+
+/* (item_icon_hook_a to _f; the box screen) Draws the item's own icon at x, y (32 x 32 menu units, the game's
+   icon's place and size; in the half-size mode's lists 16 x 16 at x, y moved by the mode's offset, as the
+   game's there) at the caller's depth, on its texture's object, and returns TRUE; or returns FALSE and the
+   caller draws the game's icon as before: no icon file, the DLL not drawing icons in this run (or in this
+   display mode), the menu not drawing in this frame, the list's icons placed off the screen (another mod
+   hides the game's icons there: said once per list), the file unusable, no room for one more texture (said
+   once) or for its quad. list: CI_LIST_... */
+static BOOL custom_icon_draw(int list, int number, int x, int y, DWORD depth)
+{
+    struct custom_icon *e;
+    float *q, u0, u1, v0, v1;
+    int k, i, small = list >= CI_LIST_ITEM_MENU_SMALL, size = small ? CI_DRAW_SIZE_SMALL : CI_DRAW_SIZE;
+
+    if (!ci_live || (small && !ci_small_live) || (k = custom_icon_of(number)) == 0 || !CI_MENU_DRAWING())
+        return FALSE;
+    if (ci_retired_count)
+        ci_free_retired(0);
+    if (x >= CI_SCREEN_RIGHT || x <= CI_SCREEN_HIDDEN_LEFT) {
+        if (list >= 0 && list < CI_LISTS && !ci_offscreen_told[list]) {
+            ci_offscreen_told[list] = 1;
+            CI_LOG("custom icons: %s draws its icons off the screen (x = %d): another mod hides the game's icons there (Enhanced Stock UI's \"Expanded Icons\" does): no custom icon is drawn in it",
+                   ci_list_names[list], x);
+        }
+        return FALSE;
+    }
+    e = &custom_icons[k - 1];
+    if (!e->texture) {
+        DWORD texture;
+
+        if (e->failed)
+            return FALSE;
+        if (custom_icons_loaded >= CI_LOADED_MAX && !ci_evict()) {
+            if (!ci_cap_told) {
+                ci_cap_told = 1;
+                CI_LOG("custom icons: %s shows more than %d different icon files at once: the rest show the game's icon (said once)",
+                       list >= 0 && list < CI_LISTS ? ci_list_names[list] : "a list", CI_LOADED_MAX);
+            }
+            return FALSE;
+        }
+        texture = CI_LOAD(e);           /* (says why in the log and sets failed when it cannot) */
+        if (!texture)
+            return FALSE;
+        e->texture = texture;
+        custom_icons_loaded++;
+    }
+    if (!CI_ADD_QUADS(e->texture))
+        return FALSE;
+    /* the whole texture, inset half a texel so that filtering never reaches past its edge */
+    u0 = 0.5f / (float)(e->width ? e->width : 1), u1 = 1.0f - u0;
+    v0 = 0.5f / (float)(e->height ? e->height : 1), v1 = 1.0f - v0;
+    if (small)
+        x += CI_SMALL_X, y += CI_SMALL_Y;   /* as FUN_006fcd45 */
+    q = *(float **)(e->texture + 0x70);
+    for (i = 0; i < 4; i++, q += 8) {       /* top left, bottom left, top right, bottom right (as FUN_006f7bfb) */
+        q[0] = (float)(x + (i >= 2 ? size : 0));
+        q[1] = (float)(y + ((i & 1) ? size : 0));
+        *(DWORD *)&q[2] = depth;
+        q[3] = 1.0f;
+        *(DWORD *)&q[4] = 0xffffffff;
+        *(DWORD *)&q[5] = 0xff000000;
+        q[6] = i >= 2 ? u1 : u0;
+        q[7] = (i & 1) ? v1 : v0;
+    }
+    **(BYTE **)(e->texture + 0x78) = 0;     /* palette 0 (the texture has one) */
+    *(DWORD *)(e->texture + 0x7c) = 0;
+    e->frame = ci_frame;
+    e->drawn_at = CI_GRAPHICS_FRAME(e->texture);
+    e->used = ++ci_clock;
+    return TRUE;
+}
+
+/* A followed render of the sheet's last quarter: the game's render (or whoever had the call), then every
+   loaded icon rendered and, when the game empties its sheet there (empty), emptied, in the same state, clip
+   and place in the frame. An icon not drawn since its last emptying is passed over by FUN_0066e641 (its
+   frame stamp). */
+static void ci_render(DWORD next, DWORD object, int game, int empty)
+{
+    int k;
+
+    CI_CALL_NEXT_RENDER(next, object, game);
+    for (k = 0; k < custom_icon_count; k++)
+        if (custom_icons[k].texture) {
+            CI_RENDER(custom_icons[k].texture, game);
+            if (empty)
+                CI_EMPTY(custom_icons[k].texture);
+        }
+    for (k = 0; k < ci_retired_count; k++) {    /* (a reading of the files in this frame) what was queued before it */
+        CI_RENDER(ci_retired[k].texture, game);
+        if (empty)
+            CI_EMPTY(ci_retired[k].texture);
+    }
+}
+
+static void __cdecl ci_render_hook_0(DWORD object, int game)       /* 006fa1c1, in FUN_006fa12f */
+{
+    ci_render(ci_render_next[0], object, game, 1);
+}
+
+static void __cdecl ci_render_hook_1(DWORD object, int game)       /* 006fa3d9, in FUN_006fa347 */
+{
+    ci_render(ci_render_next[1], object, game, 1);
+}
+
+static void __cdecl ci_render_hook_2(DWORD object, int game)       /* 006cca92, the main menu's end of frame */
+{
+    ci_render(ci_render_next[2], object, game, 1);
+    ci_frame++;
+}
+
+static void __cdecl ci_render_hook_3(DWORD object, int game)       /* 006dc2b5, in FUN_006dc1eb: the battle menu's render (each of its calls empties the sheet) */
+{
+    ci_render(ci_render_next[3], object, game, 1);
+    ci_frame++;
+}
+
+static void __cdecl ci_render_hook_4(DWORD object, int game)       /* 006cef35, in FUN_006cee84: rendered, not emptied, as the game's sheet there */
+{
+    ci_render(ci_render_next[4], object, game, 0);
+}
+
+/* (S5) The half-size display mode's renders of its sheet [00dc104c]: the same four kinds of moment */
+static void __cdecl ci_render_hook_5(DWORD object, int game)       /* 006ccacc, the main menu's end of frame (its half-size branch) */
+{
+    ci_render(ci_render_next[5], object, game, 1);
+    ci_frame++;
+}
+
+static void __cdecl ci_render_hook_6(DWORD object, int game)       /* 006fda03, in FUN_006fd9a3 (the half-size FUN_006fa12f) */
+{
+    ci_render(ci_render_next[6], object, game, 1);
+}
+
+static void __cdecl ci_render_hook_7(DWORD object, int game)       /* 006fdb32, in FUN_006fdaeb (the half-size FUN_006fa347) */
+{
+    ci_render(ci_render_next[7], object, game, 1);
+}
+
+static void __cdecl ci_render_hook_8(DWORD object, int game)       /* 006dc579, in FUN_006dc50d: the battle menu's half-size render (it empties the sheet) */
+{
+    ci_render(ci_render_next[8], object, game, 1);
+    ci_frame++;
+}
+
+/* A followed call of the game's sheet loader: the game's work, then every icon texture freed. */
+static void __cdecl ci_sheet_hook_0(int hi) { CI_CALL_NEXT_SHEET(ci_sheet_next[0], hi); ci_free_all(); }
+static void __cdecl ci_sheet_hook_1(int hi) { CI_CALL_NEXT_SHEET(ci_sheet_next[1], hi); ci_free_all(); }
+static void __cdecl ci_sheet_hook_2(int hi) { CI_CALL_NEXT_SHEET(ci_sheet_next[2], hi); ci_free_all(); }
+
+/* Are these the bytes before a call at `site`, and is it a call (e8)? */
+static BOOL ci_site_is(DWORD site, const BYTE *before, int count)
+{
+    const BYTE *p = CI_CODE(site - (DWORD)count);
+    int i;
+
+    for (i = 0; i < count; i++)
+        if (p[i] != before[i])
+            return FALSE;
+    return p[count] == 0xe8;
+}
+
+/* The eight calls that draw the game's icon in the lists this covers (install_hooks has pointed them at
+   item_icon_hook_a to _f before): each that is not a call of this DLL's hook (another mod blanked or changed
+   it: Enhanced Stock UI's "Expanded Icons" blanks 0071c16c and 006ded7f) is said once; no custom icon is
+   drawn there, since nothing of this DLL's runs there. The number that are this DLL's. */
+static int ci_draw_sites_check(void)
+{
+    static const struct { DWORD site; int list; } draws[CI_DRAWS] = {
+        { 0x00715910u, CI_LIST_ITEM_MENU }, { 0x0071b8d4u, CI_LIST_SHOP }, { 0x0071c16cu, CI_LIST_SHOP }, { 0x006ded7fu, CI_LIST_BATTLE },
+        { 0x007162cdu, CI_LIST_ITEM_MENU_SMALL }, { 0x0071cfc2u, CI_LIST_SHOP_SMALL }, { 0x0071d83bu, CI_LIST_SHOP_SMALL }, { 0x006df188u, CI_LIST_BATTLE_SMALL },
+    };
+    int i, ours = 0;
+
+    for (i = 0; i < CI_DRAWS; i++) {
+        const BYTE *p = CI_CODE(draws[i].site);
+        DWORD target = draws[i].site + 5 + *(const DWORD *)(p + 1);
+
+        if (p[0] == 0xe8 && target == CI_DRAW_HOOK(draws[i].list))
+            ours++;
+        else if (p[0] != 0xe8)
+            CI_LOG("custom icons: the call at %08lx (%s) is not there (byte %02x): another mod has blanked it (Enhanced Stock UI's \"Expanded Icons\" does): no custom icon is drawn there",
+                   draws[i].site, ci_list_names[draws[i].list], p[0]);
+        else
+            CI_LOG("custom icons: the call at %08lx (%s) goes to %08lx, not this DLL's: another mod has it: no custom icon is drawn there",
+                   draws[i].site, ci_list_names[draws[i].list], target);
+    }
+    return ours;
+}
+
+/* Once, from install_hooks. The four render calls: every one compared first (the instruction that loads
+   [00dc0fd4] and pushes it, then a call); all four followed, then read back; anything amiss and the ones
+   done are put back, and the DLL draws no icon in this run (one log line). Then the other render call (on
+   its own); then (S5) the half-size mode's four renders of [00dc104c] the same way as the first four but
+   on their own (a miss: that mode's lists show the game's icons, one log line; the full-size mode is not
+   touched by it); the sheet loader's three calls (the push of its argument, then a call), each on its own:
+   one not followed is logged, and the icons then stay loaded until the files are read again. Then the
+   eight draw calls are looked at. */
+static void custom_icons_install(void)
+{
+    static const BYTE mov_ecx[7] = { 0x8b, 0x0d, 0xd4, 0x0f, 0xdc, 0x00, 0x51 };   /* mov ecx,[00dc0fd4]; push ecx */
+    static const BYTE mov_eax[6] = { 0xa1, 0xd4, 0x0f, 0xdc, 0x00, 0x50 };         /* mov eax,[00dc0fd4]; push eax */
+    static const BYTE small_eax[6] = { 0xa1, 0x4c, 0x10, 0xdc, 0x00, 0x50 };       /* mov eax,[00dc104c]; push eax */
+    static const BYTE small_ecx[7] = { 0x8b, 0x0d, 0x4c, 0x10, 0xdc, 0x00, 0x51 }; /* mov ecx,[00dc104c]; push ecx */
+    static const BYTE small_edx[7] = { 0x8b, 0x15, 0x4c, 0x10, 0xdc, 0x00, 0x52 }; /* mov edx,[00dc104c]; push edx */
+    static const struct { DWORD site; const BYTE *before; int count; } renders[CI_RENDERS] = {
+        { 0x006fa1c1u, mov_ecx, 7 }, { 0x006fa3d9u, mov_ecx, 7 }, { 0x006cca92u, mov_eax, 6 }, { 0x006dc2b5u, mov_ecx, 7 },
+        { 0x006cef35u, mov_eax, 6 },
+        { 0x006ccaccu, small_eax, 6 }, { 0x006fda03u, small_ecx, 7 }, { 0x006fdb32u, small_edx, 7 }, { 0x006dc579u, small_eax, 6 },
+    };
+    static const BYTE push0[2] = { 0x6a, 0x00 }, push1[2] = { 0x6a, 0x01 };
+    static const struct { DWORD site; const BYTE *before; } sheets[3] = {
+        { 0x006c0f68u, push0 }, { 0x006cd3dbu, push1 }, { 0x006cd62du, push0 },
+    };
+    static void *const render_hooks[CI_RENDERS] = {
+        (void *)ci_render_hook_0, (void *)ci_render_hook_1, (void *)ci_render_hook_2, (void *)ci_render_hook_3, (void *)ci_render_hook_4,
+        (void *)ci_render_hook_5, (void *)ci_render_hook_6, (void *)ci_render_hook_7, (void *)ci_render_hook_8,
+    };
+    static void *const sheet_hooks[3] = { (void *)ci_sheet_hook_0, (void *)ci_sheet_hook_1, (void *)ci_sheet_hook_2 };
+    static int done;
+    DWORD old_rel[CI_RENDERS];
+    int i, patched = 0;
+
+    if (done)
+        return;
+    done = 1;
+    for (i = 0; i < CI_RENDERS_CORE; i++)
+        if (!ci_site_is(renders[i].site, renders[i].before, renders[i].count)) {
+            CI_LOG("custom icons OFF: the render call at %08lx is not as expected (byte %02x): the game's icons are shown",
+                   renders[i].site, CI_CODE(renders[i].site)[0]);
+            return;
+        }
+    for (i = 0; i < CI_RENDERS_CORE; i++)
+        old_rel[i] = *(const DWORD *)(CI_CODE(renders[i].site) + 1);
+    for (i = 0; i < CI_RENDERS_CORE; i++, patched++)
+        if (!CI_PATCH(renders[i].site, CI_FN_RENDER_OBJECT, render_hooks[i], &ci_render_next[i]) ||
+            *(const DWORD *)(CI_CODE(renders[i].site) + 1) != (DWORD)render_hooks[i] - (renders[i].site + 5))
+            break;
+    if (patched < CI_RENDERS_CORE) {
+        int undone = 0;
+
+        for (i = 0; i <= patched && i < CI_RENDERS_CORE; i++)
+            undone += CI_WRITE_REL(renders[i].site, old_rel[i]);
+        CI_LOG("custom icons OFF: the render call at %08lx could not be followed (%d put back): the game's icons are shown",
+               renders[patched].site, undone);
+        return;
+    }
+    ci_live = 1;
+    i = CI_RENDER_EXTRA;
+    if (ci_site_is(renders[i].site, renders[i].before, renders[i].count) &&
+        CI_PATCH(renders[i].site, CI_FN_RENDER_OBJECT, render_hooks[i], &ci_render_next[i]))
+        ci_others_followed++;
+    else
+        CI_LOG("custom icons: the render call at %08lx (an extra pass of the battle loop) is not as expected (byte %02x): not followed (in that pass the game's icons may show where custom ones are not)",
+               renders[i].site, CI_CODE(renders[i].site)[0]);
+    /* (S5) the half-size display mode's four, together or not at all */
+    for (i = CI_RENDERS_SMALL_FIRST; i < CI_RENDERS; i++)
+        if (!ci_site_is(renders[i].site, renders[i].before, renders[i].count)) {
+            CI_LOG("custom icons: the half-size display mode's render call at %08lx is not as expected (byte %02x): not followed: that mode's lists show the game's icons",
+                   renders[i].site, CI_CODE(renders[i].site)[0]);
+            break;
+        }
+    if (i == CI_RENDERS) {
+        for (i = CI_RENDERS_SMALL_FIRST; i < CI_RENDERS; i++)
+            old_rel[i] = *(const DWORD *)(CI_CODE(renders[i].site) + 1);
+        for (i = patched = CI_RENDERS_SMALL_FIRST; i < CI_RENDERS; i++, patched++)
+            if (!CI_PATCH(renders[i].site, CI_FN_RENDER_OBJECT, render_hooks[i], &ci_render_next[i]) ||
+                *(const DWORD *)(CI_CODE(renders[i].site) + 1) != (DWORD)render_hooks[i] - (renders[i].site + 5))
+                break;
+        if (patched < CI_RENDERS) {
+            int undone = 0;
+
+            for (i = CI_RENDERS_SMALL_FIRST; i <= patched && i < CI_RENDERS; i++)
+                undone += CI_WRITE_REL(renders[i].site, old_rel[i]);
+            CI_LOG("custom icons: the half-size display mode's render call at %08lx could not be followed (%d put back): that mode's lists show the game's icons",
+                   renders[patched].site, undone);
+        } else
+            ci_small_live = 1;
+    }
+    for (i = 0; i < 3; i++)
+        if (ci_site_is(sheets[i].site, sheets[i].before, 2) &&
+            CI_PATCH(sheets[i].site, CI_FN_SHEET_LOAD, sheet_hooks[i], &ci_sheet_next[i]))
+            ci_sheet_followed++;
+    ci_draw_sites_ours = ci_draw_sites_check();
+    CI_LOG("custom icons: on: the Item menu, the shop's lists, the box and the battle's item list draw an item's own icon file (4 of 4 render calls followed, %d of 1 other, %d of 4 of the half-size display mode; %d of 3 sheet loads followed%s; %d of 8 draw calls this DLL's)",
+           ci_others_followed, ci_small_live ? 4 : 0, ci_sheet_followed, ci_sheet_followed == 3 ? "" : ": the icons stay loaded until the files are read again",
+           ci_draw_sites_ours);
+}
+/* CUSTOM ICONS PURE END */
+
+/* Puts back a call's 4-byte displacement (custom_icons_install, when not all four could be followed). */
+static BOOL ci_write_rel(DWORD site, DWORD rel)
+{
+    DWORD old_protect;
+
+    if (!VirtualProtect((void *)(site + 1), 4, PAGE_EXECUTE_READWRITE, &old_protect))
+        return FALSE;
+    *(DWORD *)(site + 1) = rel;
+    VirtualProtect((void *)(site + 1), 4, old_protect, &old_protect);
+    FlushInstructionCache(GetCurrentProcess(), (void *)(site + 1), 4);
+    return TRUE;
+}
+
+/* An icon can not be used in this session: said once, with the file and why. */
+static void ci_fail(struct custom_icon *e, const char *path, const char *why)
+{
+    e->failed = 1;
+    log_line("custom icon file:%s: %s: %s: the game's icon is shown", e->file, path, why);
+}
+
+/* Reads the first PX_TEX_HEADER bytes of a .tex and checks them as an icon, against the file's length (its
+   palette and pixels must be in it). NULL (and the size), or why. */
+static const char *ci_tex_header(const char *path, WORD *width, WORD *height)
+{
+    HANDLE file = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    BYTE header[PX_TEX_HEADER];
+    DWORD got = 0, length;
+    px_u32 w = 0, h = 0;
+    const char *why;
+
+    if (file == INVALID_HANDLE_VALUE)
+        return "could not be read";
+    length = GetFileSize(file, NULL);
+    if (length == INVALID_FILE_SIZE || !ReadFile(file, header, sizeof header, &got, NULL))
+        got = 0, length = 0;
+    CloseHandle(file);
+    why = px_icon_tex_problem(header, got, length, &w, &h);
+    *width = (WORD)w, *height = (WORD)h;
+    return why;
+}
+
+/* Makes the PNG at png_path into an icon .tex at out. NULL, or why not. */
+static const char *ci_convert(struct custom_icon *e, const char *png_path, const char *out)
+{
+    HANDLE file = CreateFileA(png_path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    DWORD size, got = 0;
+    px_u32 tex_size = 0, side = 0, w = 0, h = 0;
+    const char *why = "could not be read";
+    BYTE *png = NULL, *tex = NULL;
+
+    if (file != INVALID_HANDLE_VALUE) {
+        size = GetFileSize(file, NULL);
+        if (size == INVALID_FILE_SIZE || size >= 64u * 1024 * 1024)
+            why = "too large a file";
+        else if ((png = PX_ALLOC(size + 1)) == NULL)
+            why = "out of memory";
+        else if (ReadFile(file, png, size, &got, NULL) && got == size)
+            tex = px_png_to_icon_tex(png, size, &tex_size, &side, &w, &h, &why);
+        CloseHandle(file);
+    }
+    if (tex) {
+        file = CreateFileA(out, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        why = "the converted file could not be written";
+        if (file != INVALID_HANDLE_VALUE) {
+            if (WriteFile(file, tex, tex_size, &got, NULL) && got == tex_size)
+                why = NULL;
+            CloseHandle(file);
+        }
+    }
+    if (!why)
+        log_line("custom icon file:%s: the PNG (%u x %u%s) made into a %u x %u texture: %s", e->file, w, h,
+                 w != h ? ", not square: stretched" : "", side, side, out);
+    if (png)
+        PX_FREE(png);
+    if (tex)
+        PX_FREE(tex);
+    return why;
+}
+
+/* Gives the cached .tex the PNG's own time, so that a PNG put back with an older time is also seen as
+   changed (the cache is made again whenever the two times differ). Nothing is said if it cannot: the
+   times then differ, and the PNG is converted once in each session. */
+static void ci_set_file_time(const char *path, const FILETIME *when)
+{
+    HANDLE file = CreateFileA(path, FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+
+    if (file == INVALID_HANDLE_VALUE)
+        return;
+    SetFileTime(file, NULL, NULL, when);
+    CloseHandle(file);
+}
+
+/* The folder strings handed to the game's loader: kept for the session (the game may keep the pointer). */
+static char ci_folders[CI_FOLDERS_MAX][MAX_PATH + 200];
+static int ci_folder_count;
+
+/* The texture object for an icon (CI_LOAD), or 0 with e->failed set and the reason in the log. */
+static DWORD ci_load_texture(struct custom_icon *e)
+{
+    char path[MAX_PATH + 200], folder[MAX_PATH + 200], name[96];
+    const char *why;
+    BYTE source[0x80];
+    DWORD saved_mode, texture, attributes;
+    int game = ((int (__cdecl *)(void))0x00676578u)(), length, cut, i;
+    char *kept = NULL;
+
+    lstrcpyA(path, config_dir);
+    lstrcatA(path, CI_FOLDER);
+    lstrcatA(path, e->file);
+    attributes = GetFileAttributesA(path);
+    if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY)) {
+        ci_fail(e, path, "no such file");
+        return 0;
+    }
+    length = lstrlenA(e->file);
+    if ((e->file[length - 3] | 0x20) == 'p') {
+        /* a PNG: its .tex in the cache folder, made again when the PNG's time is not the cached file's (or the
+           cached one is not usable); checked once a session */
+        WIN32_FILE_ATTRIBUTE_DATA png_info, tex_info;
+        char cache[MAX_PATH + 200];
+
+        lstrcpyA(folder, config_dir);
+        lstrcatA(folder, CACHE_FOLDER_NAME);
+        CreateDirectoryA(folder, NULL);
+        lstrcatA(folder, "\\");
+        ci_cache_name(e->file, name);
+        lstrcpyA(cache, folder);
+        lstrcatA(cache, name);
+        if (!e->converted) {
+            BOOL png_time = GetFileAttributesExA(path, GetFileExInfoStandard, &png_info);
+
+            if (!png_time || !GetFileAttributesExA(cache, GetFileExInfoStandard, &tex_info) ||
+                CompareFileTime(&tex_info.ftLastWriteTime, &png_info.ftLastWriteTime) != 0 ||
+                ci_tex_header(cache, &e->width, &e->height)) {
+                if ((why = ci_convert(e, path, cache)) != NULL) {
+                    ci_fail(e, path, why);
+                    return 0;
+                }
+                if (png_time)
+                    ci_set_file_time(cache, &png_info.ftLastWriteTime);
+            }
+            e->converted = 1;
+        }
+        if ((why = ci_tex_header(cache, &e->width, &e->height)) != NULL) {
+            ci_fail(e, cache, why);
+            return 0;
+        }
+    } else {
+        /* a .tex of the user's: loaded from where it is, as it is (its header checked against its length) */
+        if ((why = ci_tex_header(path, &e->width, &e->height)) != NULL) {
+            ci_fail(e, path, why);
+            return 0;
+        }
+        lstrcpyA(folder, path);
+        for (cut = lstrlenA(folder); cut > 0 && folder[cut - 1] != '\\'; cut--)
+            ;
+        lstrcpyA(name, folder + cut);
+        folder[cut] = 0;
+    }
+    lstrcpyA(name + lstrlenA(name) - 4, ".tim");    /* the loader swaps the extension to .tex */
+    {
+        /* relative to the game's folder where it lies inside it, as load_portrait_named does: FFNx names a
+           plain-file texture by the path it was asked for (so a mod may supply <mod_path>\\<that path>_00.dds) */
+        char game_dir[MAX_PATH];
+        DWORD n = GetModuleFileNameA(NULL, game_dir, MAX_PATH), j;
+
+        while (n > 0 && game_dir[n - 1] != '\\' && game_dir[n - 1] != '/')
+            n--;
+        for (j = 0; j < n && folder[j] && (folder[j] | 0x20) == (game_dir[j] | 0x20); j++)
+            ;
+        if (n && j == n && folder[n]) {
+            char relative[MAX_PATH + 200];
+            HANDLE probe;
+
+            lstrcpyA(relative, folder + n);
+            lstrcatA(relative, name);
+            lstrcpyA(relative + lstrlenA(relative) - 4, ".tex");
+            probe = CreateFileA(relative, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+            if (probe != INVALID_HANDLE_VALUE) {
+                CloseHandle(probe);
+                for (j = 0; folder[n + j]; j++)
+                    folder[j] = folder[n + j];
+                folder[j] = 0;
+            }
+        }
+    }
+    for (i = 0; i < ci_folder_count && !kept; i++)
+        if (!lstrcmpiA(ci_folders[i], folder))
+            kept = ci_folders[i];
+    if (!kept) {
+        if (ci_folder_count == CI_FOLDERS_MAX) {
+            ci_fail(e, path, "icons are loaded from too many folders (32)");
+            return 0;
+        }
+        kept = ci_folders[ci_folder_count++];
+        lstrcpyA(kept, folder);
+    }
+    saved_mode = ((DWORD (__cdecl *)(void))0x00674530u)();
+    ((void (__cdecl *)(int))0x0067453au)(0);
+    ((void (__cdecl *)(int, BYTE *))0x006745e6u)(4, source);
+    *(DWORD *)(source + 0x44) = 0;                  /* not from an archive */
+    *(DWORD *)(source + 0x48) = 0;
+    *(DWORD *)(source + 0x4c) = 0;
+    *(DWORD *)(source + 0x24) = (DWORD)kept;
+    ((void (__cdecl *)(int, BYTE *))0x00674659u)(4, source);       /* blend mode 4, as the game's icon sheet */
+    texture = ((DWORD (__cdecl *)(int, int, BYTE *, const char *, DWORD))0x006710acu)(
+        1, 0xc, source, name, *(DWORD *)(game + 0x910));
+    ((void (__cdecl *)(DWORD))0x0067453au)(saved_mode);
+    if (!texture)
+        ci_fail(e, path, "the game's texture loader did not load it");
+    else if (!e->told) {
+        e->told = 1;
+        log_line("custom icon file:%s loaded (%u x %u) from %s%s", e->file, e->width, e->height, kept, name);
+    }
+    return texture;
+}
+
+/* ==== CUSTOM ICONS: end ==== */
 
 static LONG limit_opens_logged;
 /* `effect_file = NAME:LOOSE` of a new character's limit: while that limit is the one being carried out, a
@@ -10132,6 +11497,48 @@ static DWORD big_hit_amount(int target, WORD shown)
 #define FN_HIT_IMMUNE_CHECK     0x005dc0eau
 static DWORD enemy_hp_limit = 9999;     /* as set by load_game_settings */
 
+/* TESTING AID `test_party_damage = N` (game file): every hit of a party member's action (the acting
+   actor, battle slot 0-2, whoever sits there) that takes HP from an enemy (4-9) takes exactly N, held to
+   the enemy damage limit. Put in at the same point as fixed_damage, after it, so it is after the game's
+   formula, its critical, element (double, half, absorb) and clamp, and before the game's own "cannot be
+   hurt" check (which still makes it 0) and the HP change, the pop-up's number and the drain. Left as
+   they are: a miss (action[0x86] bit 0), a hit with no amount (bit 1: power 0, a status-only hit), a hit
+   that restores (action[0x88] bit 0: healing, an absorbed element), MP (bit 2), an amount of 0, a hit on
+   a party member, and every hit of an enemy's action. 0 is off. */
+/* TEST PARTY DAMAGE PURE BEGIN */
+#define TEST_PARTY_DAMAGE_MAX   9999999      /* seven digits, as DAMAGE_LIMIT_MAX */
+static DWORD test_party_damage;      /* 0: off; set by load_game_settings */
+
+/* The hit's amount with the testing aid applied: `amount` unchanged unless the hit is one it changes. */
+static int test_party_damage_amount(DWORD wanted, DWORD limit, int actor, int target, DWORD miss_flags,
+                                    DWORD result_flags, int amount)
+{
+    if (!wanted || actor < 0 || actor > 2 || target < 4 || target > 9 || (miss_flags & 3) || (result_flags & 5) ||
+        amount < 1)
+        return amount;
+    if (wanted > limit)
+        wanted = limit;
+    return wanted > TEST_PARTY_DAMAGE_MAX ? TEST_PARTY_DAMAGE_MAX : (int)wanted;
+}
+
+/* test_party_damage's value: off / no / 0 (off) or a number 1 to 9999999 (decimal or 0x). FALSE on a
+   mistake (the caller leaves it off). */
+static BOOL test_party_damage_value(char *value, char *stop, DWORD *out)
+{
+    char *p = value;
+    DWORD n;
+
+    if (word_is(value, stop, "off") || word_is(value, stop, "no")) {
+        *out = 0;
+        return TRUE;
+    }
+    if (stop - value > 9 || !parse_number(&p, stop, &n) || p != stop || n > TEST_PARTY_DAMAGE_MAX)
+        return FALSE;      /* (ten decimal digits or more could wrap the 32-bit reading) */
+    *out = n;
+    return TRUE;
+}
+/* TEST PARTY DAMAGE PURE END */
+
 static int __cdecl fixed_damage_hook(int target)
 {
     int *action = *(int **)ADDR_ACTION_PTR;
@@ -10148,24 +11555,33 @@ static int __cdecl fixed_damage_hook(int target)
 
         action[0x85] = (int)(amount > limit ? limit : amount);
     }
+    if (test_party_damage)
+        action[0x85] = test_party_damage_amount(test_party_damage, enemy_hp_limit, action[ACT_ACTOR], target,
+                                                (DWORD)action[0x86], (DWORD)action[0x88], action[0x85]);
     return ((int (__cdecl *)(int))FN_HIT_IMMUNE_CHECK)(target);
 }
 
 static void state_limit_hit(int actor);     /* a limit's `state`: the limit has a target in the hit loop */
+static BOOL state_landed_before(DWORD *before);         /* (dexterity_per_target) the ten statuses before the hit */
+static void state_landed_after(const DWORD *before);    /* ... and whether a status of the limit landed with it */
 
 static void __cdecl hit_target_hook(int attacker, int target)
 {
     const int *action;
+    DWORD before[10];
+    BOOL counting = state_landed_before(before);
 
     if (limit_elements.count && attacker == limit_elements.actor) {
         /* `hit_elements`: this hit's element (the last one listed goes on for any further hits) */
-        int k = limit_elements.hits < limit_elements.count ? limit_elements.hits : limit_elements.count - 1;
+        int k = every_target_element_for(attacker, limit_elements.hits, limit_elements.count);   /* (every target): by hit */
 
         (*(int **)ADDR_ACTION_PTR)[0x11] = limit_elements.element[k];
         limit_elements.hits++;
     }
     ((void (__cdecl *)(int, int))FN_HIT_TARGET)(attacker, target);
     action = *(const int **)ADDR_ACTION_PTR;
+    if (counting)
+        state_landed_after(before);
     /* the ACTING actor, not the hit's attacker: for a reflected hit that is the one it bounced off */
     if (action[ACT_COMMAND_TYPE] == 0x14 && action[ACT_ACTOR] >= 0 && action[ACT_ACTOR] < 3)
         state_limit_hit(action[ACT_ACTOR]);
@@ -10235,6 +11651,19 @@ static void game_text(char *out, const BYTE *in, int max)
 static BOOL enemies_describe(LONG battle, char *scene, int slot, char *folder);   /* (enemies, scenes) */
 static void enemies_load_scene(DWORD number, void *callback);                       /* (enemies, scenes) */
 static void enemies_game_scene(void);                                               /* (enemies, scenes) */
+static void surrounded_new_load(void);                                              /* (surrounded) */
+static unsigned sur_reach_begin(const int *action);                                 /* (surrounded, stage 2: the reach rule) */
+static void sur_reach_trim(int *action, unsigned out, unsigned asked, const char *where);
+static void sur_reach_end(int *action, unsigned out);
+static BOOL sur_counter_allowed(int actor);
+static void install_surrounded_reach(int *ok, int *total);
+static void sur_counter_done(void);                                                 /* (surrounded, stage 4: the rules) */
+static void sur_rules_apply(void);
+static void sur_rows_off(void);
+static unsigned sur_rows_back;                                                     /* (stage 4b) members found in the back row since sur_arm (the log) */
+static void install_surrounded_rules(int *ok, int *total);
+static int sur_back_hit_begin(const int *action, DWORD *saved);
+static void sur_back_hit_end(const int *action, int begun, DWORD saved);
 
 static void describe_battle(const char *prefix)
 {
@@ -10270,13 +11699,18 @@ static void follow_esui_battle_avatars(void);
 static void __cdecl load_scene_hook(DWORD number, void *callback)
 {
     follow_esui_battle_avatars();       /* a mod's patches may arrive after the kernel was loaded */
+    if (!*(const DWORD *)0x00c069bcu)
+        surrounded_new_load();          /* (surrounded) a load begins (the loader's state 0): nothing armed until written */
     if (enemies_live && number >= 1024 && number <= 16383)
         enemies_load_scene(number, callback);   /* (enemies) a DLL scene: its stand-in loaded, then written over */
-    else if (enemies_live && number >= 1020) {
-        /* (enemies) scene 255 or past 4095: FUN_005d14a9 would read past scene.bin's table */
+    else if (number >= 1020) {
+        /* (enemies) scene 255 or past 4095, or with enemies = off any scene past 254 (a field's BATTLE with a DLL
+           scene's number): FUN_005d14a9 would read past scene.bin's table */
         if (!*(const DWORD *)0x00c069bcu && InterlockedIncrement(&battles_logged) <= 400)
-            log_line("enemies: battle %lu (scene %lu) is no battle the game or a DLL scene has: battle 0 (scene 0:0) plays in its place", number, number >> 2);
-        enemies_game_scene();
+            log_line("enemies: battle %lu (scene %lu) is no battle the game or a DLL scene has%s: battle 0 (scene 0:0) plays in its place",
+                     number, number >> 2, enemies_live ? "" : " (enemies off)");
+        if (enemies_live)
+            enemies_game_scene();
         ((void (__cdecl *)(DWORD, void *))FN_LOAD_SCENE)(0, callback);
     } else {
         if (enemies_live)
@@ -10647,6 +12081,7 @@ static void install_hooks(void)
     ok += patch_call(0x007162cdu, 0x007177a8u, item_icon_hook_b);
     ok += patch_call(0x0071b8d4u, 0x0071e1e7u, item_icon_hook_c) & patch_call(0x0071c16cu, 0x0071e1e7u, item_icon_hook_c);
     ok += patch_call(0x0071cfc2u, 0x0071e2feu, item_icon_hook_d) & patch_call(0x0071d83bu, 0x0071e2feu, item_icon_hook_d);
+    custom_icons_install();     /* (custom icons) the render calls the lists' own icons need, all or none (the half-size mode's on their own; after hooks a-f: it looks at their calls); logs itself */
     for (i = 0; i < sizeof item_restriction_sites / sizeof item_restriction_sites[0]; i++, total++)
         ok += patch_call(item_restriction_sites[i], FN_ITEM_RESTRICTIONS, item_restrictions_hook);
     total++;
@@ -10730,6 +12165,21 @@ static const struct flag_name special_flags[] = {
 };
 
 /* What one [section] of the file has set so far. */
+/* `script_bytes` (see "A spell's caster script bytes", after "A spell's caster script"): the spells' bytes */
+#define SPELL_BYTES_MAX         128          /* bytes of a spell's script_bytes, as a limit's `script` */
+#define SPELL_BYTES_SPELLS      64           /* spells that may carry script_bytes */
+#define SPELL_BYTES_BUFFER      256          /* a lent copy: the interpreter's position is a byte, it cannot read past this */
+#define SPELL_BYTES_SLOT_MAGIC  0x1d         /* the command's own script lent: Magic (and `party_vanishes = no`) */
+#define SPELL_BYTES_SLOT_SUMMON 0x1f         /* and Summon with the presentation */
+static struct spell_bytes_entry {
+    WORD id;
+    BYTE length;
+    signed char max_animation;          /* the highest animation byte the bytes play; -1 none */
+    char model[3];                      /* `script_bytes_model`: the caster's script file's two letters, upper case; "" = any */
+    BYTE bytes[SPELL_BYTES_MAX];
+} spell_bytes[SPELL_BYTES_SPELLS];
+static int spell_bytes_count;           /* entries taken by this reading of the spell file */
+
 struct spell_draft {
     int id, line;
     int base;                           /* kernel attack ID to copy, or -1 */
@@ -10740,6 +12190,9 @@ struct spell_draft {
     DWORD flag_add[4], flag_remove[4];  /* element, target, status, special: flags to turn on and off
                                            in whatever the record otherwise holds (+name / -name) */
     struct spell spell;                 /* everything except the record */
+    BYTE bytes[SPELL_BYTES_MAX];        /* `script_bytes`, accepted; bytes_length 0 = not given */
+    BYTE bytes_length;
+    char bytes_model[3];                /* `script_bytes_model`, upper case; "" = not given */
 };
 
 static BOOL is_space(char c)
@@ -14205,6 +15658,11 @@ static const char nfx_stage0_text[] =
 
 static BOOL spell_file_reading;        /* load_spells is reading: `animation = 0x100` (an effect copy) is taken */
 static int effect_copy_base(DWORD number);   /* ("Effect copies", after the spell file code) */
+static const char *spell_script_value_problem(DWORD value);  /* ("A spell's caster script", after the actor's script table) */
+static void spell_script_forget(void);
+static const char *spell_bytes_problem(const BYTE *b, int length, int *max_animation);    /* ("A spell's caster script bytes") */
+static void spell_bytes_forget_log(void);
+static const char *state_bytes(BYTE *out, BYTE *out_length, int most, char *value, char *stop);   /* (a state's scripts, after the forms) */
 
 /* Applies one `key = value` line to the draft. Returns NULL, or what was
    wrong with it. */
@@ -14388,6 +15846,68 @@ static const char *apply_key(struct spell_draft *draft, char *key, char *key_end
         draft->spell.order_group = (BYTE)g;
         return NULL;
     }
+    if (word_is(key, key_end, "script_bytes")) {
+        /* the caster's own script as bytes (see "A spell's caster script bytes"); a refused value leaves the key
+           as it was */
+        static char refused[400];
+        BYTE bytes[SPELL_BYTES_MAX], length;
+        const char *why;
+        int max_animation;
+
+        if (!spell_file_reading)
+            return "script_bytes is a spell file key: a limit has `script`";
+        if (word_is(value, end, "none")) {
+            draft->bytes_length = 0;
+            return NULL;
+        }
+        why = state_bytes(bytes, &length, SPELL_BYTES_MAX, value, end);
+        if (!why)
+            why = spell_bytes_problem(bytes, length, &max_animation);
+        if (why) {
+            wsprintfA(refused, "script_bytes: %s; the spell is kept without it", why);
+            return refused;
+        }
+        copy_bytes(draft->bytes, bytes, length);
+        draft->bytes_length = length;
+        return NULL;
+    }
+    if (word_is(key, key_end, "script_bytes_model")) {
+        /* the bytes play only on a caster whose script file is XY..AB (its two letters, or the whole name) */
+        BOOL whole = end - value == 4 && (value[2] | 0x20) == 'a' && (value[3] | 0x20) == 'b';
+
+        if (!spell_file_reading)
+            return "script_bytes_model is a spell file key";
+        if (word_is(value, end, "none")) {
+            draft->bytes_model[0] = 0;
+            return NULL;
+        }
+        if ((end - value != 2 && !whole) || !((value[0] | 0x20) >= 'a' && (value[0] | 0x20) <= 'z') ||
+            !((value[1] | 0x20) >= 'a' && (value[1] | 0x20) <= 'z'))
+            return "script_bytes_model is the caster's script file in the battle archive's naming, its two letters or its name (xy or XYAB), or none";
+        draft->bytes_model[0] = (char)(value[0] & ~0x20);
+        draft->bytes_model[1] = (char)(value[1] & ~0x20);
+        draft->bytes_model[2] = 0;
+        return NULL;
+    }
+    if (word_is(key, key_end, "script")) {
+        /* the caster's model script (see "A spell's caster script"); a refused value leaves the key as it was */
+        static char refused[400];
+        const char *why;
+
+        if (word_is(value, end, "none")) {
+            draft->spell.script = 0;
+            return NULL;
+        }
+        if (!parse_number(&p, end, &number) || p != end)
+            return "script must be a model script number (0x1c-0x21, 0x23, 0x25, 0x27, 0x29, 0x2b or 0x2d), or none";
+        if ((why = spell_script_value_problem(number)) != NULL) {
+            wsprintfA(refused, "script must be 0x1c-0x21, 0x23, 0x25, 0x27, 0x29, 0x2b or 0x2d (0x%lx: %s); the spell is kept without it",
+                      number, why);
+            return refused;
+        }
+        draft->spell.script = (BYTE)number;
+        return NULL;
+    }
     if (word_is(key, key_end, "list")) {
         if (word_is(value, end, "summon"))
             draft->spell.is_summon = 1;
@@ -14505,6 +16025,33 @@ static void finish_spell(struct spell_draft *draft)
             spell->record[i] = draft->value[i];
     apply_flag_changes(draft, spell->record);
     warn_reflect_with_hits(spell->record, "spell", draft->id, draft->line);
+    spell->bytes_entry = 0;
+    if (draft->bytes_length && spell_bytes_count >= SPELL_BYTES_SPELLS) {
+        log_line("spell file line %d: spell %d: script_bytes not used: only %d spells may carry it",
+                 draft->line, draft->id, SPELL_BYTES_SPELLS);
+    } else if (draft->bytes_length) {
+        /* (taken here, after the returns above: a skipped spell takes no entry) */
+        struct spell_bytes_entry *e = &spell_bytes[spell_bytes_count];
+        int max_animation;
+
+        if (spell->script) {
+            log_line("spell file line %d: spell %d has script_bytes and script: script (0x%x) is not used",
+                     draft->line, draft->id, spell->script);
+            spell->script = 0;
+        }
+        e->id = (WORD)draft->id;
+        e->length = draft->bytes_length;
+        copy_bytes(e->bytes, draft->bytes, draft->bytes_length);
+        spell_bytes_problem(e->bytes, e->length, &max_animation);     /* (accepted when read: for its highest animation) */
+        e->max_animation = (signed char)max_animation;
+        e->model[0] = draft->bytes_model[0];
+        e->model[1] = draft->bytes_model[1];
+        e->model[2] = 0;
+        spell->bytes_entry = (BYTE)(++spell_bytes_count);
+    } else if (draft->bytes_model[0]) {
+        log_line("spell file line %d: spell %d: script_bytes_model is not used: the spell has no script_bytes",
+                 draft->line, draft->id);
+    }
     for (i = 0; i < 4; i++)
         if (draft->flag_add[i] || draft->flag_remove[i]) {
             log_line("spell %d: flags changed from its base: element %04x, target %02x, status %08lx, special %04x (special is stored inverted)",
@@ -14675,6 +16222,9 @@ static void load_spells(void)
     spell_support = NULL;
     spells = NULL;
     spell_count = 0;
+    spell_script_forget();              /* a re-read value is logged again at its next cast */
+    spell_bytes_count = 0;              /* script_bytes: the table is filled again (a lend points into a party slot's own copy) */
+    spell_bytes_forget_log();
     for (character = 0; character < 3; character++) {
         if (spell_list[character])
             VirtualFree(spell_list[character], 0, MEM_RELEASE);
@@ -14769,6 +16319,39 @@ static void load_spells(void)
     spell_file_reading = FALSE;
     VirtualFree(text, 0, MEM_RELEASE);
     log_line("spell file: %d spells loaded, %d line(s) with problems", spell_count, errors);
+    {
+        /* the spells that name a caster script, in one line (the first 24) */
+        char list[24 * 12 + 8];
+        int named = 0, n = 0, i;
+
+        for (i = 0; i < spell_count; i++) {
+            if (!spells[i].script)
+                continue;
+            if (named++ < 24)
+                n += wsprintfA(list + n, "%s %u 0x%x", n ? "," : "", spells[i].id, spells[i].script);
+        }
+        if (named)
+            log_line("spells: %d spell(s) name a caster script (script =):%s%s", named, list, named > 24 ? ", ..." : "");
+    }
+    {
+        /* the spells that carry their caster's script (script_bytes), in one line (the first 24); each ID once */
+        char list[24 * 32 + 8];
+        int carried = 0, n = 0, i;
+
+        for (i = 0; i < spell_count; i++) {
+            const struct spell_bytes_entry *e;
+
+            if (!spells[i].bytes_entry)
+                continue;
+            e = &spell_bytes[spells[i].bytes_entry - 1];
+            if (carried++ < 24)
+                n += wsprintfA(list + n, e->model[0] ? "%s %u (%u bytes, model %s)" : "%s %u (%u bytes)", n ? "," : "",
+                               spells[i].id, (unsigned)e->length, e->model);
+        }
+        if (carried)
+            log_line("spells: %d spell(s) carry their caster's script (script_bytes):%s%s", carried, list,
+                     carried > 24 ? ", ..." : "");
+    }
     if (spell_count)
         log_line("first spell: ID %d, record reached through index %08lx", spells[0].id,
                  (DWORD)index_reaching(spells[0].record));
@@ -17735,7 +19318,8 @@ static BOOL sign_extend_site(DWORD address, BOOL check_only)
    commands hits `hits` times (the turns are the command's own: Attack 1, 2x-Cut 2, 4x-Cut 4), with
    scripts of the state's own, and a turn whose target has died goes to another; the attack may go at
    every enemy, with an element and a range of the state's (`attack_targets`, `attack_element`,
-   `long_range`); physical hits on the actor may all miss (`physical_evade`); and model scripts of the
+   `long_range`); physical hits on the actor may all miss (`physical_evade`); its chances to cover an ally and to
+   counter with Attack may be raised (`cover`, `counter`: "A state's cover and counter"); and model scripts of the
    actor's may be replaced while the state lasts (`script_NN`: reactions, casting). The battle side is
    further down, with the limits ("A state", before battle_start_party_hook).
 
@@ -17803,6 +19387,11 @@ struct limit_state {                    /* one [12 state NAME] section */
     BYTE view_back;                     /* `view_back`: per cent the eye goes back from the point looked at; 0 = not */
     /* the yellow pointer over the acting party member while the state lasts (see "A state's pointer raised") */
     WORD pointer_raise;                 /* `pointer_raise`: units the pointer goes up; 0 = where the game puts it */
+    /* the actor's Cover and Counter Attack chances while the state lasts (see "A state's cover and counter") */
+    BYTE cover;                         /* `cover`: 0-100, per cent; 0 = the materia's own chance only */
+    BYTE counter;                       /* `counter`: 0-100, per cent; 0 = the materia's own Counter Attack only */
+    /* the actor's battle dexterity while the state lasts (see "A state's dexterity_per_target") */
+    BYTE dex_per_target;                /* `dexterity_per_target`: 1-255 for each target the limit's status landed on; 0 = none */
 };
 
 static const struct { BYTE number; const char *name; } state_command_names[] = {
@@ -17848,6 +19437,421 @@ static void state_commands_text(char *out, DWORD mask)
     if (!out[0])
         lstrcpyA(out, "none");
 }
+
+/* ---- FORGET FLAG PURE begin (no game memory, no Windows: tools/work/dll_forget_flag/test/forget compiles this block alone) ----
+
+   `forget_flag = BANK:BYTE.BIT` (the character file): a save bit that a field script turns on to ask
+   that every character naming it FORGETS its record, as if it had never joined: a guest who joins for
+   one scene, to be made afresh from its sheet when it really joins. The DLL looks at the start of
+   new_characters_joining (every party-slot rebuild, the PHS) and at the end of a load; it forgets a
+   character only when that is safe, and turns the bit OFF once it has looked (a one-shot request).
+
+   The bit's place, as the game's field reader FUN_0060f750 finds a bank's byte (read from the code):
+   bank 1 at 00dc08dc + byte, 3 + 0x100, 11 (B) + 0x200, 13 (D) + 0x300, 15 (F) + 0x400: the save's
+   five banks, 0x500 bytes. Kept as ((offset << 3) | bit) + 1; 0 = no flag. */
+#define FORGET_FLAG_NONE        0
+#define FORGET_BANK_BYTES       0x500
+
+static int forget_flag_offset(int flag)
+{
+    return (flag - 1) >> 3;
+}
+
+static int forget_flag_bit(int flag)
+{
+    return (flag - 1) & 7;
+}
+
+/* "3:1.4", for a line (out: at least 12 bytes) */
+static void forget_flag_text(int flag, char *out)
+{
+    static const char *const banks[5] = { "1", "3", "11", "13", "15" };
+    int offset = forget_flag_offset(flag), byte = offset & 0xff, i = 0;
+    const char *b = banks[(offset >> 8) % 5];
+
+    while (*b)
+        out[i++] = *b++;
+    out[i++] = ':';
+    if (byte >= 100)
+        out[i++] = (char)('0' + byte / 100);
+    if (byte >= 10)
+        out[i++] = (char)('0' + byte / 10 % 10);
+    out[i++] = (char)('0' + byte % 10);
+    out[i++] = '.';
+    out[i++] = (char)('0' + forget_flag_bit(flag));
+    out[i] = 0;
+}
+
+/* The value of `forget_flag`: BANK:BYTE.BIT (bank 1, 3, 11, 13 or 15, also written B, D or F; byte 0-255;
+   bit 0-7), or none. NULL with *flag set, or what is wrong (*flag untouched). */
+static const char *forget_flag_parse(const char *p, const char *end, int *flag)
+{
+    static const char format[] = "forget_flag must be BANK:BYTE.BIT (such as 3:1.4) or none";
+    int bank = 0, byte = 0, base, digits = 0;
+
+    if (end - p == 4 && (p[0] | 0x20) == 'n' && (p[1] | 0x20) == 'o' && (p[2] | 0x20) == 'n' && (p[3] | 0x20) == 'e') {
+        *flag = FORGET_FLAG_NONE;
+        return NULL;
+    }
+    if (p < end && (*p | 0x20) >= 'b' && (*p | 0x20) <= 'f' && p + 1 < end && p[1] == ':')
+        bank = 11 + ((*p++ | 0x20) - 'b'), digits = 1;
+    else
+        while (p < end && *p >= '0' && *p <= '9' && digits < 3)
+            bank = bank * 10 + (*p++ - '0'), digits++;
+    if (!digits || p >= end || *p++ != ':')
+        return format;
+    base = bank == 1 ? 0 : bank == 3 ? 0x100 : bank == 11 ? 0x200 : bank == 13 ? 0x300 : bank == 15 ? 0x400 : -1;
+    if (base < 0)
+        return "forget_flag: the bank must be 1, 3, 11 (B), 13 (D) or 15 (F), the save's banks as a field script names them for its bits";
+    digits = 0;
+    while (p < end && *p >= '0' && *p <= '9' && digits < 4)
+        byte = byte * 10 + (*p++ - '0'), digits++;
+    if (!digits || p >= end || *p++ != '.')
+        return format;
+    if (byte > 255)
+        return "forget_flag: the byte must be 0 to 255";
+    if (p + 1 != end || *p < '0' || *p > '7')
+        return "forget_flag: the bit must be 0 to 7";
+    if (base == 0x200 && byte >= 192)
+        return "forget_flag: bytes 192-255 of bank 11 hold a character's record (the DLL's own place): not a flag";
+    if (base == 0x100 && byte >= 9 && byte <= 11)
+        return "forget_flag: bytes 9-11 of bank 3 are the field's copy of the party: not a flag";
+    *flag = (((base + byte) << 3) | (*p - '0')) + 1;
+    return NULL;
+}
+
+/* What a character is now, as forget_judge needs it (filled by the DLL from the game's memory, by the
+   test from its model). Gear bytes are the record's +0x1c, +0x1d, +0x1e; materia 16 dwords from +0x40. */
+#define FORGET_GEAR_WIDE        (-2)        /* expect[]: the sheet names a WIDE piece of the kind */
+#define FORGET_GEAR_UNKNOWN     (-1)        /* expect[]: the sheet does not say (a copy of its base's record) */
+#define FORGET_RECORD_GEAR      0x1c
+#define FORGET_RECORD_MATERIA   0x40
+#define FORGET_RECORD_SIZE      0x84
+
+struct forget_view {
+    int has_record;                 /* the character has a record (in its seat, or in its sheet while it is not seated) */
+    int in_party;                   /* its seat's ID is in the party (00dc0230) or in the field's copy of it (00dc09e5) */
+    int locked;                     /* the PHS's "locked in the party" bit of its seat */
+    int shown;                      /* the PHS shows it (its seat's bit; not seated: not hidden) */
+    int pending;                    /* its sheet's wide pieces are still to be put on (a load's wish not resolved yet) */
+    int wide_live;                  /* wide gear is at work in this run */
+    const unsigned char *record;    /* its record (FORGET_RECORD_SIZE bytes), or 0 */
+    int expect[3];                  /* the byte of its weapon, armour, accessory as its sheet makes it, or FORGET_GEAR_WIDE / _UNKNOWN */
+    int wide_number[3];             /* the sheet's wide piece of each kind, 0 none */
+    int wide_worn[3];               /* the ledger: the wide piece the record wears of each kind, 0 none */
+    int wide_slot[3];               /* the lent slot of wide_number now, -1 none */
+    unsigned long start_materia[16];        /* the sheet's materia: ID | AP << 8, ffffffff empty */
+};
+
+/* forget_judge's answers */
+#define FORGET_NOTHING          0           /* no record: nothing to forget */
+#define FORGET_GO               1           /* forgotten */
+#define FORGET_DEFER            2           /* not now (its sheet's wide pieces are being put on): the bit stays on */
+#define FORGET_IN_PARTY         3           /* refused: in the party */
+#define FORGET_LOCKED           4           /* refused: the PHS locks it in the party */
+#define FORGET_SHOWN            5           /* refused: the PHS shows it */
+#define FORGET_GEAR_NOT_SAID    6           /* refused: its sheet does not name that kind (detail: the kind) */
+#define FORGET_WIDE_OFF         7           /* refused: wide gear is not at work in this run: what was made cannot be told (detail: the kind) */
+#define FORGET_WIDE_NOT_WORN    8           /* refused: it does not wear its sheet's wide piece (detail: the kind) */
+#define FORGET_GEAR_DIFFERS     9           /* refused: it wears another piece than its sheet's (detail: the kind) */
+#define FORGET_MATERIA_DIFFERS  10          /* refused: a materia slot differs from the sheet's (detail: the slot) */
+
+/* May the character be forgotten? Only one that is out of the party, hidden from the PHS and UNTOUCHED: it wears
+   exactly its sheet's gear (the sheet's wide piece through its lent slot, the sheet's bytes otherwise) and holds
+   materia of the sheet's IDs in the sheet's slots (AP is not compared: a battle adds AP). `detail`: the kind or the
+   materia slot a refusal is about, else -1. */
+static int forget_judge(const struct forget_view *v, int *detail)
+{
+    int k, i;
+
+    *detail = -1;
+    if (!v->has_record || !v->record)
+        return FORGET_NOTHING;
+    if (v->pending)
+        return FORGET_DEFER;
+    if (v->in_party)
+        return FORGET_IN_PARTY;
+    if (v->locked)
+        return FORGET_LOCKED;
+    if (v->shown)
+        return FORGET_SHOWN;
+    for (k = 0; k < 3; k++) {
+        int byte = v->record[FORGET_RECORD_GEAR + k];
+
+        *detail = k;
+        if (v->expect[k] == FORGET_GEAR_UNKNOWN)
+            return FORGET_GEAR_NOT_SAID;
+        if (v->expect[k] == FORGET_GEAR_WIDE) {
+            if (!v->wide_live)
+                return FORGET_WIDE_OFF;
+            if (!v->wide_number[k] || v->wide_worn[k] != v->wide_number[k] || v->wide_slot[k] < 0 || byte != v->wide_slot[k])
+                return FORGET_WIDE_NOT_WORN;
+        } else if (byte != v->expect[k]) {
+            return FORGET_GEAR_DIFFERS;
+        }
+    }
+    for (i = 0; i < 16; i++) {
+        const unsigned char *m = v->record + FORGET_RECORD_MATERIA + i * 4;
+        int want = (int)(v->start_materia[i] & 0xff), have = m[0];
+
+        *detail = i;
+        if ((want == 0xff) != (have == 0xff) || (want != 0xff && have != want))
+            return FORGET_MATERIA_DIFFERS;
+    }
+    *detail = -1;
+    return FORGET_GO;
+}
+
+/* What the poll is given: the save's banks and the roster, through the DLL's own routines (the test's models). */
+struct forget_env {
+    unsigned char *banks;                                           /* 00dc08dc: FORGET_BANK_BYTES bytes */
+    int count;                                                      /* characters of the roster */
+    int (*flag_of)(int n);                                          /* its forget_flag; FORGET_FLAG_NONE: none, or no such character */
+    void (*view_of)(int n, struct forget_view *v);                  /* fills *v (given zeroed) */
+    void (*forget)(int n, const struct forget_view *v);             /* the record goes: only after FORGET_GO */
+    void (*say)(int n, int flag, int verdict, int detail);          /* one line a character */
+};
+#define FORGET_POLL_MAX         64
+
+/* Every character whose flag is ON is judged and, when it may be, forgotten; then every flag that was on is turned
+   OFF (after all its characters were looked at), except one that a character DEFERRED. Returns how many were
+   forgotten. */
+static int forget_poll(const struct forget_env *e)
+{
+    int on[FORGET_POLL_MAX], keep[FORGET_POLL_MAX], ons = 0, keeps = 0, n, i, j, gone = 0;
+
+    for (n = 0; n < e->count; n++) {
+        int flag = e->flag_of(n), verdict, detail, offset;
+        struct forget_view v;
+        unsigned char *z = (unsigned char *)&v;
+
+        if (flag == FORGET_FLAG_NONE)
+            continue;
+        offset = forget_flag_offset(flag);
+        if (offset < 0 || offset >= FORGET_BANK_BYTES || !(e->banks[offset] & (1 << forget_flag_bit(flag))))
+            continue;
+        for (i = 0; i < ons && on[i] != flag; i++)
+            ;
+        if (i == ons && ons < FORGET_POLL_MAX)
+            on[ons++] = flag;
+        for (i = 0; i < (int)sizeof v; i++)
+            z[i] = 0;
+        e->view_of(n, &v);
+        verdict = forget_judge(&v, &detail);
+        if (verdict == FORGET_GO) {
+            e->forget(n, &v);
+            gone++;
+        } else if (verdict == FORGET_DEFER && keeps < FORGET_POLL_MAX) {
+            keep[keeps++] = flag;
+        }
+        e->say(n, flag, verdict, detail);
+    }
+    for (i = 0; i < ons; i++) {
+        for (j = 0; j < keeps && keep[j] != on[i]; j++)
+            ;
+        if (j == keeps)
+            e->banks[forget_flag_offset(on[i])] &= (unsigned char)~(1 << forget_flag_bit(on[i]));
+    }
+    return gone;
+}
+/* ---- FORGET FLAG PURE end ---- */
+
+/* ---- OUTFIT PURE begin (no game memory, no Windows: tools/work/field/casual_field/swap/test compiles this block, after the FORGET FLAG PURE one, alone) ----
+
+   A character may have a SECOND LOOK, chosen by one save bit, in the field and in the battle:
+       field_model  = ABCD                 ; the field skeleton (the first look)
+       field_model_when  = 3:62.0 EFGH     ; while save bit 3:62.0 is on: EFGH.HRC wherever a field names ABCD.HRC
+       battle_files = ab                   ; the battle files (the first look)
+       battle_files_when = 3:62.0 cd       ; while the bit is on: cd.. instead of ab..
+   The plain keys are the look while the bit is OFF, the _when keys the look while it is ON. The two keys may name the same
+   bit (the usual case) or two. The bit is read from the save's own banks (the same as forget_flag's). By the project's
+   convention a mod that uses these keys holds the WHOLE byte of the bit for outfit looks (a story that uses 3:62.0 holds
+   all of byte 3:62): this key uses its bit .0, and a later look takes a further bit of the byte (which needs further keys:
+   only one pair of keys exists per character today); a field script must not use the rest of that byte for anything else.
+   `none` clears a key. A bad value is refused with a line and the key is not set. */
+#define OUTFIT_FIELD            0       /* kind: four characters of a skeleton's name */
+#define OUTFIT_BATTLE           1       /* kind: two letters of a model's files */
+
+/* Copies s to msg at *n, never past cap - 1, always ends in a zero byte. */
+static void outfit_say(char *msg, int cap, int *n, const char *s)
+{
+    while (*s && *n < cap - 1)
+        msg[(*n)++] = *s++;
+    msg[*n < cap ? *n : cap - 1] = 0;
+}
+
+/* The value of `field_model_when` (kind OUTFIT_FIELD) or `battle_files_when` (OUTFIT_BATTLE), value..end: either `none`
+   (*flag = FORGET_FLAG_NONE, text[0] = 0) or BANK:BYTE.BIT and then 4 (field) or 2 (battle) characters, upper cased into
+   text (zero ended; 5 bytes of room). Returns NULL, or msg with what is wrong; *flag and text are then untouched. */
+static const char *outfit_when_parse(int kind, const char *value, const char *end, int *flag, char *text, char *msg, int cap)
+{
+    static const char field_key[] = "field_model_when: ", battle_key[] = "battle_files_when: ";
+    const char *key = kind == OUTFIT_FIELD ? field_key : battle_key;
+    const char *p = value, *bit_end, *word, *problem;
+    int want = kind == OUTFIT_FIELD ? 4 : 2, new_flag = FORGET_FLAG_NONE, k, n = 0;
+    char letters[4];
+
+    msg[0] = 0;
+    while (p < end && (*p == ' ' || *p == '\t'))
+        p++;
+    while (end > p && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\r'))
+        end--;
+    if (end - p == 4 && (p[0] | 0x20) == 'n' && (p[1] | 0x20) == 'o' && (p[2] | 0x20) == 'n' && (p[3] | 0x20) == 'e') {
+        *flag = FORGET_FLAG_NONE;
+        text[0] = 0;
+        return NULL;
+    }
+    for (bit_end = p; bit_end < end && *bit_end != ' ' && *bit_end != '\t'; bit_end++)
+        ;
+    for (word = bit_end; word < end && (*word == ' ' || *word == '\t'); word++)
+        ;
+    if (bit_end == p || word == end) {
+        outfit_say(msg, cap, &n, key);
+        outfit_say(msg, cap, &n, "expected BANK:BYTE.BIT (such as 3:62.0) and then ");
+        outfit_say(msg, cap, &n, kind == OUTFIT_FIELD ? "four characters (ABCD for ABCD.HRC)" : "two letters (such as zs)");
+        outfit_say(msg, cap, &n, ", or none");
+        return msg;
+    }
+    if ((problem = forget_flag_parse(p, bit_end, &new_flag)) != NULL) {
+        outfit_say(msg, cap, &n, key);
+        outfit_say(msg, cap, &n, "the bit: ");
+        outfit_say(msg, cap, &n, problem);
+        return msg;
+    }
+    if (new_flag == FORGET_FLAG_NONE) {
+        outfit_say(msg, cap, &n, key);
+        outfit_say(msg, cap, &n, "a bit is needed before the letters (to clear the key write none alone)");
+        return msg;
+    }
+    if (end - word != want) {
+        outfit_say(msg, cap, &n, key);
+        outfit_say(msg, cap, &n, kind == OUTFIT_FIELD ? "the skeleton must be four characters (ABCD for ABCD.HRC)" :
+                                                         "the files must be two letters (such as zs)");
+        return msg;
+    }
+    for (k = 0; k < want; k++) {
+        char ch = word[k];
+
+        if (ch >= 'a' && ch <= 'z')
+            ch = (char)(ch - 0x20);
+        if (!((ch >= 'A' && ch <= 'Z') || (kind == OUTFIT_FIELD && ch >= '0' && ch <= '9'))) {
+            outfit_say(msg, cap, &n, key);
+            outfit_say(msg, cap, &n, kind == OUTFIT_FIELD ? "a skeleton's name may only use letters and digits" :
+                                                             "the files' letters may only be letters");
+            return msg;
+        }
+        letters[k] = ch;
+    }
+    for (k = 0; k < want; k++)
+        text[k] = letters[k];
+    text[want] = 0;
+    *flag = new_flag;
+    return NULL;
+}
+
+/* One character's names for the shared-skeleton test: model = its field_model ("" none), alt = its field_model_when's
+   skeleton ("" no such key). Four characters each, upper case, zero ended or full. */
+struct outfit_names {
+    const char *model, *alt;
+};
+
+static int outfit_same4(const char *a, const char *b)
+{
+    int k;
+
+    if (!a[0] || !b[0])
+        return 0;
+    for (k = 0; k < 4; k++) {
+        if (a[k] != b[k])
+            return 0;
+        if (!a[k])
+            break;
+    }
+    return 1;
+}
+
+/* 1 when the two characters would share a skeleton the rename cannot tell apart, and one of them has a `field_model_when`:
+   the rename works on a skeleton's NAME, and the game numbers a field's models by the order its CHAR commands run, so a
+   model cannot be said to be this character's or that one's. Their keys are then switched off, both. */
+static int outfit_clash(const struct outfit_names *a, const struct outfit_names *b)
+{
+    if (!a->alt[0] && !b->alt[0])
+        return 0;
+    return outfit_same4(a->model, b->model) || outfit_same4(a->model, b->alt) || outfit_same4(a->alt, b->model) ||
+           outfit_same4(a->alt, b->alt);
+}
+
+/* 1 when `model` (a field_model: four characters, upper case) is one of the game's own skeletons: `lookup` says whether
+   "<model>.hrc" is among char.lgp's names (in_char_lgp in the DLL). A `field_model_when` renames every model of a field
+   that names the character's field_model, so on a stock skeleton it would rename the game's own NPCs. */
+static int outfit_model_is_stock(const char *model, int (*lookup)(const char *))
+{
+    static const char tail[] = ".hrc";
+    char name[9];
+    int k;
+
+    if (!model[0])
+        return 0;
+    for (k = 0; k < 4; k++) {
+        if (!model[k])
+            return 0;
+        name[k] = model[k];
+    }
+    for (k = 0; k < 5; k++)
+        name[4 + k] = tail[k];
+    return lookup(name) != 0;
+}
+
+/* The three states the field swap tells apart for one character (the log says a line when it changes). */
+#define OUTFIT_STATE_OFF        1       /* the bit is off: the first look */
+#define OUTFIT_STATE_ON         2       /* the bit is on and the second look's file is there: the second look */
+#define OUTFIT_STATE_ON_MISSING 3       /* the bit is on and the second look's file is not there: the first look stays */
+
+/* The state of a character's field look. `ready` (field_when_ready in the DLL: it looks the file up once and says so in
+   the log when it is missing) is called FIRST, when the bit is on, so a line about the file comes before the line about the
+   state; *used is 1 when the second look is in force. */
+static int outfit_field_state(int on, int (*ready)(void *), void *who, int *used)
+{
+    *used = on ? ready(who) != 0 : 0;
+    return !on ? OUTFIT_STATE_OFF : *used ? OUTFIT_STATE_ON : OUTFIT_STATE_ON_MISSING;
+}
+
+/* The line for a change of state, from the look in force (`now`) and the other one: msg (cap bytes). */
+static void outfit_state_line(char *msg, int cap, int id, const char *bit, int state, const char *first, const char *second)
+{
+    char digits[12], one[2] = { 0, 0 };
+    int n = 0, d = 0, v = id;
+
+    msg[0] = 0;
+    do {
+        digits[d++] = (char)('0' + v % 10);
+        v /= 10;
+    } while (v && d < 11);
+    outfit_say(msg, cap, &n, "character ");
+    while (d)
+        one[0] = digits[--d], outfit_say(msg, cap, &n, one);
+    outfit_say(msg, cap, &n, ": save bit ");
+    outfit_say(msg, cap, &n, bit);
+    if (state == OUTFIT_STATE_OFF) {
+        outfit_say(msg, cap, &n, " is off: its field skeleton is ");
+        outfit_say(msg, cap, &n, first);
+        outfit_say(msg, cap, &n, ".HRC");
+    } else if (state == OUTFIT_STATE_ON) {
+        outfit_say(msg, cap, &n, " is on: its field skeleton is ");
+        outfit_say(msg, cap, &n, second);
+        outfit_say(msg, cap, &n, ".HRC");
+    } else {
+        outfit_say(msg, cap, &n, " is on, but ");
+        outfit_say(msg, cap, &n, second);
+        outfit_say(msg, cap, &n, ".HRC was not found: its field skeleton stays ");
+        outfit_say(msg, cap, &n, first);
+        outfit_say(msg, cap, &n, ".HRC");
+    }
+}
+/* ---- OUTFIT PURE end ---- */
+
+/* first weapon of each of the nine, for a sheet that names none (build_character_record; forget_sheet_byte) */
+static const BYTE sheet_first_weapon[9] = { 0, 32, 16, 62, 48, 87, 101, 114, 73 };
 
 /* equip_like's values other than one of the nine (0 to 8) */
 #define EQUIP_LIKE_UNSET        (-1)        /* no equip_like line: the base's (or battle_like's) equipment, set once the whole file is read */
@@ -17910,6 +19914,12 @@ struct new_character {
     /* `hit_elements`: the element of each hit, in place of the record's */
     BYTE limit_hit_element_count[12];
     WORD limit_hit_element[12][LIMIT_SEQ_MAX];
+    /* `status2` / `status2_mode`: a second status change beside the record's own (limit_status2_apply); 0 = none */
+    DWORD limit_status2[12];
+    BYTE limit_status2_mode[12];        /* 0 inflict, 1 cure, 2 toggle: the action's mask it is added to */
+    /* (every target) `hits_on_every_target`; each spell_effects entry's `room N` (0 = none) */
+    BYTE limit_every_target[12];
+    BYTE limit_seq_room[12][LIMIT_SEQ_MAX];
     /* `state = NAME` of a limit, and the character's [12 state NAME] sections (inside the part
        copy_limits copies, and zeroed with the sheet when the files are read again) */
     struct limit_state state[STATE_MAX];
@@ -17933,11 +19943,12 @@ struct new_character {
     BYTE record[SAVE_RECORD_SIZE];
     int copy_of;                        /* `copy_of = N`: the character (file ID) it was copied from, or 0 */
     int keep_seat;                      /* `keep_seat = yes`: always seated, and its seat is never given to another */
+    int forget_flag;                    /* `forget_flag = BANK:BYTE.BIT`: the save bit that asks for its record to be forgotten (FORGET FLAG PURE); FORGET_FLAG_NONE = none. Not copied by copy_of */
     char field_model[8];                /* `field_model = YUAA`: its field skeleton YUAA.HRC (four characters, upper case); "" = none */
     signed char field_model_found;      /* 0 not looked for yet, 1 the skeleton file can be found, -1 it can not */
     BYTE body_blend;                    /* `body_blend = yes`: the body parts of its own battle model keep each group's blend mode (load_character_model_hook) */
     int ai_like;                        /* `ai_like`: the kernel's character-AI entry it has a private copy of, + 1; 0 = none */
-    char ai_file[AI_NAME_MAX + 1];      /* `ai = NAME`: its block is SpellExtConfig\ai\NAME.ai; "" = none */
+    char ai_file[AI_NAME_MAX + 1];      /* `ai = NAME`: its block is <game>\direct\ai\NAME.ai (a mod's), else SpellExtConfig\ai\NAME.ai; "" = none */
     BYTE ai_keys_here;                  /* of the section being read: 1 ai_like given, 2 ai given (the second of the two is refused) */
     DWORD battle_avatar_texture;        /* Enhanced Stock UI's battle window: its small picture, once loaded */
     BYTE battle_avatar_tried, battle_avatar_queued;
@@ -17948,6 +19959,14 @@ struct new_character {
     int limit_item_give;                /* `limit_item_on_load`: testing aid */
     BYTE limit_item_name[32], limit_item_description[96];
     BYTE limit_item_line[3][LIMIT_LINE_SIZE];   /* what it says: on learning / not yet / shown an item that is not its own */
+    /* The outfit keys (OUTFIT PURE): a second look for the same character, chosen by one save bit. Last in the
+       struct: the live tables' readers know the offsets of the fields above. Cleared by every reading of the files. */
+    int field_when_flag;                /* `field_model_when = BANK:BYTE.BIT ABCD`: while the bit is on the field skeleton is ABCD.HRC; FORGET_FLAG_NONE = no key */
+    char field_when_model[8];           /* ABCD, upper case */
+    signed char field_when_found;       /* 0 not looked for yet, 1 ABCD.HRC can be found, -1 it can not (the first outfit stays) */
+    int battle_when_flag;               /* `battle_files_when = BANK:BYTE.BIT xx`: while the bit is on the battle files are xx..; FORGET_FLAG_NONE = no key */
+    char battle_when_prefix[4];         /* xx, upper case */
+    char battle_letters_now[4];         /* the two letters the last battle load of this character chose (battle_prefix or battle_when_prefix); "" = none yet */
 };
 
 /* ---- Seats and the roster ------------------------------------------------------
@@ -17999,6 +20018,114 @@ static struct new_character *roster_character(int file_id)
 static int character_file_id(const struct new_character *c)
 {
     return NEW_CHARACTER_FIRST_ID + (int)(c - new_characters);
+}
+
+/* Whether the save bit of an outfit key (`field_model_when`, `battle_files_when`) is on now: the game's memory, the same
+   banks as forget_flag (ADDR_FORGET_BANKS, 00dc08dc = ADDR_SAVE_BLOCK + 0xba4: the save's five banks, read from the game). */
+#define ADDR_OUTFIT_BANKS       (ADDR_SAVE_BLOCK + 0x0ba4u)
+
+static int outfit_bit_on(int flag)
+{
+    int offset;
+
+    if (flag == FORGET_FLAG_NONE)
+        return 0;
+    offset = forget_flag_offset(flag);
+    if (offset < 0 || offset >= FORGET_BANK_BYTES)
+        return 0;
+    return (((const BYTE *)ADDR_OUTFIT_BANKS)[offset] >> forget_flag_bit(flag)) & 1;
+}
+
+static BOOL in_char_lgp(const char *file_name);          /* (defined with the field models, below) */
+
+/* After the character file is read: what a `_when` key needs of its character, and the shared-skeleton refusal. One line
+   for each key refused or kept (a character is named by its number). A `field_model_when` of a character whose
+   field_model is one of the game's own skeletons (char.lgp) is switched off: the rename could not be told from the game's
+   own models. */
+static void outfit_check_keys(void)
+{
+    int i, j;
+
+    for (i = 0; i < ROSTER_MAX; i++) {
+        struct new_character *c = &new_characters[i];
+
+        if (!c->defined)
+            continue;
+        if (c->field_when_flag != FORGET_FLAG_NONE) {
+            if (!c->field_model[0]) {
+                log_line("character %d: field_model_when is not used: the character has no field_model (the look while the bit is off)",
+                         character_file_id(c));
+                c->field_when_flag = FORGET_FLAG_NONE;
+            } else if (outfit_model_is_stock(c->field_model, in_char_lgp)) {
+                log_line("character %d: field_model_when is not used: its field_model %s.HRC is one of the game's own skeletons (char.lgp), and renaming it would rename the game's own models in every field",
+                         character_file_id(c), c->field_model);
+                c->field_when_flag = FORGET_FLAG_NONE;
+            } else if (outfit_same4(c->field_model, c->field_when_model)) {
+                log_line("character %d: field_model_when is not used: it names the same skeleton as field_model (%s)",
+                         character_file_id(c), c->field_model);
+                c->field_when_flag = FORGET_FLAG_NONE;
+            }
+        }
+        if (c->battle_when_flag != FORGET_FLAG_NONE) {
+            if (!c->battle_prefix[0]) {
+                log_line("character %d: battle_files_when is not used: the character has no battle_files (the look while the bit is off)",
+                         character_file_id(c));
+                c->battle_when_flag = FORGET_FLAG_NONE;
+            } else if (c->battle_prefix[0] == c->battle_when_prefix[0] && c->battle_prefix[1] == c->battle_when_prefix[1]) {
+                log_line("character %d: battle_files_when is not used: it names the same files as battle_files (%s)",
+                         character_file_id(c), c->battle_prefix);
+                c->battle_when_flag = FORGET_FLAG_NONE;
+            }
+        }
+        if (c->field_when_flag == FORGET_FLAG_NONE)
+            c->field_when_model[0] = 0;
+        if (c->battle_when_flag == FORGET_FLAG_NONE)
+            c->battle_when_prefix[0] = 0;
+    }
+    for (i = 0; i < ROSTER_MAX; i++)
+        for (j = i + 1; j < ROSTER_MAX; j++) {
+            struct new_character *a = &new_characters[i], *b = &new_characters[j];
+            struct outfit_names na, nb;
+
+            if (!a->defined || !b->defined)
+                continue;
+            na.model = a->field_model;
+            na.alt = a->field_when_flag != FORGET_FLAG_NONE ? a->field_when_model : "";
+            nb.model = b->field_model;
+            nb.alt = b->field_when_flag != FORGET_FLAG_NONE ? b->field_when_model : "";
+            if (outfit_clash(&na, &nb)) {
+                log_line("characters %d and %d share a field skeleton (one of them has a field_model_when): the rename of a skeleton cannot tell whose model is whose, so both characters' field_model_when keys are switched off",
+                         character_file_id(a), character_file_id(b));
+                a->field_when_flag = b->field_when_flag = FORGET_FLAG_NONE;
+                a->field_when_model[0] = b->field_when_model[0] = 0;
+            }
+        }
+    for (i = 0; i < ROSTER_MAX; i++) {
+        struct new_character *c = &new_characters[i];
+        char bit[16];
+
+        if (!c->defined)
+            continue;
+        if (c->field_when_flag != FORGET_FLAG_NONE) {
+            forget_flag_text(c->field_when_flag, bit);
+            log_line("character %d: field_model_when: while save bit %s is on, %s.HRC takes the place of %s.HRC in every field it is read for (by convention the whole byte of that bit is held for outfit looks: a later look takes a further bit)",
+                     character_file_id(c), bit, c->field_when_model, c->field_model);
+        }
+        if (c->battle_when_flag != FORGET_FLAG_NONE) {
+            forget_flag_text(c->battle_when_flag, bit);
+            log_line("character %d: battle_files_when: while save bit %s is on, its battle files are %s.. instead of %s..",
+                     character_file_id(c), bit, c->battle_when_prefix, c->battle_prefix);
+        }
+        if (c->field_when_flag != FORGET_FLAG_NONE && c->battle_when_flag != FORGET_FLAG_NONE &&
+            c->field_when_flag != c->battle_when_flag) {
+            char other[16];
+
+            forget_flag_text(c->field_when_flag, bit);
+            forget_flag_text(c->battle_when_flag, other);
+            log_line("character %d: the field's and the battle's outfit keys name different bits (%s and %s): the field and the battle can then disagree",
+                     character_file_id(c), bit, other);
+        }
+    }
 }
 
 /* The character ID the game knows a seated character by, or -1. */
@@ -18916,6 +21043,29 @@ static struct new_character *model_name_owner(const char *name, int *stem_length
    works the equipped weapon's file name out of it, as the game does (state_weapon_prop_name). */
 static char party_model_file[3][16];
 
+/* (the outfit keys) The two letters a character's battle files carry in THIS battle: battle_files while its save bit
+   (battle_files_when) is off, the _when letters while it is on. Chosen when the model is loaded, which is once for a
+   battle, so the files of one battle are all of one look; archive_name_hook writes them. */
+#define BATTLE_LETTERS_LOG_MAX  16
+
+static void battle_letters_choose(struct new_character *c)
+{
+    static LONG logged;
+    int on = c->battle_when_flag != FORGET_FLAG_NONE && c->battle_when_prefix[0] && outfit_bit_on(c->battle_when_flag);
+    const char *letters = on ? c->battle_when_prefix : c->battle_prefix;
+
+    c->battle_letters_now[0] = letters[0];
+    c->battle_letters_now[1] = letters[1];
+    c->battle_letters_now[2] = 0;
+    if (on && InterlockedIncrement(&logged) <= BATTLE_LETTERS_LOG_MAX) {
+        char bit[16];
+
+        forget_flag_text(c->battle_when_flag, bit);
+        log_line("character %d: save bit %s is on: its battle files are %s.. (not %s..)", character_file_id(c), bit,
+                 c->battle_when_prefix, c->battle_prefix);
+    }
+}
+
 static int __cdecl load_party_model_hook(int zero, int slot, const char *name)
 {
     struct new_character *c = slot >= 0 && slot < 3 ? new_character(((const BYTE *)ADDR_PARTY)[slot]) : NULL;
@@ -18927,6 +21077,7 @@ static int __cdecl load_party_model_hook(int zero, int slot, const char *name)
             c->model_base_stem[i] = name[i];
         c->model_base_stem[i] = 0;
         name = c->model_name;
+        battle_letters_choose(c);
     }
     if (slot >= 0 && slot < 3) {
         int i;
@@ -18994,9 +21145,11 @@ static void __cdecl archive_name_hook(int patterns, void *table, const char *nam
     struct new_character *c = model_name_owner(name, &stem);
 
     if (c && c->battle_prefix[0] && base_model_part_name(name, base_name)) {
+        const char *letters = c->battle_letters_now[0] ? c->battle_letters_now : c->battle_prefix;     /* (the outfit keys) this battle's look */
+
         ((void (__cdecl *)(int, void *, const char *, char *))FN_ARCHIVE_NAME)(patterns, table, base_name, out);
-        out[0] = c->battle_prefix[0];
-        out[1] = c->battle_prefix[1];
+        out[0] = letters[0];
+        out[1] = letters[1];
         return;
     }
     if (!c) {
@@ -19035,7 +21188,20 @@ static void __cdecl archive_name_hook(int patterns, void *table, const char *nam
    relocates 74 offsets and plays them. If any is missing, or the scripts play an animation the model does
    not have (a model mod with other animations), the slot's own model is loaded instead, with one line.
    The loaded model is looked at again before the hook returns (its script file and the animations the
-   scripts play are there). */
+   scripts play are there).
+   A REFUSED form (or a number that is no form) is also ENDED (form_end_refused): after the hook returns, the
+   a2 case makes its operand SS the current script, the idle script and 00bf2df8 of the model just loaded
+   (004241b6-004241fc, read from the code), and SS was written for the form's model: the slot's own model's
+   script SS can be anything (an action that waits for an effect that never comes holds the battle). So the
+   operand, which the a2 case keeps at +0xe of the interpreter's command record (*008fe2ac, held in its
+   [ebp-0x14] from 0041fbbb), is made 0x3b before the hook returns: the exe's own script 0x3b (007c110c:
+   `00 ee`, animation 0 then finished, the same for every model; the game queues it for a party actor after a
+   command with nothing to show, 005cab7c(0x3b)). Then, as the game's KO revert (FUN_00433bd2) does for a
+   party actor marked transformed: the mark (009a8b39 bit 8) and AI control (009ab0e0 bit 0x10, which
+   FUN_005df95a set at the action's additional effect 3) are cleared, max HP is the battle-start one again
+   (009a8dca) and event 0x18 with 0 shows it. The priority-0 queue entry FUN_005df95a posted (command -1) is
+   taken after this display; without bit 0x10 it runs no AI (00435789). Not undone: FUN_005df95a's full heal,
+   the statuses it cleared (Confusion, Frog, Berserk) and the form byte 009ab0a7. */
 #define ADDR_FORM_CASE          0x00424070u  /* the a2 case from its test of 009aded8 to its second call: 0x46 bytes */
 #define SITE_FORM_LOAD_FROM_4   0x00424090u  /* e8 9b 62 00 00: 0042a330(0, 0, actor, 007c1098[n]) when n >= 4 */
 #define SITE_FORM_LOAD_BELOW_4  0x004240b1u  /* e8 7a 62 00 00: 0042a330(0, 1, actor, 007c1098[n]) when n < 4 */
@@ -19052,6 +21218,21 @@ static void __cdecl archive_name_hook(int patterns, void *table, const char *nam
 #define ADDR_FORM_LOAD_KIND     0x007c1ff0u  /* FUN_00429a12's row for kind 2 (the party loader): 0, 1, archive yes, archive 2, name callback */
 #define FN_FORM_NAME_CALLBACK   0x005e2908u  /* the battle archive's name callback that row holds (it reaches 005e292f) */
 #define FORM_LETTERS_SIZE       200          /* open_file_006820d2 gives the callback a 200-byte buffer */
+/* (a refused form ended: form_end_refused) */
+#define ADDR_FORM_SCRIPT_ARGS   0x008fe2acu  /* pointer to the interpreter's command record: +4 the running script, +0xe the a2's operand */
+#define ADDR_FORM_SCRIPT_POS    0x00be11b4u  /* byte, FORM_MODEL_STATE_SIZE per actor: the position in the running script */
+#define FORM_MODEL_STATE_SIZE   0x1aec
+#define FORM_OPCODE_RELOAD      0xa2
+#define FORM_OPCODE_FINISHED    0xee
+#define FORM_END_SCRIPT         0x3b         /* FUN_0041fba4 plays the exe's 007c110c for script 0x3b: 00 ee */
+#define ADDR_FORM_END_SCRIPT    0x007c110cu
+#define ADDR_FORM_TIMER_FLAGS   0x009a8b39u  /* byte, 0x44 per actor: bit 8 transformed (FUN_005df95a; FUN_00433bd2 clears it) */
+#define FORM_TRANSFORMED        0x08
+#define ADDR_FORM_ACTOR_FLAGS   0x009ab0e0u  /* dword, 0x68 per actor: bit 0x10 AI-controlled */
+#define FORM_AI_CONTROLLED      0x10
+#define ADDR_FORM_MAX_HP        0x009ab10cu  /* dword, 0x68 per actor */
+#define ADDR_FORM_START_MAX_HP  0x009a8dcau  /* word, 0x34 per party slot: the battle-start max HP (what FUN_00433bd2 restores) */
+#define FN_FORM_QUEUE_POST      0x00435139u  /* FUN_00435139(queue, actor, kind, value), cdecl: (2, actor, 0x18, 0) = FUN_0043503f(actor, 0) */
 
 /* The form a made-up file name belongs to (FORM00.xxx), if it is one of the file's usable forms; else NULL. */
 static const struct form_def *form_of_name(const char *name, int *stem_length)
@@ -19191,6 +21372,62 @@ static const char *form_loaded_ready(int model, int max_animation)
     return NULL;
 }
 
+/* FORM A2 HOOK BEGIN  (tested natively by form_refusal's test/unit, with the game's memory and routines as stubs) */
+
+/* The a2 command's operand, as the a2 case keeps it (+0xe of the interpreter's command record), if the
+   running script's last two bytes are that a2 and its operand; else NULL. Called on entry, before any load
+   (the running script may live in the model the load frees). */
+static WORD *form_a2_operand(int slot)
+{
+    BYTE *args = *(BYTE *const *)ADDR_FORM_SCRIPT_ARGS;
+    const BYTE *script;
+    BYTE at;
+
+    if (!args || IsBadReadPtr(args, 0x10))
+        return NULL;
+    script = *(const BYTE *const *)(args + 4);
+    at = *(const BYTE *)(ADDR_FORM_SCRIPT_POS + slot * FORM_MODEL_STATE_SIZE);
+    if (!script || IsBadReadPtr(script + (BYTE)(at - 2), 1) || IsBadReadPtr(script + (BYTE)(at - 1), 1))
+        return NULL;
+    if (script[(BYTE)(at - 2)] != FORM_OPCODE_RELOAD || script[(BYTE)(at - 1)] != *(const WORD *)(args + 0xe))
+        return NULL;
+    return (WORD *)(args + 0xe);
+}
+
+/* A refused form ends here, after the slot's own model is loaded: the a2 case plays the exe's script 0x3b
+   (00 ee) on it instead of the form's SS, and the actor is left as the game's KO revert leaves one that was
+   marked transformed (the mark and AI control cleared, the battle-start max HP). `what` names the form. */
+static void form_end_refused(int slot, WORD *operand, const char *what)
+{
+    static LONG logged;
+    BYTE *timer = (BYTE *)(ADDR_FORM_TIMER_FLAGS + slot * 0x44);
+    DWORD *flags = (DWORD *)(ADDR_FORM_ACTOR_FLAGS + slot * 0x68);
+    DWORD *max_hp = (DWORD *)(ADDR_FORM_MAX_HP + slot * 0x68);
+    DWORD start = *(const WORD *)(ADDR_FORM_START_MAX_HP + slot * 0x34), max_was = *max_hp;
+    int script = operand ? (int)*operand : -1;
+    BOOL marked = (*timer & FORM_TRANSFORMED) != 0;
+    char played[192], left[192];        /* the longest texts: 156 and 126 characters (test/unit measures them) */
+
+    if (operand) {
+        *operand = FORM_END_SCRIPT;
+        wsprintfA(played, "its own model plays the game's script 0x%02x (animation 0, then finished) instead of script 0x%02x", FORM_END_SCRIPT, script);
+    } else {
+        lstrcpyA(played, "*** the a2 command's operand was not where it is read (the running script does not end in a2 SS): its own model plays that script, which may hold the battle");
+    }
+    if (marked) {
+        *timer &= (BYTE)~FORM_TRANSFORMED;
+        *flags &= ~(DWORD)FORM_AI_CONTROLLED;
+        *max_hp = start;
+        ((void (__cdecl *)(int, int, int, int))FN_FORM_QUEUE_POST)(2, slot, 0x18, 0);
+        wsprintfA(left, "the transformed mark and AI control are cleared and max HP is %lu (it was %lu), as the game's revert at KO leaves them",
+                  (unsigned long)start, (unsigned long)max_was);
+    } else {
+        lstrcpyA(left, "it was not marked transformed (nothing else changed)");
+    }
+    if (InterlockedIncrement(&logged) <= FORM_LOG_MAX)
+        log_line("form %s: the transformation in slot %d is ENDED: %s; %s", what, slot, played, left);
+}
+
 static int __cdecl form_model_load_hook(int zero, int flag, int slot, const char *name)
 {
     static LONG logged;
@@ -19204,6 +21441,8 @@ static int __cdecl form_model_load_hook(int zero, int flag, int slot, const char
         const struct form_def *f = n >= FORM_FIRST && n < FORM_FIRST + form_count && forms[n - FORM_FIRST].name[0] &&
                                    !forms[n - FORM_FIRST].bad ? &forms[n - FORM_FIRST] : NULL;
         const char *back = own ? own : ((const char *const *)ADDR_FORM_NAME_TABLE)[FORM_GAME_OWN_FIRST];
+        WORD *operand = form_a2_operand(slot);          /* (before any load: see form_a2_operand) */
+        char number[24];
 
         if (f) {
             char why[320];
@@ -19237,6 +21476,9 @@ static int __cdecl form_model_load_hook(int zero, int flag, int slot, const char
         }
         r = load_model_slot(0, 0, slot, back);
         form_note_slot(slot, NULL, back);
+        if (!f)
+            wsprintfA(number, "number 0x%02x", n & 0xff);
+        form_end_refused(slot, operand, f ? f->name : number);
         return r;
     }
     if (party && (c || form_in_slot[slot]) && own && n >= FORM_GAME_OWN_FIRST) {
@@ -19255,6 +21497,7 @@ static int __cdecl form_model_load_hook(int zero, int flag, int slot, const char
         form_note_slot(slot, NULL, name);
     return r;
 }
+/* FORM A2 HOOK END */
 
 /* Whether the code at `at` begins with `bytes` (or is another module's jump there, which still does the
    routine's work when called). */
@@ -19293,6 +21536,26 @@ static void install_form_hooks(BOOL archive_hooked)
         0x50, 0x0f, 0xbf, 0x4d, 0x08, 0x51, 0x6a, 0x01, 0x6a, 0x00,     /* push name, actor, 1, 0 */
         0xe8, 0x7a, 0x62, 0x00, 0x00                    /* 004240b1 call 0042a330 */
     };
+    static const BYTE queue_post[9] = { 0x55, 0x8b, 0xec, 0x83, 0xec, 0x08, 0x8b, 0x45, 0x08 };
+    static const struct { DWORD at; int count; const char *what; BYTE bytes[0x24]; } end_code[] = {
+        { 0x0041fbbbu, 9, "the interpreter's command record (FUN_0041fba4 keeps *008fe2ac in [ebp-0x14])",
+          { 0x8b, 0x0d, 0xac, 0xe2, 0x8f, 0x00,                 /* mov ecx, [008fe2ac] */
+            0x89, 0x4d, 0xec } },                               /* mov [ebp-0x14], ecx */
+        { 0x0042402au, 0x24, "the a2 case's read of its operand",
+          { 0x0f, 0xbf, 0x55, 0x08, 0x69, 0xd2, 0xec, 0x1a, 0x00, 0x00,   /* movsx edx, actor; imul edx, 0x1aec */
+            0x33, 0xc0, 0x8a, 0x82, 0xb4, 0x11, 0xbe, 0x00,             /* xor eax, eax; mov al, [edx + 00be11b4] */
+            0x8b, 0x4d, 0xec, 0x8b, 0x51, 0x04,                         /* mov ecx, [ebp-0x14]; mov edx, [ecx+4] */
+            0x66, 0x0f, 0xb6, 0x04, 0x02,                               /* movzx ax, byte [edx + eax] */
+            0x8b, 0x4d, 0xec, 0x66, 0x89, 0x41, 0x0e } },               /* mov ecx, [ebp-0x14]; mov [ecx+0xe], ax */
+        { 0x004241b6u, 0x18, "the a2 case's use of its operand after the load",
+          { 0x0f, 0xbf, 0x55, 0x08, 0x69, 0xd2, 0xec, 0x1a, 0x00, 0x00,
+            0x8b, 0x45, 0xec, 0x66, 0x8b, 0x48, 0x0e,                   /* mov eax, [ebp-0x14]; mov cx, [eax+0xe] */
+            0x66, 0x89, 0x8a, 0x7a, 0x11, 0xbe, 0x00 } },               /* mov [edx + 00be117a], cx */
+        { 0x004248beu, 4, "the interpreter's entry for script 0x3b", { 0xe3, 0xfc, 0x41, 0x00 } },   /* 0042488a[0x3b - 0x2e] = 0041fce3 */
+        { 0x0041fce3u, 10, "the interpreter's script 0x3b",
+          { 0x8b, 0x45, 0xec, 0xc7, 0x40, 0x04, 0x0c, 0x11, 0x7c, 0x00 } },                  /* mov [eax+4], 007c110c */
+        { ADDR_FORM_END_SCRIPT, 2, "the game's script 0x3b", { 0x00, FORM_OPCODE_FINISHED } }    /* 00 ee */
+    };
     const char *off = NULL;
     int i, done;
 
@@ -19320,11 +21583,29 @@ static void install_form_hooks(BOOL archive_hooked)
                  ADDR_FORM_CASE, ADDR_FORM_CASE + (DWORD)i, ((const BYTE *)ADDR_FORM_CASE)[i], expected[i]);
         return;
     }
+    /* what ending a refused form relies on (form_end_refused), each read from the exe file */
+    for (i = 0; i < (int)(sizeof end_code / sizeof end_code[0]); i++) {
+        int k;
+
+        for (k = 0; k < end_code[i].count && ((const BYTE *)end_code[i].at)[k] == end_code[i].bytes[k]; k++)
+            ;
+        if (k < end_code[i].count) {
+            form_hooks_state = -1;
+            log_line("form hooks: 0 of 2: %s at %08lx is not the game's (byte %08lx is %02x, expected %02x; another DLL or patch?): a refused form could not be ended, so no form = key is honoured, a revert loads what the game says",
+                     end_code[i].what, end_code[i].at, end_code[i].at + (DWORD)k, ((const BYTE *)end_code[i].at)[k], end_code[i].bytes[k]);
+            return;
+        }
+    }
+    if (!form_routine_is(FN_FORM_QUEUE_POST, queue_post, sizeof queue_post)) {
+        form_hooks_state = -1;
+        log_line("form hooks: 0 of 2: the game's event post (00435139) does not start as expected: a refused form could not be ended, so no form = key is honoured, a revert loads what the game says");
+        return;
+    }
     done = patch_call(SITE_FORM_LOAD_FROM_4, FN_LOAD_MODEL_SLOT, form_model_load_hook);
     done += patch_call(SITE_FORM_LOAD_BELOW_4, FN_LOAD_MODEL_SLOT, form_model_load_hook);
     form_hooks_state = done == 2 ? 1 : -1;
     log_line("form hooks: %d of 2 (the a2 command's calls of 0042a330 at 00424090, 004240b1)%s", done,
-             done == 2 ? ": transformations into forms, and a new character's own model on the way back"
+             done == 2 ? ": transformations into forms, and a new character's own model on the way back; a refused form is ended (script 0x3b)"
                        : ": no form = key is honoured");
 }
 
@@ -20018,6 +22299,12 @@ static const char *apply_character_key(struct new_character *c, char *key, char 
         c->battle_prefix[2] = 0;
         return NULL;
     }
+    if (word_is(key, key_end, "battle_files_when")) {
+        /* BANK:BYTE.BIT xx: while the save bit is on, the battle files are xx.. (OUTFIT PURE); none clears it */
+        static char say[200];
+
+        return outfit_when_parse(OUTFIT_BATTLE, value, end, &c->battle_when_flag, c->battle_when_prefix, say, sizeof say);
+    }
     if (word_is(key, key_end, "body_blend")) {
         int yes;
 
@@ -20317,6 +22604,7 @@ static int load_characters(void)
                     current->own_target_set[i] = 0;
                 current->party_slot = 0;
                 current->join_on_load = 0;
+                current->forget_flag = FORGET_FLAG_NONE;
                 current->portrait[0] = 0;
                 current->portrait_number = -1;
                 current->portrait_texture = 0;
@@ -20326,6 +22614,9 @@ static int load_characters(void)
                 current->model_base_stem[0] = 0;
                 current->field_model[0] = 0;
                 current->field_model_found = 0;
+                current->field_when_flag = current->battle_when_flag = FORGET_FLAG_NONE;     /* (the outfit keys) none until the section says */
+                current->field_when_model[0] = current->battle_when_prefix[0] = current->battle_letters_now[0] = 0;
+                current->field_when_found = 0;
                 current->body_blend = 0;
                 current->ai_like = 0;
                 current->ai_file[0] = 0;
@@ -20369,6 +22660,8 @@ static int load_characters(void)
                 } else if (word_is(start, key_end, "keep_seat")) {
                     if (!parse_yes_no(value, stop, &current->keep_seat))
                         problem = "expected yes or no";
+                } else if (word_is(start, key_end, "forget_flag")) {
+                    problem = forget_flag_parse(value, stop, &current->forget_flag);
                 } else if (word_is(start, key_end, "copy_of")) {
                     /* everything an earlier section says, to be changed by the lines that follow (so it
                        belongs at the top of its section); not its party slot or how it joins */
@@ -20382,12 +22675,14 @@ static int load_characters(void)
                         copy_bytes((BYTE *)current, (const BYTE *)from, sizeof *current);
                         current->copy_of = (int)n;
                         current->party_slot = current->join_on_load = current->keep_seat = 0;
+                        current->forget_flag = FORGET_FLAG_NONE;       /* (a guest's one-shot request names that guest alone) */
                         current->portrait_texture = current->battle_avatar_texture = 0;
                         current->battle_avatar_tried = current->battle_avatar_queued = 0;
                         current->limit_block = current->seated = 0;
                         current->has_record = current->hidden = 0;
                         current->gear_wish_pending = 0;     /* (a sheet's wide piece) its start_wide is copied; nothing is pending for it */
                         current->model_base_stem[0] = 0;
+                        current->battle_letters_now[0] = 0;     /* (the outfit keys are copied; what the last battle chose is not) */
                         current->ai_keys_here = 0;      /* (the AI keys it copied may be changed by one line of its own) */
                         wsprintfA(current->model_name, "NEWCH%d.DAT", own_id);
                     }
@@ -20418,6 +22713,12 @@ static int load_characters(void)
                         }
                         current->field_model[problem ? 0 : 4] = 0;
                     }
+                } else if (word_is(start, key_end, "field_model_when")) {
+                    /* BANK:BYTE.BIT ABCD: while the save bit is on, ABCD.HRC wherever a field names field_model (OUTFIT PURE); none clears it */
+                    static char say[200];
+
+                    problem = outfit_when_parse(OUTFIT_FIELD, value, stop, &current->field_when_flag, current->field_when_model, say, sizeof say);
+                    current->field_when_found = 0;
                 } else if (word_is(start, key_end, "ai_like") || word_is(start, key_end, "ai")) {
                     problem = character_ai_key(word_is(start, key_end, "ai_like"), value, stop, &current->ai_like,
                                                current->ai_file, &current->ai_keys_here);
@@ -20467,6 +22768,7 @@ static int load_characters(void)
         if (c->portrait[0])
             portrait_source_line(c);
     }
+    outfit_check_keys();            /* (the outfit keys) each _when key needs its plain key; a skeleton two characters share is refused */
     return count;
 }
 
@@ -21097,6 +23399,57 @@ static const struct char_ai_block *char_ai_occupant(int id)
     return b && b->bytes ? b : NULL;
 }
 
+/* `ai = NAME`'s block, from the first place that has it, for any character:
+     1. <game>\direct\ai\NAME.ai, opened with the wide CreateFile as the other direct\ lookups here
+        (supplied_in_direct_folder, field_model_source). A mod manager answers that open: 7th Heaven 4.6.1
+        matches a path under its monitored folder <game>\direct\ by the rest of the path against the
+        files of the active mod folders, so a mod's <folder>\ai\NAME.ai is served there, and a ModFolder's
+        ActiveWhen (a mod option) decides whether it is. It is asked whatever the driver: the open is this
+        DLL's own, not FFNx's, and FFNx's direct mode plays no part in it. Without a mod manager it is a
+        plain file there, if any.
+     2. SpellExtConfig\ai\NAME.ai, as before.
+   The bytes (VirtualAlloc'd, one byte more than *size) or NULL; *from is the folder it came from, for the log. */
+static BYTE *read_character_ai_file(const char *ai_name, DWORD *size, const char **from)
+{
+    char path[MAX_PATH + 96];
+    WCHAR wide[MAX_PATH + 96];
+    DWORD n = GetModuleFileNameA(NULL, path, MAX_PATH), got = 0;
+    HANDLE file;
+    BYTE *bytes = NULL;
+    int i;
+
+    *from = NULL;
+    if (n > 0 && n < MAX_PATH && lstrlenA(ai_name) <= AI_NAME_MAX) {
+        while (n > 0 && path[n - 1] != '\\' && path[n - 1] != '/')
+            n--;
+        wsprintfA(path + n, "direct\\ai\\%s.ai", ai_name);
+        for (i = 0; path[i]; i++)
+            wide[i] = (BYTE)path[i];
+        wide[i] = 0;
+        file = CreateFileW(wide, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+        if (file != INVALID_HANDLE_VALUE && file != NULL) {
+            *size = GetFileSize(file, NULL);
+            if (*size != INVALID_FILE_SIZE)
+                bytes = VirtualAlloc(NULL, *size + 1, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            if (bytes && (!ReadFile(file, bytes, *size, &got, NULL) || got != *size)) {
+                VirtualFree(bytes, 0, MEM_RELEASE);
+                bytes = NULL;
+            }
+            CloseHandle(file);
+            if (bytes) {
+                *from = "<game>\\direct\\";
+                return bytes;
+            }
+            log_line("ai = %s: <game>\\direct\\ai\\%s.ai opens but cannot be read: SpellExtConfig\\ai is tried", ai_name, ai_name);
+        }
+    }
+    wsprintfA(path, "ai\\%s.ai", ai_name);
+    bytes = (BYTE *)read_whole_file(path, size);
+    if (bytes)
+        *from = "SpellExtConfig\\";
+    return bytes;
+}
+
 /* After the character file is read (start-up; a reload from the main menu, when no battle runs): every
    block made afresh from the keys. The first block made puts the two hooks in. */
 static void build_character_ai(void)
@@ -21107,7 +23460,7 @@ static void build_character_ai(void)
         struct char_ai_block *b = &char_ai[i];
         const struct new_character *c = &new_characters[i];
         char name[AI_NAME_MAX + 8], sections[160];
-        const char *problem;
+        const char *problem, *from = NULL;
         BYTE *bytes;
         DWORD size = 0, where;
         int home, bad_entry, bad_section, s;
@@ -21129,10 +23482,12 @@ static void build_character_ai(void)
         } else {
             home = 0;
             wsprintfA(name, "ai\\%s.ai", c->ai_file);
-            bytes = (BYTE *)read_whole_file(name, &size);
+            bytes = read_character_ai_file(c->ai_file, &size, &from);
             if (!bytes) {
-                log_line("character %d: ai = %s: SpellExtConfig\\%s cannot be read: no AI of its own", NEW_CHARACTER_FIRST_ID + i,
-                         c->ai_file, name);
+                /* not an error: a mod option may serve the file or not (a ModFolder with ActiveWhen) */
+                log_line("character %d: ai = %s: no file is served or found for it (neither <game>\\direct\\%s, a mod's %s, "
+                         "nor SpellExtConfig\\%s): it has no AI of its own, as without the key", NEW_CHARACTER_FIRST_ID + i,
+                         c->ai_file, name, name, name);
                 continue;
             }
         }
@@ -21156,7 +23511,7 @@ static void build_character_ai(void)
                 lstrcatA(sections, ai_section_names[s]);
             }
         log_line("character %d: AI %s%s (%d entries, %lu bytes), its own entry %d: %s", NEW_CHARACTER_FIRST_ID + i,
-                 c->ai_like ? "a private copy of the loaded kernel's block, like entry " : "SpellExtConfig\\",
+                 c->ai_like ? "a private copy of the loaded kernel's block, like entry " : from,
                  name, b->entries, b->size, home, sections[0] ? sections : "NO script (it will do nothing by itself)");
         built++;
     }
@@ -23086,6 +25441,105 @@ static struct new_character *field_seat_character(int id)
     return c->field_model_found > 0 ? c : NULL;
 }
 
+/* ---- The outfit swap in the field (`field_model_when`; OUTFIT PURE, fm_rename_skeleton) ----
+
+   While a character's save bit is on and the skeleton file of its second look can be found, every model a field names
+   with the character's field_model is named with the second look's instead, in the field as it is read (same length: no
+   offset moves), and the entity this DLL adds for the character gets the second look's. The alternate's file is always
+   looked for, field_model_check or not: a field naming a missing skeleton does not load. Not found: one line, and the
+   first look stays. */
+static BOOL field_when_ready(struct new_character *c)
+{
+    if (!c->field_when_found) {
+        const char *where = field_model_source(c->field_when_model);
+
+        c->field_when_found = where ? 1 : -1;
+        if (where)
+            log_line("character %d: field_model_when: %s.HRC found, %s", character_file_id(c), c->field_when_model, where);
+        else
+            log_line("character %d: field_model_when: %s.HRC was not found (FFNx's direct folder, a mod's char folder, or char.lgp): its first look, %s.HRC, stays",
+                     character_file_id(c), c->field_when_model, c->field_model);
+    }
+    return c->field_when_found > 0;
+}
+
+/* The four characters of the skeleton this character is named with now. */
+static const char *field_model_now(struct new_character *c)
+{
+    if (c->field_when_flag != FORGET_FLAG_NONE && c->field_when_model[0] && outfit_bit_on(c->field_when_flag) && field_when_ready(c))
+        return c->field_when_model;
+    return c->field_model;
+}
+
+static int field_when_ready_cb(void *c)
+{
+    return field_when_ready((struct new_character *)c);
+}
+
+#define FIELD_SWAP_LOG_MAX      40
+
+static void field_swap_skeletons(const char *name)
+{
+    static LONG logged;
+    static signed char last[ROSTER_MAX];                /* 0 not said, else OUTFIT_STATE_*: the state the log last said */
+    BYTE *file = *(BYTE **)ADDR_FIELD_FILE;
+    DWORD room = *(const DWORD *)ADDR_FIELD_FILE_ROOM;
+    int i;
+
+    for (i = 0; i < ROSTER_MAX; i++) {
+        struct new_character *c = &new_characters[i];
+        char from[8], to[8], why[160], bit[16];
+        unsigned last_off, length;
+        int on, n, k, state, used;
+
+        if (!c->defined || c->field_when_flag == FORGET_FLAG_NONE || !c->field_model[0] || !c->field_when_model[0])
+            continue;
+        on = outfit_bit_on(c->field_when_flag);
+        state = outfit_field_state(on, field_when_ready_cb, c, &used);      /* (the file is looked for, and a missing one said, before the state line) */
+        if (last[i] != state) {
+            char say[200];
+
+            last[i] = (signed char)state;
+            forget_flag_text(c->field_when_flag, bit);
+            outfit_state_line(say, sizeof say, character_file_id(c), bit, state, c->field_model, c->field_when_model);
+            log_line("%s", say);
+        }
+        if (!used)
+            continue;
+        if (!file || room < 42 || room > 0x10000000u || IsBadReadPtr(file, 42)) {
+            log_line("field %.40s: no skeleton swapped: there is no field file where the game keeps it", name);
+            return;
+        }
+        last_off = *(const DWORD *)(file + 6 + 8 * 4);
+        if (*(const WORD *)file != 0 || *(const DWORD *)(file + 2) != 9 || last_off < 42 || last_off > room - 4 ||
+            *(const DWORD *)(file + last_off) > room - 4 - last_off) {
+            log_line("field %.40s: no skeleton swapped: the file's header is not as expected", name);
+            return;
+        }
+        length = last_off + 4 + *(const DWORD *)(file + last_off);
+        if (IsBadWritePtr(file, length)) {
+            log_line("field %.40s: no skeleton swapped: the field file cannot be written", name);
+            return;
+        }
+        for (k = 0; k < 4; k++) {
+            from[k] = c->field_model[k];
+            to[k] = c->field_when_model[k];
+            from[4 + k] = ".HRC"[k];
+            to[4 + k] = ".HRC"[k];
+        }
+        n = fm_rename_skeleton(file, length, from, to, why, sizeof why);
+        if (n < 0) {
+            if (InterlockedIncrement(&logged) <= FIELD_SWAP_LOG_MAX)
+                log_line("field %.40s: no skeleton swapped for character %d: %s (the file is left as read)", name, character_file_id(c), why);
+        } else if (n > 0 && InterlockedIncrement(&logged) <= FIELD_SWAP_LOG_MAX) {
+            log_line("field %.40s: character %d wears %s.HRC (its save bit is on): %d model%s renamed from %s.HRC", name,
+                     character_file_id(c), c->field_when_model, n, n == 1 ? "" : "s", c->field_model);
+        }
+        if (logged == FIELD_SWAP_LOG_MAX + 1 && InterlockedIncrement(&logged))
+            log_line("field skeleton swaps: %d lines have been said; the rest are not listed", FIELD_SWAP_LOG_MAX);
+    }
+}
+
 /* After the field has been read: the seats' entities. One line in the log per field read; a
    field that is refused says why the first time only (the reasons are the field's own). */
 static void field_add_seats(const char *name)
@@ -23122,7 +25576,7 @@ static void field_add_seats(const char *name)
             extra[count].entity[k] = extra[count].hrc[k] = 0;
         wsprintfA(extra[count].entity, "sx%d", id);
         wsprintfA(model_names[count], "sx%d.char", id);
-        copy_bytes((BYTE *)extra[count].hrc, (const BYTE *)c->field_model, 4);
+        copy_bytes((BYTE *)extra[count].hrc, (const BYTE *)field_model_now(c), 4);     /* (the outfit swap) the look the save bit says */
         copy_bytes((BYTE *)extra[count].hrc + 4, (const BYTE *)".HRC", 4);
         extra[count].model_name = model_names[count];
         count++;
@@ -23204,9 +25658,37 @@ static int __cdecl field_read_hook(const char *name)
     if (!resumed)
         fields_after_read(name, result);            /* (field capacity) a registered field's line; nothing with the feature off */
     /* back from a battle or a menu nothing was read: the file is as it was left here, and nothing is done or said */
-    if (result && !resumed && field_entities_hooked && field_entities_mode && new_characters_live)
-        field_add_seats(name ? name : "?");
+    if (result && !resumed && new_characters_live) {
+        field_swap_skeletons(name ? name : "?");     /* (the outfit swap) a second look for a character whose save bit is on; before the seats, so a merged body is named as the rest */
+        if (field_entities_hooked && field_entities_mode)
+            field_add_seats(name ? name : "?");
+    }
     return result;
+}
+
+/* (the outfit swap) After the hooks are in (fields_start), and after a Re-init that brings a `field_model_when` into a
+   file that had none: says whether the field reader's call goes through field_read_hook, which a `field_model_when`
+   needs, when some character has one. Says it once while the keys stay (it says again after a time with none). */
+static void outfit_start_report(void)
+{
+    static const BYTE before[5] = { 0x68, 0xf0, 0x1e, 0xcc, 0x00 };
+    const BYTE *code = (const BYTE *)(SITE_FIELD_READ - 5);
+    static int said;                    /* 1 once said for the keys as they are now; 0 again when no character has one */
+    int i, any = 0;
+
+    for (i = 0; i < ROSTER_MAX; i++)
+        any |= new_characters[i].defined && new_characters[i].field_when_flag != FORGET_FLAG_NONE;
+    if (!any) {
+        said = 0;
+        return;
+    }
+    if (said)
+        return;
+    said = 1;
+    if (code[5] == 0xe8 && SITE_FIELD_READ + 5 + *(const DWORD *)(code + 6) == (DWORD)field_read_hook && code[0] == before[0])
+        log_line("field_model_when: on: the field reader's call at %08lx goes through this DLL (chained); the skeleton is swapped as a field is read", SITE_FIELD_READ);
+    else
+        log_line("field_model_when: NOT on: the field reader's call at %08lx is not hooked (no skeleton is swapped)", SITE_FIELD_READ);
 }
 
 /* Always installed with the new characters; whether it does anything is the game file's
@@ -24164,6 +26646,318 @@ static void __cdecl new_game_hook(void)
     wide_new_game();                /* is the stock the kernel's starting stock? (for the log) */
 }
 
+/* ---- The materia theft (MENU 0x0f) and its return (MENU 0x10) reach the seats ----------------
+
+   MENU 0x0f, FUN_00717961 (called only from FUN_006cbd82), offers every materia of the shown nine
+   (character IDs 0 to 8 whose bit of the PHS "shown" word 00dc0dde is set: their 16 slots, by the
+   fixed record index i) and of the 200-entry stock to FUN_00717a6f, which keeps the 48 with the
+   highest priority byte (009217c8, the DLL's materia_keep_stolen when that is live) in a work list
+   at 00dd1800. FUN_00717ba3 then removes each listed value from where it is (FUN_00717c15: the
+   first exact match among the shown nine, weapon slots then armour slots, then the stock) and
+   copies the 48 to 00dc07d4, the save's list of stolen materia. MENU 0x10, FUN_00717d32 (only
+   from FUN_006cbd8c), hands each non-empty entry of that list to FUN_00717d8d, which puts it into
+   the first empty slot that exists of a shown character counting DOWN from 8 to 0, and returns 1
+   when there is none: the stock then gets it (FUN_006cc0ea).
+   Both routines know only IDs 0 to 8, so a seat (12 to 15) kept all its materia. Three of the
+   routines' own calls are chained here, so the game's whole routine still runs:
+     00717a66 (call 00717ba3)  the seats taking part offer their 16 slots, through the game's
+                               00717a6f, before anything is removed;
+     00717bd9 (call 00717c15)  a listed value the nine and the stock do not hold is removed from
+                               a seat's slot (seats 12 up, weapon slots then armour slots);
+     00717d68 (call 00717d8d)  at the return, a seat taking part that is IN THE ACTIVE PARTY is
+                               filled first (15 down to 12), then the game's 8 down to 0.
+   A seat takes part when it is occupied, its record exists (record[0] == ID) and the PHS shows
+   it: the game's own test for the nine plus the record. The return also wants it in the party,
+   as the game's only return scene hides the benched members first so that the materia goes to
+   the active party; a seat is a member no script knows, so the rule is applied to it here.
+   Every theft writes one line with a count of all the materia it could reach before and after
+   (they must agree). All three calls or none. */
+#define SITE_THEFT_TAKE_ALL         0x00717a66u  /* in FUN_00717961: call FUN_00717ba3 (remove the 48, copy them to 00dc07d4) */
+#define FN_THEFT_TAKE_ALL           0x00717ba3u
+#define SITE_THEFT_TAKE_ONE         0x00717bd9u  /* in FUN_00717ba3: call FUN_00717c15(value) */
+#define FN_THEFT_TAKE_ONE           0x00717c15u
+#define SITE_THEFT_RETURN_ONE       0x00717d68u  /* in FUN_00717d32: call FUN_00717d8d(value), 0 = placed, 1 = to the stock */
+#define FN_THEFT_RETURN_ONE         0x00717d8du
+#define FN_THEFT_OFFER              0x00717a6fu  /* FUN_00717a6f(DWORD *slot): offer one materia to the work list */
+#define ADDR_THEFT_STOLEN           0x00dc07d4u  /* the save's 48 stolen materia (savemap +0xa9c) */
+#define THEFT_STOLEN_COUNT          48
+#define THEFT_STOCK_COUNT           200
+#define OPERAND_THEFT_WEAPON_SLOTS  0x00717e16u  /* FUN_00717d8d's operand: weapon table + 0x1c (the DLL repoints it with the table) */
+#define OPERAND_THEFT_ARMOUR_SLOTS  0x00717e84u  /* the same for the armour table + 0x09 */
+
+static int theft_seat_taken[SEAT_MAX];          /* at the theft now being made: slots emptied on each seat */
+static int theft_seat_given[SEAT_MAX];          /* at the return now being made: slots filled on each seat */
+static int theft_return_calls, theft_return_expected;
+static int theft_return_benched;                /* at the return now being made: pieces put on a benched seat because the nine and the stock had no room */
+static int theft_return_lost;                   /* ... and pieces the game's caller could not keep (no room on the nine, the seats or in the full stock) */
+static int theft_nowhere_said;
+
+/* NULL when seat `id` takes part in the theft; otherwise why not, for the log. */
+static const char *theft_seat_out(int id)
+{
+    if (id < NEW_CHARACTER_FIRST_ID || id >= NEW_CHARACTER_FIRST_ID + seat_count)
+        return "not a seat";
+    if (!new_character(id))
+        return "empty seat";
+    if (*new_character_record(id) != (BYTE)id)
+        return "no record";
+    if (!(((const WORD *)ADDR_PHS_MASKS)[1] & (1 << id)))
+        return "not shown";
+    return NULL;
+}
+
+static BOOL theft_seat_takes_part(int id)
+{
+    return new_characters_live && theft_seat_out(id) == NULL;
+}
+
+static BOOL theft_seat_in_party(int id)
+{
+    const BYTE *party = (const BYTE *)ADDR_PARTY, *field_party = (const BYTE *)ADDR_FIELD_PARTY;
+    int slot;
+
+    for (slot = 0; slot < 3; slot++)
+        if (party[slot] == id || field_party[slot] == id)
+            return TRUE;
+    return FALSE;
+}
+
+static DWORD *theft_seat_slots(int id)
+{
+    return (DWORD *)(new_character_record(id) + SAVE_RECORD_MATERIA);
+}
+
+static int theft_count(const DWORD *p, int n)
+{
+    int k = 0;
+
+    while (n-- > 0)
+        k += *p++ != 0xffffffff;
+    return k;
+}
+
+/* Every materia the theft can reach: the shown nine's slots, the slots of the seats taking part, the stock. */
+static int theft_census(void)
+{
+    WORD shown = ((const WORD *)ADDR_PHS_MASKS)[1];
+    int k = theft_count((const DWORD *)ADDR_MATERIA_STOCK, THEFT_STOCK_COUNT), i;
+
+    for (i = 0; i < 9; i++)
+        if (shown & (1 << i))
+            k += theft_count((const DWORD *)(ADDR_SAVE_RECORDS + i * SAVE_RECORD_SIZE + SAVE_RECORD_MATERIA), 16);
+    for (i = NEW_CHARACTER_FIRST_ID; i < NEW_CHARACTER_FIRST_ID + seat_count; i++)
+        if (theft_seat_takes_part(i))
+            k += theft_count(theft_seat_slots(i), 16);
+    return k;
+}
+
+/* Does `value` sit where FUN_00717c15 looks (a slot of a shown one of the nine, or the stock)? Read only. */
+static BOOL theft_game_holds(DWORD value)
+{
+    WORD shown = ((const WORD *)ADDR_PHS_MASKS)[1];
+    const DWORD *p;
+    int i, j;
+
+    for (i = 0; i < 9; i++) {
+        if (!(shown & (1 << i)))
+            continue;
+        p = (const DWORD *)(ADDR_SAVE_RECORDS + i * SAVE_RECORD_SIZE + SAVE_RECORD_MATERIA);
+        for (j = 0; j < 16; j++)
+            if (p[j] == value)
+                return TRUE;
+    }
+    p = (const DWORD *)ADDR_MATERIA_STOCK;
+    for (j = 0; j < THEFT_STOCK_COUNT; j++)
+        if (p[j] == value)
+            return TRUE;
+    return FALSE;
+}
+
+/* 00717a66: the seats offer theirs, then the game's FUN_00717ba3 removes the 48 and keeps them. */
+static void __cdecl theft_take_all_hook(void)
+{
+    char seats[192];
+    int before, after, taken, from_seats = 0, n = 0, id, j;
+
+    if (!new_characters_live) {
+        ((void (__cdecl *)(void))FN_THEFT_TAKE_ALL)();
+        return;
+    }
+    theft_return_calls = 0;             /* (a return is never under way here; a fresh start for its count) */
+    before = theft_census();
+    for (id = NEW_CHARACTER_FIRST_ID; id < NEW_CHARACTER_FIRST_ID + SEAT_MAX; id++) {
+        theft_seat_taken[id - NEW_CHARACTER_FIRST_ID] = 0;
+        if (theft_seat_takes_part(id))
+            for (j = 0; j < 16; j++)
+                ((void (__cdecl *)(DWORD *))FN_THEFT_OFFER)(theft_seat_slots(id) + j);
+    }
+    ((void (__cdecl *)(void))FN_THEFT_TAKE_ALL)();
+    taken = theft_count((const DWORD *)ADDR_THEFT_STOLEN, THEFT_STOLEN_COUNT);
+    after = theft_census() + taken;
+    seats[0] = 0;
+    for (id = NEW_CHARACTER_FIRST_ID; id < NEW_CHARACTER_FIRST_ID + seat_count && n < (int)sizeof seats - 40; id++) {
+        const char *out = theft_seat_out(id);
+
+        from_seats += theft_seat_taken[id - NEW_CHARACTER_FIRST_ID];
+        n += out ? wsprintfA(seats + n, "%s%d %s", n ? ", " : "", id, out)
+                 : wsprintfA(seats + n, "%s%d %d taken", n ? ", " : "", id, theft_seat_taken[id - NEW_CHARACTER_FIRST_ID]);
+    }
+    log_line("MENU 0x0f (all materia stolen): %d taken in all, %d of them from seats; seats: %s; count %s (%d before, %d after)",
+             taken, from_seats, seats[0] ? seats : "none", before == after ? "OK" : "MISMATCH: STOP and keep this log",
+             before, after);
+}
+
+/* 00717bd9: one listed value. Where the game would find it, the game removes it, as before;
+   otherwise it is on a seat taking part, and comes off the first slot that holds it. */
+static void __cdecl theft_take_one_hook(DWORD value)
+{
+    int id, j;
+
+    if (!new_characters_live || theft_game_holds(value)) {
+        ((void (__cdecl *)(DWORD))FN_THEFT_TAKE_ONE)(value);
+        return;
+    }
+    for (id = NEW_CHARACTER_FIRST_ID; id < NEW_CHARACTER_FIRST_ID + seat_count; id++) {
+        DWORD *slots;
+
+        if (!theft_seat_takes_part(id))
+            continue;
+        slots = theft_seat_slots(id);
+        for (j = 0; j < 16; j++)
+            if (slots[j] == value) {
+                slots[j] = 0xffffffff;
+                theft_seat_taken[id - NEW_CHARACTER_FIRST_ID]++;
+                return;
+            }
+    }
+    if (theft_nowhere_said < 4) {
+        theft_nowhere_said++;
+        log_line("*** MENU 0x0f: a stolen materia %08lx was found nowhere (the count below says so too): STOP and keep this log ***",
+                 value);
+    }
+}
+
+/* Into the first empty slot that exists of a seat taking part (and, with `party_only`, in the
+   active party), 15 down to 12, weapon slots then armour slots, as FUN_00717d8d does for each of
+   the nine. */
+static BOOL theft_return_to_seat(DWORD value, BOOL party_only)
+{
+    const BYTE *weapon_slots = (const BYTE *)*(const DWORD *)OPERAND_THEFT_WEAPON_SLOTS;     /* exactly the table the game's routine reads */
+    const BYTE *armour_slots = (const BYTE *)*(const DWORD *)OPERAND_THEFT_ARMOUR_SLOTS;
+    int id, j;
+
+    for (id = NEW_CHARACTER_FIRST_ID + seat_count - 1; id >= NEW_CHARACTER_FIRST_ID; id--) {
+        const BYTE *record;
+        DWORD *slots;
+
+        if (!theft_seat_takes_part(id) || (party_only && !theft_seat_in_party(id)))
+            continue;
+        record = new_character_record(id);
+        slots = theft_seat_slots(id);
+        for (j = 0; j < 8; j++)
+            if (slots[j] == 0xffffffff && weapon_slots[record[SAVE_RECORD_WEAPON] * WEAPON_RECORD_SIZE + j]) {
+                slots[j] = value;
+                theft_seat_given[id - NEW_CHARACTER_FIRST_ID]++;
+                return TRUE;
+            }
+        for (j = 0; j < 8; j++)
+            if (slots[8 + j] == 0xffffffff && armour_slots[record[SAVE_RECORD_ARMOUR] * ARMOUR_RECORD_SIZE + j]) {
+                slots[8 + j] = value;
+                theft_seat_given[id - NEW_CHARACTER_FIRST_ID]++;
+                return TRUE;
+            }
+    }
+    return FALSE;
+}
+
+/* 00717d68: one stolen value given back: a seat in the active party first, else the game's
+   FUN_00717d8d (the nine, else 1 and the caller puts it in the stock). When the game has no room
+   AND the stock is full, the caller's FUN_006cc0ea would drop the piece: then a seat taking part
+   that is benched holds it rather (nothing is lost unless every seat taking part is full too).
+   The list does not change during the return, so its count at the first call says which call is
+   the last; the line is written then. */
+static int __cdecl theft_return_one_hook(DWORD value)
+{
+    char seats[160];
+    int result, id, n = 0, to_seats = 0;
+
+    if (!new_characters_live)
+        return ((int (__cdecl *)(DWORD))FN_THEFT_RETURN_ONE)(value);
+    if (theft_return_calls == 0) {
+        theft_return_expected = theft_count((const DWORD *)ADDR_THEFT_STOLEN, THEFT_STOLEN_COUNT);
+        for (id = 0; id < SEAT_MAX; id++)
+            theft_seat_given[id] = 0;
+        theft_return_benched = theft_return_lost = 0;
+    }
+    theft_return_calls++;
+    result = theft_return_to_seat(value, TRUE) ? 0 : ((int (__cdecl *)(DWORD))FN_THEFT_RETURN_ONE)(value);
+    if (result && theft_count((const DWORD *)ADDR_MATERIA_STOCK, THEFT_STOCK_COUNT) == THEFT_STOCK_COUNT
+        && theft_return_to_seat(value, FALSE)) {
+        theft_return_benched++;
+        result = 0;
+    }
+    if (result && theft_count((const DWORD *)ADDR_MATERIA_STOCK, THEFT_STOCK_COUNT) == THEFT_STOCK_COUNT)
+        theft_return_lost++;
+    if (theft_return_calls >= theft_return_expected) {
+        seats[0] = 0;
+        for (id = NEW_CHARACTER_FIRST_ID; id < NEW_CHARACTER_FIRST_ID + seat_count && n < (int)sizeof seats - 40; id++) {
+            const char *out = theft_seat_out(id);
+
+            to_seats += theft_seat_given[id - NEW_CHARACTER_FIRST_ID];
+            n += out ? wsprintfA(seats + n, "%s%d %s", n ? ", " : "", id, out)
+                : !theft_seat_in_party(id) ? wsprintfA(seats + n, "%s%d not in the party, %d given", n ? ", " : "", id,
+                                                       theft_seat_given[id - NEW_CHARACTER_FIRST_ID])
+                : wsprintfA(seats + n, "%s%d %d given", n ? ", " : "", id, theft_seat_given[id - NEW_CHARACTER_FIRST_ID]);
+        }
+        log_line("MENU 0x10 (materia given back): %d in the list, %d to seats (%d of them to benched seats, the stock being full), the rest to the game's routine (the nine, then the stock); %d lost (the stock was full); seats: %s",
+                 theft_return_calls, to_seats, theft_return_benched, theft_return_lost, seats[0] ? seats : "none");
+        theft_return_calls = 0;
+    }
+    return result;
+}
+
+static BOOL theft_call_is(DWORD site, DWORD target, DWORD *found)
+{
+    const BYTE *p = (const BYTE *)site;
+
+    *found = p[0] == 0xe8 ? site + 5 + *(const DWORD *)(p + 1) : 0;
+    return p[0] == 0xe8 && *found == target;
+}
+
+/* All three calls, or none: each is checked to be the game's own before any is changed. */
+static void install_theft_seats(void)
+{
+    static const DWORD sites[3] = { SITE_THEFT_TAKE_ALL, SITE_THEFT_TAKE_ONE, SITE_THEFT_RETURN_ONE };
+    static const DWORD targets[3] = { FN_THEFT_TAKE_ALL, FN_THEFT_TAKE_ONE, FN_THEFT_RETURN_ONE };
+    void *hooks[3];
+    DWORD found;
+    int i, k;
+
+    hooks[0] = (void *)theft_take_all_hook;
+    hooks[1] = (void *)theft_take_one_hook;
+    hooks[2] = (void *)theft_return_one_hook;
+    for (i = 0; i < 3; i++)
+        if (!theft_call_is(sites[i], targets[i], &found)) {
+            if (found)
+                log_line("MENU 0x0f / 0x10 (the materia theft and its return) reach the seats: NOT on (the call at %08lx goes to %08lx, not the game's %08lx): a seat keeps its materia, as before",
+                         sites[i], found, targets[i]);
+            else
+                log_line("MENU 0x0f / 0x10 (the materia theft and its return) reach the seats: NOT on (at %08lx no call but byte %02x; the game's calls %08lx): a seat keeps its materia, as before",
+                         sites[i], (unsigned)*(const BYTE *)sites[i], targets[i]);
+            return;
+        }
+    for (i = 0; i < 3; i++)
+        if (!patch_call(sites[i], targets[i], hooks[i])) {
+            for (k = 0; k < i; k++)
+                patch_call(sites[k], (DWORD)hooks[k], (void *)targets[k]);
+            log_line("MENU 0x0f / 0x10 (the materia theft and its return) reach the seats: NOT on (the call at %08lx could not be changed; the ones before it are put back): a seat keeps its materia, as before",
+                     sites[i]);
+            return;
+        }
+    log_line("MENU 0x0f / 0x10 (the materia theft and its return) reach the seats: on (calls at %08lx, %08lx, %08lx); at the return a seat is given back only while in the active party",
+             sites[0], sites[1], sites[2]);
+}
+
 /* Turns the feature on, once: needs the game's weapon table memory to be free. */
 static void enable_new_characters(void)
 {
@@ -24279,6 +27073,7 @@ static void enable_new_characters(void)
     field_join_guarded = guard_field_join();
     log_line("MENU 0x11 (take everything off) with a seat's ID acts on the seat's record: %s",
              patch_call(SITE_STRIP_CHARACTER, FN_STRIP_CHARACTER, strip_character_hook) ? "on" : "NOT on");
+    install_theft_seats();
     install_field_entities();
     install_name_screen();
     install_name_code();
@@ -25266,6 +28061,9 @@ static struct {
     struct limit_state state;
     BYTE gauge_held;                    /* `limit_gauge = frozen` is in force: the gauge's divisor is STATE_GAUGE_NEVER ... */
     DWORD gauge_divisor;                /* ... and was this */
+    WORD landed;                        /* (dexterity_per_target) the armed limit's targets a status of it landed on, bit per actor */
+    BYTE dex_on;                        /* the state raised the dexterity: put back when it ends (not when a battle starts) */
+    BYTE dex_base, dex_written, dex_added;   /* the dexterity before, the one written, what was really added */
 } state_run[3];
 
 /* `limit_gauge = frozen`. Damage taken fills a party member's limit gauge by an amount divided by the
@@ -25296,6 +28094,9 @@ static int state_lines;                 /* lines logged about affected actions i
 static BOOL weapon_hook_live;
 static BOOL evade_hook_live;            /* `physical_evade`: the physical hit check is followed (physical_hit_check_hook) */
 static BYTE evade_said[3];              /* a miss of `physical_evade` said for the actor in this battle */
+static BOOL cover_hook_live;            /* `cover`: the hit's call of the Cover check is followed (cover_check_hook) */
+static BOOL counter_hook_live;          /* `counter`: the action's call of the counter list is followed (counter_run_hook) */
+static void guard_battle_start(void);   /* "A state's cover and counter": its lines of the battle */
 static BYTE menu_all_said[3];           /* the battle menu's widened cursor said for the actor in this battle */
 static void view_lift_battle_start(void);   /* a state's home view (`view_raise`): in the camera's part */
 static void view_lift_install(int actor);
@@ -25308,6 +28109,8 @@ static void state_stay_begin(int actor);
 static void state_stay_start(int actor);
 static void state_stay_battle_start(void);
 static void state_end(int actor, const char *why);
+static void state_dex_begin(int actor);     /* `dexterity_per_target`: see "A state's dexterity_per_target", after atb_dex_follow */
+static void state_dex_end(int actor);
 static const char *state_end_reason(unsigned ends, DWORD status);
 static void state_ends_text(char *out, unsigned ends);
 static void state_keys_text(char *out, const struct limit_state *s);   /* the keys of "A state's physical_evade" and the like, for the log */
@@ -25486,6 +28289,161 @@ static void state_show_number(int entry, int target)
         *(short *)(data + 0x0a) = (short)*(const signed char *)(sheet + 0x0a);
         *(short *)(data + 0x08) = record;
     }
+}
+
+/* ---- HITS ON EVERY TARGET, the game's side (see the block before show_hit_event_hook) ---- */
+#define SITE_EVERY_TARGET_PICK  0x005d9dc8u  /* in FUN_005d9940: push eax (005d9dc7) / call FUN_005c80b5 / add esp, 4 */
+static struct {
+    int on;                     /* the action being set up / played is such a limit's */
+    int actor, id;              /* its actor and attack ID (0x80 + the limit's number) */
+    int per_hit;                /* targets of the turn, at the pick */
+    int said;                   /* lines written for this limit (EVERY_TARGET_LINES at most) */
+    WORD dying;                 /* targets whose killing result has been shown */
+    BYTE shown[EVERY_TARGET_RESULTS];
+} every_target;
+static short every_target_discard[16];  /* an event nobody reads: given back for a show call that shows nothing */
+static BOOL every_target_live;  /* the pick's call is hooked */
+#define EVERY_TARGET_LINES      8
+
+static BOOL every_target_line(void)
+{
+    return every_target.said++ < EVERY_TARGET_LINES;
+}
+
+/* The limit `id` of `actor`'s, set up now: with the key, followed. */
+static void every_target_arm(int actor, int id, BOOL on)
+{
+    int i;
+
+    every_target.on = on && every_target_live;
+    every_target.actor = actor;
+    every_target.id = id;
+    every_target.per_hit = 0;
+    every_target.said = 0;
+    every_target.dying = 0;
+    for (i = 0; i < EVERY_TARGET_RESULTS; i++)
+        every_target.shown[i] = 0;
+    if (on && !every_target_live)
+        log_line("hits on every target: the hit loop's pick (%08lx) is not hooked: limit %d of actor %d has its hits at random targets",
+                 SITE_EVERY_TARGET_PICK, id, actor);
+}
+
+static BOOL every_target_action(const int *action)
+{
+    return every_target.on && action && action[ACT_ACTOR] == every_target.actor && action[ACT_COMMAND_TYPE] == 0x14 &&
+           action[ACT_ATTACK_ID] == every_target.id;
+}
+
+/* The call at 005d9dc8: one of the turn's targets for this hit, at random; for such a limit, all of them. */
+static int __cdecl every_target_pick_hook(int mask)
+{
+    const int *action = current_action();
+
+    if (every_target_action(action)) {
+        int n = every_target_count((unsigned)mask & 0x3ffu), hits = action[0x3f];
+
+        if ((unsigned)mask == ((unsigned)mask & 0x3ffu) && every_target_fits(n, hits)) {
+            if (every_target.per_hit != n && every_target_line())
+                log_line("hits on every target: limit %d of actor %d: each of its %d hit(s) at all %d target(s) (mask %03x)",
+                         every_target.id, every_target.actor, hits, n, (unsigned)mask);
+            every_target.per_hit = n;
+            return mask;
+        }
+        if (every_target_line())
+            log_line("hits on every target: limit %d: %d hit(s) at mask %x is more than %d results: each hit at one target, as the game picks",
+                     every_target.id, hits, (unsigned)mask, EVERY_TARGET_MAX);
+        every_target.per_hit = 0;
+    }
+    return ((int (__cdecl *)(int))FN_RANDOM_TARGET)(mask);
+}
+
+/* hit_target_hook: the hit_elements entry for the result about to be made (per_hit 0: one result a hit, as before). */
+static int every_target_element_for(int attacker, int results, int count)
+{
+    if (every_target_action(current_action()) && attacker == every_target.actor && every_target.per_hit > 0)
+        return every_target_element(results, every_target.per_hit, count);
+    return results < count ? results : count - 1;
+}
+
+static BOOL every_target_showing(void)
+{
+    int a = every_target.actor;
+
+    return every_target_showing_for(every_target.on, limit_seq.count, a, *(const signed char *)ADDR_EFFECT_ACTOR,
+                                    a >= 0 && a <= 2 ? *(const BYTE *)(ADDR_ACTOR_COMMAND_TYPE + a * ACTOR_EFFECT_STRIDE) : -1);
+}
+
+static unsigned every_target_alive(unsigned mask)
+{
+    return every_target_showing() ? mask & ~(unsigned)every_target.dying : mask;
+}
+
+/* A show call (FUN_005c0158(target), its event 4) while such a limit plays: the next result on that target. */
+static short *every_target_show(int target)
+{
+    int results = *(const BYTE *)ADDR_PLAYED_RESULTS, entry;
+
+    if (target < 0 || target > 9)
+        return ((short *(__cdecl *)(int))FN_QUEUE_EFFECT_EVENT)(4);
+    entry = every_target_pick((const BYTE *)ADDR_HIT_TARGETS, results, every_target.shown, target);
+    if (entry < 0) {
+        if (every_target_line())
+            log_line("hits on every target: limit %d: no result left to show on target %d (of %d): nothing shown", every_target.id,
+                     target, results);
+        return every_target_discard;
+    }
+    every_target.shown[entry] = 1;
+    if (every_target.dying & (1u << target)) {
+        state_show_number(entry, target);       /* already dying: its number only, no second reaction or death */
+        return every_target_discard;
+    }
+    if (state_show_entry_flags(entry) & 4)
+        every_target.dying |= (WORD)(1u << target);
+    return state_show_queue(entry, target);
+}
+
+/* limit_seq_task's loop: whether the step due waits for room (see `room N`). */
+static int limit_room_hold(void)
+{
+    int k = limit_seq.next, need, room, d;
+
+    if (k < 0 || k >= LIMIT_SEQ_STEPS || !(need = limit_room.need[k]) || limit_room.pass == k + 1)
+        return 0;
+    room = limit_seq_tasks_room();
+    d = limit_room_decide(need, room, limit_room.waited);
+    if (d == LIMIT_ROOM_HOLD) {
+        if (!limit_room.waited)
+            log_line("limit spell effects: frame %d, step %d waits for room: %d free slot(s) in the list of 100, %d wanted (the limit's clock waits too)",
+                     limit_seq.frame, k, room, need);
+        limit_room.waited++;
+        limit_room.held = 1;
+        return 1;
+    }
+    if (d == LIMIT_ROOM_PASS) {
+        log_line("limit spell effects: step %d waited %d frames and the list of 100 still has %d free slot(s), %d wanted: its effect is passed over",
+                 k, limit_room.waited, room, need);
+        limit_room.pass = k + 1;
+    } else if (limit_room.waited) {
+        log_line("limit spell effects: step %d starts after %d frame(s) of waiting (%d free slots)", k, limit_room.waited, room);
+    }
+    limit_room.waited = 0;
+    return 0;
+}
+
+/* The call at 005d9dc8, hooked once from install_limit_hooks: refused with a line unless the bytes are the game's. */
+static void every_target_install(void)
+{
+    static const BYTE before[1] = { 0x50 }, after[3] = { 0x83, 0xc4, 0x04 };
+
+    if (every_target_live)
+        return;
+    if (!bytes_are(SITE_EVERY_TARGET_PICK - 1, before, 1) || !bytes_are(SITE_EVERY_TARGET_PICK + 5, after, 3))
+        log_line("patch %08lx skipped: the bytes around the call are not push eax / call / add esp, 4", SITE_EVERY_TARGET_PICK);
+    else
+        every_target_live = patch_call(SITE_EVERY_TARGET_PICK, FN_RANDOM_TARGET, every_target_pick_hook);
+    log_line("hits on every target: the hit loop's pick (%08lx -> %08lx) is %s", SITE_EVERY_TARGET_PICK, FN_RANDOM_TARGET,
+             every_target_live ? "followed: a limit with hits_on_every_target hits every target with each hit"
+                               : "NOT followed: hits_on_every_target changes nothing");
 }
 
 static BOOL state_show_task_start(void)
@@ -25736,16 +28694,21 @@ static void state_battle_start(void)
             log_line("state %s actor %d: set up by a limit in the last battle and never entered: dropped", state_run[i].armed_state.name, i);
         state_run[i].armed = state_run[i].reached = state_run[i].on = 0;
         state_run[i].gauge_held = 0;    /* the battle's start sets every gauge's divisor anew */
+        state_run[i].landed = 0;
+        state_run[i].dex_on = 0;        /* the battle records were made afresh (FUN_005cf650): nothing to put back */
         state_action[i].live = 0;
         state_placed[i].table = NULL;   /* the models are loaded afresh: nothing to put back */
     }
     state_stay_battle_start();          /* nor of a state's idle; its task went with the lists */
     state_show_forget();
+    every_target_forget(&every_target.on, &every_target.per_hit, &limit_room.waited, &limit_room.pass, &limit_room.held);
+    every_target.dying = 0;             /* (every target) the last battle's limit is not followed into this one */
     state_show.task = 0;                /* the battle's set-up empties the task lists (FUN_005beec6) */
     state_stop.pending = 0;
     state_lines = 0;
     evade_said[0] = evade_said[1] = evade_said[2] = 0;
     menu_all_said[0] = menu_all_said[1] = menu_all_said[2] = 0;
+    guard_battle_start();
     view_lift_battle_start();
     pointer_raise_battle_start();
 }
@@ -25779,10 +28742,14 @@ static void state_enter(int actor, const char *when)
              turn_hook_live && state_show_live ? "" : "; BUT the per-turn call, the record's call or the f7 task's call is not followed, so nothing changes");
     state_keys_text(keys, s);
     if (keys[0])
-        log_line("state %s actor %d: %s%s", s->name, actor, keys,
-                 s->physical_evade && !evade_hook_live ? "; BUT the physical hit check is not followed, so physical hits are rolled as always" : "");
+        log_line("state %s actor %d: %s%s%s%s", s->name, actor, keys,
+                 s->physical_evade && !evade_hook_live ? "; BUT the physical hit check is not followed, so physical hits are rolled as always" : "",
+                 s->cover && !cover_hook_live ? "; BUT the Cover check's call is not followed, so the actor covers by its materia only" : "",
+                 s->counter && !counter_hook_live ? "; BUT the counter list's call is not followed, so the actor counters by its materia only" : "");
     if (s->gauge_frozen)
         state_gauge(actor, TRUE);
+    if (s->dex_per_target)
+        state_dex_begin(actor);         /* `dexterity_per_target`: raised from here, put back by state_end */
     state_stay_begin(actor);            /* its idle, its prop, its task: stage C */
     view_lift_install(actor);           /* `view_raise`, `view_back`: the home view lifted while it lasts */
     pointer_raise_install(actor);       /* `pointer_raise`: the pointer over the acting actor raised while it lasts */
@@ -25797,6 +28764,7 @@ static void state_arm(int actor, const struct new_character *c, int index, int s
     state_run[actor].level = (BYTE)(index / 3 + 1);
     state_run[actor].position = (BYTE)(index % 3 + 1);
     state_run[actor].reached = 0;
+    state_run[actor].landed = 0;        /* (dexterity_per_target) counted by this limit's own hits */
     state_run[actor].armed = 1;
 }
 
@@ -26424,6 +29392,7 @@ static void __cdecl weapon_setup_hook(void)
     int *action;
     int actor;
 
+    spell_bytes_put_back();     /* script_bytes: the last action's lent cast slots go back (its display is over) */
     ((void (__cdecl *)(void))FN_WEAPON_SETUP)();
     action = current_action();
     actor = action[ACT_ACTOR];
@@ -26437,6 +29406,8 @@ static void __cdecl weapon_setup_hook(void)
        action (note_limit_action), which a weapon attack is not, so her next Attack took the last element */
     if (limit_elements.count && limit_elements.actor == actor)
         limit_elements.count = 0;
+    if (every_target.on && every_target.actor == actor)
+        every_target.on = 0;        /* (every target) */
     if (actor < 0 || actor > 2 || !(state_run[actor].armed | state_run[actor].on))
         return;
     state_settle(actor);
@@ -26469,7 +29440,9 @@ static void __cdecl weapon_setup_hook(void)
    bits 1 and 2, the attacker's flag 0x80 at 009ab0e0; it reads no argument, its caller's push is left unread)
    and on a miss sets bit 0 of action[0x86] and nothing else; its hit path (FUN_005de53b, the target's facing)
    is not taken. No luck roll, status or affinity of the routine can make the hit land. Every other hit: the
-   game's routine, unchanged. The random numbers its roll would have used are not drawn. */
+   game's routine, unchanged. The random numbers its roll would have used are not drawn. (In a surrounded battle an
+   enemy's hit on a member from outside that member's place is made a back hit around the game's routine:
+   sur_back_hit_begin / _end, "Surrounded (stage 4)".) */
 #define ADDR_HIT_STEP_PHYSICAL  0x007b77a8u  /* the hit-step table, entry 0: b0 db 5d 00 */
 #define FN_HIT_CHECK_PHYSICAL   0x005ddbb0u  /* 55 8b ec 83 ec 2c a1 0c ce 99 00 */
 #define FN_HIT_FACING           0x005de356u  /* 55 8b ec 83 ec 2c c7 45 f4 00 00 00 00 */
@@ -26490,7 +29463,13 @@ static void __cdecl physical_hit_check_hook(void)
         }
         return;
     }
-    ((void (__cdecl *)(void))FN_HIT_CHECK_PHYSICAL)();
+    {
+        DWORD saved = 0;
+        int back = sur_back_hit_begin(action, &saved);  /* (surrounded) 0 outside a surrounded battle: nothing done */
+
+        ((void (__cdecl *)(void))FN_HIT_CHECK_PHYSICAL)();
+        sur_back_hit_end(action, back, saved);
+    }
 }
 
 /* The table entry, after a look at the two routines the hook calls (FUN_005ddbb0 and FUN_005de356 begin as the
@@ -26516,20 +29495,259 @@ static BOOL install_evade_hook(void)
     return patch_pointer(ADDR_HIT_STEP_PHYSICAL, FN_HIT_CHECK_PHYSICAL, physical_hit_check_hook);
 }
 
+/* ---- A state's cover and counter (`cover = 0-100`, `counter = 0-100`) ----------------------------------------------
+
+   COVER. FUN_005db1d6(pair) is the Cover check of a hit on one target (pair[0] the target): for a single-target
+   physical hit on a party member (action[0x12] set, not the attacker itself, action[0x2e] == 1, no special flag 4 in
+   action[0x1b], no 0x800 in the status masks action[0x20..0x22], not command 0x20 unless action[9] is ff) each OTHER
+   party member in the same group (the words 009a88aa) that is not the attacker, has no flag 8 at 009a8b39 + k*0x44
+   and none of the statuses 0x86805c45 (KO, sleep, confusion, stop, frog, ...: 009ab0dc + k*0x68) rolls FUN_005c8bdc(100)
+   (0-99) against its Cover chance, the byte at battle record +1 (00dba499 + slot*0x440, written by the Cover
+   materia); one of those who passed (FUN_005c80b5, at random) takes the hit: pair[0] = it, pair[1] = the target.
+   Its one call is in FUN_005da5da (a hit on one target), 005da613: push eax / call 005db1d6 / add esp, 4. The call
+   is pointed at cover_check_hook: for the call only, each party actor in a state with `cover` has its chance byte
+   raised to the state's (when the materia's is lower), the game's routine runs with every one of its rules, and the
+   bytes are put back as they were before the hook returns. Nothing is left changed between two calls: the record is
+   the Cover materia's own again at once (and the menus, the save and the next battle never see the state's chance).
+
+   COUNTER. FUN_005c8cfa(actor, 2) runs the counter list of a party member hit by an enemy: in FUN_00435d81, for each
+   target the action hit, with an enemy as the attacker (009aea64 > 3), 00436969: push 2 / push ecx / call 005c8cfa /
+   add esp, 8. The list is 8 entries of 3 bytes at battle record +0x24 (00dba4bc + slot*0x440): type, ID, value. For
+   kind 2 the types 7 (Magic Counter), 8 (Counter) and 9 (Counter Attack: FUN_005cde86 writes 9, 9, the materia's
+   chance for its level) are each rolled, FUN_005c8bdc(100) < value, and queued (Counter Attack: 007b769c[2] = 1, the
+   Attack command, at the attacker); none while the actor has a status of 0x82804c44 (bits 2 6 10 11 14 23 25 31:
+   sleep, confusion, stop, frog, petrify, berserk, paralysis, imprisoned in the wiki's names) or flag 0x10 at
+   009ab0e0 + k*0x68. The call is pointed at counter_run_hook: for the call only, for
+   an actor in a state with `counter`, the list's best Counter Attack entry (type 9) offers the state's chance when it
+   offers less (its value raised), or, with no Counter Attack in the list, an empty entry (type 0: FUN_005cf282
+   clears all 24 bytes) is a Counter Attack of that chance; the game's routine runs; the entry's bytes are put back.
+   Kind 2 writes nothing in the list (only kind 0, Final Attack, counts its uses down), so what is put back is
+   exactly what the materia gave. A full list with no Counter Attack: the state's counter cannot be offered (one
+   line a battle).
+
+   Both calls must be where the exe has them, with the bytes around them (and the routines must begin as the
+   game's); otherwise the call is left alone, with a line, and the key changes nothing. GUARD PURE below is the
+   arithmetic, compiled apart by its stage's test script. */
+#define SITE_COVER_CHECK        0x005da613u  /* in FUN_005da5da: 8b 45 f4 50 [e8 be 0b 00 00] 83 c4 04 */
+#define FN_COVER_CHECK          0x005db1d6u  /* 55 8b ec 83 ec 1c 8b 45 */
+#define SITE_COUNTER_RUN        0x00436969u  /* in FUN_00435d81: 6a 02 8b 4d ec 51 [e8 8c 23 19 00] 83 c4 08 */
+#define FN_COUNTER_RUN          0x005c8cfau  /* 55 8b ec 83 ec 2c 83 7d */
+#define CHR_COVER               0x01         /* battle record byte: the Cover chance, per cent (FUN_005db1d6 reads 00dba499) */
+#define GUARD_LINES             12           /* lines of a battle about the state's cover and counter, in all */
+
+/* ---- GUARD PURE begin (no game memory, no Windows: its stage's test folder) ---- */
+#define COUNTER_TYPE_ATTACK     9            /* a Counter Attack entry: FUN_005cde86 writes 9, 9, its chance */
+enum { GUARD_NONE, GUARD_RAISED, GUARD_ADDED, GUARD_FULL };
+
+/* The counter list `list` (COUNTER_ENTRIES of 3 bytes: type, ID, value) made to offer a Counter Attack of `rate`
+   per cent at least. GUARD_NONE: nothing changed (rate 0, or an entry of type 9 already offers rate or more);
+   GUARD_RAISED: the type-9 entry *index with the highest value was below rate, its value is now rate; GUARD_ADDED:
+   no type-9 entry, the first empty one (type 0) *index is now 9, 9, rate; GUARD_FULL: neither, nothing changed.
+   saved[] holds the entry's three bytes from before (RAISED, ADDED). */
+static int guard_counter_raise(unsigned char *list, int rate, unsigned char saved[3], int *index)
+{
+    int k, best = -1, empty = -1;
+
+    *index = -1;
+    if (rate <= 0)
+        return GUARD_NONE;
+    if (rate > 100)
+        rate = 100;
+    for (k = 0; k < COUNTER_ENTRIES; k++) {
+        if (list[k * 3] == COUNTER_TYPE_ATTACK && (best < 0 || list[k * 3 + 2] > list[best * 3 + 2]))
+            best = k;
+        if (list[k * 3] == 0 && empty < 0)
+            empty = k;
+    }
+    k = best >= 0 ? best : empty;
+    if (k < 0)
+        return GUARD_FULL;
+    if (best >= 0 && list[k * 3 + 2] >= rate)
+        return GUARD_NONE;
+    saved[0] = list[k * 3];
+    saved[1] = list[k * 3 + 1];
+    saved[2] = list[k * 3 + 2];
+    *index = k;
+    if (best < 0) {
+        list[k * 3] = COUNTER_TYPE_ATTACK;
+        list[k * 3 + 1] = COUNTER_TYPE_ATTACK;
+    }
+    list[k * 3 + 2] = (unsigned char)rate;
+    return best >= 0 ? GUARD_RAISED : GUARD_ADDED;
+}
+
+/* guard_counter_raise undone: the entry's bytes as they were. */
+static void guard_counter_restore(unsigned char *list, int result, const unsigned char saved[3], int index)
+{
+    if ((result != GUARD_RAISED && result != GUARD_ADDED) || index < 0 || index >= COUNTER_ENTRIES)
+        return;
+    list[index * 3] = saved[0];
+    list[index * 3 + 1] = saved[1];
+    list[index * 3 + 2] = saved[2];
+}
+
+/* A Cover chance raised to `rate` per cent (0-100) when it is lower; 1 if it was raised. */
+static int guard_cover_raise(unsigned char *chance, int rate)
+{
+    if (rate > 100)
+        rate = 100;
+    if (rate <= 0 || *chance >= rate)
+        return 0;
+    *chance = (unsigned char)rate;
+    return 1;
+}
+/* ---- GUARD PURE end ---- */
+
+static int guard_lines;                 /* lines of this battle about the state's cover and counter */
+static BYTE cover_said[3], counter_said[3], counter_full_said[3];
+
+static void guard_battle_start(void)
+{
+    guard_lines = 0;
+    cover_said[0] = cover_said[1] = cover_said[2] = 0;
+    counter_said[0] = counter_said[1] = counter_said[2] = 0;
+    counter_full_said[0] = counter_full_said[1] = counter_full_said[2] = 0;
+}
+
+static BOOL guard_line(void)
+{
+    if (guard_lines >= GUARD_LINES)
+        return FALSE;
+    if (++guard_lines == GUARD_LINES)
+        log_line("limit states: %d lines about the states' cover and counter in this battle; no more are written", GUARD_LINES);
+    return guard_lines < GUARD_LINES;
+}
+
+static BYTE *guard_record(int slot)
+{
+    return (BYTE *)(ADDR_CHARACTER_RECORD + (DWORD)slot * CHARACTER_STRIDE);
+}
+
+/* The call of FUN_005db1d6 in FUN_005da5da (see above). */
+static void __cdecl cover_check_hook(BYTE *pair)
+{
+    BYTE saved[3];
+    unsigned raised = 0;
+    int k, target = pair ? (signed char)pair[0] : -1, now;
+
+    for (k = 0; k < 3; k++)
+        if (target >= 0 && target <= 2 && k != target && state_run[k].on && state_run[k].state.cover) {
+            /* (a hit on an enemy, or on the actor itself, is never covered by it: the routine's own rules) */
+            saved[k] = guard_record(k)[CHR_COVER];
+            if (guard_cover_raise(guard_record(k) + CHR_COVER, state_run[k].state.cover))
+                raised |= 1u << k;
+        }
+    ((void (__cdecl *)(BYTE *))FN_COVER_CHECK)(pair);
+    for (k = 0; k < 3; k++)
+        if (raised & 1u << k)
+            guard_record(k)[CHR_COVER] = saved[k];
+    if (!raised || !pair)
+        return;
+    now = (signed char)pair[0];
+    for (k = 0; k < 3; k++)
+        if ((raised & 1u << k) && (now == k || !cover_said[k]) && guard_line()) {
+            if (now == k)
+                log_line("state %s actor %d: cover %d%% (its materia's %d%%): it covers actor %d (takes the hit)",
+                         state_run[k].state.name, k, (int)state_run[k].state.cover, (int)saved[k], target);
+            else
+                log_line("state %s actor %d: cover %d%% (its materia's %d%%) for a hit on actor %d: %s (said once a battle unless it covers)",
+                         state_run[k].state.name, k, (int)state_run[k].state.cover, (int)saved[k], target,
+                         now == target ? "nobody covers (the game's rules: the hit, the group, the statuses, the roll)" : "another covers");
+            cover_said[k] = 1;
+        }
+}
+
+/* The call of FUN_005c8cfa(target, 2) in FUN_00435d81 (see above). */
+static void __cdecl counter_run_hook(int actor, int kind)
+{
+    BYTE saved[3], *list;
+    int result, index;
+
+    if (kind == 2 && !sur_counter_allowed(actor))
+        return;                         /* (surrounded) hit from out of its reach: no counter (said there) */
+    if (kind != 2 || actor < 0 || actor > 2 || !state_run[actor].on || !state_run[actor].state.counter) {
+        ((void (__cdecl *)(int, int))FN_COUNTER_RUN)(actor, kind);
+        sur_counter_done();             /* (surrounded) the hold of this run, if any, is over */
+        return;
+    }
+    list = guard_record(actor) + CHR_COUNTERS;
+    result = guard_counter_raise(list, state_run[actor].state.counter, saved, &index);
+    if (result == GUARD_FULL) {
+        if (!counter_full_said[actor] && guard_line())
+            log_line("state %s actor %d: counter %d%%: its counter list is full (8 entries, no Counter Attack): only its materia's counters",
+                     state_run[actor].state.name, actor, (int)state_run[actor].state.counter);
+        counter_full_said[actor] = 1;
+    } else if (result != GUARD_NONE && !counter_said[actor] && guard_line()) {
+        log_line("state %s actor %d: counter %d%%: the counter list's entry %d %s while the list is rolled (put back after; said once a battle)",
+                 state_run[actor].state.name, actor, (int)state_run[actor].state.counter, index,
+                 result == GUARD_RAISED ? "(its Counter Attack) offers the state's chance" : "(empty) is a Counter Attack of the state's chance");
+        counter_said[actor] = 1;
+    }
+    ((void (__cdecl *)(int, int))FN_COUNTER_RUN)(actor, kind);
+    sur_counter_done();
+    guard_counter_restore(list, result, saved, index);
+}
+
+/* One call site, after a look at its bytes and at the routine's first ones: FALSE (said) if any differs. */
+static BOOL install_guard_call(DWORD site, const BYTE *before, int nbefore, const BYTE *after, int nafter,
+                               DWORD fn, const BYTE *head, int nhead, void *hook, const char *what)
+{
+    if (!bytes_are(site - (DWORD)nbefore, before, nbefore) || !bytes_are(site + 5, after, nafter)) {
+        log_line("limit states: %s: the bytes around the call at %08lx are not the game's: not followed", what, site);
+        return FALSE;
+    }
+    if (!bytes_are(fn, head, nhead)) {
+        log_line("limit states: %s: %08lx does not begin as the game's routine: not followed", what, fn);
+        return FALSE;
+    }
+    return patch_call(site, fn, hook);
+}
+
+/* The counter call alone (the limit states', and the surrounded reach rule's, which may come first). */
+static BOOL install_counter_call(void)
+{
+    static const BYTE counter_before[6] = { 0x6a, 0x02, 0x8b, 0x4d, 0xec, 0x51 }, counter_after[3] = { 0x83, 0xc4, 0x08 };
+    static const BYTE counter_head[8] = { 0x55, 0x8b, 0xec, 0x83, 0xec, 0x2c, 0x83, 0x7d };
+
+    return install_guard_call(SITE_COUNTER_RUN, counter_before, 6, counter_after, 3, FN_COUNTER_RUN, counter_head, 8,
+                              counter_run_hook, "counter");
+}
+
+static void install_guard_hooks(void)
+{
+    static const BYTE cover_before[4] = { 0x8b, 0x45, 0xf4, 0x50 }, cover_after[3] = { 0x83, 0xc4, 0x04 };
+    static const BYTE cover_head[8] = { 0x55, 0x8b, 0xec, 0x83, 0xec, 0x1c, 0x8b, 0x45 };
+
+    if (!cover_hook_live)
+        cover_hook_live = install_guard_call(SITE_COVER_CHECK, cover_before, 4, cover_after, 3, FN_COVER_CHECK, cover_head, 8,
+                                             cover_check_hook, "cover");
+    log_line("limit states: the Cover check's call (%08lx -> %08lx) is %s", SITE_COVER_CHECK, FN_COVER_CHECK,
+             cover_hook_live ? "followed: a state's cover applies" : "NOT followed: a state's cover changes nothing");
+    if (!counter_hook_live)
+        counter_hook_live = install_counter_call();
+    log_line("limit states: the counter list's call (%08lx -> %08lx) is %s", SITE_COUNTER_RUN, FN_COUNTER_RUN,
+             counter_hook_live ? "followed: a state's counter applies" : "NOT followed: a state's counter changes nothing");
+}
+
 /* The call of FUN_005dc390 in the hit loop (005d9b06), once at the start of every turn of every
    action. See "A state, stage B2". For anything but a turn of a noted action of a party actor in a
-   state this is the game's call and nothing more. */
+   state this is the game's call and nothing more (but in a surrounded battle, a party actor's turn is held to its
+   reach: sur_reach_begin / _trim / _end, "Surrounded (stage 2)"). */
 static void __cdecl turn_targets_hook(void)
 {
     int *action = current_action();
     int actor = action[ACT_ACTOR], turn = -1;
+    unsigned asked = (unsigned)action[ACT_TARGETS], out;
 
     state_stop.pending = 0;             /* a stop asked for at an earlier turn that the loop left another way */
     if (actor >= 0 && actor <= 2 && state_action[actor].live)
         turn = state_turn_begin(actor, action);
+    out = sur_reach_begin(action);      /* (surrounded) 0 outside a surrounded battle: nothing done */
     ((void (__cdecl *)(void))turn_targets_next)();
+    sur_reach_trim(action, out, asked, "turn");
     if (turn >= 0)
         state_turn_aim(actor, action, turn);
+    sur_reach_end(action, out);
 }
 
 /* The hit loop's "no target" exit (005d9bc8: FUN_005dbd40(action[0x37])). See THE STOP. Anything
@@ -27263,26 +30481,34 @@ static void state_lend_end(int actor, BOOL task, char *said)
    look at its first bytes. */
 static int archive_name_state;          /* 0 not looked at, 1 as expected (or another module's jump), -1 not */
 
-static BOOL state_weapon_prop_name(int actor, char *out, int *model)
+/* FUN_005e2460 may be called at its own address (prop = weapon, script_bytes_model): looked at once. */
+static BOOL archive_name_usable(void)
 {
     static const BYTE first[6] = { 0x55, 0x8b, 0xec, 0x81, 0xec, 0x04 };
     const BYTE *at = (const BYTE *)FN_ARCHIVE_NAME;
-    char part[24], letters[16];
-    int i, n = *(const BYTE *)(ADDR_WEAPON_MODEL + (DWORD)actor * 0x440) & 0x0f;
+    int i;
 
-    *model = n;
-    out[0] = 0;
     if (!archive_name_state) {
         archive_name_state = 1;
         for (i = 0; i < 6 && at[0] != 0xe9; i++)
             if (at[i] != first[i]) {
-                log_line("prop = weapon: off: %08lx does not start as expected (byte %d is %02x); states run without such a prop",
+                log_line("prop = weapon: off: %08lx does not start as expected (byte %d is %02x); states run without such a prop, and script_bytes_model knows only forms and new characters",
                          FN_ARCHIVE_NAME, i, at[i]);
                 archive_name_state = -1;
                 break;
             }
     }
-    if (archive_name_state < 0 || !state_weapon_part_name(part, party_model_file[actor], n))
+    return archive_name_state > 0;
+}
+
+static BOOL state_weapon_prop_name(int actor, char *out, int *model)
+{
+    char part[24], letters[16];
+    int i, n = *(const BYTE *)(ADDR_WEAPON_MODEL + (DWORD)actor * 0x440) & 0x0f;
+
+    *model = n;
+    out[0] = 0;
+    if (!archive_name_usable() || !state_weapon_part_name(part, party_model_file[actor], n))
         return FALSE;
     for (i = 0; i < (int)sizeof letters; i++)
         letters[i] = 0;
@@ -27509,6 +30735,7 @@ static void state_end(int actor, const char *why)
         return;
     state_run[actor].on = 0;
     state_gauge(actor, FALSE);          /* `limit_gauge = frozen`: the gauge fills again */
+    state_dex_end(actor);               /* `dexterity_per_target`: the dexterity put back (its own line) */
     state_action[actor].live = 0;       /* no turn of hers is given the state's hits from here on; the records of an
                                            action already worked out keep their notes: its hits are still shown */
     state_idle_back(actor, idle);
@@ -27881,6 +31108,143 @@ static void atb_dex_follow(void)
     }
 }
 
+/* ---- A state's dexterity_per_target -------------------------------------------------------------
+   `dexterity_per_target = N` in a [12 state NAME] section: while the state lasts the actor's battle dexterity (byte
+   009ab0f0 + actor * 0x68, AI variable 40a0: hit rate, evasion and, with atb_follows_dexterity, the time gauge) is
+   N higher for each target the limit that began the state put one of its statuses on, to 255 at most.
+   "Put on" (read from the code, battle_hit_target_005da5da, FUN_005da5da): a hit that did not miss (action[0x86]
+   bit 0) works the target's new status dword out of its old one and the action's masks and writes it at
+   009ab0dc + target * 0x68 at once (the display shows it later); the hit counts its target when that dword gained a
+   bit of the action's inflict mask (action[0x20], put there by battle_set_status_fields_005ca766 from the attack
+   record) that it did not have before the call. A target that already had the status gains nothing (the game then
+   sets action[0x86] bit 0x800000: no change) and is not counted. hit_target_hook keeps the ten status dwords
+   before the game's call and looks after it, only for an action of command type 0x14 (a limit) of a party actor
+   whose armed state has the key; each target is counted once whatever the number of hits on it (a bit per actor).
+   The count is taken when the state is entered (state_enter: at the limit's ec, when the whole action, hit loop
+   included, has been worked out) and the dexterity is raised then. A limit used again while the actor is in the
+   state changes nothing (state_enter's rule), so the bonus does not stack.
+   When the state ends (its `ends`: ko, frog; or another state is entered) the dexterity is put back: to the value
+   it had before the raise when it is still the one written; otherwise (a battle script has changed it since) only
+   what was added comes off, never below 1. At a battle's end nothing is written: the next battle makes its battle
+   records afresh (FUN_005cf650 -> battle_copy_party_stats_005d05bd), so the raise never reaches the character's
+   own stats, the menus or a save.
+   No game code is patched for this: two data reads and a byte written, around the existing call at SITE_HIT_TARGET. */
+/* ---- STATE DEXTERITY PURE begin (no game memory, no Windows: its stage's test folder) ---- */
+#define STATE_DEX_ACTORS        10           /* actors 0-9: the bits of the landed mask */
+
+/* The landed mask's bit for one hit on `target`: the hit did not miss and the target's status gained a bit of
+   the action's inflict mask that it did not have before. 0 otherwise. */
+static WORD state_dex_landed_bit(int target, DWORD before, DWORD after, DWORD inflict, int missed)
+{
+    if (missed || target < 0 || target >= STATE_DEX_ACTORS || !(after & ~before & inflict))
+        return 0;
+    return (WORD)(1u << target);
+}
+
+/* How many targets the mask holds (bits 0-9 only). */
+static int state_dex_count(WORD mask)
+{
+    int k, n = 0;
+
+    for (k = 0; k < STATE_DEX_ACTORS; k++)
+        if (mask & (1u << k))
+            n++;
+    return n;
+}
+
+/* The raised dexterity: per x count more, 255 at most; *added = what was really added. */
+static BYTE state_dex_raise(BYTE now, unsigned per, int count, BYTE *added)
+{
+    unsigned want = per * (unsigned)(count < 0 ? 0 : count > STATE_DEX_ACTORS ? STATE_DEX_ACTORS : count);
+    unsigned room = 255u - now;
+
+    if (want > room)
+        want = room;
+    *added = (BYTE)want;
+    return (BYTE)(now + want);
+}
+
+/* The dexterity put back when the state ends: `base` (the one before the raise) when it is still the one written;
+   otherwise only `added` comes off, never below 1. */
+static BYTE state_dex_restore(BYTE now, BYTE written, BYTE base, BYTE added)
+{
+    if (now == written)
+        return base;
+    if (now > added)
+        return (BYTE)(now - added);
+    return 1;
+}
+/* ---- STATE DEXTERITY PURE end ---- */
+
+/* hit_target_hook, before the game's FUN_005da5da: for a limit of a party actor whose armed state counts landed
+   statuses, the ten status dwords now. FALSE (nothing kept) for anything else. */
+static BOOL state_landed_before(DWORD *before)
+{
+    const int *action = *(const int **)ADDR_ACTION_PTR;
+    int actor, k;
+
+    if (!action || action[ACT_COMMAND_TYPE] != 0x14)
+        return FALSE;
+    actor = action[ACT_ACTOR];
+    if (actor < 0 || actor > 2 || !state_run[actor].armed || !state_run[actor].armed_state.dex_per_target)
+        return FALSE;
+    for (k = 0; k < STATE_DEX_ACTORS; k++)
+        before[k] = *(const DWORD *)(ADDR_ACTOR_STATE + (DWORD)k * 0x68);
+    return TRUE;
+}
+
+/* ... and after it: the hit's target (action[0x82], after cover or reflect) is noted when a status of the
+   action's (inflict mask action[0x20]) landed on it. */
+static void state_landed_after(const DWORD *before)
+{
+    const int *action = *(const int **)ADDR_ACTION_PTR;
+    int actor = action[ACT_ACTOR], target = action[0x82];
+    DWORD after;
+
+    if (actor < 0 || actor > 2 || target < 0 || target >= STATE_DEX_ACTORS)
+        return;
+    after = *(const DWORD *)(ADDR_ACTOR_STATE + (DWORD)target * 0x68);
+    state_run[actor].landed |= state_dex_landed_bit(target, before[target], after, (DWORD)action[0x20], action[0x86] & 1);
+}
+
+/* state_enter: the state with the key is entered: the dexterity is raised by what its limit's hits counted. */
+static void state_dex_begin(int actor)
+{
+    const struct limit_state *s = &state_run[actor].state;
+    BYTE *dex = (BYTE *)(ADDR_ACTOR_DEXTERITY + (DWORD)actor * 0x68);
+    int count = state_dex_count(state_run[actor].landed);
+    BYTE now = *dex, added, raised = state_dex_raise(now, s->dex_per_target, count, &added);
+
+    state_run[actor].dex_on = added != 0;
+    state_run[actor].dex_base = now;
+    state_run[actor].dex_written = raised;
+    state_run[actor].dex_added = added;
+    if (added)
+        *dex = raised;
+    log_line("state %s actor %d: dexterity_per_target %u: a status of the limit landed on %d target(s) (actors %03x): dexterity %u -> %u (+%u%s)%s",
+             s->name, actor, (unsigned)s->dex_per_target, count, (unsigned)state_run[actor].landed, (unsigned)now, (unsigned)raised,
+             (unsigned)added, added < s->dex_per_target * (unsigned)count ? ", held to 255" : "",
+             !added ? "; nothing to put back" : atb_follows_dex ? "; the time gauge follows it at the next action's set-up (atb_follows_dexterity)"
+                                                : "; the time gauge does NOT follow it until the game works the gauge out again (atb_follows_dexterity = no in the game file)");
+}
+
+/* state_end: the dexterity the state raised is put back (see above). */
+static void state_dex_end(int actor)
+{
+    BYTE *dex = (BYTE *)(ADDR_ACTOR_DEXTERITY + (DWORD)actor * 0x68);
+    BYTE now, back;
+
+    if (!state_run[actor].dex_on)
+        return;
+    state_run[actor].dex_on = 0;
+    now = *dex;
+    back = state_dex_restore(now, state_run[actor].dex_written, state_run[actor].dex_base, state_run[actor].dex_added);
+    *dex = back;
+    log_line("state %s actor %d: dexterity %u -> %u: the state's +%u taken off%s", state_run[actor].state.name, actor,
+             (unsigned)now, (unsigned)back, (unsigned)state_run[actor].dex_added,
+             now == state_run[actor].dex_written ? " (the value before the state)" : " (it had been changed since the raise: only the state's part comes off, at least 1 left)");
+}
+
 static void __cdecl battle_start_party_hook(void)
 {
     const BYTE *party = (const BYTE *)ADDR_PARTY;
@@ -27895,6 +31259,7 @@ static void __cdecl battle_start_party_hook(void)
     }
     ((void (__cdecl *)(void))FN_BATTLE_START_PARTY)();
     forget_followup_scripts();
+    spell_bytes_forget();       /* script_bytes: the models are loaded afresh, nothing to put back */
     atb_dex_battle_start();     /* atb_follows_dexterity: the dexterity the steps are about to be made from */
     effect_swap_off();          /* a swap left from the last battle's last limit */
     effect_copies_battle_start();   /* effect copies: nothing of the last battle's loads is known */
@@ -28149,6 +31514,612 @@ static DWORD *state_own_table(int actor)
     return holder && *holder ? (DWORD *)((BYTE *)*holder + 0x68) : NULL;
 }
 
+/* ---- A spell's caster script ------------------------------------------------------------------------
+   `script = N` on an extended spell: the model script a party member plays to cast it, in place of the
+   command's own (the game's 007b7510: Magic 0x1d, Summon 0x1f). The game does the same itself in handler
+   0x0c (FUN_005c94d3: Magic with attack 0x36 gets 0x34). Written into action[8] at the set-up
+   (action_setup_hook, after the summon block), and only when:
+   - the caster is a party member (0-2): an enemy model relocates scripts 0-0x1f only (its `script` is in
+     the enemies files), and the action is cast as magic (type 2: Magic, W-Magic, a `list = summon` spell,
+     the materia counters and Mime, which all queue again through FUN_00432687);
+   - the spell cannot be reflected, or N is 0x1c-0x1f: a bounce opens a record with this number for the
+     actor that reflects it (FUN_005d9940, the sequencer's case 3 writes it into that actor's 00be117a),
+     and for an enemy table[0x20] and up are script bytes, not pointers;
+   - the caster's model AS DRAWN NOW (a form's after its a2, a frog's) has a cast in slot N: walked command
+     by command, an e8 (preload) and then an ec (the effect step) before its first end.
+   Otherwise the command's own script plays, as without the key, with one log line per spell and model.
+   The values (spell_script_value_problem) keep out what the game plays by itself (0-0x1b), the first of
+   each several-target pair of 008ff1e8 (the game plays the second), the exe's scripts 0x2e-0x3b and the
+   limits' slots 0x3c up. */
+#define SPELL_SCRIPT_WALK_MAX   1024         /* bytes walked in a slot's script */
+#define SPELL_SCRIPT_REFLECT_MAX 0x1f        /* the highest slot a reflectable spell may name: an enemy has 32 */
+#define SPELL_SPECIAL_NO_REFLECT 0x200       /* action[0x1b] (the record's special word): set = cannot be reflected */
+#define SPELL_SCRIPT_LOGS       64           /* "spell script:" lines, per run of the game */
+
+/* SPELL SCRIPT PURE BEGIN  (no Win32 call inside: tested natively, script_key stage 1's test) */
+/* NULL if `value` may be a spell's `script`, else why not (for the reading's problem line). */
+static const char *spell_script_value_problem(DWORD value)
+{
+    if (value < 0x1c)
+        return "0-0x1b are the idles, the KO pose, the reactions the game plays by itself, Defend, Attack and the Cut turns";
+    if (value >= 0x22 && value <= 0x2c && !(value & 1))
+        return "the game plays the next number when the cast has several targets (008ff1e8): name that one or another";
+    if (value <= 0x2d)
+        return NULL;
+    if (value <= 0x3b && value != 0x33)
+        return "the game plays its own script there for every model (0x2e-0x32, 0x34-0x3b); 0x34 also skips the silence and frog checks";
+    return "0x33 is the reaction none; 0x3c-0x49 are limits and follow-ups, written by the DLL at a limit's set-up; a model has 74";
+}
+
+/* NULL if a spell keyed with `slot` may be cast with it by this actor, command type and special word
+   (action[0x1b]), else why not. The model's own slot is checked after this (spell_script_walk). */
+static const char *spell_script_rule(int actor, int command_type, int slot, DWORD special)
+{
+    if (actor < 0 || actor > 2)
+        return "script = is for party members: an enemy plays its own";
+    if (command_type != 2)
+        return "script = is for a cast as magic (Magic, Summon, W-, counters, Mime)";
+    if (slot > SPELL_SCRIPT_REFLECT_MAX && !(special & SPELL_SPECIAL_NO_REFLECT))
+        return "the spell can be reflected: a bounce's record gives this number to the actor that reflects it, "
+               "and an enemy's model has scripts 0-0x1f only (name 0x1c-0x1f, or add special = -reflectable)";
+    return NULL;
+}
+
+/* NULL if the script at `script` (`length` bytes readable) is a cast: walked command by command with
+   form_operands (not following jumps), it has e8 (preload) and later ec (the effect step) before its first
+   ee, f1 or 9e, and meets no ff, fe c0, a2 or ac before it. Else why not. */
+static const char *spell_script_walk(const BYTE *script, int length)
+{
+    int at = 0, preload = 0;
+
+    while (at < length) {
+        BYTE op = script[at];
+
+        if (op == 0xee || op == 0xf1 || op == 0x9e)
+            return "the slot's script has no effect step (ec): the spell would never show";
+        if (op == 0xff || (op == 0xfe && at + 1 < length && script[at + 1] == 0xc0))
+            return "the slot's script never finishes (fe c0 / ff): the battle would wait on it";
+        if (op == 0xa2 || op == 0xac)
+            return "the slot's script reloads the model (a2 / ac)";
+        if (op == 0xe8)
+            preload = 1;
+        if (op == 0xec)
+            return preload ? NULL : "the slot's script has ec without an e8 (preload) before it";
+        at += op < 0x8e ? 1 : 1 + form_operands[op - 0x8e];
+    }
+    return "the slot's script has no end within 1024 bytes (or runs into memory that cannot be read)";
+}
+/* SPELL SCRIPT PURE END */
+
+static struct { WORD id; DWORD table; } spell_script_logged[SPELL_SCRIPT_LOGS];
+static int spell_script_logged_count;   /* in the memo; emptied when the spell file is read again */
+static LONG spell_script_log_lines;     /* written this run */
+
+static void spell_script_forget(void)
+{
+    spell_script_logged_count = 0;
+}
+
+/* NULL if slot `slot` of the actor's model as drawn now holds a cast (spell_script_walk), else why not. */
+static const char *spell_script_check(int actor, int slot)
+{
+    DWORD *table = actor_script_table(actor);
+    const BYTE *at;
+    int length = 0;
+
+    if (!table || IsBadReadPtr(table, MODEL_SCRIPT_COUNT * 4))
+        return "the actor has no model";
+    at = (const BYTE *)table[slot];
+    if (at < (const BYTE *)(table + MODEL_SCRIPT_COUNT))
+        return "the model's slot points into its header (an unused slot)";
+    /* what can be read of it, up to the walk's limit: page by page */
+    while (length < SPELL_SCRIPT_WALK_MAX && !IsBadReadPtr(at + length, 1))
+        length += 0x1000 - (int)((DWORD)(at + length) & 0xfff);
+    return spell_script_walk(at, length < SPELL_SCRIPT_WALK_MAX ? length : SPELL_SCRIPT_WALK_MAX);
+}
+
+/* One line per spell and model (the model's script table as drawn now), SPELL_SCRIPT_LOGS a run. */
+static void spell_script_log(int actor, int spell, int slot, int before, const char *why)
+{
+    DWORD table = actor >= 0 && actor < 10 ? (DWORD)actor_script_table(actor) : 0;
+    char name[32];
+    int i;
+
+    for (i = 0; i < spell_script_logged_count; i++)
+        if (spell_script_logged[i].id == spells[spell].id && spell_script_logged[i].table == table)
+            return;
+    if (spell_script_logged_count < SPELL_SCRIPT_LOGS) {
+        spell_script_logged[spell_script_logged_count].id = spells[spell].id;
+        spell_script_logged[spell_script_logged_count++].table = table;
+    }
+    if (spell_script_log_lines >= SPELL_SCRIPT_LOGS)
+        return;
+    if (++spell_script_log_lines == SPELL_SCRIPT_LOGS) {
+        log_line("(spell script: %d lines written: the rest of the run's are not)", SPELL_SCRIPT_LOGS);
+        return;
+    }
+    game_text(name, spells[spell].name, sizeof name);
+    if (!why)
+        log_line("spell script: actor %d casts %u '%s': script %x of its model (in place of %x)",
+                 actor, spells[spell].id, name, slot, before);
+    else
+        log_line("spell script: actor %d casts %u '%s': script %x NOT used: %s; the game's %x plays",
+                 actor, spells[spell].id, name, slot, why, before);
+}
+
+/* `script = N` of an extended spell: the caster's model script. Called by action_setup_hook after the game's
+   set-up and the summon block. Writes action[8] only when every check passes. */
+static void spell_script_apply(int *action, int spell)
+{
+    int actor = action[ACT_ACTOR], slot, before = action[ACT_SCRIPT];
+    const char *why;
+
+    if (spell < 0 || !spells[spell].script || before < 0)      /* not given, or the game shows nothing (-1) */
+        return;
+    slot = spells[spell].script;
+    why = spell_script_rule(actor, action[ACT_COMMAND_TYPE], slot, (DWORD)action[0x1b]);
+    if (!why)
+        why = spell_script_check(actor, slot);
+    if (!why)
+        action[ACT_SCRIPT] = slot;
+    spell_script_log(actor, spell, slot, before, why);
+}
+
+/* ---- A spell's caster script bytes (script_bytes) ---------------------------------------------------
+   `script_bytes = e8 fc ea 06 c9 07 ca 08 ec 09 e5 ee` on an extended spell: the caster's own script for that
+   cast, carried by the spell (`script = N` above picks a slot the model already has). At the cast's set-up
+   (action_setup_hook, after spell_script_apply) the command's OWN slot of the caster's own script table,
+   0x1d (Magic) or 0x1f (Summon with the presentation), is pointed at a copy of the bytes in a 256-byte buffer
+   of that party slot's, the rest ee: FUN_0041fba4 takes the slot's pointer from the table on every call and
+   reads it at a BYTE position (00be11b4), so it never reads past start + 255. action[8] is not changed: a
+   reflect bounce gives the reflector the number it gets today, and it plays its own, unlent slot.
+   The slot goes back at the next action's set-up (handler 0x0c or 0x0e: one action is wholly displayed
+   before the next is set up), only if the table is still the actor's own and the slot still holds the copy
+   (the states' rule: nothing is written into a model loaded since, or a slot another hand wrote), never
+   while the actor plays it; it is forgotten at a battle's start (the models are loaded afresh).
+   At reading (spell_bytes_problem): only the commands the game's own cast scripts use (slots 0x1d-0x1f of its
+   20 party files) plus the c9 .. ca hold, animations 00-2b, e8 first, one ec, ee last; a hold needs something
+   that ends the frame's pass between the first byte c9 and the first ca (ca jumps there while an effect loads,
+   00bf2a30: with the game's own loader a hold of nothing spins within one frame), no ec inside it; ed needs
+   an fa after it. At the cast (spell_bytes_apply): a party actor, a cast as magic, script 1d or 1f, its own
+   model drawn (not a frog), the model's animation count (record +8) above every animation the bytes play
+   and each one loaded (+0xc), the slot not lent by a state nor played now, the last lend back; with
+   `script_bytes_model = XY`, the caster's script file is XY.. (a form's model_script / model_files, a new
+   character's battle_files of this battle, else the battle archive's name for the slot's data file).
+   Otherwise the command's own script plays, with one log line per spell and model. */
+#define SPELL_BYTES_LOGS        64           /* "spell bytes:" lines, per run of the game */
+
+/* SPELL BYTES PURE BEGIN  (no Win32 call inside: tested natively, script_bytes stage B1's test) */
+static struct spell_bytes_lend {
+    DWORD *table;                       /* the table the slot is lent in; NULL = nothing lent */
+    int slot;
+    DWORD original;                     /* the slot's own pointer */
+    BYTE said_busy;                     /* the "still played" line was written for this lend */
+    BYTE bytes[SPELL_BYTES_BUFFER];     /* the copy, the rest ee */
+} spell_bytes_lent[3];
+
+/* `text` with its first XX replaced by `value` in hexadecimal (a static buffer, for a problem line). */
+static const char *spell_bytes_say(const char *text, int value)
+{
+    static char out[256];
+    static const char digits[] = "0123456789abcdef";
+    int i = 0, done = 0;
+
+    for (; *text && i < (int)sizeof out - 1; text++) {
+        if (!done && text[0] == 'X' && text[1] == 'X') {
+            out[i++] = digits[value >> 4 & 15];
+            if (i < (int)sizeof out - 1)
+                out[i++] = digits[value & 15];
+            text++;
+            done = 1;
+        } else {
+            out[i++] = *text;
+        }
+    }
+    out[i] = 0;
+    return out;
+}
+
+/* The commands a spell's script_bytes may use: those of the game's own cast scripts, and the hold c9 / ca. */
+static BOOL spell_bytes_allowed(BYTE op)
+{
+    static const BYTE list[] = { 0xe8, 0xec, 0xea, 0xfc, 0xed, 0xfa, 0xe5, 0xe6, 0xa4, 0xa5, 0xf4, 0xf3, 0xc9, 0xca, 0xee };
+    unsigned i;
+
+    for (i = 0; i < sizeof list; i++)
+        if (list[i] == op)
+            return TRUE;
+    return FALSE;
+}
+
+static const char *spell_bytes_refused_command(BYTE op)
+{
+    if (op == 0xb6 || op == 0xaa)
+        return "b6 NN aa are an enemy's (a 60-list task and the camera's hold, no party script uses them): write NN as a plain animation byte and drop aa";
+    if (op == 0xa2 || op == 0xac)
+        return spell_bytes_say("XX reloads the model (a2 / ac)", op);
+    if (op == 0xc1 || op == 0xb3 || op == 0xce)
+        return spell_bytes_say("XX jumps (to a mark of the script)", op);
+    if (op == 0xfe || op == 0xff)
+        return spell_bytes_say("XX never finishes (fe c0 / ff): the battle would wait on it", op);
+    if (op == 0xf1)
+        return "f1 holds the script on its own byte after the action: the slot is put back under it";
+    if (op == 0x9e)
+        return "9e waits on the target and the effects: no game cast does, and a 9e end once locked a battle";
+    return spell_bytes_say("XX is not one of the commands the game's own cast scripts use (e8 ec ea fc ed fa e5 e6 a4 a5 f4 f3 c9 ca ee)", op);
+}
+
+/* NULL if `length` bytes may be a spell's script_bytes, else why not; *max_animation is the highest animation
+   byte it plays (-1: none). Walked command by command with form_operands. */
+static const char *spell_bytes_problem(const BYTE *b, int length, int *max_animation)
+{
+    int at[SPELL_BYTES_MAX], count = 0, i, j, e8 = 0, ec = 0, c9 = 0, first_c9, first_ca = -1, last_ca = -1;
+    BOOL waits = FALSE, armed = FALSE, command;
+
+    *max_animation = -1;
+    if (length < 3)
+        return "a cast is at least 3 bytes (e8, ec, ee)";
+    if (length > SPELL_BYTES_MAX)
+        return "a spell's script_bytes may be up to 128 bytes";
+    if (b[0] != 0xe8)
+        return "a cast starts with e8, the preload of the spell's effect files";
+    for (i = 0; i < length; ) {
+        BYTE op = b[i];
+        int n = 1;
+
+        if (op < 0x8e) {
+            if (op >= 0x2c && op <= 0x33)
+                return spell_bytes_say("animation XX is a limit pack's (2c-33): a spell loads no pack", op);
+            if (op > 0x2b)
+                return spell_bytes_say("animation XX is past 2b: only the body animations that have a weapon track in the party layout, 00-2b", op);
+            if (op > *max_animation)
+                *max_animation = op;
+        } else {
+            if (!spell_bytes_allowed(op))
+                return spell_bytes_refused_command(op);
+            n += form_operands[op - 0x8e];
+            if (i + n > length)
+                return spell_bytes_say("the operands of XX run past the end", op);
+            e8 += op == 0xe8;
+            ec += op == 0xec;
+            c9 += op == 0xc9;
+            if (op == 0xca) {
+                if (!c9)
+                    return "ca jumps to just after a c9: there is none before it";
+                if (first_ca < 0)
+                    first_ca = i;
+                last_ca = i;
+            }
+            if (op == 0xee && i != length - 1)
+                return "ee before the last byte: a cast ends with ee, once";
+        }
+        at[count++] = i;
+        i += n;
+    }
+    if (b[at[count - 1]] != 0xee || at[count - 1] != length - 1)
+        return "the last command is not ee: a cast ends with ee, once";
+    if (e8 != 1)
+        return "e8 more than once: a cast has one preload";
+    if (ec != 1)
+        return ec ? "ec more than once: a cast has one effect step" : "no ec: a cast has one effect step";
+    if (first_ca >= 0) {
+        /* ca (while an effect loads) searches the bytes from 0 for the first BYTE c9, operands included */
+        for (first_c9 = 0; b[first_c9] != 0xc9; first_c9++)
+            ;
+        for (command = FALSE, j = 0; j < count; j++)
+            if (at[j] == first_c9)
+                command = TRUE;
+        if (!command)
+            return "a byte c9 inside a command's operand (f4 c9) comes before the hold's c9: ca would jump there";
+        for (j = 0; j < count; j++) {
+            BYTE op = b[at[j]];
+
+            if (at[j] <= first_c9 || at[j] >= first_ca)
+                continue;
+            if (op <= 0x2b)
+                waits = TRUE;
+            else if (op == 0xf4)
+                armed = b[at[j] + 1] >= 1;
+            else if (op == 0xf3 && armed)
+                waits = TRUE;
+        }
+        if (!waits)
+            return "nothing between c9 and ca waits a frame: while the effect loads the hold would repeat for ever within one frame (the game's own: c9 f4 01 f3 ca, or c9 07 ca)";
+        for (j = 0; j < count; j++)
+            if (b[at[j]] == 0xec && at[j] > first_c9 && at[j] < last_ca)
+                return "ec inside the hold: the effect step could run again";
+    }
+    for (j = 0; j < count; j++) {
+        int k;
+
+        if (b[at[j]] != 0xed)
+            continue;
+        for (k = j + 1; k < count && b[at[k]] != 0xfa; k++)
+            ;
+        if (k == count)
+            return "ed steps the caster forward, one step more each cast: only fa puts it home (an fa after it)";
+    }
+    return NULL;
+}
+
+/* NULL if a spell with script_bytes may lend them for this actor, command type and script number. */
+static const char *spell_bytes_rule(int actor, int command_type, int slot)
+{
+    if (actor < 0 || actor > 2)
+        return "script_bytes is for party members: an enemy plays its own";
+    if (command_type != 2)
+        return "script_bytes is for a cast as magic (Magic, Summon, W-, counters, Mime)";
+    if (slot != SPELL_BYTES_SLOT_MAGIC && slot != SPELL_BYTES_SLOT_SUMMON)
+        return "the game plays another script than a cast's (1d, 1f) for it";
+    return NULL;
+}
+
+/* The first animation the bytes play that a model with `count` animations (the record's +8) and the array
+   `animations` (its +0xc, readable up to the highest one played) does not have; -1 if it has them all. */
+static int spell_bytes_animation_missing(const BYTE *b, int length, int count, const DWORD *animations)
+{
+    int i = 0;
+
+    while (i < length) {
+        BYTE op = b[i];
+
+        if (op < 0x8e) {
+            if (op >= count || !animations || !animations[op])
+                return op;
+            i++;
+        } else {
+            i += 1 + form_operands[op - 0x8e];
+        }
+    }
+    return -1;
+}
+
+/* script_bytes_model: whether the two letters `have` (the caster's script file, "" = not known) are `want`. */
+static BOOL spell_bytes_model_is(const char *want, const char *have)
+{
+    int k;
+
+    for (k = 0; k < 2; k++)
+        if (!have[k] || (have[k] & ~0x20) != (want[k] & ~0x20))
+            return FALSE;
+    return TRUE;
+}
+
+/* The lend: slot `slot` of `table` points at the copy, the rest of the buffer ee. */
+static void spell_bytes_lend_one(struct spell_bytes_lend *d, DWORD *table, int slot, const BYTE *bytes, int length)
+{
+    int i;
+
+    for (i = 0; i < SPELL_BYTES_BUFFER; i++)
+        d->bytes[i] = i < length ? bytes[i] : 0xee;
+    d->original = table[slot];
+    d->slot = slot;
+    d->said_busy = 0;
+    d->table = table;
+    table[slot] = (DWORD)d->bytes;
+}
+
+#define SPELL_BYTES_NONE        0            /* spell_bytes_back_one: nothing was lent */
+#define SPELL_BYTES_BACK        1            /* put back */
+#define SPELL_BYTES_GONE        2            /* forgotten: the table is not the actor's own now, or the slot was written since */
+#define SPELL_BYTES_KEPT        3            /* still lent: the actor plays the slot (`busy`) */
+
+/* The put-back of one actor's lend at the next set-up: `own` is the actor's own table now. */
+static int spell_bytes_back_one(struct spell_bytes_lend *d, DWORD *own, BOOL busy)
+{
+    if (!d->table)
+        return SPELL_BYTES_NONE;
+    if (d->table == own && d->table[d->slot] == (DWORD)d->bytes) {
+        if (busy)
+            return SPELL_BYTES_KEPT;
+        d->table[d->slot] = d->original;
+        d->table = NULL;
+        return SPELL_BYTES_BACK;
+    }
+    d->table = NULL;
+    return SPELL_BYTES_GONE;
+}
+/* A new battle loads the models afresh: nothing to put back. */
+static void spell_bytes_forget(void)
+{
+    spell_bytes_lent[0].table = spell_bytes_lent[1].table = spell_bytes_lent[2].table = NULL;
+}
+/* SPELL BYTES PURE END */
+
+static struct { WORD id; DWORD table; } spell_bytes_logged[SPELL_BYTES_LOGS];
+static int spell_bytes_logged_count;    /* in the memo; emptied when the spell file is read again */
+static LONG spell_bytes_log_lines;      /* written this run */
+
+static void spell_bytes_forget_log(void)
+{
+    spell_bytes_logged_count = 0;
+}
+
+/* FALSE once SPELL_BYTES_LOGS lines are written this run (the last of them says so). */
+static BOOL spell_bytes_line(void)
+{
+    if (spell_bytes_log_lines >= SPELL_BYTES_LOGS)
+        return FALSE;
+    if (++spell_bytes_log_lines == SPELL_BYTES_LOGS) {
+        log_line("(spell bytes: %d lines written: the rest of the run's are not)", SPELL_BYTES_LOGS);
+        return FALSE;
+    }
+    return TRUE;
+}
+
+/* At the set-up of any action (handler 0x0c or 0x0e): the last action's display is over, its lends go back. */
+static void spell_bytes_put_back(void)
+{
+    int actor;
+
+    for (actor = 0; actor < 3; actor++) {
+        struct spell_bytes_lend *d = &spell_bytes_lent[actor];
+
+        if (!d->table)
+            continue;
+        if (spell_bytes_back_one(d, state_own_table(actor), state_lend_busy(actor, d->slot)) == SPELL_BYTES_KEPT &&
+            !d->said_busy) {
+            d->said_busy = 1;           /* never expected: kept, tried again at the next set-up */
+            if (spell_bytes_line())
+                log_line("spell bytes: actor %d: slot %x is still played at the next set-up: put back at a later one",
+                         actor, d->slot);
+        }
+    }
+}
+
+/* The two letters of the script file the party actor's model was loaded from, upper case, into `two` (3 bytes):
+   a form's model_script (or model_files), a new character's battle_files of this battle, else the battle
+   archive's name for the slot's data file with the script file's extension B (STEM.B: two letters for the
+   model, AB for the part). FALSE if none is known. */
+static BOOL spell_bytes_model_letters(int actor, char *two)
+{
+    const struct form_def *f = form_in_slot[actor];
+    const struct new_character *c;
+    const char *file = party_model_file[actor];
+    char name[24], letters[16];
+    int stem, i;
+
+    two[0] = two[1] = two[2] = 0;
+    if (f)
+        form_part_letters(f, "B", two);
+    else if (file[0] && (c = model_name_owner(file, &stem)) != NULL) {
+        const char *now = c->battle_letters_now[0] ? c->battle_letters_now : c->battle_prefix;
+
+        two[0] = now[0];
+        two[1] = now[0] ? now[1] : 0;
+    } else if (file[0] && archive_name_usable()) {
+        for (stem = -1, i = 0; file[i]; i++)
+            if (file[i] == '.')
+                stem = i;
+        if (stem < 0)
+            stem = i;
+        if (stem < 1 || stem > 15)
+            return FALSE;
+        for (i = 0; i < stem; i++)
+            name[i] = file[i];
+        name[stem] = '.';
+        name[stem + 1] = 'B';
+        name[stem + 2] = 0;
+        for (i = 0; i < (int)sizeof letters; i++)
+            letters[i] = 0;
+        archive_name_hook(ARCHIVE_PATTERNS, (void *)ADDR_ARCHIVE_PATTERNS, name, letters);
+        for (i = 0; i < 4; i++)
+            if (!((letters[i] >= 'A' && letters[i] <= 'Z') || (letters[i] >= 'a' && letters[i] <= 'z')))
+                return FALSE;           /* the game's table has no such model: nothing was written */
+        if (letters[4])
+            return FALSE;
+        two[0] = letters[0];
+        two[1] = letters[1];
+    }
+    for (i = 0; i < 2; i++) {
+        if (!((two[i] >= 'A' && two[i] <= 'Z') || (two[i] >= 'a' && two[i] <= 'z'))) {
+            two[0] = two[1] = 0;
+            return FALSE;
+        }
+        two[i] = (char)(two[i] & ~0x20);
+    }
+    return TRUE;
+}
+
+/* Rule 9's refusal: the slot still holds the actor's last lent copy, which plays for this cast. */
+static const char spell_bytes_still_lent[] = "its last cast's script is still lent (the slot was played at this set-up)";
+
+/* One line per spell and model (the model's script table as drawn now), SPELL_BYTES_LOGS a run. */
+static void spell_bytes_log(int actor, int spell, int slot, const struct spell_bytes_entry *e, const char *why, int count)
+{
+    DWORD table = actor >= 0 && actor < 10 ? (DWORD)actor_script_table(actor) : 0;
+    char name[32], model[16], animations[48];
+    int i;
+
+    for (i = 0; i < spell_bytes_logged_count; i++)
+        if (spell_bytes_logged[i].id == spells[spell].id && spell_bytes_logged[i].table == table)
+            return;
+    if (spell_bytes_logged_count < SPELL_BYTES_LOGS) {
+        spell_bytes_logged[spell_bytes_logged_count].id = spells[spell].id;
+        spell_bytes_logged[spell_bytes_logged_count++].table = table;
+    }
+    if (!spell_bytes_line())
+        return;
+    game_text(name, spells[spell].name, sizeof name);
+    if (why == spell_bytes_still_lent) {
+        log_line("spell bytes: actor %d casts %u '%s': its own script NOT used: %s; the last lent script plays",
+                 actor, spells[spell].id, name, why);
+        return;
+    }
+    if (why) {
+        log_line("spell bytes: actor %d casts %u '%s': its own script NOT used: %s; the game's %x plays",
+                 actor, spells[spell].id, name, why, slot);
+        return;
+    }
+    model[0] = 0;
+    if (e->model[0])
+        wsprintfA(model, " (%s..AB)", e->model);
+    if (e->max_animation >= 0)
+        wsprintfA(animations, "animations up to %02x; the model has %d", (unsigned)e->max_animation, count);
+    else
+        wsprintfA(animations, "no animation of the model; it has %d", count);
+    log_line("spell bytes: actor %d casts %u '%s': its own script (%u bytes) plays as script %x of its model%s (%s)",
+             actor, spells[spell].id, name, (unsigned)e->length, slot, model, animations);
+}
+
+/* `script_bytes` of an extended spell: the caster's own script, lent into the command's slot for this action.
+   Called by action_setup_hook after spell_script_apply. Lends only when every check passes. */
+static void spell_bytes_apply(int *action, int spell)
+{
+    int actor = action[ACT_ACTOR], slot = action[ACT_SCRIPT], count = 0, missing, k;
+    const struct spell_bytes_entry *e;
+    const DWORD *record = NULL;
+    DWORD *table = NULL;
+    const char *why;
+    static char text[160];
+    char two[3];
+
+    if (spell < 0 || !spells[spell].bytes_entry || slot < 0)   /* not given, or the game shows nothing (-1) */
+        return;
+    e = &spell_bytes[spells[spell].bytes_entry - 1];
+    why = spell_bytes_rule(actor, action[ACT_COMMAND_TYPE], slot);
+    if (!why && *(const signed char *)(ADDR_SHOWN_MODEL + (DWORD)actor * 0x74) != actor)
+        why = "the model is drawn by another (a frog)";
+    if (!why) {
+        table = state_own_table(actor);
+        record = *(const DWORD *const *)(ADDR_MODEL_POINTERS + (DWORD)actor * 4);
+        if (!table || IsBadReadPtr(table, MODEL_SCRIPT_COUNT * 4) || !record || IsBadReadPtr(record, 0x10))
+            why = "the actor's model or its script table cannot be read";
+        else
+            count = (int)record[2];
+    }
+    if (!why && e->model[0]) {
+        if (!spell_bytes_model_letters(actor, two))
+            why = "script_bytes_model: the letters of the caster's script file are not known";
+        else if (!spell_bytes_model_is(e->model, two)) {
+            wsprintfA(text, "script_bytes_model is %s: the caster's script file is %s..AB", e->model, two);
+            why = text;
+        }
+    }
+    if (!why && e->max_animation >= 0) {
+        if (count <= e->max_animation) {
+            wsprintfA(text, "the model has %d animations; the script plays %02x", count, (unsigned)e->max_animation);
+            why = text;
+        } else if (!record[3] || IsBadReadPtr((const void *)record[3], (e->max_animation + 1) * 4)) {
+            why = "the model's animation table cannot be read";
+        } else if ((missing = spell_bytes_animation_missing(e->bytes, e->length, count, (const DWORD *)record[3])) >= 0) {
+            wsprintfA(text, "animation %02x of the model is not loaded", (unsigned)missing);
+            why = text;
+        }
+    }
+    if (!why)
+        for (k = 0; k < state_lend[actor].count; k++)
+            if (state_lend[actor].slot[k] == slot && ((state_lend[actor].lent | state_lend[actor].waiting) & (1u << k)))
+                why = "a state lends this slot: its script plays";
+    if (!why && state_lend_busy(actor, slot))
+        why = "the actor plays this slot now";
+    if (!why && spell_bytes_lent[actor].table)
+        why = spell_bytes_still_lent;
+    if (!why)
+        spell_bytes_lend_one(&spell_bytes_lent[actor], table, slot, e->bytes, e->length);
+    spell_bytes_log(actor, spell, slot, e, why, count);
+}
+
 static void restore_followup_script(int actor)
 {
     int k;
@@ -28288,6 +32259,77 @@ static void __cdecl queued_setup_hook(void)
         follow_chain_step(action[ACT_ACTOR], action[ACT_ATTACK_ID]);
 }
 
+/* `status2`: a second status change of a new character's limit, beside the one its record holds.
+   An attack record has one status list and one mode (byte 0x11: inflict, cure or toggle, and the chance), but the
+   action keeps three masks: FUN_005ca766, called by the record's set-up FUN_005c94d3 (handler 0x0c), puts the
+   record's list in action[0x20] (inflicted), [0x21] (cured) or [0x22] (toggled) by the mode and the chance in
+   action[0x23]. Each hit (FUN_005db960) rolls the chance once for the three together (FUN_005dc129), copies them, and
+   the hit's result (FUN_005da5da) applies them together: new = (old | inflicted) & ~cured ^ toggled, each less the
+   target's immunities (and nothing inflicted on a petrified target). So a limit can cure some statuses and inflict
+   others by adding the second list to its own mask after the game's set-up of the limit, as the game's own Flash
+   handler (0x18, FUN_005ca651) adds Death to an Attack's after its weapon set-up. Called from note_limit_action, which
+   action_setup_hook runs after FN_ACTION_SETUP for a limit of a new character only (id 0x80 up: not its follow-ups,
+   whose own records are set up later by FUN_005ca807 and keep the game's masks). The chance is the record's: when
+   the record has no status change (byte 0x11 = ff) FUN_005ca766 sets no chance and the action's is 0 (built zeroed by
+   FUN_00435d81), so it is made certain (0xfc, the record's `always`). A record whose list has bit 31 (the game's other
+   use of action[0x20]: 0x80000000 and 009aad1e) is left alone. */
+#define ACT_STATUS_INFLICT      0x20         /* action[0x20] inflicted, [0x21] cured, [0x22] toggled: FUN_005ca766 */
+#define ACT_STATUS_CHANCE       0x23         /* 0-0xfc; 0xfc and up certain (FUN_005dc129) */
+static int limit_status2_log_budget = 24;
+
+/* ---- STATUS2 PURE begin (its stage's test extracts this block: no game memory, no calls) ---- */
+enum { STATUS2_ADDED = 0, STATUS2_ADDED_CERTAIN = 1, STATUS2_NOTHING = 2, STATUS2_SPECIAL = 3 };
+
+/* masks[0..2] = the action's inflicted, cured and toggled masks as the game's set-up left them, *chance its chance;
+   record_change = the limit record's byte 0x11. Adds `mask` to masks[mode]; makes the chance certain when the record
+   has no status change of its own. */
+static int status2_add(DWORD masks[3], int *chance, DWORD mask, int mode, int record_change)
+{
+    if (!mask || mode < 0 || mode > 2)
+        return STATUS2_NOTHING;
+    if (masks[0] & 0x80000000u)
+        return STATUS2_SPECIAL;
+    masks[mode] |= mask;
+    if ((record_change & 0xff) >> 6 == 3) {
+        *chance = 0xfc;
+        return STATUS2_ADDED_CERTAIN;
+    }
+    return STATUS2_ADDED;
+}
+/* ---- STATUS2 PURE end ---- */
+
+static void limit_status2_apply(int *action, const struct new_character *c, int position)
+{
+    DWORD masks[3];
+    int k, chance, result;
+
+    if (!action)
+        return;
+    for (k = 0; k < 3; k++)
+        masks[k] = (DWORD)action[ACT_STATUS_INFLICT + k];
+    chance = action[ACT_STATUS_CHANCE];
+    result = status2_add(masks, &chance, c->limit_status2[position], c->limit_status2_mode[position],
+                         c->limit_record[position][REC_STATUS_CHANGE]);
+    if (result == STATUS2_NOTHING)
+        return;
+    if (result != STATUS2_SPECIAL) {
+        for (k = 0; k < 3; k++)
+            action[ACT_STATUS_INFLICT + k] = (int)masks[k];
+        action[ACT_STATUS_CHANCE] = chance;
+    }
+    if (limit_status2_log_budget > 0) {
+        limit_status2_log_budget--;
+        if (result == STATUS2_SPECIAL)
+            log_line("status2: attack %d's own status list is the game's special one (bit 31): status2 not added", action[ACT_ATTACK_ID]);
+        else
+            log_line("status2: attack %d, actor %d: %08x added to the %s; the action now inflicts %08x, cures %08x, toggles %08x, chance %d%s",
+                     action[ACT_ATTACK_ID], action[ACT_ACTOR], (unsigned)c->limit_status2[position],
+                     c->limit_status2_mode[position] == 1 ? "cured" : c->limit_status2_mode[position] == 2 ? "toggled" : "inflicted",
+                     (unsigned)masks[0], (unsigned)masks[1], (unsigned)masks[2], chance,
+                     result == STATUS2_ADDED_CERTAIN ? " (made certain: the record has no status change)" : "");
+    }
+}
+
 static void note_limit_action(int actor, int command, int id)
 {
     /* a new action is being set up: the display of the last one is over (state scripts lent a model's
@@ -28299,6 +32341,7 @@ static void note_limit_action(int actor, int command, int id)
     if (!limit_seq.running)
         limit_seq.count = 0;
     limit_elements.count = 0;
+    every_target.on = 0;            /* (every target) armed again below for such a limit */
     if (actor < 0 || actor > 2 || command != 0x14) {
         if (actor >= 0 && actor <= 2) {
             follow_chain[actor].c = NULL;
@@ -28344,6 +32387,9 @@ static void note_limit_action(int actor, int command, int id)
             follow_chain[actor].c = c;
             follow_chain[actor].position = position;
             follow_chain[actor].done = 0;
+            if (c->limit_status2[position])
+                limit_status2_apply(current_action(), c, position);
+            every_target_arm(actor, id, c->limit_every_target[position]);    /* (every target) */
             if (c->limit_seq_count[position]) {
                 int k;
 
@@ -28354,6 +32400,7 @@ static void note_limit_action(int actor, int command, int id)
                     limit_seq.flags[k] = c->limit_seq_flags[position][k];
                     limit_seq.skip[k] = c->limit_seq_skip[position][k];
                     limit_seq.native[k] = c->limit_seq_native[position][k];
+                    limit_room.need[k] = c->limit_seq_room[position][k];   /* (room) */
                     limit_seq.task_fn[k][0] = limit_seq.task_fn[k][1] = limit_seq.task_fn[k][2] = limit_seq.task_fn[k][3] = 0;
                 }
                 limit_seq.actor = actor;
@@ -28362,6 +32409,16 @@ static void note_limit_action(int actor, int command, int id)
                 limit_seq.hits_now = limit_seq.hits_last = 0;
                 limit_seq.ring_held = limit_seq.ring_end_said = limit_seq.hold60_said = 0;
                 limit_seq.hit = -1;
+                limit_room.waited = limit_room.pass = limit_room.held = 0;     /* (room) */
+                /* (visual children) limit_seq_task of the last limit, if one still runs, ends at its next run; nothing marked */
+                limit_seq.task_slot = -1;
+                limit_seq.watch_frames = limit_seq.watch_said = limit_seq.watch_dropped = 0;
+                visual_watch_reset();           /* (a visual_watch_task of the last limit's ends at its next run) */
+                for (k = 0; k < LIMIT_SEQ_STEPS; k++)
+                    limit_seq.visual_started[k] = limit_seq.visual_targets[k] = 0;
+                for (k = 0; k < limit_seq.count; k++)
+                    if (limit_seq.flags[k] & SEQ_VISUAL)
+                        visual_watch_on = 1;    /* looked at from now on, so that a task is judged when it is new */
             }
             if (c->limit_hit_element_count[position]) {
                 int k;
@@ -28542,8 +32599,11 @@ static BYTE limit_seq_draft_count, limit_seq_draft_effect[LIMIT_SEQ_MAX];
 static WORD limit_seq_draft_frame[LIMIT_SEQ_MAX];
 static BYTE limit_seq_draft_flags[LIMIT_SEQ_MAX], limit_seq_draft_skip[LIMIT_SEQ_MAX];
 static WORD limit_seq_draft_native[LIMIT_SEQ_MAX];
+static BYTE limit_seq_draft_room[LIMIT_SEQ_MAX], limit_every_target_draft;   /* (every target) `room N`; hits_on_every_target */
 static BYTE limit_element_draft_count;
 static WORD limit_element_draft[LIMIT_SEQ_MAX];
+static DWORD limit_status2_draft;       /* status2: the statuses; 0 = none */
+static int limit_status2_mode_draft;    /* status2_mode: 0 inflict (the default), 1 cure, 2 toggle */
 static BYTE limit_script_draft[3][LIMIT_SCRIPT_MAX];    /* script, followup_script, followup_chain_script */
 static int limit_follow_chain_draft, limit_follow_strength_draft[FOLLOW_CHAIN_MAX];
 static char limit_swap_draft[2][32];
@@ -28629,6 +32689,7 @@ static const char *state_section_start(struct new_character *c, char *name, char
     c->state[spare].attack_element = 0;
     c->state[spare].long_range = 0;
     c->state[spare].physical_evade = 0;
+    c->state[spare].cover = c->state[spare].counter = 0;
     c->state[spare].lend_count = 0;
     *out = &c->state[spare];
     return NULL;
@@ -28686,7 +32747,8 @@ static const char *state_bytes(BYTE *out, BYTE *out_length, int most, char *valu
             v = v * 16 + d;
         }
         if (length == most)
-            return most == STATE_SCRIPT_MAX ? "a state's attack script may be up to 48 bytes"
+            return most == SPELL_BYTES_MAX ? "a spell's script_bytes may be up to 128 bytes"
+                 : most == STATE_SCRIPT_MAX ? "a state's attack script may be up to 48 bytes"
                  : most == STATE_LEND_MAX ? "a state's script_NN may be up to 32 bytes" : "a state's idle script may be up to 16 bytes";
         out[length++] = (BYTE)v;
     }
@@ -28999,6 +33061,18 @@ static const char *state_key(struct limit_state *s, char *key, char *key_end, ch
             s->physical_evade = 0;
         else
             return "physical_evade is normal (the default) or 100: every physical hit on the actor misses while the state lasts";
+    } else if (word_is(key, key_end, "cover") || word_is(key, key_end, "counter")) {
+        BOOL cover = word_is(key, key_end, "cover");
+
+        if (stop > value && stop[-1] == '%')
+            stop--;
+        if (!parse_number(&p, stop, &n) || p != stop || n > 100)
+            return cover ? "cover is 0 (the default) to 100: the per cent chance the actor covers an ally (takes a single physical hit meant for it), as the Cover materia's, while the state lasts; the Cover materia's own chance if it is higher"
+                         : "counter is 0 (the default) to 100: the per cent chance the actor counters with Attack when an enemy hits it, as the Counter Attack materia's, while the state lasts; the materia's own chance if it is higher";
+        if (cover)
+            s->cover = (BYTE)n;
+        else
+            s->counter = (BYTE)n;
     } else if (word_is(key, key_end, "view_raise")) {
         if (!parse_number(&p, stop, &n) || p != stop || n > STATE_VIEW_RAISE_MAX)
             return "view_raise is 0 (the default) to 6000: units the battle's home view (between turns, the command menu, choosing a target) goes up while an actor is in the state";
@@ -29013,10 +33087,14 @@ static const char *state_key(struct limit_state *s, char *key, char *key_end, ch
         if (!parse_number(&p, stop, &n) || p != stop || n > STATE_POINTER_RAISE_MAX)
             return "pointer_raise is 0 (the default) to 6000: units the yellow pointer over the party member whose command menu is open goes up while the actor is in the state";
         s->pointer_raise = (WORD)n;
+    } else if (word_is(key, key_end, "dexterity_per_target")) {
+        if (!parse_number(&p, stop, &n) || p != stop || n > 255)
+            return "dexterity_per_target is 0 (the default) to 255: how much the actor's battle dexterity rises, while the state lasts, for each target a status of the limit that began the state landed on (255 at most in all)";
+        s->dex_per_target = (BYTE)n;
     } else if (key_end - key >= 7 && word_is(key, key + 7, "script_")) {
         return state_lend_key(s, key, key_end, value, stop);
     } else {
-        return "a state's section takes: hits, commands, ends (battle ko frog), retarget, hit_gap, stop_step, camera, attack_script / _next / _next2 / _last / _only, idle_script, idle_weak_script, prop (a name, or weapon), prop_bone, prop_offset, prop_turn, prop_scale, prop_hide, prop_colour, attack_targets, attack_element, long_range, physical_evade, script_NN, view_raise, view_back, pointer_raise";
+        return "a state's section takes: hits, commands, ends (battle ko frog), retarget, hit_gap, stop_step, camera, attack_script / _next / _next2 / _last / _only, idle_script, idle_weak_script, prop (a name, or weapon), prop_bone, prop_offset, prop_turn, prop_scale, prop_hide, prop_colour, attack_targets, attack_element, long_range, physical_evade, cover, counter, script_NN, view_raise, view_back, pointer_raise, dexterity_per_target";
     }
     return NULL;
 }
@@ -29036,6 +33114,10 @@ static void state_keys_text(char *out, const struct limit_state *s)
         wsprintfA(out + lstrlenA(out), "%slong_range", out[0] ? ", " : "");
     if (s->physical_evade)
         wsprintfA(out + lstrlenA(out), "%sphysical_evade 100", out[0] ? ", " : "");
+    if (s->cover)
+        wsprintfA(out + lstrlenA(out), "%scover %u%%", out[0] ? ", " : "", (unsigned)s->cover);
+    if (s->counter)
+        wsprintfA(out + lstrlenA(out), "%scounter %u%%", out[0] ? ", " : "", (unsigned)s->counter);
     if (s->lend_count) {
         wsprintfA(out + lstrlenA(out), "%sscripts lent:", out[0] ? ", " : "");
         for (k = 0; k < s->lend_count && k < STATE_LENDS_MAX; k++)
@@ -29045,6 +33127,8 @@ static void state_keys_text(char *out, const struct limit_state *s)
         wsprintfA(out + lstrlenA(out), "%sview_raise %u, view_back %u%%", out[0] ? ", " : "", (unsigned)s->view_raise, (unsigned)s->view_back);
     if (s->pointer_raise)
         wsprintfA(out + lstrlenA(out), "%spointer_raise %u", out[0] ? ", " : "", (unsigned)s->pointer_raise);
+    if (s->dex_per_target)
+        wsprintfA(out + lstrlenA(out), "%sdexterity_per_target %u", out[0] ? ", " : "", (unsigned)s->dex_per_target);
 }
 
 /* The load-time lines of the keys above, and what is odd about a script_NN. */
@@ -29279,8 +33363,44 @@ static void finish_limit(struct spell_draft *draft, struct new_character *c, int
         log_line("character %d limit %d-%d: script from the file (%d bytes), follow-up script (%d bytes)",
                  NEW_CHARACTER_FIRST_ID + (int)(c - new_characters), level, position, limit_script_draft_length[0],
                  limit_script_draft_length[1]);
+    if (limit_every_target_draft) {
+        /* (every target) the record holds N x T results in hit order: only an `all` step shows its own (the next on
+           each target); a one-target step, a bare hit or a one-target native effect would show the result at its step
+           index, another hit's on another target: refused */
+        int kept = 0;
+
+        for (i = 0; i < limit_seq_draft_count; i++) {
+            BYTE f = limit_seq_draft_flags[i];
+
+            if ((f & SEQ_HIT) || !(f & SEQ_ALL)) {
+                log_line("limits file line %d: character %d limit %d-%d has hits_on_every_target: its spell_effects entry %d (%s, frame %d) is refused: such a limit takes `all` entries only",
+                         line, NEW_CHARACTER_FIRST_ID + (int)(c - new_characters), level, position, i + 1,
+                         (f & SEQ_HIT) ? "a bare hit" : (f & SEQ_NATIVE) ? "a native effect on one target" : "an effect on one target",
+                         (int)limit_seq_draft_frame[i]);
+                continue;
+            }
+            limit_seq_draft_effect[kept] = limit_seq_draft_effect[i];
+            limit_seq_draft_frame[kept] = limit_seq_draft_frame[i];
+            limit_seq_draft_flags[kept] = f;
+            limit_seq_draft_skip[kept] = limit_seq_draft_skip[i];
+            limit_seq_draft_native[kept] = limit_seq_draft_native[i];
+            limit_seq_draft_room[kept] = limit_seq_draft_room[i];
+            kept++;
+        }
+        for (i = kept; i < limit_seq_draft_count; i++)
+            limit_seq_draft_flags[i] = limit_seq_draft_room[i] = 0;
+        limit_seq_draft_count = (BYTE)kept;
+    }
     c->limit_seq_count[index] = limit_seq_draft_count;
     c->limit_hit_element_count[index] = limit_element_draft_count;
+    c->limit_status2[index] = limit_status2_draft;
+    c->limit_status2_mode[index] = (BYTE)limit_status2_mode_draft;
+    if (limit_status2_draft)
+        log_line("character %d limit %d-%d: status2 %08x (%s), beside the record's own status change (byte 11 %02x, status %08x)",
+                 NEW_CHARACTER_FIRST_ID + (int)(c - new_characters), level, position, (unsigned)limit_status2_draft,
+                 limit_status2_mode_draft == 1 ? "cured" : limit_status2_mode_draft == 2 ? "toggled" : "inflicted",
+                 entry[REC_STATUS_CHANGE], (unsigned)*(const DWORD *)(entry + REC_STATUS));
+    c->limit_every_target[index] = limit_every_target_draft;   /* (every target) */
     for (i = 0; i < LIMIT_SEQ_MAX; i++) {
         c->limit_seq_effect[index][i] = limit_seq_draft_effect[i];
         c->limit_seq_frame[index][i] = limit_seq_draft_frame[i];
@@ -29288,7 +33408,11 @@ static void finish_limit(struct spell_draft *draft, struct new_character *c, int
         c->limit_seq_skip[index][i] = limit_seq_draft_skip[i];
         c->limit_seq_native[index][i] = limit_seq_draft_native[i];
         c->limit_hit_element[index][i] = limit_element_draft[i];
+        c->limit_seq_room[index][i] = limit_seq_draft_room[i];     /* (room) */
     }
+    if (limit_every_target_draft)       /* (every target) */
+        log_line("character %d limit %d-%d: hits on every target (each hit at every target of its turn)",
+                 NEW_CHARACTER_FIRST_ID + (int)(c - new_characters), level, position);
     if (limit_seq_draft_count || limit_element_draft_count)
         log_line("character %d limit %d-%d: %d spell effect(s), %d per-hit element(s)",
                  NEW_CHARACTER_FIRST_ID + (int)(c - new_characters), level, position, limit_seq_draft_count,
@@ -29367,15 +33491,17 @@ static int finish_forms(void)
             log_line("limits file line %d: form %s: %s", f->line, f->name, why);
             problems++;
         }
-        for (n = 0; !why && !f->bad && n < ROSTER_MAX; n++) {
-            const char *prefix = new_characters[n].battle_prefix;
-            const char *two = !new_characters[n].defined || !prefix[0] ? NULL
+        for (n = 0; !why && !f->bad && n < 2 * ROSTER_MAX; n++) {
+            /* (the outfit keys) a character's battle_files_when letters are its files too: n >= ROSTER_MAX takes those */
+            const char *prefix = n < ROSTER_MAX ? new_characters[n].battle_prefix : new_characters[n - ROSTER_MAX].battle_when_prefix;
+            const char *two = !new_characters[n % ROSTER_MAX].defined || !prefix[0] ? NULL
                             : f->files[0] == prefix[0] && f->files[1] == prefix[1] ? f->files
                             : f->scripts[0] == prefix[0] && f->scripts[1] == prefix[1] ? f->scripts : NULL;
 
             if (two) {
-                log_line("limits file line %d: form %s: %s %s is also character %d's battle_files: the form would load that character's files; give the form two letters of its own",
-                         f->line, f->name, two == f->files ? "model_files" : "model_script", two, NEW_CHARACTER_FIRST_ID + n);
+                log_line("limits file line %d: form %s: %s %s is also character %d's %s: the form would load that character's files; give the form two letters of its own",
+                         f->line, f->name, two == f->files ? "model_files" : "model_script", two, NEW_CHARACTER_FIRST_ID + n % ROSTER_MAX,
+                         n < ROSTER_MAX ? "battle_files" : "battle_files_when");
                 problems++;
                 f->bad = 1;
             }
@@ -29680,6 +33806,11 @@ static void load_limits(void)
                         limit_effect = -1;
                         limit_script_draft_length[0] = limit_script_draft_length[1] = limit_script_draft_length[2] = 0;
                         limit_seq_draft_count = limit_element_draft_count = 0;
+                        limit_status2_draft = 0;
+                        limit_status2_mode_draft = 0;
+                        limit_every_target_draft = 0;   /* (every target) */
+                        for (i = 0; i < LIMIT_SEQ_MAX; i++)
+                            limit_seq_draft_room[i] = 0;
                         limit_follow_chain_draft = 0;
                         limit_swap_draft[0][0] = limit_swap_draft[1][0] = 0;
                         limit_state_draft[0] = 0;
@@ -29908,9 +34039,12 @@ static void load_limits(void)
                 } else if (word_is(start, key_end, "spell_effects")) {
                     /* [limit | effect] number : frame [all] [visual], ... or hit:frame   one for each hit (or step) */
                     char *q = value, *word_end;
-                    int is_limit = 0, is_skip = 0, is_native = 0;
+                    int is_limit = 0, is_skip = 0, is_native = 0, is_room = 0;    /* (room) */
 
                     limit_seq_draft_count = 0;
+                    for (is_room = 0; is_room < LIMIT_SEQ_MAX; is_room++)
+                        limit_seq_draft_room[is_room] = 0;    /* (room) */
+                    is_room = 0;
                     while (!problem && (word_end = next_word(&q, stop)) != NULL) {
                         DWORD effect, frame;
 
@@ -29920,6 +34054,18 @@ static void load_limits(void)
                         } else if (limit_seq_draft_count && (limit_seq_draft_flags[limit_seq_draft_count - 1] & SEQ_NATIVE) && !is_limit && !is_native &&
                             (word_is(q, word_end, "visual") || word_is(q, word_end, "skip"))) {
                             problem = "spell_effects: an `effect N:frame` entry (a native effect) takes `all` only, not visual or skip";
+                        } else if (is_room) {
+                            /* (room) the free slots of the list of 100 this entry waits for */
+                            DWORD slots;
+
+                            if (!parse_number(&q, word_end, &slots) || q != word_end || slots < 1 || slots > 100)
+                                problem = "spell_effects: `room` must be followed by a number of free slots, 1 to 100";
+                            else
+                                limit_seq_draft_room[limit_seq_draft_count - 1] = (BYTE)slots;
+                            is_room = 0;
+                        } else if (word_is(q, word_end, "room") && limit_seq_draft_count && !is_limit && !is_native &&
+                                   !(limit_seq_draft_flags[limit_seq_draft_count - 1] & (SEQ_NATIVE | SEQ_HIT))) {
+                            is_room = 1;    /* (room) a game effect's entry only: not a bare hit or a native effect */
                         } else if (is_skip) {
                             DWORD frames;
 
@@ -29968,6 +34114,8 @@ static void load_limits(void)
                         }
                         q = word_end;
                     }
+                    if (!problem && is_room)
+                        problem = "spell_effects: `room` must be followed by a number of free slots";    /* (room) */
                     if (problem || is_limit || is_skip || is_native) {
                         if (!problem)
                             problem = is_skip ? "spell_effects: `skip` must be followed by a number of frames"
@@ -29995,6 +34143,26 @@ static void load_limits(void)
                     }
                     if (problem)
                         limit_element_draft_count = 0;
+                } else if (word_is(start, key_end, "status2")) {
+                    /* a second status change of the limit: the names as for `status`; none = no second change */
+                    DWORD mask;
+
+                    if (!parse_flags(value, stop, status_flags, 0xffffffffu, &mask))
+                        problem = "status2 is a list of status names, as for status (regen barrier ...), or none";
+                    else if (mask & 0x80000000u)
+                        problem = "status2 cannot hold imprisoned (the game reads that bit of a status list as something else)";
+                    else
+                        limit_status2_draft = mask;
+                } else if (word_is(start, key_end, "status2_mode")) {
+                    static const char *const modes[] = { "inflict", "cure", "toggle" };
+                    int k;
+
+                    for (k = 0; k < 3 && !word_is(value, stop, modes[k]); k++)
+                        ;
+                    if (k == 3)
+                        problem = "status2_mode must be inflict, cure or toggle";
+                    else
+                        limit_status2_mode_draft = k;
                 } else if (word_is(start, key_end, "state")) {
                     /* NAME: the state its user is in once the limit has been carried out; its section is [12 state NAME] */
                     if (word_is(value, stop, "none"))
@@ -30084,6 +34252,14 @@ static void load_limits(void)
                         problem = "uses applies to the second and third limits of levels 1 to 3: a number up to 65534";
                     else
                         uses = (long)n;
+                } else if (word_is(start, key_end, "hits_on_every_target")) {
+                    /* (every target) yes: each hit of the limit goes to every target of its turn */
+                    int on;
+
+                    if (!parse_yes_no(value, stop, &on))
+                        problem = "expected yes or no";
+                    else
+                        limit_every_target_draft = (BYTE)(on != 0);
                 } else if (word_is(start, key_end, "learned")) {
                     if (!parse_yes_no(value, stop, &learned))
                         problem = "expected yes or no";
@@ -30154,6 +34330,8 @@ static int install_limit_hooks(void)
     log_line("limit states: the physical hit check (hit-step table entry %08lx -> %08lx) is %s", ADDR_HIT_STEP_PHYSICAL,
              FN_HIT_CHECK_PHYSICAL, evade_hook_live ? "followed: a state's physical_evade applies"
                                                     : "NOT followed: a state's physical_evade changes nothing");
+    /* a state's cover and counter: the two calls of the game's routines. Not counted either: only those keys need them */
+    install_guard_hooks();
     /* a state's attack_targets = all_enemies in the battle menu: the target cursor's set-up. Not counted either */
     if (!menu_all_live)
         menu_all_live = install_menu_target_hook();
@@ -30196,6 +34374,7 @@ static int install_limit_hooks(void)
     log_line("limit states: the no-target call (%08lx -> %08lx) is %s", SITE_TURN_NO_TARGET, state_no_target_next,
              state_stop_live ? "followed: a burst that runs out of targets ends without the empty step, or keeps its camera"
                              : "NOT followed: a burst that runs out of targets ends with the game's empty step and its camera cut");
+    every_target_install();         /* (every target) not counted: only the key needs it */
     return ok;
 }
 
@@ -32831,6 +37010,176 @@ static void character_wide_wear_pending(const char *moment)
         if (new_characters[n].gear_wish_pending)
             character_wide_wear(&new_characters[n], moment);
 }
+
+/* ==== `forget_flag` (the character file): a guest's record is forgotten: begin ====
+
+   The rules are FORGET FLAG PURE's (forget_judge, forget_poll, with the struct new_character); here
+   the game's memory is read for them and the record goes. When the bit is on, a character naming it
+   that is out of the party, hidden from the PHS and untouched loses its record as if it had never
+   joined: the record in its seat is cleared as seat_put clears one (`keep_seat`: the seat stays its
+   own; nothing else is moved), or the one its sheet keeps while it is not seated; its seat's PHS bits
+   are cleared; each wide piece its sheet MADE for it is taken off (the ledger's entry cleared, so no
+   WORN entry is written; the lent slot given back unless another record wears that number or the
+   Equip menu's list offers it): the piece was made by the sheet and is made again at its next join,
+   so none is added or lost. Its level, experience, AP, limits, kills and gauge were in the record.
+   Every refusal is one line and loses nothing. Never while a save's stand-ins are written, nor in a
+   load before its wide pieces are put on (the next look settles it). */
+#define ADDR_FORGET_BANKS       (ADDR_SAVE_BLOCK + 0x0ba4u)     /* 00dc08dc: the save's five banks (FUN_0060f750) */
+static const char *forget_moment = "";
+
+static int forget_flag_of(int n)
+{
+    const struct new_character *c = &new_characters[n];
+
+    return n >= 0 && n < ROSTER_MAX && c->defined ? c->forget_flag : FORGET_FLAG_NONE;
+}
+
+/* The byte of kind `k` that build_character_record gives the character from its sheet, or FORGET_GEAR_WIDE (its
+   sheet names a wide piece: worn through a lent slot) or FORGET_GEAR_UNKNOWN (its sheet does not name it and the
+   record was a copy of its base's: what it was cannot be told). The same steps as build_character_record. */
+static int forget_sheet_byte(const struct new_character *c, int k, const BYTE *record)
+{
+    static const int new_first[3] = { NEW_WEAPON_FIRST_ITEM, NEW_ARMOUR_FIRST_ITEM, NEW_ACCESSORY_FIRST_ITEM };
+    static const int new_count[3] = { NEW_WEAPON_COUNT, NEW_ARMOUR_COUNT, NEW_ACCESSORY_COUNT };
+    int at = SAVE_RECORD_WEAPON + k, holder = GEAR_HOLDER_ROSTER + (int)(c - new_characters), item, w;
+
+    if (c->start_wide[k])
+        return FORGET_GEAR_WIDE;
+    if (c->start_set[at]) {
+        item = gear_base[k] + c->start[at];
+        if (item >= new_first[k] && item < new_first[k] + new_count[k] && defined_new_kind(item) != k + 1)
+            return gear_stand_in(holder, k, record);
+        return c->start[at];
+    }
+    if (!c->from_sheet)
+        return FORGET_GEAR_UNKNOWN;
+    if (k == 1)
+        return 0;
+    if (k == 2)
+        return 0xff;
+    if (c->equip_like >= 0 && c->equip_like < 9)
+        return sheet_first_weapon[c->equip_like];
+    w = character_first_weapon(c);
+    return w >= 0 ? w : sheet_first_weapon[c->base >= 0 && c->base < 9 ? c->base : 0];
+}
+
+static void forget_view_of(int n, struct forget_view *v)
+{
+    const struct new_character *c = &new_characters[n];
+    const BYTE *party = (const BYTE *)ADDR_PARTY, *field_party = (const BYTE *)ADDR_FIELD_PARTY;
+    const WORD *phs = (const WORD *)ADDR_PHS_MASKS;
+    int id = character_seat_id(c), h = GEAR_HOLDER_ROSTER + n, k, slot;
+    BYTE *record = gear_holder_record(h);      /* the record in its seat (if it is the seat's), or its sheet's copy; NULL: none */
+
+    v->has_record = record != NULL;
+    v->record = record;
+    if (!record)
+        return;
+    if (id >= 0) {
+        for (slot = 0; slot < 3; slot++)
+            v->in_party |= party[slot] == (BYTE)id || field_party[slot] == (BYTE)id;
+        v->locked = (phs[0] >> id) & 1;
+        v->shown = (phs[1] >> id) & 1;
+    } else {
+        v->shown = !c->hidden;                  /* not seated: the PHS shows it as a stand-in unless a field script had hidden it */
+    }
+    v->pending = c->gear_wish_pending != 0;
+    v->wide_live = gear_wide_live;
+    for (k = 0; k < 3; k++) {
+        v->expect[k] = forget_sheet_byte(c, k, record);
+        v->wide_number[k] = c->start_wide[k];
+        v->wide_worn[k] = gear_wide_live ? gear_worn[h][k] : 0;
+        v->wide_slot[k] = gear_wide_live && c->start_wide[k] ? gear_slot_of(k, c->start_wide[k]) : -1;
+    }
+    for (k = 0; k < 16; k++)
+        v->start_materia[k] = c->start_materia[k];
+}
+
+static void forget_act(int n, const struct forget_view *v)
+{
+    struct new_character *c = &new_characters[n];
+    int h = GEAR_HOLDER_ROSTER + n, id = character_seat_id(c), k, i;
+    WORD *phs = (WORD *)ADDR_PHS_MASKS;
+    BYTE *record;
+
+    esui_avatars_off();                         /* (as seat_put) its swap of the gauge byte must not be in a record that goes */
+    for (k = 0; k < 3; k++) {
+        int number = v->wide_number[k], slot = v->wide_slot[k], released = 0;
+
+        if (!number || !gear_wide_live || gear_worn[h][k] != number)
+            continue;                           /* (forget_judge saw it worn) */
+        gear_worn[h][k] = 0;
+        if (slot >= 0 && gear_lent[k][slot] == number && !gear_listed[k][slot] && !gear_worn_wears(number)) {
+            gear_slot_release(k, slot);
+            released = 1;
+        }
+        log_line("forget_flag: character %d: wide %s %d \"%s\" of its sheet is taken off with its record (it was made for it and is made again when it joins): lent slot %d %s; no worn entry is left",
+                 character_file_id(c), gear_kind_text(k), number, gear_wide_log_name(number), slot,
+                 released ? "given back" : "kept (another record wears that number, or the Equip menu's list offers it)");
+    }
+    record = id >= 0 ? new_character_record(id) : c->record;
+    for (i = 0; i < SAVE_RECORD_SIZE; i++)
+        record[i] = 0;
+    if (id >= 0) {
+        record[0] = UNUSED_RECORD_ID;           /* as seat_put leaves an empty seat's record */
+        phs[0] &= (WORD)~(1 << id);
+        phs[1] &= (WORD)~(1 << id);
+    }
+    c->has_record = c->hidden = 0;
+    c->gear_wish_pending = 0;
+}
+
+static void forget_say(int n, int flag, int verdict, int detail)
+{
+    const struct new_character *c = &new_characters[n];
+    char bit[16], what[200];
+    int id = character_seat_id(c), file_id = character_file_id(c);
+
+    forget_flag_text(flag, bit);
+    switch (verdict) {
+    case FORGET_NOTHING:
+        log_line("forget_flag %s is on (%s): character %d has no record (not joined yet, or forgotten already): nothing to forget", bit, forget_moment, file_id);
+        break;
+    case FORGET_GO:
+        if (id >= 0)
+            wsprintfA(what, c->keep_seat > 0 ? "it keeps seat %d (keep_seat)" : "it stays in seat %d", id);
+        else
+            lstrcpyA(what, "it has no seat");
+        log_line("forget_flag %s is on (%s): character %d is FORGOTTEN: its record is gone (level, experience, equipment, materia and their AP, limits, kills, gauge); %s. It is made from its sheet when a field script adds it again",
+                 bit, forget_moment, file_id, what);
+        break;
+    case FORGET_DEFER:
+        log_line("forget_flag %s is on (%s): character %d is not looked at yet (its sheet's wide pieces are still to be put on): the flag stays on until the next look", bit, forget_moment, file_id);
+        break;
+    default:
+        if (verdict == FORGET_MATERIA_DIFFERS && detail >= 0 && detail < 16)
+            wsprintfA(what, "%s slot %d holds other materia than its sheet's", detail < 8 ? "a weapon" : "an armour", detail % 8 + 1);
+        else if (verdict >= FORGET_GEAR_NOT_SAID && verdict <= FORGET_GEAR_DIFFERS && detail >= 0 && detail < 3)
+            wsprintfA(what, verdict == FORGET_GEAR_NOT_SAID ? "its sheet does not name its %s (the record was a copy of its base's: what it was made with cannot be told)"
+                          : verdict == FORGET_WIDE_OFF ? "its sheet names a wide %s and wide gear is not at work in this run (whether the piece was made cannot be told)"
+                          : verdict == FORGET_WIDE_NOT_WORN ? "it does not wear its sheet's wide %s (a stand-in or another piece is in its place; the piece may be in the item list or the box)"
+                          : "it wears another %s than its sheet's", gear_kind_text(detail));
+        else
+            lstrcpyA(what, verdict == FORGET_IN_PARTY ? "it is in the party"
+                         : verdict == FORGET_LOCKED ? "the PHS locks it in the party"
+                         : verdict == FORGET_SHOWN ? "the PHS shows it (a field script hides it, MMBud 0, before it turns the flag on)" : "?");
+        log_line("forget_flag %s is on (%s): character %d is NOT forgotten: %s. Nothing is lost: its record stays as it is; the flag is turned off",
+                 bit, forget_moment, file_id, what);
+        break;
+    }
+}
+
+/* The look: at the start of new_characters_joining and at the end of a load. */
+static void forget_flags_poll(const char *moment)
+{
+    static const struct forget_env env = { (unsigned char *)ADDR_FORGET_BANKS, ROSTER_MAX, forget_flag_of, forget_view_of, forget_act, forget_say };
+
+    if (!new_characters_live || gear_standins_on || character_wide_defer)
+        return;
+    forget_moment = moment;
+    forget_poll(&env);
+}
+/* ==== `forget_flag`: end ==== */
 
 /* ==== THE BOX (stage B6), the window: begin ====
 
@@ -38570,8 +42919,6 @@ static void build_character_record(struct new_character *c, BYTE *record, int id
     int i, k, materia_given_count;
 
     if (c->from_sheet) {
-        /* first weapon of each of the nine, for when the sheet names none */
-        static const BYTE first_weapon[9] = { 0, 32, 16, 62, 48, 87, 101, 114, 73 };
         int level = c->level_like >= 0 ? followed_level(c) : c->start_set[1] ? c->start[1] : 1, hp, mp;
         DWORD experience = curve_experience(c, level - 1);
 
@@ -38586,13 +42933,13 @@ static void build_character_record(struct new_character *c, BYTE *record, int id
         record[0x0e] = 1;                               /* limit level */
         *(WORD *)(record + 0x22) = c->own_limits ? c->limit_start : c->limits_like >= 0;   /* limits learned */
         if (c->equip_like >= 0 && c->equip_like < 9) {
-            record[0x1c] = first_weapon[c->equip_like];
+            record[0x1c] = sheet_first_weapon[c->equip_like];
         } else {
             /* equip_like = none: the first weapon it may equip (as the stand-in); without one, its base's
                first, which it may not equip: said unless the sheet names its weapon (applied below) */
             int w = character_first_weapon(c);
 
-            record[0x1c] = w >= 0 ? (BYTE)w : first_weapon[c->base >= 0 && c->base < 9 ? c->base : 0];
+            record[0x1c] = w >= 0 ? (BYTE)w : sheet_first_weapon[c->base >= 0 && c->base < 9 ? c->base : 0];
             if (w < 0 && !c->start_set[SAVE_RECORD_WEAPON] && !c->start_wide[0])
                 log_line("character %d: equip_like = none, and no weapon it may equip is defined (no weapon file's equip list names it, and no weapon is for all nine): it is created wearing weapon %d, its base's first, which it may not equip. Give it weapon = on its sheet, or name it in a weapon's equip list",
                          character_file_id(c), ITEM_ID_WEAPON_BASE + record[0x1c]);
@@ -38686,6 +43033,7 @@ static void new_characters_joining(void)
 
     if (!new_characters_live)
         return;
+    forget_flags_poll("a party slot rebuilt, or the PHS");       /* (`forget_flag`) first: a guest forgotten now is made again below only if it is wanted */
     for (id = NEW_CHARACTER_FIRST_ID; id < NEW_CHARACTER_FIRST_ID + seat_count; id++) {
         BOOL wanted = (((const WORD *)ADDR_PHS_MASKS)[1] >> id) & 1;
         struct new_character *c = new_character(id);
@@ -39235,6 +43583,7 @@ struct weapon_draft {
     DWORD roster_equip;                     /* the file's characters its `equip` list names: see parse_equip */
     BYTE value[WEAPON_RECORD_SIZE], is_set[WEAPON_RECORD_SIZE];
     BYTE name[32], description[96];
+    char icon_file[CI_FILE_ROOM];           /* (custom icons) icon = file:NAME; "" none */
 };
 
 static const struct flag_name equip_flags[] = {
@@ -39440,12 +43789,15 @@ static const char *apply_weapon_key(struct weapon_draft *draft, char *key, char 
         if (!parse_kernel_weapon(value, end, &draft->throw_like) || draft->throw_like >= WEAPON_COUNT_ORIGINAL)
             return "throw_like must be a kernel weapon: 0 to 127, or its item ID 128 to 255";
     } else if (word_is(key, key_end, "icon")) {
+        if (end - value >= 5 && (value[0] | 0x20) == 'f' && (value[1] | 0x20) == 'i' && (value[2] | 0x20) == 'l' &&
+            (value[3] | 0x20) == 'e' && value[4] == ':')
+            return ci_file_problem(value, end, draft->icon_file);  /* (custom icons) a picture; shown in its place when it cannot be: the icon word of another icon line, or the base's */
         for (i = 0; icon_names[i].name && !word_is(value, end, icon_names[i].name); i++)
             ;
         if (icon_names[i].name)
             draft->icon = (int)icon_names[i].value;
         else if (!parse_kernel_weapon(value, end, &draft->icon) || draft->icon >= WEAPON_COUNT_ORIGINAL)
-            return "icon must be sword, glove, gunarm, headdress, staff, spear, shuriken, megaphone, gun, armour, accessory, item, or a kernel weapon";
+            return "icon must be sword, glove, gunarm, headdress, staff, spear, shuriken, megaphone, gun, armour, accessory, item, or a kernel weapon (or file:NAME.png or file:NAME.tex, a picture of your own)";
     } else if (word_is(key, key_end, "price")) {
         if (!parse_number(&p, end, &n) || p != end || n > 0x7fffffff)
             return "price must be a number";
@@ -39543,6 +43895,7 @@ static void start_weapon_draft(struct weapon_draft *draft, int id, int line)
     for (i = 0; i < WEAPON_RECORD_SIZE; i++)
         draft->value[i] = draft->is_set[i] = 0;
     draft->name[0] = draft->description[0] = 0xff;
+    draft->icon_file[0] = 0;                /* (custom icons) */
 }
 
 /* ---- (kernel overrides) the kernel's prices and throw tables, kept ---- */
@@ -39612,6 +43965,7 @@ static int finish_kernel_weapon(struct weapon_draft *draft)
     copy_bytes(kernel_override_description[0][k], draft->description, sizeof draft->description);
     if (draft->icon >= 0)
         kernel_weapon_icon_override[k] = (BYTE)draft->icon;
+    custom_icon_of_id[draft->id] = ci_take(draft->icon_file, "weapon", draft->line);       /* (custom icons) 128-255 here */
     kernel_override_roster[0][k] = draft->roster_equip;
     if (draft->price >= 0)
         price_table[draft->id] = (DWORD)draft->price;
@@ -39627,7 +43981,10 @@ static int finish_kernel_weapon(struct weapon_draft *draft)
 /* (The box, stage B5.) The section of a wide WEAPON ([10000] to [15999]) is finished: its
    definition goes into the catalogue of wide gear (the record of its base with the keys laid
    over it, exactly as a `[320]` section's), and nowhere else: its record is copied into the
-   DLL's table only while it holds a lent slot. Never thrown in this version. */
+   DLL's table only while it holds a lent slot. (Wide throw) `throw` sets bit 3 of its restriction
+   word as a `[320]` section's would be (else the base's), kept in `throws` (the record's word keeps
+   bit 3 set as before), and `throw_like` is kept: it is thrown only while wide throw is on
+   (gear_wide_throwable), through a lent slot. */
 static int finish_wide_weapon(struct weapon_draft *draft)
 {
     struct wide_gear *g = wide_gear_new(draft->id);
@@ -39646,13 +44003,18 @@ static int finish_wide_weapon(struct weapon_draft *draft)
     restrictions = *(WORD *)(g->record + WEAPON_RESTRICTIONS);
     if (draft->sell >= 0)
         restrictions = (WORD)(draft->sell ? restrictions & ~1 : restrictions | 1);
-    restrictions |= 8;          /* never thrown: Throw takes its weapon's record by number - 0x80, with no bound */
+    g->throws = (BYTE)(draft->throwable >= 0 ? draft->throwable == 1 : !(restrictions & 8));     /* (wide throw) as finish_weapon decides bit 3: the key, else the base's; thrown only while wide throw is on (gear_wide_throwable) */
+    restrictions |= 8;          /* the record's own word: never thrown by number, as before (Throw takes a wide weapon through a lent slot: WIDE THROW) */
     *(WORD *)(g->record + WEAPON_RESTRICTIONS) = restrictions;
-    if (draft->throwable == 1)
+    if (draft->throwable == 1 && wide_items_mode != WIDE_ON)      /* (wide throw) nothing of it with wide_items off: the line of before, word for word */
         log_line("weapon file line %d: wide weapon %d: throw = yes is not possible for a weapon numbered from 10000 in this version: it cannot be thrown", draft->line, draft->id);
+    else if (draft->throwable == 1 && wide_throw_said && !wide_throw_live)      /* (at the first reading the gate's line says it) */
+        log_line("weapon file line %d: wide weapon %d: throw = yes: it cannot be thrown in this run (wide throw is not on: see the \"wide throw:\" line at the start)", draft->line, draft->id);
+    g->throw_like = (BYTE)(draft->throw_like >= 0 ? draft->throw_like : 0xff);
     copy_bytes(g->name, draft->name, sizeof g->name);
     copy_bytes(g->description, draft->description, sizeof g->description);
     g->icon = (BYTE)(draft->icon >= 0 ? draft->icon : draft->base);
+    g->custom_icon = ci_take(draft->icon_file, "weapon", draft->line);       /* (custom icons) */
     g->base = (BYTE)draft->base;
     g->given = draft->give == 1;
     g->roster_equip = draft->roster_equip;
@@ -39693,6 +44055,7 @@ static int finish_weapon(struct weapon_draft *draft)
     copy_bytes(weapon_names[w], draft->name, sizeof draft->name);
     copy_bytes(weapon_descriptions[w], draft->description, sizeof draft->description);
     weapon_icon[w] = (BYTE)(draft->icon >= 0 ? draft->icon : draft->base);
+    custom_icon_of_id[draft->id] = ci_take(draft->icon_file, "weapon", draft->line);       /* (custom icons) 320-383 here */
     weapon_given[w] = draft->give == 1;
     weapon_roster_equip[w] = draft->roster_equip;
     price_table[draft->id] = draft->price >= 0 ? (DWORD)draft->price : kernel_price(draft->base + ITEM_ID_WEAPON_BASE);
@@ -39942,6 +44305,7 @@ struct gear_draft {
     DWORD roster_equip;                     /* the file's characters its `equip` list names: see parse_equip */
     BYTE value[GEAR_RECORD_MAX], is_set[GEAR_RECORD_MAX];
     BYTE name[32], description[96];
+    char icon[CI_FILE_ROOM];                /* (custom icons) icon = file:NAME; "" none */
 };
 
 static const struct { const char *what, *file; int first_id, count, record_size, base_id, base_count; } gear_kinds[3] = {
@@ -40146,6 +44510,8 @@ static const char *apply_gear_key(struct gear_draft *draft, char *key, char *key
         else if (!parse_number(&p, end, &n) || p != end || n > 10000)
             return "expected an amount from 0 to 9999, or all";
         *(word_is(key, key_end, "menu_hp") ? &draft->menu_hp : &draft->menu_mp) = (long)n;
+    } else if (word_is(key, key_end, "icon")) {
+        return ci_file_problem(value, end, draft->icon);       /* (custom icons) icon = file:NAME.png | file:NAME.tex (armour, accessory and item files) */
     } else if (key_end - key > 5 && (word_is(key, key + 5, "byte_") || word_is(key, key + 5, "word_"))) {
         int size = (key[0] | 0x20) == 'b' ? 1 : 2, offset;
         char *digits = key + 5;
@@ -40203,6 +44569,7 @@ static int finish_kernel_gear(struct gear_draft *draft)
     copy_bytes(kernel_override_name[kind + 1][k], draft->name, sizeof draft->name);
     copy_bytes(kernel_override_description[kind + 1][k], draft->description, sizeof draft->description);
     kernel_override_roster[kind + 1][k] = draft->roster_equip;
+    custom_icon_of_id[draft->id] = ci_take(draft->icon, gear_kinds[kind].what, draft->line);      /* (custom icons) 256-319 here */
     if (draft->price >= 0)
         price_table[draft->id] = (DWORD)draft->price;
     kernel_override_on[kind + 1][k] = 1;
@@ -40244,6 +44611,7 @@ static int finish_wide_item(struct gear_draft *draft)
     copy_bytes(w->description, draft->description, sizeof w->description);
     copy_bytes(item_table + draft->id * ITEM_RECORD_SIZE, w->record, ITEM_RECORD_SIZE);
     price_table[draft->id] = w->price;
+    w->icon = ci_take(draft->icon, "item", draft->line);       /* (custom icons) */
     draft->id = -1;
     return 1;
 }
@@ -40275,6 +44643,7 @@ static int finish_wide_gear(struct gear_draft *draft)
     g->base = (BYTE)draft->base;
     g->given = draft->give == 1;
     g->roster_equip = draft->roster_equip;
+    g->custom_icon = ci_take(draft->icon, gear_kinds[kind].what, draft->line);      /* (custom icons) */
     g->price = draft->price >= 0 ? (DWORD)draft->price : kernel_price(draft->base + gear_kinds[kind].base_id);
     draft->id = -1;
     return 1;
@@ -40321,6 +44690,7 @@ static int finish_gear(struct gear_draft *draft)
         item_menu_mp[n] = (short)(draft->menu_mp > 0 ? draft->menu_mp : 0);
         item_defined[n] = 1;
     }
+    custom_icon_of_id[draft->id] = ci_take(draft->icon, gear_kinds[kind].what, draft->line);      /* (custom icons) 105-127, 448-511 (items), 384-415, 416-447 here */
     *(WORD *)(record + restriction_offset) = restrictions;
     copy_bytes(kind == GEAR_ARMOUR ? armour_names[n] : kind == GEAR_ACCESSORY ? accessory_names[n] : item_names[n],
                draft->name, sizeof draft->name);
@@ -40390,6 +44760,7 @@ static void load_gear_file(int kind)
             else
                 loaded += finish_gear(&draft);
             draft.id = -1;
+            draft.icon[0] = 0;          /* (custom icons) */
             in_kernel = 0;
             if (kind == GEAR_ITEM && parse_number(&p, stop, &id) && p + 1 == stop && *p == ']' && id >= ITEM_COUNT_EXTENDED) {
                 /* (wide items) a number from 512 up: a wide item's, [1024] to [9999], or refused with its reason */
@@ -40514,6 +44885,7 @@ static void load_gear_files(void)
     load_gear_file(GEAR_ARMOUR);
     load_gear_file(GEAR_ACCESSORY);
     load_gear_file(GEAR_ITEM);
+    custom_icons_report();      /* (custom icons) the four files' sections that name an icon file: one line */
 }
 
 /* ---- Materia file ---------------------------------------------------------- */
@@ -41506,6 +45878,61 @@ static int shop_add_count;
 
 static BOOL shop_open_hooked;
 
+/* (Wide shop) A number from 512 up that a shop may offer now: what the purchase's add (006cbffa, the
+   DLL's wide_game_add -> box_arrive) will take, the same conditions as wide_number_refusal(n, TRUE):
+   a wide item defined while wide things are admitted; a piece of wide gear (10000-27999) a gear file
+   defines while wide gear is at work and wide things are admitted. The shop PAYS before it adds, so
+   nothing is offered that the add could refuse. Nor, for either, while this run CARRIES a loaded
+   companion's item list whole (sxc3_item_carried: a later build's) and the box does not act: a row
+   bought into the list would be written nowhere at a save (box_list_cannot_save), so the gil would be
+   paid for nothing kept; while the box acts such a row goes to the box instead (list_room). */
+static BOOL shop_wide_offerable(int id)
+{
+    if (sxc3_item_carried && !box_acts())
+        return FALSE;
+    if (gear_wide_kind(id) >= 0)
+        return gear_wide_live && wide_items_ready() && wide_gear(id) != NULL;
+    return wide_item_usable(id);
+}
+
+/* Why shop_wide_offerable says no, for the log. */
+static const char *shop_withheld_reason(int id)
+{
+    int kind = gear_wide_kind(id);
+
+    if (sxc3_item_carried && !box_acts())
+        return "this run carries the loaded companion's item list whole (a later build's) and the box is not at work: a bought row would not be saved";
+    if (kind >= 0)
+        return !gear_wide_live ? "wide gear is not at work in this run (see the \"box: wide gear\" line at the start)"
+             : !wide_items_ready() ? "wide things are not admitted in this run (see the \"wide items:\" lines at the start)"
+             : kind == 0 ? "the weapon file does not define it" : kind == 1 ? "the armour file does not define it" : "the accessory file does not define it";
+    return !wide_items_ready() ? "wide items are not admitted in this run (see the \"wide items:\" lines at the start)" : "the items file does not define it";
+}
+
+/* (Wide shop) After every reading of the gear files: the shop files' wide gear entries that nothing
+   defines (never offered) and those that cannot be sold (offered: the shop file decides; such a piece
+   is not usually put in a shop). At most one line per entry per reading. */
+static void shop_adds_gear_check(void)
+{
+    int n;
+
+    for (n = 0; n < shop_add_count; n++) {
+        int id = shop_adds[n].id, kind = gear_wide_kind(id);
+        const struct wide_gear *g;
+
+        if (shop_adds[n].materia || kind < 0)
+            continue;
+        g = wide_gear(id);
+        if (!g)
+            log_line("shop %d: wide %s %d: %s: it will not be offered", shop_adds[n].shop, wide_kind_word(id), id,
+                     !gear_wide_sections() ? "the box is off, so no gear file's wide section is read" : kind == 0 ? "no section of the weapon file defines it"
+                     : kind == 1 ? "no section of the armour file defines it" : "no section of the accessory file defines it");
+        else if (*(const WORD *)(g->record + (kind == 0 ? WEAPON_RESTRICTIONS : kind == 1 ? ARMOUR_RESTRICTIONS : ACCESSORY_RESTRICTIONS)) & 1)
+            log_line("shop %d: wide %s %d is offered; it cannot be sold (sell = no, or its base's): a piece that cannot be sold is not usually put in a shop",
+                     shop_adds[n].shop, wide_kind_word(id), id);
+    }
+}
+
 /* The game opens shop n (FUN_00719d7a notes the number; every later read is table + number * 0x54).
    Only one shop is open at a time, so the open one is made up in the LAST slot of the DLL's copy,
    whose entries may run on into the room kept after it: the game's own stock, then what the files
@@ -41525,9 +45952,9 @@ static void __cdecl shop_open_hook(int number)
 
             if (shop_adds[n].shop != number)
                 continue;
-            if (!shop_adds[n].materia && shop_adds[n].id >= ITEM_COUNT_EXTENDED && !wide_item_usable(shop_adds[n].id)) {
-                /* (wide items) a wide item that is not defined, or cannot be held in this run, is NOT offered:
-                   the shop would take the gil and the item list would refuse the item */
+            if (!shop_adds[n].materia && shop_adds[n].id >= ITEM_COUNT_EXTENDED && !shop_wide_offerable(shop_adds[n].id)) {
+                /* (wide items; wide shop: and wide gear) a wide number that is not defined, or cannot be held in this
+                   run, is NOT offered: the shop would take the gil and the item list (or the box) would refuse it */
                 if (!withheld++)
                     first_withheld = shop_adds[n].id;
                 continue;
@@ -41549,8 +45976,8 @@ static void __cdecl shop_open_hook(int number)
             log_line("shop %d opened with %d entries (the game's %d)%s", number, count, *(const WORD *)(own + 2),
                      refused ? "; more were asked for than a shop can hold (32)" : "");
         if (withheld)
-            log_line("shop %d: %d wide item(s) of the shop file are NOT offered (the first: %d): %s", number, withheld, first_withheld,
-                     !wide_items_ready() ? "wide items are not admitted in this run (see the \"wide items:\" lines at the start)" : "the items file does not define it");
+            log_line("shop %d: %d wide number(s) of the shop file are NOT offered (the first: %s %d): %s", number, withheld, wide_kind_word(first_withheld),
+                     first_withheld, shop_withheld_reason(first_withheld));
         number = SHOP_SHOWN_AS;
     }
     ((void (__cdecl *)(int))FN_SHOP_OPEN)(number);
@@ -41583,7 +46010,7 @@ static void apply_shop_adds(void)
     copy_bytes(shops, shops_original, sizeof shops_original);
     if (shop_open_hooked) {
         for (n = 0; n < shop_add_count; n++)
-            log_line("shop %d will also sell %s %d", shop_adds[n].shop, shop_adds[n].materia ? "materia" : "item", shop_adds[n].id);
+            log_line("shop %d will also sell %s %d", shop_adds[n].shop, shop_adds[n].materia ? "materia" : wide_kind_word(shop_adds[n].id), shop_adds[n].id);
         return;                 /* added as each shop opens */
     }
     for (n = 0; n < shop_add_count; n++) {
@@ -41591,8 +46018,9 @@ static void apply_shop_adds(void)
         int count = *(const WORD *)(shop + 2), k, there = 0;
 
         if (!shop_adds[n].materia && shop_adds[n].id >= ITEM_COUNT_EXTENDED) {
-            /* (wide items) offered only by the enlarged shop, which is made up as it opens */
-            log_line("shop %d: wide item %d NOT added: a wide item is offered only when the shops are enlarged (see the \"shops:\" line)", shop_adds[n].shop, shop_adds[n].id);
+            /* (wide items, wide gear) offered only by the enlarged shop, which is made up as it opens */
+            log_line("shop %d: wide %s %d NOT added: a wide number is offered only when the shops are enlarged (see the \"shops:\" line)", shop_adds[n].shop,
+                     wide_kind_word(shop_adds[n].id), shop_adds[n].id);
             continue;
         }
 
@@ -41617,7 +46045,14 @@ static void apply_shop_adds(void)
 
 /* The shop file: a section per shop, `[37]`, and in it `add = 243 244 m49` (item IDs; m and a
    number for a materia). Read after the game file, whose `shop_add` line is the same thing in one
-   line; both end in shop_adds. */
+   line; both end in shop_adds. (Wide shop) an item entry is 0-511, a wide item's number 1024-9999 or
+   a piece of wide gear's 10000-27999: the band only (the gear files are read after the shop files;
+   shop_adds_gear_check and the shop's opening look at the definitions). */
+static BOOL shop_item_number_ok(DWORD id)
+{
+    return id <= 511u || wide_item_number((int)id) || (id <= WIDE_GEAR_LAST && gear_wide_kind((int)id) >= 0);
+}
+
 #define SHOP_FILE_NAME          "FF7_SpellExt_Shops.ini"
 static void load_shop_file(void)
 {
@@ -41673,8 +46108,8 @@ static void load_shop_file(void)
 
             if (materia)
                 p++;
-            if (!parse_number(&p, word_end, &id) || (id > (materia ? 254u : 511u) && (materia || !wide_item_number((int)id))) || p != word_end || shop_add_count == SHOP_ADD_MAX) {
-                log_line("shop file line %d: add takes item IDs (0 to 511, or a wide item's number 1024 to 9999) and materia as m and an ID (m49); a shop holds 32 entries", line_number);
+            if (!parse_number(&p, word_end, &id) || (materia ? id > 254u : !shop_item_number_ok(id)) || p != word_end || shop_add_count == SHOP_ADD_MAX) {
+                log_line("shop file line %d: add takes item IDs (0 to 511), a wide item's number (1024 to 9999), a wide weapon, armour or accessory's number (10000 to 27999) and materia as m and an ID (m49); a shop holds 32 entries", line_number);
                 problems++;
                 break;
             }
@@ -43150,6 +47585,8 @@ struct en_result {
     int ai_bytes, attacks, kernel_attacks;
     int fx_count[3];            /* stage 6a: the enemy's actions in its list's order, each with its SpellExt extras */
     struct en_fx { WORD id, effect, effect_all, camera_multi; } fx[3][16];  /* effect 0 / camera_multi ffff: none */
+    BYTE surrounded[4];         /* (surrounded, stage 1) the formation's kind is `surrounded`: its image says kind 0 (normal) */
+    short party_radius[4], party_front[4];  /* (surrounded) its keys, or their defaults */
     BYTE image[EN_IMAGE_SIZE];
 };
 
@@ -43180,7 +47617,7 @@ static const char *const en_statuses[32] = {           /* the status word's bit 
 };
 static const char *const en_rate_names[8] = { "death", "double", "weak", "half", "nullify", "immune", "absorb", "fullcure" };
 static const BYTE en_rate_values[8] = { 0, 2, 2, 4, 5, 5, 6, 7 };
-static const char *const en_kinds[5] = { "normal", "preemptive", "back", "side", "pincer" };
+static const char *const en_kinds[6] = { "normal", "preemptive", "back", "side", "pincer", "surrounded" };
 static const char *const en_enemy_keys[23] = {
     "name", "model", "level", "hp", "mp", "str", "def", "mag", "mdef", "spd", "eva", "luck", "exp", "ap", "gil",
     "elements", "immune", "drops", "steals", "manipulate", "back_multiplier", "morph", "ai",
@@ -43190,17 +47627,169 @@ static const char *const en_scene_attack_keys[18] = {
     "mp", "formula", "effect", "impact", "sound", "effect_all", "camera_multi",
 };
 static const char *const en_kernel_attack_keys[6] = { "id", "script", "camera", "effect", "effect_all", "camera_multi" };
-static const char *const en_formation_keys[7] = { "stage", "camera", "rows", "kind", "escape_counter", "flags", "next" };
+static const char *const en_formation_keys[9] = { "stage", "camera", "rows", "kind", "escape_counter", "flags", "next",
+                                                   "party_radius", "party_front" };
 #define EN_JOINED_ELEMENTS      "fire ice bolt earth poison gravity water wind holy restorative cut hit punch shoot shout hidden"
 #define EN_JOINED_STATUSES      "death near_death sleep poison sadness fury confusion silence haste slow stop frog small slow_numb petrify regen barrier mbarrier reflect dual shield death_sentence manipulate berserk peerless paralysis darkness dual_drain death_force resist lucky_girl imprisoned"
 #define EN_JOINED_RATES         "death double weak half nullify immune absorb fullcure"
-#define EN_JOINED_KINDS         "normal preemptive back side pincer"
+#define EN_JOINED_KINDS         "normal preemptive back side pincer surrounded"
 #define EN_SORTED_ENEMY_KEYS    "ai ap back_multiplier def drops elements eva exp gil hp immune level luck mag manipulate mdef model morph mp name spd steals str"
 #define EN_SORTED_ATTACK_KEYS   "accuracy base camera camera_multi effect effect_all element formula id impact mp name power script sound status status_chance target"
 #define EN_SORTED_KERNEL_KEYS   "camera camera_multi effect effect_all id script"
 #define EN_NATIVE_BASE          0x94        /* stage 6a: a scene attack's effect byte under a SpellExt effect: the game's enemy
                                                effect 94, magic effect 02's routine 005d4788 (no file; it shows the hit) */
-#define EN_SORTED_FORMATION_KEYS "camera escape_counter flags kind next rows stage"
+#define EN_SORTED_FORMATION_KEYS "camera escape_counter flags kind next party_front party_radius rows stage"
+
+/* ---- Surrounded (stage 1): the triangle's geometry (the compiler's refusal and the placement share it) ----
+   A formation of `kind = surrounded` is a NORMAL battle to the game (kind byte 0: no script of kind 0 rewrites a home
+   direction) whose actors the DLL turns once they are placed. Party place k (0-2; the party slot k stands there, the
+   leader at place 0) has the direction a_k = party_front + 120 k degrees: its member stands at party_radius x
+   (-sin a_k, -cos a_k) round the arena's origin and faces a_k, outward. (Facing f looks along (-sin f, -cos f): opcode
+   ed steps x -= sin f, z -= cos f, and the game's sin / cos (00662538 / 006624fd) are the plain ones, 4096 a turn.)
+   An enemy belongs to the place whose direction is nearest its bearing from the origin (the largest dot product; a
+   tie: the lower place) and faces that place, whether or not a member stands there. Its SIDE is the neighbour of its
+   place it leans toward: 0 = place k + 2 (the one before), 1 = place k + 1, 2 = neither (alone and straight ahead, or
+   the middle one of three). Two enemies in one place: the one at the smaller angle is side 0, the other side 1 (equal
+   angles: the earlier row). Kept for the reach rule (stage 2). Angles here in whole degrees; the game's in 4096ths. */
+#define EN_SUR_KIND             5       /* en_kinds' index of "surrounded" */
+#define EN_SUR_RADIUS_DEFAULT   600
+#define EN_SUR_RADIUS_MIN       200
+#define EN_SUR_RADIUS_MAX       3000
+#define EN_SUR_PER_PLACE        2       /* at most two enemies in front of a member (the user, 2026-11-12) */
+
+/* sin of a whole number of degrees, 4096 = 1.0 (nfx_sin's table) */
+static int en_sur_sin(int degrees)
+{
+    static const short quarter[91] = {
+        0, 71, 143, 214, 286, 357, 428, 499, 570, 641, 711, 782, 852, 921, 991, 1060, 1129, 1198, 1266, 1334,
+        1401, 1468, 1534, 1600, 1666, 1731, 1796, 1860, 1923, 1986, 2048, 2110, 2171, 2231, 2290, 2349, 2408, 2465,
+        2522, 2578, 2633, 2687, 2741, 2793, 2845, 2896, 2946, 2996, 3044, 3091, 3138, 3183, 3228, 3271, 3314, 3355,
+        3396, 3435, 3474, 3511, 3547, 3582, 3617, 3650, 3681, 3712, 3742, 3770, 3798, 3824, 3849, 3873, 3896, 3917,
+        3937, 3956, 3974, 3991, 4006, 4021, 4034, 4046, 4056, 4065, 4074, 4080, 4086, 4090, 4094, 4095, 4096,
+    };
+    int d = degrees % 360;
+
+    if (d < 0)
+        d += 360;
+    return d <= 90 ? quarter[d] : d <= 180 ? quarter[180 - d] : d <= 270 ? -quarter[d - 180] : -quarter[360 - d];
+}
+
+/* v / 4096, rounded to the nearest (halves away from 0) */
+static int en_sur_div4096(int v)
+{
+    return v >= 0 ? (v + 2048) >> 12 : -((-v + 2048) >> 12);
+}
+
+/* sin of an angle in 4096ths of a turn, 4096 = 1.0 (the degree table, interpolated) */
+static int en_sur_sin4096(int a)
+{
+    int t = (a & 0xfff) * 360, d = t >> 12, f = t & 0xfff, s0 = en_sur_sin(d);
+
+    return s0 + en_sur_div4096((en_sur_sin(d + 1) - s0) * f);
+}
+
+/* party place k: where it is (x, z) and its facing (4096ths), for party_radius `radius` and party_front `front` */
+static void en_sur_place(int radius, int front, int k, int *x, int *z, int *facing)
+{
+    int a = (front + 120 * k) % 360;
+
+    *x = en_sur_div4096(-radius * en_sur_sin(a));
+    *z = en_sur_div4096(-radius * en_sur_sin(a + 90));
+    *facing = ((a * 4096 + 180) / 360) & 0xfff;
+}
+
+/* The facing (4096ths) that looks along (dx, dz): the one whose (-sin f, -cos f) lies nearest that line, ahead.
+   0 for (0, 0). */
+static int en_sur_facing(int dx, int dz)
+{
+    long long best_cross = -1;
+    int f, best = 0;
+
+    if (!dx && !dz)
+        return 0;
+    for (f = 0; f < 4096; f++) {
+        long long s = en_sur_sin4096(f), c = en_sur_sin4096(f + 1024);
+        long long ahead = -(dx * s + dz * c), cross = dx * c - dz * s;
+
+        if (ahead <= 0)
+            continue;
+        if (cross < 0)
+            cross = -cross;
+        if (best_cross < 0 || cross < best_cross) {
+            best_cross = cross;
+            best = f;
+        }
+    }
+    return best;
+}
+
+/* The place (0-2) of a point (x, z) round the origin; *along its distance along the place's direction, *across
+   along the place's turn (> 0: toward place k + 1), both x 4096. */
+static int en_sur_sector(int x, int z, int front, int *along, int *across)
+{
+    int k, best = 0, best_along = 0, best_across = 0;
+
+    for (k = 0; k < 3; k++) {
+        int a = (front + 120 * k) % 360, s = en_sur_sin(a), c = en_sur_sin(a + 90);
+        int d = -x * s - z * c;                 /* (|x|, |z| <= 32768, |s|, |c| <= 4096: inside 2^28 each) */
+
+        if (!k || d > best_along) {
+            best = k;
+            best_along = d;
+            best_across = -x * c + z * s;
+        }
+    }
+    *along = best_along;
+    *across = best_across;
+    return best;
+}
+
+/* n (up to 6) enemies at (x[i], z[i]): place[i] (0-2) and side[i] (0-2) of each, count[k] the enemies of place k. */
+static void en_sur_assign(int n, const short *x, const short *z, int front, signed char *place, signed char *side, int *count)
+{
+    int along[6], across[6], i, j;
+
+    count[0] = count[1] = count[2] = 0;
+    for (i = 0; i < n && i < 6; i++) {
+        place[i] = (signed char)en_sur_sector(x[i], z[i], front, &along[i], &across[i]);
+        count[(int)place[i]]++;
+    }
+    for (i = 0; i < n && i < 6; i++) {
+        int rank = 0, k = place[i];
+
+        for (j = 0; j < n && j < 6; j++)
+            if (j != i && place[j] == k) {
+                long long ij = (long long)across[j] * along[i], ji = (long long)across[i] * along[j];
+
+                if (ij < ji || (ij == ji && j < i))
+                    rank++;                     /* enemy j stands at a smaller angle (toward place k + 2) */
+            }
+        if (count[k] == 1)
+            side[i] = (signed char)(across[i] > 0 ? 1 : across[i] < 0 ? 0 : 2);
+        else
+            side[i] = (signed char)(rank == 0 ? 0 : rank == count[k] - 1 ? 1 : 2);
+    }
+}
+
+/* (surrounded, stage 2) The REACH SET of party place k (the user's rule, 2026-11-12): the enemies of its own place;
+   from place k + 1 the one that leans toward place k (side 0); from place k + 2 the one that leans toward place k
+   (side 1); a place with ONE enemy (as the scene placed them: count[]) gives that enemy to both its neighbours. A bit
+   per enemy actor (enemy i = actor 4 + i, bit 4 + i), for the n enemies of en_sur_assign. */
+static unsigned en_sur_reach(int k, int n, const signed char *place, const signed char *side, const int *count)
+{
+    unsigned bits = 0;
+    int i, after = (k + 1) % 3, before = (k + 2) % 3;
+
+    for (i = 0; i < n && i < 6; i++) {
+        int p = place[i];
+
+        if (p < 0 || p > 2)
+            continue;
+        if (p == k || (p == after && (count[p] == 1 || side[i] == 0)) || (p == before && (count[p] == 1 || side[i] == 1)))
+            bits |= 1u << (4 + i);
+    }
+    return bits;
+}
 
 static char en_arena[EN_ARENA_SIZE];
 static int en_arena_used, en_file_count;
@@ -44460,21 +49049,22 @@ static BOOL en_build(const struct en_env *env, const char *name, int want, DWORD
         list_count[f] = c;
     }
     for (f = 0; f < 4; f++) {
-        struct en_key *keyed[7];
+        struct en_key *keyed[9];
         BYTE *setup = img + EN_O_SETUP + 0x14 * f, *camera_out = img + EN_O_CAMERA + 0x30 * f, *row;
         BYTE stand_setup[0x14], stand_camera[0x30];
         long long part[3];
         int parts, cs, cf, kind = 0, rows;
         const char *c, *row_start[8];
         int row_length[8];
+        short row_x[6], row_z[6];       /* (surrounded) the rows' places, for the count in front of each party place */
 
-        for (i = 0; i < 7; i++)
+        for (i = 0; i < 9; i++)
             keyed[i] = NULL;
         for (i = 0; i < list_count[f]; i++) {
             k = list[f][i];
-            for (j = 0; j < 7 && en_cmp(k->key, en_formation_keys[j]); j++)
+            for (j = 0; j < 9 && en_cmp(k->key, en_formation_keys[j]); j++)
                 ;
-            if (j == 7)
+            if (j == 9)
                 return en_fail("%.320s: unknown key \"%.320s\" (keys: %.320s)", en_at(k), k->key, EN_SORTED_FORMATION_KEYS);
             keyed[j] = k;
         }
@@ -44511,11 +49101,19 @@ static BOOL en_build(const struct en_env *env, const char *name, int want, DWORD
         if (f == r->formation)
             r->stand_in = cs * 4 + cf;
         if (keyed[3]) {
-            for (kind = 0; kind < 5 && !en_lower_is(keyed[3]->value, en_kinds[kind]); kind++)
+            for (kind = 0; kind < 6 && !en_lower_is(keyed[3]->value, en_kinds[kind]); kind++)
                 ;
-            if (kind == 5)
+            if (kind == 6)
                 return en_fail("%.320s: kind is one of %.320s", en_at(keyed[3]), EN_JOINED_KINDS);
         }
+        /* (surrounded) the game's kind is 0, normal; the DLL keeps the rest beside the image */
+        r->surrounded[f] = kind == EN_SUR_KIND;
+        if (kind == EN_SUR_KIND)
+            kind = 0;
+        if (keyed[7]) { if (!en_number(keyed[7]->value, en_at(keyed[7]), EN_SUR_RADIUS_MIN, EN_SUR_RADIUS_MAX, &n)) return FALSE; } else n = EN_SUR_RADIUS_DEFAULT;
+        r->party_radius[f] = (short)n;
+        if (keyed[8]) { if (!en_number(keyed[8]->value, en_at(keyed[8]), 0, 359, &n)) return FALSE; } else n = 0;
+        r->party_front[f] = (short)n;
         if (!keyed[6] || en_lower_is(keyed[6]->value, "none"))
             n = 0xffff;
         else if (!en_number(keyed[6]->value, en_at(keyed[6]), 0, 0xfffe, &n))
@@ -44612,6 +49210,18 @@ static BOOL en_build(const struct en_env *env, const char *name, int want, DWORD
             row[10] = (BYTE)cover;
             row[11] = (BYTE)(cover >> 8);
             row[12] = row[13] = row[14] = row[15] = 0xff;
+            row_x[i] = (short)xyz[0];
+            row_z[i] = (short)xyz[2];
+        }
+        if (r->surrounded[f]) {
+            signed char place[6], side[6];
+            int count_at[3];
+
+            en_sur_assign(rows, row_x, row_z, r->party_front[f], place, side, count_at);
+            for (i = 0; i < 3; i++)
+                if (count_at[i] > EN_SUR_PER_PLACE)
+                    return en_fail("scene %.320s [formation %d]: kind = surrounded: party place %d has %d enemies in front of it (at most %d)",
+                                   name, f, i, count_at[i], EN_SUR_PER_PLACE);
         }
     }
     /* the AI area: three entry offsets, then each enemy's entry at an even offset */
@@ -45347,6 +49957,7 @@ struct en_tail {
     WORD escape;                /* 009a8754: the set-up's escape counter */
     WORD kind_word;             /* 009aad20 */
     WORD escape_now, escape_copy;   /* 009aad0a, 009aad0e */
+    BYTE surrounded;            /* (surrounded) the formation is `surrounded`: kind 0 stays 0 (no pre-emptive promotion) */
 };
 
 /* As the game does it, without the Battle Square's branch: TRUE if the field's flags ask for that branch
@@ -45355,8 +49966,8 @@ static BOOL en_tail(struct en_tail *t, const BYTE *kind_table)
 {
     BOOL square = FALSE;
 
-    if ((t->field_flags & 4) && (t->flags & 0x10) && t->kind == 0)
-        t->kind = 1;                    /* pre-emptive, from the field's flags */
+    if ((t->field_flags & 4) && (t->flags & 0x10) && t->kind == 0 && !t->surrounded)
+        t->kind = 1;                    /* pre-emptive, from the field's flags (never for a surrounded formation) */
     t->kind_word = kind_table[t->kind];
     if (t->field_flags & 0x40)
         square = TRUE;
@@ -46588,6 +51199,808 @@ static void battle_menu_field_read(void)
 }
 /* ==== BATTLE MENU END (the page itself is with the SpellExt menu: BATTLE PAGE) ==== */
 
+/* ---- Surrounded (stage 1): the triangle, written after the game places the actors ----
+   A DLL scene's formation of `kind = surrounded` (the compiler: kind byte 0, normal; en_tail: no pre-emptive
+   promotion) is armed at its overwrite (sur_arm). The battle's visual set-up FUN_00429ac0 places the enemies
+   (FUN_0042b8d2, from the scene's rows) and, frames later, the party (FUN_0042a6bf -> FUN_0042ae73 from the kind's
+   tables); the logic set-up FUN_00437db0, which loads the scene and so arms this, runs wholly before it (the battle
+   loop 0041c0bb: mode 2 calls 009ad1bc = 00437db0 until it is done, only then mode 4 calls 009ad1c0 = 00429ac0).
+   Two of the game's calls are chained, the game's routine first:
+     0042a6c3 (call FUN_0042ae73, in FUN_0042a6bf)  the party's placement: the triangle (sur_apply) after it, and the
+                                                    enemies' facings (they were placed before it);
+     00429f9b (call FUN_0042b8d2, in FUN_00429d8a)  a scene's next formation places its enemies (only them): the same
+                                                    again, for the new enemies.
+   Written per party slot k present (009a87f4 + k*0x10 != -1): its home place 00bfd0a0 (x, z; y as the game put it),
+   its place now 00be12de, its facing 00be12d8 and home direction 00be1190 (en_sur_place). Per enemy (actor 4 + i,
+   i < 00bf2050): its place (0-2) and side by en_sur_assign from its home place (the scene's row: not moved), facing
+   and home direction toward its party place (en_sur_facing), kept in `sur` for stage 2. Under kind 0 no model script
+   rewrites a home direction (e5, b4, fc only for kinds 1-7), so every f9 / e5 turns an actor back to these.
+   Nothing else is changed: the game's escape, rows, gauges, targets and cameras are a normal battle's (stages 2-4).
+   A refused call (bytes not the exe's): one line at start-up, and a surrounded formation plays as a normal battle. */
+#define SITE_SUR_PARTY_PLACE    0x0042a6c3u  /* in FUN_0042a6bf: call FUN_0042ae73 (the party's places, and its script pointers) */
+#define FN_SUR_PARTY_PLACE      0x0042ae73u
+#define SITE_SUR_NEXT_ENEMIES   0x00429f9bu  /* in FUN_00429d8a (case 8): call FUN_0042b8d2 (the enemies' places) */
+#define FN_SUR_ENEMY_PLACE      0x0042b8d2u
+#define ADDR_SUR_HOME_PLACE     0x00bfd0a0u  /* 3 shorts (x, y, z) per actor: its home place (opcodes fa / a6 put it back there) */
+#define ADDR_SUR_POSITION       0x00be12deu  /* 3 shorts per actor, 0x1aec apart: its place now */
+#define ADDR_SUR_FACING         0x00be12d8u  /* short per actor: its facing, 4096 a turn */
+#define ADDR_SUR_HOME_DIRECTION 0x00be1190u  /* short per actor: its home direction (f9, and e5 under kind 0, face it again) */
+#define ADDR_SUR_ENEMY_COUNT    0x00bf2050u  /* signed byte: the enemies FUN_0042b8d2 placed, actors 4 up */
+#define SUR_ACTOR_STRIDE        0x1aecu
+#define SUR_LOG_MAX             200
+
+static struct {
+    LONG armed;                 /* the battle being loaded is a surrounded formation (sur_arm; 0 at every load's start) */
+    DWORD battle;
+    int formation, radius, front;
+    int placed;                 /* the party stands on the triangle in this battle */
+    short px[3], pz[3], pf[3];  /* the three party places and their facings */
+    int enemies;                /* actors 4 .. 4 + enemies - 1, at the last placement */
+    signed char place[6], side[6];  /* (stage 2) each enemy's party place 0-2 and side (en_sur_assign); -1: no enemy */
+    int count[3];               /* the enemies of each place */
+    short facing[6];
+    unsigned reach[3];          /* (stage 2) each party place's reach set (en_sur_reach), enemy bits 4-9 */
+} sur;
+static LONG sur_hooks;          /* 1: both calls chained; -1: refused at start-up; 0: enemies off (never tried) */
+static LONG sur_logged;
+static LONG sur_reach_on;       /* (stage 2) 1: the reach rule's five calls are followed; -1: refused; 0: never tried */
+static BYTE sur_menu_said[3];  /* (stage 2) a member's cursor narrowed (1), with no enemy left (2): said once a battle */
+
+/* load_scene_hook, at the first call of every load: nothing is armed until a surrounded formation is written. */
+static void surrounded_new_load(void)
+{
+    InterlockedExchange(&sur.armed, 0);
+}
+
+/* enemies_overwrite: the DLL scene's formation `formation` is now the battle's. */
+static void sur_arm(int formation)
+{
+    InterlockedExchange(&sur.armed, 0);
+    if (!enemies_staged.surrounded[formation])
+        return;
+    if (sur_hooks <= 0) {
+        if (InterlockedIncrement(&sur_logged) <= SUR_LOG_MAX)
+            log_line("surrounded: battle %lu (DLL scene %d formation %d) is surrounded, but the placement calls are not hooked (start-up line \"surrounded:\"): it plays as a normal battle",
+                     enemies_staged.battle, enemies_staged.scene, formation);
+        return;
+    }
+    sur.battle = enemies_staged.battle;
+    sur.formation = formation;
+    sur.radius = enemies_staged.party_radius[formation];
+    sur.front = enemies_staged.party_front[formation];
+    InterlockedExchange(&sur.armed, 1);
+    /* (stage 4, A9) no escape, the game's own way for a battle that cannot be fled, as the loader's tail (005d1405-
+       005d1437, and en_tail) makes it of a set-up without the escape flag: the set-up's flag 4 (009a8760) clear, so
+       every escape effect (additional effect 5: Exit's Escape, Smoke Bomb; its check at 005dcb18) gives the game's
+       "can't escape" message 0x36; and the battle's copy of the field's flags (009a88a6) with bit 8, so L1+R1
+       (FUN_004326bf, 00432773) shows battle text 0x36. Both words are written anew at every load. */
+    *(WORD *)(ADDR_SCENE_SETUP + 0x10) &= (WORD)~4u;
+    *(WORD *)ADDR_BATTLE_FIELD_FLAGS |= 8;
+    /* (stage 4b, A11) rows off here, at the scene's load inside the logic set-up FUN_00437db0 (its call 00437f0d):
+       after the party set-up wrote each member's back-row flag 0x40 from the save (FUN_005cf650, 00437efd) and
+       before FUN_005d0ca0 (00437fbd) copies it to the row word and the AI's init scripts run (FUN_005cfe10,
+       00437fc7). An init that notes the row (AI bit 4026) so sees the front row the battle keeps. */
+    sur_rows_back = 0;
+    sur_rows_off();
+    if (InterlockedIncrement(&sur_logged) <= SUR_LOG_MAX)
+        log_line("surrounded: battle %lu formation %d: no escape (set-up flags %04x, field flags %04x: L1+R1, Exit and Smoke Bomb say \"can't escape\")",
+                 sur.battle, formation, *(const WORD *)(ADDR_SCENE_SETUP + 0x10), *(const WORD *)ADDR_BATTLE_FIELD_FLAGS);
+}
+
+/* The triangle and the enemies' facings, after the game's placement (`when`: for the log). */
+static void sur_apply(const char *when)
+{
+    char party[400], foes[700];
+    short ex[6], ez[6];
+    int k, i, n = *(const signed char *)ADDR_SUR_ENEMY_COUNT, at;
+    BYTE kind = *(const BYTE *)ADDR_BATTLE_KIND;
+
+    if (kind != 0) {                    /* (the compiler wrote 0 and en_tail kept it: never expected) */
+        InterlockedExchange(&sur.armed, 0);
+        if (InterlockedIncrement(&sur_logged) <= SUR_LOG_MAX)
+            log_line("surrounded: battle %lu: the battle's kind (00bfd0e0) is %u, not 0: nothing is turned (%s); it plays as the game placed it",
+                     sur.battle, kind, when);
+        return;
+    }
+    at = 0;
+    for (k = 0; k < 3; k++) {
+        int x, z, facing;
+        signed char id = *(const signed char *)(ADDR_BATTLE_SLOT_ID + k * 0x10);
+
+        en_sur_place(sur.radius, sur.front, k, &x, &z, &facing);
+        sur.px[k] = (short)x;
+        sur.pz[k] = (short)z;
+        sur.pf[k] = (short)facing;
+        if (id != -1) {
+            short *home = (short *)(ADDR_SUR_HOME_PLACE + k * 6);
+            short *now = (short *)(ADDR_SUR_POSITION + k * SUR_ACTOR_STRIDE);
+
+            home[0] = (short)x;
+            home[2] = (short)z;
+            now[0] = (short)x;
+            now[1] = home[1];
+            now[2] = (short)z;
+            *(short *)(ADDR_SUR_FACING + k * SUR_ACTOR_STRIDE) = (short)facing;
+            *(short *)(ADDR_SUR_HOME_DIRECTION + k * SUR_ACTOR_STRIDE) = (short)facing;
+        }
+        at += wsprintfA(party + at, "%s place %d (%d, %d) facing %03x: %s", k ? ";" : "", k, x, z, facing,
+                        id != -1 ? "slot's member" : "empty");
+    }
+    if (n < 0)
+        n = 0;
+    if (n > 6)
+        n = 6;
+    for (i = 0; i < n; i++) {
+        const short *home = (const short *)(ADDR_SUR_HOME_PLACE + (4 + i) * 6);
+
+        ex[i] = home[0];
+        ez[i] = home[2];
+    }
+    en_sur_assign(n, ex, ez, sur.front, sur.place, sur.side, sur.count);
+    at = 0;
+    for (i = 0; i < 6; i++) {
+        int k2, facing;
+
+        if (i >= n) {
+            sur.place[i] = sur.side[i] = -1;
+            continue;
+        }
+        k2 = sur.place[i];
+        facing = en_sur_facing(sur.px[k2] - ex[i], sur.pz[k2] - ez[i]);
+        sur.facing[i] = (short)facing;
+        *(short *)(ADDR_SUR_FACING + (4 + i) * SUR_ACTOR_STRIDE) = (short)facing;
+        *(short *)(ADDR_SUR_HOME_DIRECTION + (4 + i) * SUR_ACTOR_STRIDE) = (short)facing;
+        at += wsprintfA(foes + at, "%s actor %d (%d, %d) place %d side %s facing %03x", i ? ";" : "", 4 + i, ex[i], ez[i], k2,
+                        sur.side[i] == 0 ? "0 (toward place k+2)" : sur.side[i] == 1 ? "1 (toward place k+1)" : "2 (ahead)", facing);
+    }
+    sur.enemies = n;
+    for (k = 0; k < 3; k++)
+        sur.reach[k] = en_sur_reach(k, n, sur.place, sur.side, sur.count);     /* (stage 2) */
+    sur_menu_said[0] = sur_menu_said[1] = sur_menu_said[2] = 0;
+    sur.placed = 1;
+    sur_rules_apply();                  /* (stage 4) rows off */
+    if (InterlockedIncrement(&sur_logged) <= SUR_LOG_MAX) {
+        log_line("surrounded: battle %lu formation %d, %s: party_radius %d, party_front %d degrees:%s", sur.battle, sur.formation, when,
+                 sur.radius, sur.front, party);
+        log_line("surrounded: battle %lu: %d enemies (in front of places 0/1/2: %d/%d/%d):%s", sur.battle, n, sur.count[0], sur.count[1],
+                 sur.count[2], n ? foes : " none");
+        log_line("surrounded: battle %lu: reach sets (enemy actor bits): place 0 %04x, place 1 %04x, place 2 %04x; the reach rule is %s",
+                 sur.battle, sur.reach[0], sur.reach[1], sur.reach[2],
+                 sur_reach_on > 0 ? "on" : "NOT on (start-up line \"surrounded: reach rule\"): every member reaches every enemy");
+    }
+}
+
+/* At 0042a6c3: the game's party placement, then the triangle (a surrounded battle only). */
+static void __cdecl sur_party_place_hook(void)
+{
+    ((void (__cdecl *)(void))FN_SUR_PARTY_PLACE)();
+    sur.placed = 0;
+    if (sur.armed)
+        sur_apply("the battle's set-up");
+}
+
+/* At 00429f9b: the game's placement of a next formation's enemies, then their facings (and the party's places again). */
+static void __cdecl sur_next_enemies_hook(void)
+{
+    ((void (__cdecl *)(void))FN_SUR_ENEMY_PLACE)();
+    if (sur.armed)
+        sur_apply("a next formation");
+    else if (sur.placed) {
+        sur.placed = 0;
+        if (InterlockedIncrement(&sur_logged) <= SUR_LOG_MAX)
+            log_line("surrounded: the next formation is not surrounded: its enemies stand and face as the game placed them; the party stays on the triangle");
+    }
+}
+
+/* `call target` at `site`? */
+static BOOL sur_call_is(DWORD site, DWORD target)
+{
+    const BYTE *p = (const BYTE *)site;
+
+    return p[0] == 0xe8 && site + 5 + *(const DWORD *)(p + 1) == target;
+}
+
+/* enemies_start: both calls or none, each checked with the bytes around it first. */
+static void install_surrounded(int *ok, int *total)
+{
+    static const BYTE party_before[] = { 0x55, 0x8b, 0xec, 0x51 };    /* FUN_0042a6bf: push ebp; mov ebp, esp; push ecx */
+    static const BYTE party_after[] = { 0x6a, 0x03, 0x6a, 0x00 };     /* push 3; push 0 */
+    static const BYTE next_before[] = { 0x85, 0xc9, 0x75, 0x0c };     /* test ecx, ecx; jne +0c (00bf2a30 still loading) */
+    static const BYTE next_after[] = { 0xc6, 0x05, 0xfc, 0xcd, 0xbf, 0x00, 0x09 };    /* mov byte [00bfcdfc], 9 */
+    BOOL party = bytes_are(SITE_SUR_PARTY_PLACE - 4, party_before, 4) && sur_call_is(SITE_SUR_PARTY_PLACE, FN_SUR_PARTY_PLACE) &&
+                 bytes_are(SITE_SUR_PARTY_PLACE + 5, party_after, 4);
+    BOOL next = bytes_are(SITE_SUR_NEXT_ENEMIES - 4, next_before, 4) && sur_call_is(SITE_SUR_NEXT_ENEMIES, FN_SUR_ENEMY_PLACE) &&
+                bytes_are(SITE_SUR_NEXT_ENEMIES + 5, next_after, 7);
+    int patched = 0;
+
+    *total += 2;
+    if (!party || !next) {
+        sur_hooks = -1;
+        log_line("surrounded: NOT on: the call at %08lx (FUN_0042ae73) is %s, the call at %08lx (FUN_0042b8d2) is %s: a formation of kind = surrounded plays as a normal battle",
+                 SITE_SUR_PARTY_PLACE, party ? "as the exe has it" : "NOT as the exe has it", SITE_SUR_NEXT_ENEMIES,
+                 next ? "as the exe has it" : "NOT as the exe has it");
+        return;
+    }
+    patched += patch_call(SITE_SUR_PARTY_PLACE, FN_SUR_PARTY_PLACE, sur_party_place_hook);
+    patched += patch_call(SITE_SUR_NEXT_ENEMIES, FN_SUR_ENEMY_PLACE, sur_next_enemies_hook);
+    *ok += patched;
+    sur_hooks = patched == 2 ? 1 : -1;
+    log_line("surrounded: %s (calls at %08lx -> %08lx, the party's places, and %08lx -> %08lx, a next formation's enemies; %d of 2 chained): a DLL scene's formation of kind = surrounded is placed as a triangle",
+             patched == 2 ? "on" : "NOT on", SITE_SUR_PARTY_PLACE, FN_SUR_PARTY_PLACE, SITE_SUR_NEXT_ENEMIES, FN_SUR_ENEMY_PLACE, patched);
+    if (sur_hooks == 1) {
+        install_surrounded_reach(ok, total);    /* (stage 2) the reach rule: only with the triangle */
+        install_surrounded_rules(ok, total);    /* (stage 4) back hits, rows, counters, Reflect */
+    }
+}
+
+/* ---- Surrounded (stage 2): the reach rule ----
+   In a surrounded battle (armed and placed, above) a party member's actions aimed at enemies reach only its REACH SET
+   (en_sur_reach: its own place's enemies, the nearer one of each neighbour's; sur.reach[] from the placement). The
+   game's own target code does the work, with the enemies out of reach taken out of what it may aim at, and put back
+   at once:
+     005d9b06  the hit loop's per-turn call of FUN_005dc390 (turn_targets_hook, the existing hook): the targetable word
+               009a8896 loses them for the call (and for a state's re-aim, which runs inside it), the turn's targets
+               (action[6]) lose them after it, then 009a8896 is put back. So a single target out of reach (or dead)
+               becomes another in reach by the game's own retarget, an all-target spell goes at the reach set, a random
+               pick (4x-Cut, Comet2, a limit's random hits: each turn, and each hit from that turn's targets) picks in
+               it, a follow-up (and the DLL's chained follow-ups, split beams, a state's retarget and all_enemies) too.
+     005c94a4  the same call in handler 0x0a (Sense's list 0a 16 09), before Sense reads its target.
+     006db2e2  the battle menu's target selection, each frame: FUN_006e5980 writes the cursor's pool 00dc3c60, then
+               the pool loses them; the cursor (FUN_006e6291, FUN_006e59bc) moves only within the pool, a cursor left
+               on one sounds the buzzer at confirm (006db0ee: DAT_00dc38d0), and the issue (FUN_006d86d2) gives an
+               all-target command the pool's side: the reach set.
+     006e5c68  the same in the cursor's set-up (FUN_006e5c52), which then moves a start outside the pool into it.
+     00436969  the counter call (counter_run_hook, the existing hook): a member hit by an enemy out of its reach runs
+               no counter list (Counter Attack, Counter, Magic Counter) unless it is long range (009a8b39 bit 2: its
+               weapon's targeting has no short-range bit, or the Long Range materia cleared it, FUN_005cfbf5; or
+               00dba4bb bit 4, the materia itself); then the counter is queued as the game does, and at its turn
+               (queue priority 1 with targets, the member long range) it is not narrowed: it hits the attacker.
+   Never narrowed: an enemy's action (actor 4-9, a manipulated one too: its menu, window 0x13, is left alone), a summon
+   (command type 3: Summon, W-Summon, a counter's or Mime's summon, the DLL's summons; the menu: command 3 or 0x16),
+   anything aimed at the party (only enemy bits are taken out), every action of a member who is the last one standing
+   (A7: present, status bits 0x1 KO and 0x4000 Petrify clear), and everything when the battle is not surrounded. A member whose reach set has
+   no living enemy: its cursor finds no enemy (the game's no-target cursor: for one target it moves to an ally, as
+   the game does when no enemy can be aimed at; for all enemies confirm sounds the buzzer); an action already queued
+   finds no target at its turn and takes the hit loop's own no-target exit (005d9bc8, FUN_005dbd40: magic, Enemy
+   Skill, a limit play their "no effect" script, anything else steps forward and back). Nothing waits on anything. */
+#define SITE_SUR_MENU_FRAME     0x006db2e2u  /* in FUN_006db0ee: 0f 85 20 04 00 00 [e8 99 a6 00 00] e8 .. (006db2e7: FFNx reads that call) */
+#define SITE_SUR_MENU_SETUP     0x006e5c68u  /* in FUN_006e5c52: 89 45 fc [e8 13 fd ff ff] 33 c9 66 8b 0d 84 3c dc 00 */
+#define FN_SUR_MENU_POOL        0x006e5980u  /* FUN_006e5980(): 00dc3c60 = the uncovered 009a8898, or every target 009a889a */
+#define SITE_SUR_SENSE_TARGETS  0x005c94a4u  /* in FUN_005c94a1 (handler 0x0a): 55 8b ec [e8 e7 2e 01 00] 5d c3 */
+#define ADDR_SUR_MENU_POOL      0x00dc3c60u  /* word: the actors the target cursor may go to */
+#define ADDR_SUR_MENU_WINDOWS   0x00dc2068u  /* byte per battle menu window, 2 = open; 0x13 = Manipulate's list (FUN_006d86d2) */
+#define ADDR_SUR_QUEUE_ENTRY    0x009a9884u  /* the queue entry being built (FUN_00435789): [0] priority, [2] actor, [6] targets */
+#define ADDR_SUR_ATTACKER       0x009aea64u  /* int: the actor of the action being built (FUN_00435d81) */
+#define ADDR_SUR_LONG_RANGE     0x009a8b39u  /* byte, 0x44 per party slot: 2 = long range (FUN_005cfbf5) */
+#define SUR_COMMAND_SUMMON      3           /* action[10] (Summon, W-Summon 0x16 mapped by 007b7618), and the menu's command */
+#define SUR_COMMAND_W_SUMMON    0x16
+#define SUR_PRIORITY_COUNTER    1           /* FUN_005c8cfa queues a counter (kind 2) at priority 1, at its attackers */
+#define SUR_REACH_LOG_MAX       300
+
+static LONG sur_reach_logged;
+static unsigned sur_removed;            /* the bits of 009a8896 taken out by sur_reach_begin, put back by sur_reach_end */
+
+static BOOL sur_reach_line(void)
+{
+    return InterlockedIncrement(&sur_reach_logged) <= SUR_REACH_LOG_MAX;
+}
+
+/* (stage 4) Is party slot k standing, as the game's defeat test counts it? FUN_00432c60 writes the targetable word
+   009a8896 = the active actors 009ab0aa without the dead (KO 0x1, and imprisoned 0x80000000 while 009aad1e is 0 or
+   3), and the battle loop FUN_0041c0bb ends the battle lost when 009a8896 & ~petrified (0x4000) & 0xf is 0. Read from
+   the actor's own words here, not from 009a8896 (the reach rule narrows that word's enemy bits for a moment, and the
+   game rewrites it once a tick). */
+#define ADDR_SUR_ACTIVE         0x009ab0aau  /* word: the active actors (FUN_00432c60 ANDs 009a8896 with it) */
+#define ADDR_SUR_IMPRISON_RULE  0x009aad1eu  /* word: 0 or 3 = imprisoned (status 0x80000000) counts as dead (FUN_00432c60) */
+static BOOL sur_standing(int k)
+{
+    DWORD status = *(const DWORD *)(ADDR_ACTOR_STATE + k * 0x68);
+    WORD rule = *(const WORD *)ADDR_SUR_IMPRISON_RULE;
+
+    if (*(const signed char *)(ADDR_BATTLE_SLOT_ID + k * 0x10) == -1 || !(*(const WORD *)ADDR_SUR_ACTIVE & (1u << k)))
+        return FALSE;                   /* no member, or not in the active mask */
+    if (status & 0x4001)
+        return FALSE;                   /* KO'd (0x1) or petrified (0x4000) */
+    if ((status & 0x80000000u) && (rule == 0 || rule == 3))
+        return FALSE;                   /* imprisoned, while the battle counts that as down */
+    return TRUE;
+}
+
+/* The enemy bits party actor `actor` cannot reach now; 0 when the rule does not apply (not surrounded, not a party
+   actor, the last member standing: sur_standing). */
+static unsigned sur_out_of_reach(int actor)
+{
+    int k, alive = 0;
+
+    if (sur_reach_on <= 0 || !sur.armed || !sur.placed || actor < 0 || actor > 2)
+        return 0;
+    for (k = 0; k < 3; k++)
+        if (sur_standing(k))
+            alive++;
+    if (alive <= 1)
+        return 0;                       /* the last one standing reaches every enemy */
+    return 0x3f0u & ~sur.reach[actor];
+}
+
+static BOOL sur_long_range(int actor)
+{
+    return (*(const BYTE *)(ADDR_SUR_LONG_RANGE + actor * 0x44) & 2) || (*(const BYTE *)(ADDR_PARTY_LONG_RANGE + actor * 0x440) & 4);
+}
+
+/* Why this party action is not narrowed, or NULL. */
+static const char *sur_exempt(const int *action)
+{
+    const BYTE *entry = (const BYTE *)ADDR_SUR_QUEUE_ENTRY;
+
+    if (action[ACT_COMMAND_TYPE] == SUR_COMMAND_SUMMON)
+        return "a summon";
+    if (entry[0] == SUR_PRIORITY_COUNTER && (int)(signed char)entry[2] == action[ACT_ACTOR] && (*(const WORD *)(entry + 6) & 0x3f0u)
+        && sur_long_range(action[ACT_ACTOR]))
+        return "a long-range member's counter";
+    return NULL;
+}
+
+/* Before the game's FUN_005dc390 for `action`: the enemies out of reach leave 009a8896. Returned (0: nothing done). */
+static unsigned sur_reach_begin(const int *action)
+{
+    unsigned out = sur_out_of_reach(action[ACT_ACTOR]);
+    const char *why;
+
+    if (sur_removed) {                  /* (never expected: a begin without its end) */
+        *(WORD *)ADDR_BATTLE_TARGETABLE |= (WORD)sur_removed;
+        sur_removed = 0;
+    }
+    if (!out)
+        return 0;
+    why = sur_exempt(action);
+    if (why) {
+        if ((action[ACT_TARGETS] & (int)out) && sur_reach_line())
+            log_line("surrounded: actor %d command %02x: %s: not held to its reach (targets %04x)", action[ACT_ACTOR],
+                     action[ACT_COMMAND] & 0xff, why, action[ACT_TARGETS] & 0xffff);
+        return 0;
+    }
+    sur_removed = *(const WORD *)ADDR_BATTLE_TARGETABLE & out;
+    *(WORD *)ADDR_BATTLE_TARGETABLE &= (WORD)~out;
+    return out;
+}
+
+/* After it: the turn's targets lose any enemy out of reach (a dead one the attack may hit, an "everyone" attack, a
+   redirect). `asked`: action[6] before the call, for the log. */
+static void sur_reach_trim(int *action, unsigned out, unsigned asked, const char *where)
+{
+    unsigned now;
+
+    if (!out)
+        return;
+    action[ACT_TARGETS] &= ~(int)out;
+    now = (unsigned)action[ACT_TARGETS] & 0xffff;
+    if (((asked & out) || (!now && (asked & 0x3f0u))) && sur_reach_line())
+        log_line("surrounded: actor %d command %02x (%s): targets asked %04x, out of its reach %04x: %s %04x", action[ACT_ACTOR],
+                 action[ACT_COMMAND] & 0xff, where, asked & 0xffff, out, now ? "goes at" : "no target in reach (the game's no-target exit)", now);
+}
+
+/* After the turn's work: the turn's targets once more (a state's re-aim ran inside), and 009a8896 as it was. */
+static void sur_reach_end(int *action, unsigned out)
+{
+    if (out)
+        action[ACT_TARGETS] &= ~(int)out;
+    *(WORD *)ADDR_BATTLE_TARGETABLE |= (WORD)sur_removed;
+    sur_removed = 0;
+}
+
+/* counter_run_hook, FUN_005c8cfa(actor, 2): may `actor` (hit by the action's actor) run its counter list? (stage 4)
+   Hit from out of its reach and not long range: the list runs with sur_counter_hold = the enemies out of its reach,
+   and the queue call (sur_counter_queue_hook) makes only the counters whose targets are none of those: a counter
+   aimed at itself or the party (FUN_005c8eeb's flags without 2: Magic Counter with Cure, Regen ...). Without that
+   call followed, as stage 2: no counter at all. counter_run_hook clears the hold after the run. */
+static unsigned sur_counter_hold;       /* the enemy bits a counter being queued may not be aimed at; 0: none */
+static BOOL sur_counter_queue_live;     /* the call at 005c8ed5 is followed */
+
+static BOOL sur_counter_allowed(int actor)
+{
+    int attacker = *(const int *)ADDR_SUR_ATTACKER;
+    unsigned out;
+
+    sur_counter_hold = 0;
+    if (attacker < 4 || attacker > 9)
+        return TRUE;
+    out = sur_out_of_reach(actor);
+    if (!(out & (1u << attacker)))
+        return TRUE;
+    if (sur_long_range(actor)) {
+        if (sur_reach_line())
+            log_line("surrounded: member %d was hit by actor %d, out of its reach: it is long range, its counters are as the game's", actor, attacker);
+        return TRUE;
+    }
+    if (sur_counter_queue_live) {
+        sur_counter_hold = out;
+        return TRUE;                    /* (said by the queue hook, for each counter it does not make) */
+    }
+    if (sur_reach_line())
+        log_line("surrounded: member %d was hit by actor %d, out of its reach: no counter", actor, attacker);
+    return FALSE;
+}
+
+/* The menu's pool, just written by FUN_006e5980: the enemies out of the menu member's reach taken out. */
+static void sur_menu_narrow(void)
+{
+    int actor = *(const BYTE *)ADDR_BATTLE_MENU_ACTOR, command = *(const BYTE *)ADDR_MENU_COMMAND;
+    unsigned out, pool;
+
+    if (*(const BYTE *)(ADDR_SUR_MENU_WINDOWS + 0x13) == 2 || command == SUR_COMMAND_SUMMON || command == SUR_COMMAND_W_SUMMON)
+        return;                         /* a manipulated enemy's command; a summon */
+    out = sur_out_of_reach(actor);
+    pool = *(const WORD *)ADDR_SUR_MENU_POOL;
+    if (!(pool & out))
+        return;
+    *(WORD *)ADDR_SUR_MENU_POOL = (WORD)(pool & ~out);
+    if (!(sur_menu_said[actor] & 1) && sur_reach_line())
+        log_line("surrounded: member %d's target cursor (command %02x): the enemies out of its reach (%04x) are not offered: pool %04x -> %04x",
+                 actor, command, out, pool, pool & ~out);
+    sur_menu_said[actor] |= 1;
+    if (!(pool & ~out & 0x3f0u) && !(sur_menu_said[actor] & 2)) {
+        sur_menu_said[actor] |= 2;
+        if (sur_reach_line())
+            log_line("surrounded: member %d has no enemy in reach: its cursor offers no enemy (one target: an ally, as the game when no enemy can be aimed at; all enemies: confirm buzzes)",
+                     actor);
+    }
+}
+
+static void __cdecl sur_menu_frame_hook(void)
+{
+    ((void (__cdecl *)(void))FN_SUR_MENU_POOL)();
+    sur_menu_narrow();
+}
+
+static void __cdecl sur_menu_setup_hook(void)
+{
+    ((void (__cdecl *)(void))FN_SUR_MENU_POOL)();
+    sur_menu_narrow();
+}
+
+/* Handler 0x0a's call of FUN_005dc390 (Sense, before it reads its target). */
+static void __cdecl sur_sense_targets_hook(void)
+{
+    int *action = current_action();
+    unsigned asked = (unsigned)action[ACT_TARGETS], out = sur_reach_begin(action);
+
+    ((void (__cdecl *)(void))FN_TURN_TARGETS)();
+    sur_reach_trim(action, out, asked, "Sense");
+    sur_reach_end(action, out);
+}
+
+/* install_surrounded, with the triangle on: the three new calls checked first (none written unless all three are
+   the exe's), the per-turn and counter calls hooked if the limit states have not done it yet. Refused: one line, and
+   every member reaches every enemy (the triangle stays). */
+static void install_surrounded_reach(int *ok, int *total)
+{
+    static const BYTE frame_before[6] = { 0x0f, 0x85, 0x20, 0x04, 0x00, 0x00 };        /* jne 006db702 (menu state not 0) */
+    static const BYTE setup_before[3] = { 0x89, 0x45, 0xfc };                          /* mov [ebp-4], eax */
+    static const BYTE setup_after[9] = { 0x33, 0xc9, 0x66, 0x8b, 0x0d, 0x84, 0x3c, 0xdc, 0x00 };  /* xor ecx, ecx; mov cx, [00dc3c84] */
+    static const BYTE sense_before[3] = { 0x55, 0x8b, 0xec }, sense_after[2] = { 0x5d, 0xc3 };   /* push ebp; mov ebp, esp / pop ebp; ret */
+    BOOL frame = bytes_are(SITE_SUR_MENU_FRAME - 6, frame_before, 6) && sur_call_is(SITE_SUR_MENU_FRAME, FN_SUR_MENU_POOL) &&
+                 *(const BYTE *)(SITE_SUR_MENU_FRAME + 5) == 0xe8;
+    BOOL setup = bytes_are(SITE_SUR_MENU_SETUP - 3, setup_before, 3) && sur_call_is(SITE_SUR_MENU_SETUP, FN_SUR_MENU_POOL) &&
+                 bytes_are(SITE_SUR_MENU_SETUP + 5, setup_after, 9);
+    BOOL sense = bytes_are(SITE_SUR_SENSE_TARGETS - 3, sense_before, 3) && sur_call_is(SITE_SUR_SENSE_TARGETS, FN_TURN_TARGETS) &&
+                 bytes_are(SITE_SUR_SENSE_TARGETS + 5, sense_after, 2);
+    int patched = 0;
+
+    *total += 3;
+    if (!frame || !setup || !sense) {
+        sur_reach_on = -1;
+        log_line("surrounded: reach rule NOT on: the call at %08lx is %s, at %08lx %s, at %08lx %s (each must call %08lx / %08lx / %08lx with the exe's bytes round it): every member reaches every enemy",
+                 SITE_SUR_MENU_FRAME, frame ? "as the exe has it" : "NOT as the exe has it", SITE_SUR_MENU_SETUP,
+                 setup ? "as the exe has it" : "NOT as the exe has it", SITE_SUR_SENSE_TARGETS, sense ? "as the exe has it" : "NOT as the exe has it",
+                 FN_SUR_MENU_POOL, FN_SUR_MENU_POOL, FN_TURN_TARGETS);
+        return;
+    }
+    if (!turn_hook_live)
+        turn_hook_live = patch_call_chained(SITE_TURN_TARGETS, FN_TURN_TARGETS, turn_targets_hook, &turn_targets_next);
+    if (!counter_hook_live)
+        counter_hook_live = install_counter_call();
+    if (!turn_hook_live || !counter_hook_live) {
+        sur_reach_on = -1;
+        log_line("surrounded: reach rule NOT on: the per-turn call %08lx is %s, the counter call %08lx is %s: every member reaches every enemy",
+                 SITE_TURN_TARGETS, turn_hook_live ? "followed" : "NOT followed", SITE_COUNTER_RUN, counter_hook_live ? "followed" : "NOT followed");
+        return;
+    }
+    patched += patch_call(SITE_SUR_MENU_FRAME, FN_SUR_MENU_POOL, sur_menu_frame_hook);
+    patched += patch_call(SITE_SUR_MENU_SETUP, FN_SUR_MENU_POOL, sur_menu_setup_hook);
+    patched += patch_call(SITE_SUR_SENSE_TARGETS, FN_TURN_TARGETS, sur_sense_targets_hook);
+    *ok += patched;
+    sur_reach_on = patched == 3 ? 1 : -1;      /* (a call left unpatched: the others are inert while this is not 1) */
+    log_line("surrounded: reach rule %s (calls at %08lx and %08lx -> %08lx, the menu's target pool; %08lx -> %08lx, Sense; %d of 3 chained; the per-turn call %08lx -> %08lx and the counter call %08lx followed): in a surrounded battle a member's attacks reach only its reach set",
+             patched == 3 ? "on" : "NOT on", SITE_SUR_MENU_FRAME, SITE_SUR_MENU_SETUP, FN_SUR_MENU_POOL, SITE_SUR_SENSE_TARGETS, FN_TURN_TARGETS,
+             patched, SITE_TURN_TARGETS, turn_targets_next, SITE_COUNTER_RUN);
+}
+
+/* ---- Surrounded (stage 4): the rules ----
+   The user's answers A8-A12 (tools/work/surrounded_encounter/REQUIREMENTS.md), each the game's own rule, in a
+   surrounded battle only (armed and placed); elsewhere every hook below is the game's call and nothing more.
+     A8 back hits   The hit-step table's physical check (physical_hit_check_hook, entry 0 of 007b77a8): an enemy's hit
+                    on a member from outside that member's place (sur.place: not one of its own enemies) gets the
+                    member's flag 0x80 (009ab0e0) set for the game's FUN_005ddbb0 only. Its FUN_005de356 then finds the
+                    two in different groups (party 0, enemies 1 under kind 0) with the same 0x80, the pincer's back
+                    hit: action[0x8d] |= 1, the hit lands (255), and FUN_005de5df multiplies the damage by the target's
+                    back multiplier / 8 (009ab0ee: 0x10 for every member, x2). The game's back hit is physical only
+                    (FUN_005de356's one call is in the physical check; no other formula reads action[0x8d]). The flag
+                    is put back after the call (also FUN_005de53b's turn of it on the hit, from action[0x8d] bit 2).
+                    A party member's hit on an enemy: never (each enemy faces its member; under kind 0 the game finds
+                    no back hit there, and nothing is changed).
+     A9 no escape   sur_arm (above): the set-up's escape flag and the field flag 8, as the game makes a battle that
+                    cannot be fled: L1+R1, Exit, Smoke Bomb and any escape effect give "can't escape".
+     A10 gauges     nothing: kind 0 (word 009aad20 = 0) is FUN_004383f5's normal start.
+     A11 rows off   sur_rows_off at sur_arm (the scene's load, 00437f0d in FUN_00437db0: before FUN_005d0ca0 and the
+                    AI's init scripts FUN_005cfe10, so an init sees the front row; stage 4b) and again at each
+                    placement (sur_rules_apply): every member's back-row flag 0x40 (009ab0e0) and row word 009a87fa
+                    cleared, as FUN_005d0ca0 does for kind words 3 and 4 (side, pincer). So FUN_005de5df halves
+                    no member's physical damage for rows, dealt or taken; a long-range attack (Long Range materia, a
+                    long-range weapon: no short-range bit 0x20 in action[0x14]) was never halved and is the same. The
+                    row change is refused as in a pincer: the menu's Change (state table 0091e6b8 entry 2,
+                    FUN_006d9dbe) is run with the kind byte 009a8762 read as 4 (its confirm sounds the buzzer, nothing
+                    is issued), and FUN_005c7f60 (009aad20 < 3) answers 0 at its two calls: Change's handler 0x04
+                    (script -1, nothing) and additional effect 0x19 (an enemy attack that moves a member's row).
+                    Enemies' rows are the scene's (rows = ... :row), as in the game's pincer.
+     A12 counters   counter_run_hook (stage 2) now lets the list run for a member hit from out of its reach, with
+                    sur_counter_hold = the enemies out of its reach; the counter queue call in FUN_005c8cfa (005c8ed5)
+                    makes only the counters aimed at none of them: those at itself or the party (FUN_005c8eeb's
+                    flags without 2: the member's bit) are made, those at the attacker (the attackers' mask 009ab0f6)
+                    are not. Long range: as stage 2 (every counter, not narrowed at its turn).
+     Reflect        the bounce of a party member's spell off a party member with Reflect (FUN_005da5da: FUN_005db199
+                    picks one enemy at random of 009a8894 & 0x3f0) picks, with the game's FUN_005d19a4, one of the
+                    caster's reach set instead; none there (or the rule does not apply): the game's own pick.
+   Every site is checked (the call and its neighbours, the routine's first bytes) before it is written; a refused
+   rule: one line, and that rule is the game's (a refused row call leaves the flags cleared but the change allowed;
+   a refused counter call leaves stage 2's rule: no counter at all from out of reach). FFNx 1.24.3 reads the state
+   table (entries 0, 19, 26 at its start-up, not entry 2) and patches none of these routines. */
+#define ADDR_SUR_ACTOR_FLAGS    0x009ab0e0u  /* dword, 0x68 per actor: 0x80 "faces +z" (the back-hit test), 0x40 back row */
+#define ADDR_SUR_ROW_SHOWN      0x009a87fau  /* word, 0x10 per party slot: 1 = back row (FUN_005d0ca0; the places, FUN_0042b4af) */
+#define ADDR_SUR_BACK_MULT      0x009ab0eeu  /* byte, 0x68 per actor: the back-hit multiplier, in eighths */
+#define SITE_SUR_ROW_CHANGE     0x005c92b6u  /* in FUN_005c92a7 (handler 0x04): c7 40 20 ff ff ff ff [e8 a5 ec ff ff] 85 c0 74 49 */
+#define SITE_SUR_ROW_EFFECT     0x005dd290u  /* in FUN_005dc880 (effect 0x19): e9 c3 03 00 00 [e8 cb ac fe ff] 85 c0 74 68 */
+#define FN_SUR_ROW_ALLOWED      0x005c7f60u  /* FUN_005c7f60(): 009aad20 < 3; 55 8b ec 83 ec 08 c7 45 */
+#define ADDR_SUR_MENU_CHANGE    0x0091e6c0u  /* the battle menu's state table 0091e6b8, entry 2 */
+#define FN_SUR_MENU_CHANGE      0x006d9dbeu  /* FUN_006d9dbe: 55 8b ec 83 ec 08 a0 62 87 9a 00 (mov al, [009a8762]) */
+#define SUR_KIND_PINCER         4
+#define SITE_SUR_COUNTER_QUEUE  0x005c8ed5u  /* in FUN_005c8cfa: 8b 45 08 50 [e8 ad 97 e6 ff] 83 c4 14 */
+#define FN_SUR_QUEUE_ACTION     0x00432687u  /* FUN_00432687(actor, priority, command, id, targets): 55 8b ec 83 ec 08 8a 45 */
+#define SITE_SUR_REFLECT_PICK   0x005da8e3u  /* in FUN_005da5da: 8b 55 0c 52 [e8 b1 08 00 00] 83 c4 04 89 45 e4 */
+#define FN_SUR_REFLECT_PICK     0x005db199u  /* FUN_005db199(reflector): 55 8b ec 51 33 c0 83 7d */
+#define FN_SUR_PICK_ONE         0x005d19a4u  /* FUN_005d19a4(mask): one of its bits at random; 55 8b ec 83 ec 08 66 c7 */
+#define SUR_RULES_LOG_MAX       200
+
+static LONG sur_rules_logged;
+static LONG sur_rows_live, sur_reflect_live, sur_back_live;
+static BYTE sur_back_said[3][6];        /* member k hit from behind by actor 4 + i: said once a battle */
+static BYTE sur_change_said[3];
+
+static BOOL sur_rules_line(void)
+{
+    return InterlockedIncrement(&sur_rules_logged) <= SUR_RULES_LOG_MAX;
+}
+
+static BOOL sur_on(void)
+{
+    return sur.armed && sur.placed;
+}
+
+/* (stage 4b) Rows off: each present member's back-row flag 0x40 (009ab0e0) and row word 009a87fa cleared; the members
+   found in the back row are kept in sur_rows_back for the log. Called at sur_arm (the scene's load, 00437f0d, before
+   FUN_005d0ca0 and the AI's init scripts) and again at each placement (sur_rules_apply), where nothing is left to do:
+   kind 0 has no writer of a member's 0x40 between them (FUN_005d0ca0 copies it; FUN_00432c60 writes it for enemies
+   only; the Change and effect 0x19 are refused). The save's row (00dbfdac) is only read, by FUN_005cf650. */
+static void sur_rows_off(void)
+{
+    int k;
+
+    for (k = 0; k < 3; k++) {
+        DWORD *flags = (DWORD *)(ADDR_SUR_ACTOR_FLAGS + k * 0x68);
+
+        if (*(const signed char *)(ADDR_BATTLE_SLOT_ID + k * 0x10) == -1)
+            continue;
+        if (*flags & 0x40)
+            sur_rows_back |= 1u << k;
+        *flags &= ~0x40u;
+        *(WORD *)(ADDR_SUR_ROW_SHOWN + k * 0x10) = 0;
+    }
+}
+
+/* sur_apply, at each placement: the rows line (rows off were done at sur_arm). */
+static void sur_rules_apply(void)
+{
+    int k, i;
+
+    for (k = 0; k < 3; k++) {
+        sur_change_said[k] = 0;
+        for (i = 0; i < 6; i++)
+            sur_back_said[k][i] = 0;
+    }
+    sur_rows_off();                     /* (stage 4b) done at sur_arm already: nothing is expected to be left here */
+    if (sur_rules_line())
+        log_line("surrounded: battle %lu: rows off (members in the back row, bits %x, are front row for this battle; a row change is %s); back hits %s; counters from out of reach: %s; Reflect: %s",
+                 sur.battle, sur_rows_back, sur_rows_live > 0 ? "refused" : "NOT refused (start-up line \"surrounded: rules\")",
+                 sur_back_live > 0 ? "on" : "NOT on", sur_counter_queue_live ? "only those at itself or the party" : "none",
+                 sur_reflect_live > 0 ? "a bounce stays in the caster's reach" : "the game's bounce");
+}
+
+/* physical_hit_check_hook, before the game's check: an enemy's hit on a member from outside its place is a back hit.
+   Returns the target + 1 when its flag 0x80 was set (*saved: the flag as it was), else 0. */
+static int sur_back_hit_begin(const int *action, DWORD *saved)
+{
+    int attacker = action[ACT_ACTOR], target = action[0x82];
+    DWORD *flags;
+
+    if (sur_back_live <= 0 || !sur_on() || attacker < 4 || attacker > 9 || target < 0 || target > 2)
+        return 0;
+    if (attacker - 4 >= sur.enemies || sur.place[attacker - 4] < 0 || sur.place[attacker - 4] == target)
+        return 0;                       /* one of its own enemies (or one the placement did not see) */
+    flags = (DWORD *)(ADDR_SUR_ACTOR_FLAGS + target * 0x68);
+    *saved = *flags & 0x80;
+    *flags |= 0x80;
+    return target + 1;
+}
+
+/* After the game's check: the flag put back; said once a battle per member and enemy when it was a back hit. */
+static void sur_back_hit_end(const int *action, int begun, DWORD saved)
+{
+    int target = begun - 1, attacker = action[ACT_ACTOR];
+    DWORD *flags;
+
+    if (!begun)
+        return;
+    flags = (DWORD *)(ADDR_SUR_ACTOR_FLAGS + target * 0x68);
+    *flags = (*flags & ~0x80u) | saved;
+    if ((action[0x8d] & 1) && !sur_back_said[target][attacker - 4]) {
+        sur_back_said[target][attacker - 4] = 1;
+        if (sur_rules_line())
+            log_line("surrounded: actor %d (place %d) hit member %d from behind: the game's back hit (it lands; damage x %d/8; said once a battle)",
+                     attacker, sur.place[attacker - 4], target, *(const BYTE *)(ADDR_SUR_BACK_MULT + target * 0x68));
+    }
+}
+
+/* FUN_005c7f60 at its two calls (Change, effect 0x19): no row change in a surrounded battle. */
+static int sur_row_refused(int allowed, const char *what)
+{
+    const int *action = current_action();
+
+    if (!allowed || sur_rows_live <= 0 || !sur_on())
+        return allowed;
+    if (sur_rules_line())
+        log_line("surrounded: %s (actor %d, command %02x): refused, rows are off", what, action[ACT_ACTOR], action[ACT_COMMAND] & 0xff);
+    return 0;
+}
+
+static int __cdecl sur_row_change_hook(void)
+{
+    return sur_row_refused(((int (__cdecl *)(void))FN_SUR_ROW_ALLOWED)(), "Change");
+}
+
+static int __cdecl sur_row_effect_hook(void)
+{
+    return sur_row_refused(((int (__cdecl *)(void))FN_SUR_ROW_ALLOWED)(), "a hit that moves a member's row (effect 0x19)");
+}
+
+/* The battle menu's state 2 (Change, confirm or cancel): the game's routine, with the kind byte read as a pincer's. */
+static void __cdecl sur_menu_change_hook(void)
+{
+    BYTE *kind = (BYTE *)(ADDR_SCENE_SETUP + 0x12);
+    BYTE keep = *kind;
+    BOOL off = sur_rows_live > 0 && sur_on() && keep == 0;
+    int member = *(const BYTE *)ADDR_BATTLE_MENU_ACTOR;
+
+    if (off)
+        *kind = SUR_KIND_PINCER;
+    ((void (__cdecl *)(void))FN_SUR_MENU_CHANGE)();
+    if (off) {
+        *kind = keep;
+        if (member >= 0 && member <= 2 && !sur_change_said[member]) {
+            sur_change_said[member] = 1;
+            if (sur_rules_line())
+                log_line("surrounded: member %d's Change: refused as in a pincer (confirm buzzes; said once a battle)", member);
+        }
+    }
+}
+
+/* The counter queue call in FUN_005c8cfa: a counter aimed at an enemy out of reach (sur_counter_hold) is not made. */
+static void __cdecl sur_counter_queue_hook(int actor, int priority, int command, int id, int targets)
+{
+    unsigned held = sur_counter_hold & (unsigned)targets & 0xffffu;
+
+    if (held) {
+        unsigned rest = (unsigned)targets & 0xffffu & ~sur_counter_hold;
+
+        if (sur_reach_line())
+            log_line("surrounded: member %d's counter (command %02x, ID %d) at %04x: %04x out of its reach: %s %04x", actor, command & 0xff, id & 0xffff,
+                     targets & 0xffff, held, rest ? "made at" : "not made", rest);
+        if (!rest)
+            return;
+        targets = (int)rest;
+    }
+    ((void (__cdecl *)(int, int, int, int, int))FN_SUR_QUEUE_ACTION)(actor, priority, command, id, targets);
+}
+
+static void sur_counter_done(void)
+{
+    sur_counter_hold = 0;
+}
+
+/* The bounce pick of FUN_005da5da: a party caster's spell off a party reflector goes at an enemy of the caster's reach. */
+static unsigned __cdecl sur_reflect_pick_hook(int reflector)
+{
+    const int *action = current_action();
+    unsigned out, pool;
+
+    if (reflector >= 0 && reflector <= 2 && (out = sur_out_of_reach(action[ACT_ACTOR])) != 0 && !sur_exempt(action)) {
+        pool = *(const WORD *)ADDR_BATTLE_ACTORS & 0x3f0u;     /* the game's pool for a party reflector */
+        if (pool & ~out) {
+            unsigned bit = ((unsigned (__cdecl *)(unsigned))FN_SUR_PICK_ONE)(pool & ~out) & 0xffffu;
+
+            if (sur_reach_line())
+                log_line("surrounded: actor %d's spell bounced off member %d (Reflect): it goes at %04x, of its reach %04x", action[ACT_ACTOR], reflector, bit,
+                         pool & ~out);
+            return bit;
+        }
+        if (sur_reach_line())
+            log_line("surrounded: actor %d's spell bounced off member %d (Reflect): no enemy of its reach is there: the game's pick", action[ACT_ACTOR], reflector);
+    }
+    return ((unsigned (__cdecl *)(int))FN_SUR_REFLECT_PICK)(reflector);
+}
+
+/* install_surrounded, with the triangle on. Each rule by itself: its sites checked first, none written otherwise. */
+static void install_surrounded_rules(int *ok, int *total)
+{
+    static const BYTE change_before[7] = { 0xc7, 0x40, 0x20, 0xff, 0xff, 0xff, 0xff }, change_after[4] = { 0x85, 0xc0, 0x74, 0x49 };
+    static const BYTE effect_before[5] = { 0xe9, 0xc3, 0x03, 0x00, 0x00 }, effect_after[4] = { 0x85, 0xc0, 0x74, 0x68 };
+    static const BYTE allowed_head[8] = { 0x55, 0x8b, 0xec, 0x83, 0xec, 0x08, 0xc7, 0x45 };
+    static const BYTE menu_head[11] = { 0x55, 0x8b, 0xec, 0x83, 0xec, 0x08, 0xa0, 0x62, 0x87, 0x9a, 0x00 };
+    static const BYTE queue_before[4] = { 0x8b, 0x45, 0x08, 0x50 }, queue_after[3] = { 0x83, 0xc4, 0x14 };
+    static const BYTE queue_head[8] = { 0x55, 0x8b, 0xec, 0x83, 0xec, 0x08, 0x8a, 0x45 };
+    static const BYTE reflect_before[4] = { 0x8b, 0x55, 0x0c, 0x52 }, reflect_after[6] = { 0x83, 0xc4, 0x04, 0x89, 0x45, 0xe4 };
+    static const BYTE reflect_head[8] = { 0x55, 0x8b, 0xec, 0x51, 0x33, 0xc0, 0x83, 0x7d };
+    static const BYTE pick_head[8] = { 0x55, 0x8b, 0xec, 0x83, 0xec, 0x08, 0x66, 0xc7 };
+    BOOL rows = bytes_are(SITE_SUR_ROW_CHANGE - 7, change_before, 7) && sur_call_is(SITE_SUR_ROW_CHANGE, FN_SUR_ROW_ALLOWED) &&
+                bytes_are(SITE_SUR_ROW_CHANGE + 5, change_after, 4) && bytes_are(SITE_SUR_ROW_EFFECT - 5, effect_before, 5) &&
+                sur_call_is(SITE_SUR_ROW_EFFECT, FN_SUR_ROW_ALLOWED) && bytes_are(SITE_SUR_ROW_EFFECT + 5, effect_after, 4) &&
+                bytes_are(FN_SUR_ROW_ALLOWED, allowed_head, 8) && *(const DWORD *)ADDR_SUR_MENU_CHANGE == FN_SUR_MENU_CHANGE &&
+                bytes_are(FN_SUR_MENU_CHANGE, menu_head, 11);
+    BOOL queue = bytes_are(SITE_SUR_COUNTER_QUEUE - 4, queue_before, 4) && sur_call_is(SITE_SUR_COUNTER_QUEUE, FN_SUR_QUEUE_ACTION) &&
+                 bytes_are(SITE_SUR_COUNTER_QUEUE + 5, queue_after, 3) && bytes_are(FN_SUR_QUEUE_ACTION, queue_head, 8);
+    BOOL reflect = bytes_are(SITE_SUR_REFLECT_PICK - 4, reflect_before, 4) && sur_call_is(SITE_SUR_REFLECT_PICK, FN_SUR_REFLECT_PICK) &&
+                   bytes_are(SITE_SUR_REFLECT_PICK + 5, reflect_after, 6) && bytes_are(FN_SUR_REFLECT_PICK, reflect_head, 8) &&
+                   bytes_are(FN_SUR_PICK_ONE, pick_head, 8);
+    int n;
+
+    *total += 6;
+    if (rows) {
+        n = patch_call(SITE_SUR_ROW_CHANGE, FN_SUR_ROW_ALLOWED, sur_row_change_hook);
+        n += patch_call(SITE_SUR_ROW_EFFECT, FN_SUR_ROW_ALLOWED, sur_row_effect_hook);
+        n += patch_pointer(ADDR_SUR_MENU_CHANGE, FN_SUR_MENU_CHANGE, sur_menu_change_hook);
+        *ok += n;
+        sur_rows_live = n == 3 ? 1 : -1;
+    } else
+        sur_rows_live = -1;
+    if (queue && patch_call(SITE_SUR_COUNTER_QUEUE, FN_SUR_QUEUE_ACTION, sur_counter_queue_hook)) {
+        sur_counter_queue_live = TRUE;
+        (*ok)++;
+    }
+    if (reflect && patch_call(SITE_SUR_REFLECT_PICK, FN_SUR_REFLECT_PICK, sur_reflect_pick_hook)) {
+        sur_reflect_live = 1;
+        (*ok)++;
+    } else
+        sur_reflect_live = -1;
+    if (!evade_hook_live)
+        evade_hook_live = install_evade_hook();     /* (shared with a state's physical_evade) */
+    sur_back_live = evade_hook_live ? 1 : -1;
+    *ok += evade_hook_live ? 1 : 0;
+    log_line("surrounded: rules: rows off %s (calls %08lx and %08lx -> %08lx, state table entry %08lx -> %08lx); counters from out of reach %s (call %08lx -> %08lx); Reflect %s (call %08lx -> %08lx); back hits %s (hit-step table %08lx); no escape: data only",
+             sur_rows_live > 0 ? "on" : "NOT on: the row change is not refused", SITE_SUR_ROW_CHANGE, SITE_SUR_ROW_EFFECT, FN_SUR_ROW_ALLOWED,
+             ADDR_SUR_MENU_CHANGE, FN_SUR_MENU_CHANGE,
+             sur_counter_queue_live ? "on: only those at itself or the party" : "NOT on: none (as stage 2)", SITE_SUR_COUNTER_QUEUE, FN_SUR_QUEUE_ACTION,
+             sur_reflect_live > 0 ? "on" : "NOT on: the game's bounce", SITE_SUR_REFLECT_PICK, FN_SUR_REFLECT_PICK,
+             sur_back_live > 0 ? "on" : "NOT on", ADDR_HIT_STEP_PHYSICAL);
+}
+
 /* ---- the load (load_scene_hook) ---- */
 
 /* The DLL scene's buffers written over the stand-in's, the field's flags put back, the tail again, the
@@ -46611,6 +52024,7 @@ static void enemies_overwrite(DWORD number)
     t.flags = *(const WORD *)(ADDR_SCENE_SETUP + 0x10);
     t.kind = *(const BYTE *)(ADDR_SCENE_SETUP + 0x12);
     t.escape = *(const WORD *)(ADDR_SCENE_SETUP + 4);
+    t.surrounded = enemies_staged.surrounded[f];
     if (en_tail(&t, (const BYTE *)ADDR_KIND_TABLE))
         log_line("enemies: the field's battle flags ask for the Battle Square (%04x): its part of the loader's tail is not done for a DLL scene", t.field_flags);
     *(WORD *)ADDR_BATTLE_FIELD_FLAGS = t.field_flags;
@@ -46619,6 +52033,7 @@ static void enemies_overwrite(DWORD number)
     *(WORD *)0x009aad20u = t.kind_word;
     *(WORD *)0x009aad0au = t.escape_now;
     *(WORD *)0x009aad0eu = t.escape_copy;
+    sur_arm(f);                         /* (surrounded) armed when this formation is one */
     /* the pool: slot i's model from its folder for this battle */
     for (i = 0; i < ENEMIES_POOL_COUNT; i++) {
         enemies_model_assign(i, i < 3 && enemies_staged.served[i] ? enemies_staged.folder[i] : "");
@@ -46844,6 +52259,7 @@ static void enemies_start(int *ok, int *total)
     *ok += test_battle_hook > 0;
     opens = enemies_find_driver_opens();
     enemies_native_base_check();
+    install_surrounded(ok, total);      /* (surrounded) the two placement calls */
     enemies_live = 1;
     enemies_read_registry();
     enemies_static_models();
@@ -46869,13 +52285,16 @@ static void load_game_settings(void)
     {
         int k;
 
-        for (k = 0; k < ROSTER_MAX; k++)    /* each field_model is looked for again, or taken on trust, from the next field on */
+        for (k = 0; k < ROSTER_MAX; k++) {  /* each field_model is looked for again, or taken on trust, from the next field on */
             new_characters[k].field_model_found = 0;
+            new_characters[k].field_when_found = 0;     /* (the outfit swap) and each field_model_when's skeleton */
+        }
     }
     items_on_load_count = 0;
     wide_items_asked = WIDE_OFF;    /* (the wide list) the key's default; taken for the run at the first reading only (wide_items_settle) */
     wide_rows_asked = WIDE_V2_ROWS;     /* (stage 3) the same for wide_rows: 510 unless the file says 320 (owner, 2026-10-14) (stage 4: or another number) */
     wide_rows_given = FALSE;
+    wide_throw_asked = 1;           /* (wide throw) on unless the file says off; taken for the run at the first reading only (wide_throw_gate) */
     box_keys_begin();               /* (the box) its keys' defaults; taken for the run at the first reading only (box_keys_settle) */
     test_fill_rows = 0;
     ach_view_on = 1;                /* (the materia view) the key's default: yes unless the file says no */
@@ -46883,7 +52302,8 @@ static void load_game_settings(void)
     test_stitm_count = test_stitm_next = 0;     /* (receive) */
     shop_add_count = 0;
     test_battle = TEST_BATTLE_OFF;  /* (test_battle) off unless this reading names a battle */
-    fields_keys_begin();            /* (field capacity) fields_file, fields_table_size, field_buffer_bytes: their defaults */
+    test_party_damage = 0;          /* (test_party_damage) off unless this reading names an amount */
+    fields_keys_begin();           /* (field capacity) fields_file, fields_table_size, field_buffer_bytes: their defaults */
     bl_keys_begin();                /* (breaking limits) breaking_limits, wide_skeletons: their defaults */
     enemies_keys_begin();           /* (enemies) enemies: off unless the file says on */
     battle_menu_keys_begin();       /* (battle menu) battle_menu and its test mode's keys: their defaults */
@@ -46973,9 +52393,9 @@ static void load_game_settings(void)
 
                     if (!parse_number(&p, word_end, &shop) || shop >= SHOP_COUNT || p >= word_end || *p != ':' ||
                         (p++, (p < word_end && (*p == 'm' || *p == 'M')) ? (materia = TRUE, p++, 0) : 0) ||
-                        !parse_number(&p, word_end, &id) || (id > (materia ? 254u : 511u) && (materia || !wide_item_number((int)id))) || p != word_end ||
+                        !parse_number(&p, word_end, &id) || (materia ? id > 254u : !shop_item_number_ok(id)) || p != word_end ||
                         shop_add_count == SHOP_ADD_MAX) {
-                        log_line("game file line %d: shop_add takes entries like 37:243 (shop 0 to 79, item ID 0 to 511 or a wide item's number 1024 to 9999) or 37:m49 (a materia ID)", line_number);
+                        log_line("game file line %d: shop_add takes entries like 37:243 (shop 0 to 79, item ID 0 to 511, a wide item's number 1024 to 9999 or a wide weapon, armour or accessory's number 10000 to 27999) or 37:m49 (a materia ID)", line_number);
                         problems++;
                         break;
                     }
@@ -46988,6 +52408,14 @@ static void load_game_settings(void)
                 if (!test_battle_value(value, stop, &test_battle)) {
                     test_battle = TEST_BATTLE_OFF;
                     log_line("game file line %d: test_battle takes a battle number 1 to 16383 (like 16; 1024 and up: a DLL scene's, with enemies = on), or scene:formation (like 4:0; scene 0 to 4095, formation 0 to 3), or off: the line gives nothing", line_number);
+                    problems++;
+                }
+            } else if (word_is(start, key_end, "test_party_damage")) {
+                /* TESTING AID: every party member's HP damage to an enemy is this (see test_party_damage_amount);
+                   a line with a mistake leaves it off */
+                if (!test_party_damage_value(value, stop, &test_party_damage)) {
+                    test_party_damage = 0;
+                    log_line("game file line %d: test_party_damage takes a number 1 to %d (like 9999), or off: the line gives nothing", line_number, TEST_PARTY_DAMAGE_MAX);
                     problems++;
                 }
             } else if (word_is(start, key_end, "seats")) {
@@ -47022,6 +52450,15 @@ static void load_game_settings(void)
             } else if (word_is(start, key_end, "wide_rows")) {
                 if (!wide_rows_key(value, stop)) {
                     log_line("game file line %d: wide_rows must be 320 or an even number from 510 to %d: 510 is used", line_number, WIDE_ROWS_MAX);
+                    problems++;
+                }
+            } else if (word_is(start, key_end, "wide_throw")) {
+                if (word_is(value, stop, "on"))
+                    wide_throw_asked = 1;
+                else if (word_is(value, stop, "off"))
+                    wide_throw_asked = 0;
+                else {
+                    log_line("game file line %d: wide_throw must be on or off: on is used", line_number);
                     problems++;
                 }
             } else if (word_is(start, key_end, "test_fill_rows")) {
@@ -47106,11 +52543,19 @@ static void load_game_settings(void)
     test_battle_settle();           /* (test_battle) */
     battle_menu_keys_settle();      /* (battle menu) one line when what the keys say has changed */
     {
-        static LONG fixed_hooked;
+        static LONG fixed_hooked, fixed_live;
 
-        if (!InterlockedExchange(&fixed_hooked, 1) &&
-            !patch_call(SITE_HIT_IMMUNE_CHECK, FN_HIT_IMMUNE_CHECK, fixed_damage_hook))
-            log_line("fixed_damage: hook not installed; the key will have no effect");
+        if (!InterlockedExchange(&fixed_hooked, 1)) {
+            fixed_live = patch_call(SITE_HIT_IMMUNE_CHECK, FN_HIT_IMMUNE_CHECK, fixed_damage_hook);
+            if (!fixed_live)
+                log_line("fixed_damage: hook not installed; the key will have no effect");
+        }
+        if (test_party_damage && fixed_live)    /* (test_party_damage) one line when on, none when off */
+            log_line("TESTING AID: test_party_damage = %lu: every hit of a party member's action that takes HP from an enemy takes %lu (held to the enemy damage limit, %lu); misses, healing, absorbed hits, MP and hits on the party stay the game's; remove the line when done",
+                     test_party_damage, test_party_damage > hp_limit ? hp_limit : test_party_damage, hp_limit);
+        else if (test_party_damage)
+            log_line("TESTING AID: test_party_damage = %lu is NOT on: the hit's call at %08lx is not the expected one (see the line above)",
+                     test_party_damage, SITE_HIT_IMMUNE_CHECK);
     }
     if (!set_limit_operand(ADDR_ENEMY_HP_LIMIT, 0xfc, hp_limit) || !set_limit_operand(ADDR_ENEMY_MP_LIMIT, 0xf0, mp_limit)) {
         log_line("damage limit: the game's code is not as expected; left alone");
@@ -52701,6 +58146,7 @@ static void reload_characters(void)
         else if (owner)
             release_limit_block(owner);                 /* the limits file no longer gives it any */
     }
+    outfit_start_report();                              /* (the outfit swap) a field_model_when this reading brought in: is the field reader's call hooked? */
 }
 
 /* ---- Live tables: a directory of this DLL's tables for a reader outside the process ----------------
@@ -52893,6 +58339,7 @@ static void reload_config(void)
     load_gear_files();
     mirror_new_gear();
     gear_wide_loaded();         /* (the box, stage B5) as after a kernel load: a lent slot's record is filled again from the definitions as they are now */
+    shop_adds_gear_check();     /* (wide shop) the shop files' wide gear entries against the definitions as they are now */
     reload_characters();
     rebuild_item_ranks();       /* the sort-by-name places of every 16-bit item number (0-511 placed as before), from the names as they are now (after the characters: a limit item is named in a sheet) */
     wide_items_report();        /* (stage 2) wide items of the items file as it is now: admitted, or why not; nothing with none defined */
@@ -54064,6 +59511,41 @@ static void draw_character_limits(struct new_character *c, int id)
     lstrcpyA(spell_view_line, "OK: the character's sheet    Cancel: back");
 }
 
+/* START GEAR PURE BEGIN  (no Win32 call: tested natively, tools/work/wide_start_display test/unit) */
+/* The value drawn after Wpn:, Arm: or Acc: on a character's page (`kind` 0, 1, 2), from what its
+   sheet gave: `wide` a WIDE piece (start_wide: its byte of start_set is clear on purpose, see
+   character_wide_key), else the byte `index` when `set`, else nothing (the base's). A wide piece
+   shows its name from the gear files (the name only, no number), or plainly, with its number, that
+   no gear file defines it now (as character_wide_key logs; the character is then created wearing
+   the stand-in). The name is at most 31 characters, as long as a name of the DLL's tables can
+   be: a long name is cut. A defined piece is grey while wide gear is not at work in this run
+   (gear_wide_live 0: it is
+   then not worn); in colour it is what the sheet names (the log's character line says if it is worn). */
+#define START_GEAR_VALUE_ROOM   31
+static void character_start_gear_line(int kind, int row, BOOL set, BYTE index, int wide)
+{
+    if (wide) {
+        const struct wide_gear *g = wide_gear(wide);
+        static BYTE name[START_GEAR_VALUE_ROOM + 1];
+        int i;
+
+        if (!g) {
+            screen_line(0x210, row, 0, "%d: not defined now", wide);
+            return;
+        }
+        for (i = 0; i < START_GEAR_VALUE_ROOM && i < (int)sizeof g->name && g->name[i] != 0xff; i++)
+            name[i] = g->name[i];
+        name[i] = 0xff;
+        screen_line(0x210, row, gear_wide_live ? 7 : 0, "%t", name);
+    } else if (!set)
+        screen_line(0x210, row, 0, "the base's");
+    else if (index == 0xff)
+        screen_line(0x210, row, 0, "none");
+    else
+        screen_line(0x210, row, 7, "%t", character_item_name(kind, index));
+}
+/* START GEAR PURE END */
+
 static void draw_character_view(void)
 {
     static const char *const stat_names[9] = { "Str", "Vit", "Mag", "Spr", "Dex", "Lck", "HP", "MP", "Exp" };
@@ -54135,6 +59617,28 @@ static void draw_character_view(void)
         screen_line(right + 0x30, top + 4 * CHARACTER_LINE, 7, "Limits: like %s", nine_names[c->limits_like]);
     else
         screen_line(right + 0x30, top + 4 * CHARACTER_LINE, 7, "Limits: none");
+    if (c->field_when_flag != FORGET_FLAG_NONE || c->battle_when_flag != FORGET_FLAG_NONE) {
+        /* (the outfit keys) field_model_when / battle_files_when: which look is in force now, F field skeleton, B battle files;
+           "on" = the key's save bit is on (the second look), "off" = the plain key's look, "no file" = the bit is on but the
+           second skeleton's file was not found. Read from the save bits and the lookups already made; nothing is looked up here. */
+        char look[48], field_part[24] = "", battle_part[16] = "";
+
+        if (c->field_when_flag != FORGET_FLAG_NONE) {
+            int on = outfit_bit_on(c->field_when_flag);
+
+            if (on && c->field_when_found < 0)
+                wsprintfA(field_part, "F %s no file", c->field_model);
+            else
+                wsprintfA(field_part, "F %s %s", on ? c->field_when_model : c->field_model, on ? "on" : "off");
+        }
+        if (c->battle_when_flag != FORGET_FLAG_NONE) {
+            int on = outfit_bit_on(c->battle_when_flag);
+
+            wsprintfA(battle_part, "B %s %s", on ? c->battle_when_prefix : c->battle_prefix, on ? "on" : "off");
+        }
+        wsprintfA(look, "%s%s%s", field_part, field_part[0] && battle_part[0] ? "  " : "", battle_part);
+        screen_line(right + 0x40, top + 5 * CHARACTER_LINE, 7, "%s", look);
+    }
 
     /* starting figures and growth */
     y = top + 5 * CHARACTER_LINE + 12;
@@ -54179,12 +59683,7 @@ static void draw_character_view(void)
         int at = 0x1c + k, row = y + (line + 1) * CHARACTER_LINE;
 
         screen_line(0x1e4, row, 5, "%s", labels[k]);
-        if (!c->start_set[at])
-            screen_line(0x210, row, 0, "the base's");
-        else if (c->start[at] == 0xff)
-            screen_line(0x210, row, 0, "none");
-        else
-            screen_line(0x210, row, 7, "%t", character_item_name(k, c->start[at]));
+        character_start_gear_line(k, row, c->start_set[at], c->start[at], c->start_wide[k]);   /* (a sheet's wide piece) start_wide first, as the record is made */
     }
     for (k = 0; k < 2; k++) {
         int shown = 0, more = 0;
@@ -54599,7 +60098,7 @@ static const char *menu_shops(void)
     return NULL;
 }
 
-/* An entry's name: an item ID (0-511) or a materia ID. NULL: none. */
+/* An entry's name: an item ID (0-511), a wide number or a materia ID. NULL: none. */
 static const BYTE *shop_entry_name(int materia, int id)
 {
     const BYTE *name;
@@ -54624,6 +60123,8 @@ static const BYTE *shop_entry_name(int materia, int id)
         return item_names[new_item_slot(id)];
     if (wide_item(id))
         return wide_item(id)->name;     /* (wide items) */
+    if (wide_gear(id))
+        return wide_gear(id)->name;     /* (wide shop) a piece of wide gear a gear file defines */
     if (id < 0 || id >= ITEM_COUNT_ORIGINAL)
         return NULL;
     name = ((const BYTE *(__cdecl *)(int, int, int))FN_TEXT_FETCH)(
@@ -54688,7 +60189,8 @@ static void draw_shop_view(void)
         screen_line(0x190, y, colour, "%s", materia[k] ? "materia" : id >= 0x80 && id < 0x100 ? "weapon" : id >= 0x100 && id < 0x120 ? "armour"
                     : id >= 0x120 && id < 0x140 ? "accessory" : id >= NEW_WEAPON_FIRST_ITEM && id < NEW_ARMOUR_FIRST_ITEM ? "new weapon"
                     : id >= NEW_ARMOUR_FIRST_ITEM && id < NEW_ACCESSORY_FIRST_ITEM ? "new armour"
-                    : id >= NEW_ACCESSORY_FIRST_ITEM && id < NEW_ITEM_HIGH_FIRST ? "new accessory" : "item");
+                    : id >= NEW_ACCESSORY_FIRST_ITEM && id < NEW_ITEM_HIGH_FIRST ? "new accessory"
+                    : gear_wide_kind(id) == 0 ? "wide weapon" : gear_wide_kind(id) == 1 ? "wide armour" : gear_wide_kind(id) == 2 ? "wide accessory" : "item");
     }
     if (!count)
         screen_line(0x30, 0x33 + 0x26 + VIEW_ROW_PITCH, 0, "This shop sells nothing");
@@ -55318,7 +60820,8 @@ static void box_list_page(BOOL open)
         menu_text_quarters = 4;
         menu_text(0x62, y, box_thing_name(number), colour);
         screen_line(0x196, y, colour, ":");
-        ((void (__cdecl *)(int, int, int, int, DWORD))FN_ITEM_ICON)(0x44, y - 4, box_icon_id(number), 0, DEPTH_TEXT);
+        if (!custom_icon_draw(CI_LIST_BOX, number, 0x44, y - 4, DEPTH_TEXT))      /* (custom icons) its own picture, else the game's icon as before */
+            ((void (__cdecl *)(int, int, int, int, DWORD))FN_ITEM_ICON)(0x44, y - 4, box_icon_id(number), 0, DEPTH_TEXT);
         ((void (__cdecl *)(int, int, int, int, int, DWORD))FN_MENU_NUMBER)(0x1a0, y + 3, quantity, 5, colour, DEPTH_TEXT);
         menu_text_quarters = 3;
     }
@@ -56297,9 +61800,9 @@ static const char *wide_hook_missing(BOOL new_game_too)
    the switch's own sites and read back with them; if anything does not read back, EVERY site of
    both sets is put back.
    Not in the table, on purpose: the bound of RANDOM THROW (004333f8): its candidates go into an
-   array of 320 words on its own stack, so it goes on looking at rows 0-319 (its two operands of
-   the copy ARE moved); the bounds inside the three routines of the list (006cbe9c, 006cbf94,
-   006cc031, 006cc0b5: never run on the list; the routine FFNx put behind 006cbe5f is fed on the
+   array of 320 words on its own stack, so the game's routine looks at rows 0-319 (its two operands
+   of the copy ARE moved; WIDE THROW, T2, replaces its one call at 005c905f to look at every row);
+   the bounds inside the three routines of the list (006cbe9c, 006cbf94, 006cc031, 006cc0b5: never run on the list; the routine FFNx put behind 006cbe5f is fed on the
    game's 320 words, which stay 320); the battle list's length byte 009ac110 (rows / 2: 255 at
    most, the reason for 510).
 
@@ -56326,7 +61829,7 @@ static const struct wide3_site {
     { 0x00433221u, "05 54 c3 9a 00", "05 Z0 Z0 Z0 Z0", WIDE3_BATTLE },
     { 0x00433275u, "81 7d f8 40 01 00 00", "81 7d f8 N0 N0 N0 N0", WIDE3_BOUND },
     { 0x00433292u, "05 54 c3 9a 00", "05 Z0 Z0 Z0 Z0", WIDE3_BATTLE },
-    /* random Throw 004333c4 (its bound stays 320) */
+    /* random Throw 004333c4 (its bound stays 320; wide throw T2 bypasses it at its call, 005c905f) */
     { 0x0043340fu, "66 8b 91 54 c3 9a 00", "66 8b 91 Z0 Z0 Z0 Z0", WIDE3_BATTLE },
     { 0x00433427u, "8a 88 58 c3 9a 00", "8a 88 Z4 Z4 Z4 Z4", WIDE3_BATTLE },
     /* lose a random item 00434969 */
@@ -56866,10 +62369,13 @@ static void wide3_hold(const char *moment)
    Enhanced Stock UI has no byte there. (Read from the code.) */
 #define WIDE_SITE_BATTLE_END    0x00431834u     /* e8 77 f4 ff ff: call 00430cb0 */
 #define WIDE_FN_BATTLE_END_NEXT 0x00430cb0u
+static void wide_throw_battle_end(void);        /* (wide throw) defined with its hooks, below */
 static void __cdecl wide_battle_end_hook(void)
 {
     ((void (__cdecl *)(void))WIDE_FN_BATTLE_END_NEXT)();
     wide_sync("a battle's end (the list written back)");
+    if (wide_throw_live)
+        wide_throw_battle_end();    /* (wide throw, T1) the slots this battle's throws lent go back; nothing unless T1 is on */
     bs_log_battle();                /* (vertex bones) the battle's one line */
     if (box_live)       /* (the box, stage B3, R8) gear gained in a battle the game reports WON goes to the box; nothing with the box LOCKED or off, or without the note of the battle's start */
         box_battle_surplus(!IsBadReadPtr((const void *)BOX_ADDR_BATTLE_WON, 2) && *(const WORD *)BOX_ADDR_BATTLE_WON == BOX_BATTLE_WON);
@@ -57124,7 +62630,7 @@ static void gear_wide_gate(void)
         return;
     }
     gear_wide_live = 1;
-    log_line("box: wide gear: %d of 36 sites written (the name and description calls of the PHS, Status, Equip and Materia screens, each compared first: 24 of 006c6b1b, 12 of 0041963c); wide gear: FFNx tables ours (006c51a4 -> %08lx, 006c51cc -> %08lx%s); %d wide piece(s) defined. A wide piece lives in the ITEM LIST (a row of number and quantity, like a wide item: greyed in the Item menu, dimmed in a battle, never thrown or sold), in the box (box = on; box = auto when the item list has no row for it) or on a character; worn, it holds a lent slot: weapons 128-191, armour 32-127, accessories 32-127. A save holds a stand-in in its place and the companion file's WORN section holds the piece",
+    log_line("box: wide gear: %d of 36 sites written (the name and description calls of the PHS, Status, Equip and Materia screens, each compared first: 24 of 006c6b1b, 12 of 0041963c); wide gear: FFNx tables ours (006c51a4 -> %08lx, 006c51cc -> %08lx%s); %d wide piece(s) defined. A wide piece lives in the ITEM LIST (a row of number and quantity, like a wide item: greyed in the Item menu, dimmed in a battle, sold in a shop only with sell = yes; a wide weapon with throw = yes is thrown while the \"wide throw:\" line below says ON), in the box (box = on; box = auto when the item list has no row for it) or on a character; worn, it holds a lent slot: weapons 128-191, armour 32-127, accessories 32-127. A save holds a stand-in in its place and the companion file's WORN section holds the piece",
              written, *(const DWORD *)ADDR_WEAPON_POWER_OPERAND, *(const DWORD *)ADDR_ARMOUR_DEFENCE_OPERAND, (driver_reads_files_itself() || GetModuleHandleA("FFNx.dll")) ? "; written before the driver started" : "; no FFNx in this process", wide_gear_count);
     gear_window_gate();             /* (the box, stage B6) the window's one site: only here, once wide gear is at work */
 }
@@ -57153,6 +62659,309 @@ static void gear_wide_loaded(void)
            : "; whether they can be owned and worn in this run is said in the \"box: wide gear:\" line that follows the box's own");
 }
 /* ==== THE BOX (stage B5), wide gear: the gate and the 36 sites: end ==== */
+
+/* ==== WIDE THROW (stages T1 and T2): begin ====
+
+   (tools/work/wide_throw/PLAN.md; every address read from the code.) The battle's Item, W-Item
+   and Throw commands share one list, every row of the battle's copy (wide_battle_at, battle_rows()
+   entries of 6 bytes); Throw offers a row whose use byte has bit 3 clear, by its 16-bit number.
+   The chosen number reaches Throw's set-up, handler 0x19 = 005c904d (table entry 008feeac), which
+   takes the weapon record at number - 0x80, with no bound, for the power (+4) and byte +0x27 (the
+   DLL's 256-record table: the operands 005c90ff and 005c9130), drops the pending pair (actor,
+   number) at 0043305c, and copies the number to action[0x26] for the name banner. The effect and
+   the thrown model come from throw_effects[] / throw_models[] at the same index. The menu has
+   already taken one from the row (006db5a9-006db5f6: by row, the number untouched); the battle's
+   end writes the row back into the item list (the switch's sites), whatever the number.
+
+   T1, A WIDE WEAPON THROWN: a wide weapon (10000-15999) with throw = yes (gear_wide_throwable) is
+   offered by Throw (its row's use byte from its record: gear_wide_battle_flags), and the DLL's
+   set-up (throw_setup_hook, the entry 008feeac) lends it a weapon slot 128-191 (the slot it holds
+   if worn, else a free one: its record copied, its throw effect and model filled from throw_like
+   or its base: gear_slot_fill), drops the pending pair with the wide number itself (the game's
+   drop would look for the slot's number), puts 0x80 + slot in action[4], calls the game's 005c904d,
+   then puts the wide number in action[0x26] so that the banner names it. A slot lent here is given
+   back at the battle's end unless somebody wears the number (wide_throw_battle_end).
+
+   T2, RANDOM THROW OVER THE WHOLE LIST: the game's 004333c4 (a confused thrower; called only from
+   005c905f) gathers its candidates into 320 words on its own stack, from rows 0-319, so it is not
+   widened: the call at 005c905f goes to random_throw_hook instead, which does what it does over
+   every row: the game's filter (a number, use bits 0 and 3 clear), the game's random index
+   (005c8bdc: one random byte * n >> 8, without the game's `and eax, 0xff` of its byte local, a
+   no-op for n <= 256 that would fold indices 256 and up onto 0-63), the game's kind test widened to
+   what the set-up has a record for (the game's weapons, the mod's 320-383, a wide weapon while T1
+   is on), the game's take (queue 0, kind 0x10: 00434c2a, use one up by number) and the game's
+   fallback (0xffff: action[8] = -1, nothing is thrown, the turn passes).
+
+   Gate (wide_throw_gate, once, after gear_wide_gate): wide_items = on, `wide_throw = on` (the
+   default) in the game file, the switch on; T1 also wide gear at work, the Throw tables the DLL's,
+   the entry and the two routines the game's; T2 the call, the random index, the queue post and
+   the take the game's. T1 and T2 are independent: each is one site, compared first and read back.
+   Refused: one *** line, and everything as before for that stage. With wide_items off nothing of
+   this is reached and nothing is said. A wide CONSUMABLE (1024-9999) is never thrown: Throw reads
+   a WEAPON record, effect and model at every step and an item has none (the readme says why). */
+#define THROW_SETUP_ENTRY       0x008feeacu     /* handler table entry 0x19: 4d 90 5c 00 */
+#define FN_THROW_SETUP          0x005c904du     /* Throw's set-up */
+#define SITE_RANDOM_THROW       0x005c905fu     /* in 005c904d: e8 60 a3 e6 ff: call 004333c4 */
+#define FN_RANDOM_THROW         0x004333c4u     /* the game's random Throw: rows 0-319 */
+#define FN_RANDOM_INDEX         0x005c8bdcu     /* (n): one random byte * n >> 8 */
+#define FN_PENDING_DROP         0x0043305cu     /* (actor, number): drops the pending pair */
+#define FN_QUEUE_POST           0x00435139u     /* (queue, actor, kind, value) */
+#define ADDR_TAKE_ENTRY         0x007c2a40u     /* queue 0's handler of kind 0x10: 2a 4c 43 00 */
+#define FN_TAKE_BY_NUMBER       0x00434c2au     /* use one up by number */
+#define WIDE_THROW_LINES        50              /* per-throw lines in a run */
+
+static int random_throw_live;                   /* (T2) the call at 005c905f is the DLL's */
+static BYTE throw_lent[64];                     /* (T1) a slot 128-191 this battle's throws lent (it was free) */
+static WORD throw_candidates[WIDE_ROWS_MAX + WIDE_GUARD_ROWS];      /* (T2) not the stack: the game's 320 words are the reason it cannot be widened */
+static int wide_throw_lines;
+
+/* WIDE THROW PURE BEGIN */
+/* (T2) The game's random Throw (004333c4) over `rows` entries of a battle's copy: every entry with a
+   number and bits 0 and 3 of its use byte clear is a candidate, in row order, into `out` (room for
+   `rows`); `random_index(n)` (the game's 005c8bdc, 0 .. n-1) chooses one; it is returned if
+   `kind_ok` says the set-up can throw it, else 0xffff, as the game's (nothing is thrown); 0xffff
+   with no candidate. *count = n, *chosen = the index chosen or -1. */
+static int wide_throw_choose(const BYTE *copy, int rows, WORD *out, int (*random_index)(int), BOOL (*kind_ok)(int), int *count, int *chosen)
+{
+    int n = 0, i;
+
+    *chosen = -1;
+    for (i = 0; i < rows; i++, copy += 6) {
+        WORD number = (WORD)(copy[0] | copy[1] << 8);
+
+        if (number != 0xffff && !(copy[4] & 9))
+            out[n++] = number;
+    }
+    *count = n;
+    if (!n)
+        return 0xffff;
+    i = random_index(n);
+    if (i < 0 || i >= n)
+        return 0xffff;          /* cannot be: the game's formula is below n */
+    *chosen = i;
+    return kind_ok(out[i]) ? out[i] : 0xffff;
+}
+
+/* (T2) What the set-up can throw: the game's weapons (0x80-0xff, the game's own test at 004334b8),
+   the mod's new weapons 320-383 (the DLL's records 192-255), and a wide weapon when `wide` (T1). */
+static BOOL wide_throw_kind(int id, BOOL wide)
+{
+    return (id >= ITEM_ID_WEAPON_BASE && id < ITEM_ID_WEAPON_BASE + WEAPON_COUNT_ORIGINAL)
+        || (id >= NEW_WEAPON_FIRST_ITEM && id < NEW_WEAPON_FIRST_ITEM + NEW_WEAPON_COUNT) || wide;
+}
+/* WIDE THROW PURE END */
+
+static BOOL wide_throw_can(int id)
+{
+    return wide_throw_kind(id, wide_throw_live && gear_wide_kind(id) == 0 && wide_gear(id) != NULL);
+}
+
+static int game_random_index(int n)
+{
+    return ((int (__cdecl *)(int))FN_RANDOM_INDEX)(n);
+}
+
+/* A number of the item list in words, for a line of the log: a wide weapon's name, else its number. */
+static const char *wide_throw_name(int id)
+{
+    static char text[2][48];
+    static int turn;
+    char *t = text[turn++ & 1];
+
+    if (gear_wide_kind(id) == 0)
+        wsprintfA(t, "wide weapon %d \"%s\"", id, gear_wide_log_name(id));
+    else
+        wsprintfA(t, "%s %d", id >= ITEM_ID_WEAPON_BASE && id < NEW_WEAPON_FIRST_ITEM + NEW_WEAPON_COUNT ? "weapon" : "number", id);
+    return t;
+}
+
+static BOOL wide_throw_may_say(void)
+{
+    if (wide_throw_lines > WIDE_THROW_LINES)
+        return FALSE;
+    if (wide_throw_lines++ == WIDE_THROW_LINES) {
+        log_line("wide throw: %d lines logged in this run; further throws go the same way but are not logged", WIDE_THROW_LINES);
+        return FALSE;
+    }
+    return TRUE;
+}
+
+/* (T2) The game's take of a random Throw's choice: queue 0, kind 0x10 (00434c2a, use one up by number). */
+static void random_throw_take(int id)
+{
+    ((void (__cdecl *)(int, int, int, int))FN_QUEUE_POST)(0, 0, 0x10, id);
+}
+
+/* (T2) A random Throw: the game's choice over every row of the battle's copy. Nothing is taken here:
+   the caller posts the game's take (random_throw_take) once the choice can be thrown. */
+static int random_throw_pick(void)
+{
+    int n, chosen, id;
+
+    id = wide_throw_choose(wide_battle_at, battle_rows(), throw_candidates, game_random_index, wide_throw_can, &n, &chosen);
+    if (wide_throw_may_say()) {
+        if (!n)
+            log_line("wide throw: random Throw: no candidate in %d rows (nothing that can be sold and thrown): nothing is thrown", battle_rows());
+        else
+            log_line("wide throw: random Throw: %d candidate(s) in %d rows, candidate %d chosen: %s%s", n, battle_rows(), chosen,
+                     chosen >= 0 ? wide_throw_name(throw_candidates[chosen]) : "none",
+                     id == 0xffff ? ", which the set-up cannot throw: nothing is thrown (as the game's)" : "");
+    }
+    return id;
+}
+
+/* (T2) In place of the game's call at 005c905f (the set-up's own, when T1 is not in): the one chosen
+   is taken from its row at once, as the game's routine does. */
+static int __cdecl random_throw_hook(void)
+{
+    int id = random_throw_pick();
+
+    if (id != 0xffff)
+        random_throw_take(id);
+    return id;
+}
+
+/* (T1) Handler 0x19, Throw's set-up, at its table entry: a wide weapon is thrown through a lent
+   slot; every other number goes to the game's set-up exactly as before. */
+static void __cdecl throw_setup_hook(void)
+{
+    int *action = current_action();
+    int number, slot = -1;
+    BOOL was_free = FALSE, picked = FALSE;
+
+    if (random_throw_live && action[ACT_QUEUED_ID] == 0xffff) {
+        action[ACT_QUEUED_ID] = random_throw_pick() & 0xffff;      /* (T2) a random Throw is chosen here, so that a wide weapon chosen gets its slot too; the game's call then finds the number set */
+        if (action[ACT_QUEUED_ID] == 0xffff) {
+            action[ACT_SCRIPT] = -1;        /* nothing to throw: the game's own fallback (005c913f), here, so that the game's set-up does not choose a second time */
+            return;
+        }
+        picked = TRUE;
+    }
+    number = action[ACT_QUEUED_ID];
+    if (picked && gear_wide_kind(number) != 0)
+        random_throw_take(number);          /* not wide: taken at once, as the game's routine does */
+    if (gear_wide_kind(number) == 0) {
+        was_free = gear_slot_of(0, number) < 0;
+        slot = wide_gear(number) ? gear_slot_lend(0, number) : -1;
+        if (slot < 0) {
+            /* the game's "nothing to throw" (005c913f): no script, the turn passes. The pending pair stays: if
+               the actor falls, or at the battle's end, the game gives the one the menu took back */
+            if (wide_throw_may_say())
+                log_line("*** wide throw: actor %d: %s is NOT thrown: %s; nothing is thrown (the turn passes, as the game's Throw with nothing to throw) ***", action[ACT_ACTOR],
+                         wide_throw_name(number), wide_gear(number) ? "every weapon slot 128-191 is lent" : "nothing defines it now");
+            action[ACT_SCRIPT] = -1;        /* a random pick of it was not taken: no random Throw has a pending pair */
+            return;
+        }
+        if (picked)
+            random_throw_take(number);      /* a random pick of a wide weapon is taken only now that it has a slot */
+        ((void (__cdecl *)(int, int))FN_PENDING_DROP)(action[ACT_ACTOR], number);
+        if (was_free)
+            throw_lent[slot - GEAR_LENT_FIRST(0)] = 1;
+        action[ACT_QUEUED_ID] = ITEM_ID_WEAPON_BASE + slot;
+    }
+    ((void (__cdecl *)(void))FN_THROW_SETUP)();
+    if (slot >= 0) {
+        action[ACT_DISPLAY_ID] = number;        /* the banner names the wide weapon; action[0xb] stays 0x80 + slot, the game's own value for a throw */
+        if (wide_throw_may_say())
+            log_line("wide throw: actor %d throws %s through lent slot %d%s (power %d, effect %d, model %08lx)", action[ACT_ACTOR], wide_throw_name(number), slot,
+                     was_free ? " (lent for the throw)" : " (the slot it holds: it is worn)", weapon_table[slot * WEAPON_RECORD_SIZE + WEAPON_POWER], throw_effects[slot], throw_models[slot]);
+    }
+}
+
+/* (T1) The battle's end (wide_battle_end_hook): every slot a throw lent goes back, unless somebody
+   wears its number now (the worn piece's own slot) or the Equip menu's list holds it. */
+static void wide_throw_battle_end(void)
+{
+    int i;
+
+    for (i = 0; i < GEAR_LENT_COUNT(0); i++) {
+        int slot = GEAR_LENT_FIRST(0) + i, number = gear_lent[0][slot];
+
+        if (!throw_lent[i])
+            continue;
+        throw_lent[i] = 0;
+        if (number && !gear_listed[0][slot] && !gear_worn_wears(number))
+            gear_slot_release(0, slot);
+    }
+}
+
+/* How many wide weapons the files define with throw = yes (or a base that can be thrown). */
+static int wide_throw_count(void)
+{
+    int i, n = 0;
+
+    for (i = 0; i < wide_gear_count; i++)
+        n += wide_gears[i].kind == 0 && wide_gears[i].throws;
+    return n;
+}
+
+/* Once, at the end of the first kernel load (after gear_wide_gate): T1 and T2, each compared first,
+   written, read back; one line each. Nothing at all, and no line, with wide_items off. */
+static void wide_throw_gate(void)
+{
+    static const BYTE setup_code[9] = { 0x55, 0x8b, 0xec, 0x51, 0xa1, 0x0c, 0xce, 0x99, 0x00 };           /* 005c904d */
+    static const BYTE drop_code[8] = { 0x55, 0x8b, 0xec, 0x51, 0xc7, 0x45, 0xfc, 0x00 };                 /* 0043305c */
+    static const BYTE index_code[20] = { 0x55, 0x8b, 0xec, 0xe8, 0xbd, 0xff, 0xff, 0xff, 0x25, 0xff, 0x00, 0x00, 0x00, 0x0f, 0xaf, 0x45, 0x08, 0xc1, 0xf8, 0x08 };   /* 005c8bdc */
+    static const BYTE post_code[9] = { 0x55, 0x8b, 0xec, 0x83, 0xec, 0x08, 0x8b, 0x45, 0x08 };           /* 00435139 */
+    static LONG tried;
+    static char text[160];
+    const char *why = NULL, *why1 = NULL, *why2 = NULL;
+    DWORD entry;
+
+    if (wide_items_mode != WIDE_ON || InterlockedExchange(&tried, 1))
+        return;
+    wide_throw_said = 1;
+    if (!wide_throw_asked)
+        why = "wide_throw = off in the game file";
+    else if (!wide_live)
+        why = "the wide item list is not on in this run (see the \"wide item list:\" lines above)";
+    /* T1 */
+    entry = *(const DWORD *)THROW_SETUP_ENTRY;
+    if (why)
+        why1 = why;
+    else if (!gear_wide_live)
+        why1 = "wide gear is not at work in this run (no gear file defines a wide piece, or see the \"box: wide gear\" line above)";
+    else if (!throw_tables_live)
+        why1 = "the Throw tables are not the DLL's (see the \"throw effect table\" and \"throw model table\" lines above): a lent slot would have no effect or model";
+    else if (entry != FN_THROW_SETUP) {
+        wsprintfA(text, "the Throw set-up's table entry %08lx holds %08lx, not the game's %08lx: another mod wrote there", THROW_SETUP_ENTRY, entry, FN_THROW_SETUP);
+        why1 = text;
+    } else if (!bytes_are(FN_THROW_SETUP, setup_code, sizeof setup_code) || !bytes_are(FN_PENDING_DROP, drop_code, sizeof drop_code))
+        why1 = "the code of the Throw set-up (005c904d) or of the pending drop (0043305c) is not the game's";
+    else if (!patch_pointer(THROW_SETUP_ENTRY, FN_THROW_SETUP, throw_setup_hook) || *(const DWORD *)THROW_SETUP_ENTRY != (DWORD)throw_setup_hook) {
+        if (*(const DWORD *)THROW_SETUP_ENTRY == (DWORD)throw_setup_hook)
+            patch_pointer(THROW_SETUP_ENTRY, (DWORD)throw_setup_hook, (void *)FN_THROW_SETUP);
+        why1 = "the table entry 008feeac could not be written or did not read back (see the \"patch\" line above): it is the game's";
+    }
+    wide_throw_live = why1 == NULL;
+    if (wide_throw_live) {
+        gear_slots_refill();        /* a slot lent already (a worn piece) gets its throw effect and model now */
+        log_line("wide throw: ON (stage T1): the Throw set-up (handler 0x19, table entry %08lx -> %08lx) is the DLL's, compared first and read back: a wide weapon with throw = yes is offered in the battle's Throw list and thrown through a lent slot (weapons 128-191: its record, thrown model and effect are the slot's for the throw, from throw_like or its base), and its row loses one as the game's Throw leaves it; %d wide weapon(s) defined that can be thrown",
+                 THROW_SETUP_ENTRY, FN_THROW_SETUP, wide_throw_count());
+    } else {
+        log_line("*** wide throw: NOT ON (stage T1): %s. A wide weapon is never thrown in this run (Throw dims it, as before)%s ***", why1,
+                 wide_gear_count && wide_throw_count() ? "; a gear file has wide weapons that can be thrown (throw = yes, or a base that can be thrown): they are not thrown" : "");
+    }
+    /* T2 */
+    if (why)
+        why2 = why;
+    else if (!wide_call_goes_to(SITE_RANDOM_THROW, (void *)FN_RANDOM_THROW))
+        why2 = "the call at 005c905f is not the game's call of 004333c4";
+    else if (!bytes_are(FN_RANDOM_INDEX, index_code, sizeof index_code) || !bytes_are(FN_QUEUE_POST, post_code, sizeof post_code) || *(const DWORD *)ADDR_TAKE_ENTRY != FN_TAKE_BY_NUMBER)
+        why2 = "the game's random index (005c8bdc), its queue post (00435139) or its take by number (007c2a40 -> 00434c2a) is not the game's";
+    else if (!patch_call(SITE_RANDOM_THROW, FN_RANDOM_THROW, random_throw_hook) || !wide_call_goes_to(SITE_RANDOM_THROW, random_throw_hook)) {
+        if (wide_call_goes_to(SITE_RANDOM_THROW, random_throw_hook))
+            patch_call(SITE_RANDOM_THROW, (DWORD)random_throw_hook, (void *)FN_RANDOM_THROW);
+        why2 = "the call at 005c905f could not be written or did not read back (see the \"patch\" line above): it is the game's";
+    }
+    random_throw_live = why2 == NULL;
+    if (random_throw_live)
+        log_line("wide throw: random Throw (stage T2): the call at %08lx -> %08lx is the DLL's, compared first and read back: it looks at every row of the battle's list (%d rows), with the game's filter (a thing that can be sold and thrown), the game's random byte (005c8bdc: byte x candidates / 256, without the game's mask of 255: with more than 256 candidates one byte reaches every (candidates / 256)th of them) and the game's fallback (nothing is thrown); it may choose the game's weapons, the mod's 320-383%s",
+                 SITE_RANDOM_THROW, FN_RANDOM_THROW, battle_rows(), wide_throw_live ? " and wide weapons with throw = yes" : " (no wide weapon: stage T1 is not on)");
+    else
+        log_line("*** wide throw: NOT ON (stage T2): %s. Random Throw is the game's: it looks at rows 0 to 319 only and throws only the game's weapons 128-255 ***", why2);
+}
+/* ==== WIDE THROW (stages T1 and T2): end ==== */
 
 /* A late refusal (step 5) after step 4 put the DLL's hook on the new game in for the switch: the
    call goes to the game's routine again, so that REFUSED is today in the game's code too. */
@@ -57491,10 +63300,10 @@ static void wide_switch_install(void)
     log_line("wide item list: a number above 511 can be in the list only as a WIDE ITEM of the items file ([1024] to [9999]) and only once wide items are ADMITTED (the \"wide items:\" lines); without one, saves are today's saves; the game's 320 words at 00dc0234 are kept as a picture of the list. Enhanced Stock UI's call at 0071b8f3: %s",
              *(const BYTE *)0x0071b8f3u == 0xe8 ? "there (its bytes are on no site)" : "not there");
     if (wide_bound == WIDE_V2_ROWS)
-        log_line("wide item list: THE LIST HAS 510 ROWS (stage 3, wide_rows = 510): %d more sites of the game's code written, every one compared first and read back: 26 bounds of 320 on the item list raised to 510 (the sell list: 160 rows of 2 to 255 rows of 2) and the 26 places that name the battle's copy of the list, which is now the DLL's array at %08lx (510 entries of 6 bytes). Random Throw goes on looking at rows 0 to 319 only (its bound is left as it is: its candidates fill an array of 320 on its own stack). The game's 320 words at 00dc0234 stay the picture of the list: row for row while no row past 319 is in use; after that every game kind and what else fits, in list order, and the companion file holds the whole list",
+        log_line("wide item list: THE LIST HAS 510 ROWS (stage 3, wide_rows = 510): %d more sites of the game's code written, every one compared first and read back: 26 bounds of 320 on the item list raised to 510 (the sell list: 160 rows of 2 to 255 rows of 2) and the 26 places that name the battle's copy of the list, which is now the DLL's array at %08lx (510 entries of 6 bytes). Random Throw: see the \"wide throw:\" lines below (the game's own looks at rows 0 to 319 only: its candidates fill an array of 320 on its own stack). The game's 320 words at 00dc0234 stay the picture of the list: row for row while no row past 319 is in use; after that every game kind and what else fits, in list order, and the companion file holds the whole list",
                  WIDE3_SITE_COUNT, (DWORD)wide_battle);
     else if (wide_bound > WIDE_V2_ROWS)
-        log_line("wide item list: THE LIST HAS %d ROWS (stage 4, wide_rows = %d): %d more sites of the game's code written, every one compared first and read back: 26 bounds of 320 on the item list raised to %d (the sell list: 160 rows of 2 to %d rows of 2), the 26 places that name the battle's copy of the list, which is now the DLL's array at %08lx (%d entries of 6 bytes), and the 8 that name the battle list's length: it is the DLL's dword at %08lx now (pairs of rows; 255 was the game's byte's most). Random Throw goes on looking at rows 0 to 319 only. The game's 320 words at 00dc0234 stay the picture of the list: row for row while no row past 319 is in use; after that every game kind and what else fits, in list order, and the companion file holds the whole list (version 3 once it does not fit 510 rows). Arrange: the next line",
+        log_line("wide item list: THE LIST HAS %d ROWS (stage 4, wide_rows = %d): %d more sites of the game's code written, every one compared first and read back: 26 bounds of 320 on the item list raised to %d (the sell list: 160 rows of 2 to %d rows of 2), the 26 places that name the battle's copy of the list, which is now the DLL's array at %08lx (%d entries of 6 bytes), and the 8 that name the battle list's length: it is the DLL's dword at %08lx now (pairs of rows; 255 was the game's byte's most). Random Throw: see the \"wide throw:\" lines below. The game's 320 words at 00dc0234 stay the picture of the list: row for row while no row past 319 is in use; after that every game kind and what else fits, in list order, and the companion file holds the whole list (version 3 once it does not fit 510 rows). Arrange: the next line",
                  wide_bound, wide_bound, WIDE3_SITE_COUNT + WIDE4_SITE_COUNT, wide_bound, (wide_bound + 1) / 2, (DWORD)wide_battle, wide_bound, (DWORD)&wide_battle_pairs);
     if (wide_bound > WIDE_V2_ROWS)
         wide_sort_install();        /* (stage 4b) Arrange over the rows in use; a refusal leaves the game's sort over all N rows */
@@ -57753,6 +63562,7 @@ static int __cdecl kernel_loader_hook(void)
     load_spells();
     install_hooks();
     fields_start();                 /* (field capacity) once: the field tables from the registry, or the game's (off) */
+    outfit_start_report();          /* (the outfit swap) says whether a field_model_when has its hook */
     effect_copies_check_files();    /* (after install_hooks, which indexes the loose files: a copy whose files are missing is dropped) */
     effect_copies_install();        /* (after install_hooks: the effect step must be this DLL's) */
     refresh_materia_table();
@@ -57772,6 +63582,7 @@ static int __cdecl kernel_loader_hook(void)
     index_limit_items(0);       /* a later call: the items file was read again, the limits file is not; no item ID is two things */
     mirror_new_gear();
     gear_wide_loaded();         /* (the box, stage B5) the wide pieces the three files define: their prices, the lent slots' records again; nothing with none defined */
+    shop_adds_gear_check();     /* (wide shop) the shop files' wide gear entries against the definitions as they are now */
     install_limit_safety();     /* (limits work, step 0) three tables moved, the spoils and battle gain calls followed: once */
     enable_new_characters();
     if (limit_item_hook_state == 0 && wide_items_mode == WIDE_ON)
@@ -57787,6 +63598,7 @@ static int __cdecl kernel_loader_hook(void)
     wide_items_report();            /* (stage 2) wide items of the items file: admitted, or why not; nothing with none defined */
     box_gate();                     /* (the box) box = on: decided once, now that the hooks, the switch and the menu are settled */
     gear_wide_gate();               /* (the box, stage B5) wide gear: decided once, right after the box; nothing at all unless the box is at work AND a gear file defines a wide piece */
+    wide_throw_gate();              /* (wide throw) T1 and T2: decided once, right after wide gear; nothing at all, and no line, with wide_items off */
     box_row_geometry();             /* (the box) where its label goes: read from the game's code; nothing unless the box is at work */
     box_script_sites();             /* (the box, stage B2) are the field's three item calls the game's? one line; nothing unless the box is at work */
     box_routing_sites();            /* (the box, stage B3) are the calls the routing knows the game's, are the battle hooks in? one line; nothing unless the box is at work */

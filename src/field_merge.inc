@@ -555,3 +555,70 @@ static unsigned field_add_entities(const unsigned char *in, unsigned in_len, uns
                (long)left_out);
     return at;      /* == total */
 }
+
+/* ---- The outfit swap: one skeleton name for another, in place ----------------------------------------
+
+   Renames every model of section 3 whose skeleton is `from` (8 characters as the file holds them, "YUAA.HRC")
+   to `to` (8 characters). Compared ignoring case. The name has the same length, so nothing in the file moves
+   and no offset, length or script is touched: only the 8 bytes of each such model's HRC field are written.
+   The whole of section 3's model list is walked FIRST (with fm_model_end, as field_add_entities does); if any
+   entry does not parse, or the header is not as expected, nothing is written and -1 is returned, `why` saying
+   what. Otherwise the number of models renamed (0 = none had it) is returned.
+   in/len: the decompressed field file as the engine holds it (its buffer is longer: len is the file's own end). */
+static int fm_rename_skeleton(unsigned char *file, unsigned len, const char *from, const char *to, char *why, int why_cap)
+{
+    unsigned off[9], i, n3, nm, p, pass;
+    unsigned char *s3;
+    int renamed = 0;
+
+    fm_why(why, why_cap, "", -1);
+    if (!file || !from || !to || len < 42 || fm_u16(file) != 0 || fm_u32(file + 2) != 9) {
+        fm_why(why, why_cap, "not a field file (no header of nine sections)", -1);
+        return -1;
+    }
+    for (i = 0; i < 9; i++) {
+        off[i] = fm_u32(file + 6 + i * 4);
+        if (off[i] < 42 || off[i] > len || len - off[i] < 4 || (i && (off[i] <= off[i - 1] || off[i] - off[i - 1] < 4))) {
+            fm_why(why, why_cap, "the section offsets are not as expected, section ", (long)i + 1);
+            return -1;
+        }
+    }
+    s3 = file + off[2] + 4;
+    n3 = off[3] - off[2] - 4;
+    if (n3 < 6) {
+        fm_why(why, why_cap, "the model section is too short", -1);
+        return -1;
+    }
+    nm = fm_u16(s3 + 2);
+    for (pass = 0; pass < 2; pass++) {              /* pass 0 proves the whole list; pass 1 writes */
+        p = 6;
+        for (i = 0; i < nm; i++) {
+            unsigned fixed = 0, anims = 0, anim_count = 0, end = fm_model_end(s3, n3, p, &fixed, &anims, &anim_count);
+            unsigned char *h;
+            int same = 1, k;
+
+            if (!end) {
+                fm_why(why, why_cap, "the model section does not parse, model ", (long)i);
+                return -1;
+            }
+            h = s3 + fixed + 2;
+            for (k = 0; k < 8; k++) {
+                unsigned a = h[k], b = (unsigned char)from[k];
+
+                if (a >= 'a' && a <= 'z')
+                    a -= 0x20;
+                if (b >= 'a' && b <= 'z')
+                    b -= 0x20;
+                if (a != b)
+                    same = 0;
+            }
+            if (same && pass) {
+                for (k = 0; k < 8; k++)
+                    h[k] = (unsigned char)to[k];
+                renamed++;
+            }
+            p = end;
+        }
+    }
+    return renamed;
+}

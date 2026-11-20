@@ -2,7 +2,8 @@
 'use strict';
 const fs = require('fs'), path = require('path');
 const A = require('../anim_core.js');
-const DIR = process.argv[2] || '/run/media/binah/Data/FF7_Decompile/FF7_SpellExt/tools/work/anims_extra';   // the party models' xxaa/xxda (from battle.lgp) and cmp_rt_aa/da (make_extra_candidate.py)
+const DIR = process.argv[2];
+if (!DIR) { console.log('usage: node tests/run_tests.js <folder with the party models\' xxaa/xxda and cmp_rt_aa/da>'); process.exit(2); }   // the party models' xxaa/xxda (from battle.lgp) and cmp_rt_aa/da (make_extra_candidate.py)
 let checks = 0, failed = 0;
 function ok(c, what) { checks++; if (!c) { failed++; console.log('FAILED: ' + what); } }
 const eq = (a, b) => a.length === b.length && a.every((x, i) => x === b[i]);

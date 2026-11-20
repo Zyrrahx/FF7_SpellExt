@@ -18,7 +18,8 @@ const ROUTES = Object.freeze([
   'ai.list', 'ai.open', 'ai.overview', 'ai.library', 'ai.check', 'ai.save', 'ai.from_kernel', 'ai.kernel_choose',
   'ai.kernel_pick', 'ai.cards', 'ai.card_edit', 'ai.recipe', 'ai.explain', 'ai.set_character', 'live.status',
   'live.tables', 'live.table', 'live.compare', 'live.find', 'ai.stage', 'ai.unstage', 'ai.rename', 'ai.delete',
-  'lib.reference',
+  'lib.reference', 'scene.check', 'scene.range', 'ai.enemies', 'ai.enemy_open', 'ai.enemy_cards', 'ai.enemy_save',
+  'app.game_file', 'game.formations', 'game.formation', 'enemy.model', 'formation.models', 'character.portrait',
 ]);
 
 contextBridge.exposeInMainWorld('spellext', Object.freeze({

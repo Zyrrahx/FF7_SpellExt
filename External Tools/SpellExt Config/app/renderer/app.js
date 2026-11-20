@@ -33,6 +33,17 @@
     "/api/ai/set_character": "ai.set_character",
     "/api/live/status": "live.status", "/api/live/tables": "live.tables", "/api/live/table": "live.table",
     "/api/live/compare": "live.compare", "/api/live/find": "live.find",
+    // stage C2: the scene and enemy forms' checks, an enemy's AI
+    "/api/scene/check": "scene.check", "/api/scene/range": "scene.range", "/api/ai/enemies": "ai.enemies",
+    "/api/ai/enemy_open": "ai.enemy_open", "/api/ai/enemy_cards": "ai.enemy_cards", "/api/ai/enemy_save": "ai.enemy_save",
+    // formation diagrams: the Game formations page
+    "/api/game/formations": "game.formations", "/api/game/formation": "game.formation",
+    // (model preview, stage 4) the Model block of an enemy file's form
+    "/api/enemy/model": "enemy.model",
+    // (3D formation view, stage 2) the models of one scene
+    "/api/formation/models": "formation.models",
+    // (portrait panel) the Portrait block of a character's page
+    "/api/character/portrait": "character.portrait",
   };
   async function invoke(route, body) {
     const r = await window.spellext.invoke(route, body);
@@ -71,6 +82,20 @@
               entry: null, expanded: new Set(), secTextOpen: false, advOpen: false,
               secDirty: null };          // Section text typed in and not applied: {path, first, last, label}
   const K = window.SpellExtKinds;
+  const EN = window.SpellExtEnPage;
+  const PT = window.SpellExtPortrait;      // (portrait panel) the Portrait block of a character's page (portrait.js)
+  // the schema entry of the open file: a main file's, or (stage C2) a scene or enemy file's en_files entry
+  function viewEntry(v) {
+    if (v && v.en_kind) return EN.entry(S.schema, v.en_kind);
+    return schemaFile(v ? v.schema_name : null);
+  }
+  // what the scene and enemy form (enpage.js) needs of this page
+  const H = {
+    h: (...a) => h(...a), api: (p, b) => api(p, b), toast: (m, b) => toast(m, b), fail: (e) => fail(e),
+    openFile: (p, l) => afterSecText(() => openFile(p, l)), edit: (b) => edit(b).catch(() => {}),
+    writable: () => !!(S.state && S.state.writable && S.view && !S.view.readonly),
+    keySpec: (k, n) => keySpec(k, n), restartBadge: (sp) => restartBadge(sp), helpText: (sp) => helpText(sp),
+  };
   const confirmSave = () => !S.state || !S.state.settings || S.state.settings.confirm_save !== false;
 
   function schemaFile(name) {
@@ -126,7 +151,9 @@
   // ---- the sidebar (design 3.2): one entry per kind, a dirty dot and a red count of problems on each ----------
   // the DLL's problems (kind "problem") about a file; the fields reader's are filed under the default name
   function problemCount(path, fields) {
-    const name = path.includes("/") ? path.split("/").pop() : path;
+    // a scene or enemy file: the scan's lines filed under its whole path (two folders may hold one name)
+    const en = /^(scenes|enemies)\//i.test(path);
+    const name = path.includes("/") && !en ? path.split("/").pop() : path;
     let n = 0;
     for (const [f, ps] of Object.entries(S.allProblems || {})) {
       const mine = f.toLowerCase() === name.toLowerCase() ||
@@ -162,14 +189,15 @@
       // a kind with two files (Spells and Spells_Test), and the files of a group when it is open
       const subs = e.multi ? (open ? e.files : []) : (e.files.length > 1 ? e.files : []);
       for (const f of subs) {
-        const name = f.path.includes("/") ? f.path.split("/").pop() : f.path;
+        const name = K.subLabel(f);
         const fp = problemCount(f.path, false);
         nav.appendChild(h("div", { class: "sub" + (S.page === "files" && S.file === f.path ? " on" : ""), "data-path": f.path,
           title: f.path + (f.read_by_dll ? "" : " (not read by the DLL)"), onclick: () => openFile(f.path) },
           h("span", { class: "elabel", text: name }),
           f.dirty ? h("span", { class: "dot", title: "unsaved changes" }) : null,
           fp ? h("span", { class: "count", text: String(fp) }) : null,
-          e.id === "other" && !f.read_by_dll ? h("span", { class: "ecount", text: "not read" }) : null,
+          (e.id === "other" || e.id === "scenes" || e.id === "enemies") && !f.read_by_dll ? h("span", { class: "ecount", text: "not read" }) : null,
+          f.generated ? h("span", { class: "ecount", title: "made by the converter: a converter run overwrites it", text: "generated" }) : null,
           f.readonly ? h("span", { class: "ecount", text: "view" }) : null));
       }
     }
@@ -230,17 +258,19 @@
     const v = S.view;
     if (!v) return;
     $("#filetitle").textContent = v.path + (v.dirty ? " *" : "");
-    const entry = schemaFile(v.schema_name);
+    const entry = viewEntry(v);
     $("#fileinfo").textContent = (entry ? entry.title + " · " : "") + (v.read_by_dll ? "" : "not read by the DLL · ") +
       (v.newline === "\\r\\n" ? "CRLF" : "LF") + (v.changed_on_disk ? " · CHANGED ON DISK" : "") + (v.readonly ? " · view only" : "") +
-      (v.raw_refused && !v.readonly ? " · Raw is view only (" + v.raw_refused + ")" : "");
+      (v.raw_refused && !v.readonly ? " · Raw is view only (" + v.raw_refused + ")" : "") +
+      (v.en_grammar ? " · a scene or enemy file: only ; starts a comment (# is text)" : "") +
+      (v.generated_note ? " · GENERATED: " + v.generated_note : "");
     $("#save").disabled = v.readonly || !S.state.writable;
     // the Form tab: the Game options for the game file, none for a file without a form (Raw and Changes only)
     const isGame = v.path.toLowerCase() === K.GAME.toLowerCase();
     const formBtn = $('#filetabs button[data-tab="form"]');
     formBtn.textContent = isGame ? "Options" : "Form";
-    formBtn.hidden = !v.schema_name;
-    if (!v.schema_name && S.tab === "form") setTab("raw");
+    formBtn.hidden = !v.schema_name && !EN.isEn(v);
+    if (!v.schema_name && !EN.isEn(v) && S.tab === "form") setTab("raw");
     $("#formsplit").hidden = isGame;
     $("#gamepage").hidden = !isGame;
     if (isGame) renderGame(v);
@@ -289,6 +319,7 @@
         badge ? h("span", { class: "kbadge " + badge, text: badge }) : null,
         s.leftover ? h("span", { class: "kbadge leftover", text: "leftover", title: "the characters file has no [" + s.group +
           "]: a character made at " + s.group + " would adopt this group (S6a, design 4.9)" }) : null,
+        EN.isEn(v) && s.kind === "other" && !s.commented ? h("span", { class: "kbadge", text: "not read", title: "the build does not read this section" }) : null,
         h("span", { class: "lbl", text: sectionLabel(s, places) }),
         s.commented && !ro ? h("button", { class: "uncom", text: "uncomment", title: "take the ; off each of its lines",
           onclick: async (ev) => {
@@ -299,8 +330,18 @@
             edit({ op: "uncomment_block", section_line: s.line }).catch(() => {});
           } }) : null));
     }
-    if (!ro && v.grammar === "sections") {
-      const inp = h("input", { type: "text", placeholder: "[3100]", title: "the new section's header, as the DLL reads it" });
+    if (EN.isEn(v)) {          // (stage C2) the other file's sections this one has not
+      for (const ps of EN.partnerSections(v)) {
+        const key = "en:" + ps.name;
+        el.appendChild(h("div", { class: "sec other" + (S.section === key ? " on" : ""), "data-en": ps.name,
+          title: v.en.role === "user" ? "only in the generated file: used as it is" : "only in your file",
+          onclick: () => afterSecText(() => { S.section = key; renderSections(); renderForm(); }) },
+          h("span", { class: "hdr", text: "[" + ps.name + "]" }), h("span", { class: "kbadge", text: v.en.role === "user" ? "generated" : "your file" })));
+      }
+    }
+    if (!ro && (v.grammar === "sections" || EN.isEn(v))) {
+      const inp = h("input", { type: "text", placeholder: EN.isEn(v) ? (v.en_kind === "scene" ? "[formation 1]" : "[attack NAME]") : "[3100]",
+        title: "the new section's header, as the DLL reads it" });
       const cur = v.outline.find((x) => x.line === S.section && x.header !== null);
       const where = h("select", { title: "where the new section goes" }, h("option", { value: "end", text: "at the end" }),
         cur ? h("option", { value: "after", text: "after " + (cur.commented ? ";" : "") + cur.header }) : null);
@@ -404,13 +445,18 @@
     el.innerHTML = "";
     const v = S.view;
     if (!v) return;
-    if (!v.schema_name) {
+    if (!v.schema_name && !EN.isEn(v)) {
       el.appendChild(h("p", { class: "muted", text: v.read_by_dll ? "This file has no form: edit it in the Raw tab." :
         "This file is not one of the DLL's config files (or is not read by it): edit it in the Raw tab." }));
       return;
     }
-    const entry = schemaFile(v.schema_name);
+    const entry = viewEntry(v);
     const flat = v.grammar === "flat";
+    if (EN.isEn(v) && typeof S.section === "string" && S.section.startsWith("en:")) {
+      const name = S.section.slice(3);
+      const ps = (v.en.sections || []).find((x) => x.name === name);
+      return EN.partnerForm(H, el, v, name, ps ? kindSpec(entry, ps.kind) : null);
+    }
     const s = v.outline.find((x) => x.line === S.section) || (flat ? v.outline[0] : null);
     if (!s) { el.appendChild(h("p", { class: "muted", text: "Pick a section on the left." })); return; }
     let kind = flat ? kindSpec(entry, "flat") : kindSpec(entry, s.kind);
@@ -426,13 +472,20 @@
     else if (kind && (kind.title !== (s.header || entry.title) || kind.id_range))
       head.appendChild(h("p", { class: "muted", text: (kind.title || "") + (kind.id_range ? " · IDs " + kind.id_range[0] + " to " + kind.id_range[1] : "") }));
     if (entry.help && flat) head.appendChild(h("p", { class: "muted", text: entry.help }));
+    if (EN.isEn(v)) head.prepend(EN.head(H, v));
     el.appendChild(head);
+    const sur = EN.isEn(v) && s.kind === "formation" && !s.commented ? EN.formation(H, v, s) : null;
+    if (sur) el.appendChild(sur);
+    // (model preview, stage 4) the Model block of an enemy file's [enemy] section (read only)
+    if (EN.isEn(v) && v.en_kind === "enemy" && s.name === "enemy" && !s.commented) el.appendChild(EN.model(H, v));
+    // (portrait panel) the Portrait block of a character's section in the Characters file (read only)
+    if (s.kind === "character" && !s.commented && /^ff7_spellext_characters\.ini$/i.test(S.file || "")) { const pb = PT.block(H, s); if (pb) el.appendChild(pb); }
     if (s.linked) el.appendChild(linkedStrip(s));
     if (s.slots) el.appendChild(slotPanel(s, v.readonly));
     const probs = {};
     for (const p of v.problems) (probs[p.line] = probs[p.line] || []).push(p);
     const keys = flat ? v.outline.flatMap((x) => x.keys) : s.keys;
-    const present = new Set();
+    const present = EN.isEn(v) && !s.commented ? EN.present(v, s) : new Set();
     for (const k of keys) {
       const spec = keySpec(kind, k.key);
       // a key the section has under another spelling the DLL also reads (defence for defense) is present too
@@ -444,7 +497,8 @@
       row.appendChild(h("div", { class: "k" }, k.key || "(no =)", h("span", { class: "ln", text: "line " + k.line }), restartBadge(spec)));
       row.appendChild(h("div", { class: "v" }, k.kind === "nokey" ? h("span", { class: "err", text: "expected key = value" }) :
         widgetFor(spec, k.value, (val) => edit({ op: "set", line: k.line, value: val }), disabled),
-        k.comment ? h("div", { class: "muted", text: k.comment }) : null));
+        k.comment ? h("div", { class: "muted", text: k.comment }) : null,
+        EN.isEn(v) && !s.commented ? EN.rowNote(H, v, s, k) : null));
       const acts = h("div", { class: "acts" },
         h("button", { text: "?", title: "help", onclick: () => row.classList.toggle("showhelp") }));
       if (!v.readonly) {
@@ -461,6 +515,8 @@
       el.appendChild(row);
     }
     if (!keys.length) el.appendChild(h("p", { class: "muted", text: "No key lines here yet." }));
+    const inh = EN.isEn(v) && !s.commented ? EN.inherited(H, v, s, kind) : null;
+    if (inh) el.appendChild(inh);
     // the problems of this section's lines that have no row (its header, a line the form does not show), under the
     // header in the DLL's words; a click goes to the line in Raw
     const rowLines = new Set(keys.map((k) => k.line));
@@ -500,6 +556,7 @@
       box.appendChild(h("span", { text: " · ai " }));
       box.appendChild(L.ai.exists || L.ai.pending ? h("button", { class: "link", text: L.ai.value + (L.ai.pending ? " (staged)" : ""),
         onclick: () => afterSecText(async () => { showPage("ai"); await openAI(L.ai.value); }) })
+        : L.ai.served ? h("span", { text: L.ai.value + aiServedText({ key: "ai", value: L.ai.value, served: L.ai.served }, []) })
         : h("span", { class: "err", text: L.ai.value + " (no ai\\" + L.ai.value + ".ai)" }));
     } else if (L.ai) box.appendChild(h("span", { text: " · ai_like = " + L.ai.value }));
     else box.appendChild(h("span", { class: "muted", text: " · no AI" }));
@@ -1060,7 +1117,12 @@
   function renderForecast() {
     const el = $("#forecast");
     el.innerHTML = "";
-    el.appendChild(h("p", { class: "muted", text: "What the DLL would log about the files as they stand here (unsaved edits included), in its own words. It does not forecast what depends on the game's data (a kernel base's content, a model's bones): the Game log tab has the DLL's verdict after a run." }));
+    el.appendChild(h("p", { class: "muted", text: "What the DLL would log about the files as they stand here (unsaved edits included), in its own words. Where the DLL reads the game's own data, this reads the game folder's: a weapon's or armour's base slots (KERNEL.BIN), and a DLL scene's build (scene.bin, the item names of kernel2.bin, its enemies' model headers). What only the running game knows is not forecast: the Game log tab has the DLL's verdict after a run." }));
+    if (S.state.files.some((f) => f.group === "scenes")) {
+      const res = h("div", { id: "checkall" });
+      el.appendChild(h("div", { class: "encheck" }, h("button", { id: "checkallbtn", text: "Check all scenes", title: "builds every registered DLL scene, with a count",
+        onclick: () => EN.checkAll(H, res) }), res));
+    }
     const files = Object.keys(S.allProblems).sort();
     let any = false;
     for (const f of files) {
@@ -1103,7 +1165,7 @@
   // ---- AI page ---------------------------------------------------------------------------------------
   // Left: the characters (their ai_like / ai lines), the files in ai\, the game's own AI. Right: the open AI as
   // its entries and their 16 sections (cards), or the whole text; the text is the truth and both views follow it.
-  const AI = { text: "", view: null, name: null, readonly: false, tab: "cards", rawDirty: false, dirty: false, over: null, windows: [] };
+  const AI = { text: "", view: null, name: null, enemy: null, readonly: false, tab: "cards", rawDirty: false, dirty: false, over: null, windows: [] };
 
   // the focused section windows (aiwin.html) read and write the open AI text through this
   window.spellextAI = {
@@ -1112,7 +1174,7 @@
       const c = e && e.cards[sec];
       if (!c || c.item === null) return null;
       return { body: c.body, title: c.title, name: c.name, section: c.section, note: c.note, shared_with: c.shared_with,
-               readonly: AI.readonly, file: AI.readonly ? $("#aititle").textContent : "ai\\" + AI.name,
+               readonly: AI.readonly, file: AI.readonly ? $("#aititle").textContent : AI.enemy ? "enemies\\" + AI.enemy : "ai\\" + AI.name,
                entry: e.indices.join(", "), kernel_id: AI.over ? AI.over.kernel_id : null };
     },
     set(ei, sec, body) {
@@ -1181,7 +1243,20 @@
     w.focus();
   }
 
-  async function renderAIList() {
+  // (ai_newthreat) an ai = NAME that a folder of this mod serves (the DLL asks for <game>\\direct\\ai\\NAME.ai before ai\\NAME.ai;
+// 7th Heaven answers it from an active folder's ai\\NAME.ai): where, when, and whether it is served now
+function aiServedText(eff, files) {
+  const s = eff && eff.key === "ai" ? eff.served : null;
+  if (!s) return "";
+  const where = s.mod + "\\" + (s.folder ? s.folder + "\\" : "") + "ai\\" + s.name + ".ai";
+  const when = s.when ? "while " + s.when : "always";
+  const now = s.active === true ? "on now" : s.active === false ? "off now: no AI of its own, as the option means" : "whether it is on now is not known";
+  const here = (files || []).some((f) => f.ai && f.name.toLowerCase() === eff.value.toLowerCase());
+  return " (served by the mod folder " + where + " " + when + ": " + now +
+    (here ? "; while it is served the DLL takes it before ai\\" + eff.value + ".ai" : "") + ")";
+}
+
+async function renderAIList() {
     const el = $("#ailist");
     el.innerHTML = "";
     let o;
@@ -1202,7 +1277,7 @@
     for (const c of o.characters) {
       const eff = c.effective;
       const effText = !eff ? "no AI line: none" : eff.key === "ai_like" ? "ai_like = " + eff.value + " (" + eff.game_name + "'s game AI)" :
-        "ai = " + eff.value + (eff.missing ? " (no ai\\" + eff.value + ".ai)" : "");
+        "ai = " + eff.value + (eff.missing ? " (no ai\\" + eff.value + ".ai)" : "") + aiServedText(eff, o.files);
       const sel = h("select", { title: "this character's AI line in FF7_SpellExt_Characters.ini" });
       const cur = c.own.length ? c.own[0].key + "=" + c.own[0].value.toLowerCase() : "";
       sel.appendChild(h("option", { value: "", text: c.copy_of !== null ? "(no line of its own: as [" + c.copy_of + "])" : "(no line: none)" }));
@@ -1234,7 +1309,7 @@
           c.inherited ? h("span", { class: "tag", text: " inherited from [" + c.copy_of + "] (copy_of)" }) : null,
           c.own.length > 1 ? h("span", { class: "bad", text: " both ai_like and ai: the DLL takes the first" }) : null),
         S.state.writable ? sel : null,
-        eff && eff.key === "ai" && !eff.missing ? h("button", { class: "link", text: "open " + eff.value, onclick: () => openAI(o.files.find((f) => f.name.toLowerCase() === eff.value.toLowerCase()).name) }) : null));
+        eff && eff.key === "ai" && !eff.missing && o.files.some((f) => f.name.toLowerCase() === eff.value.toLowerCase()) ? h("button", { class: "link", text: "open " + eff.value, onclick: () => openAI(o.files.find((f) => f.name.toLowerCase() === eff.value.toLowerCase()).name) }) : null));
     }
     if (!o.characters.length) ch.appendChild(h("p", { class: "muted", text: "The Characters file defines no character." }));
     el.appendChild(ch);
@@ -1252,6 +1327,8 @@
     fg.appendChild(h("div", { class: "addsec" }, h("button", { id: "aiaddtemplate", text: "+ Add from template", title: "the Library's AI section: " +
       "the game's character AI exported, or a recipe card", onclick: () => addFromTemplate("ai") })));
     el.appendChild(fg);
+    // (stage C2) the enemy folders' AI (enemies\<folder>\ai.ai.txt and its block ai.ai)
+    el.appendChild(enemyAIGroup());
     // (c) the game's AI, from the chosen kernel
     const gg = h("div", { class: "aigroup" }, h("h4", { text: "Game AI (read only)" }));
     gg.appendChild(kernelChooser(o));
@@ -1351,15 +1428,17 @@
     AI.text = text;
     AI.rawDirty = false;
     $("#aitext").value = text;
-    AI.view = boxBodies(await api("/api/ai/cards", { text }));
+    AI.view = boxBodies(await aiCards(text));
     renderAICards();
   }
+  // the cards of a text: an enemy's under its rule (stage C2), any other under the block rules
+  const aiCards = (text) => (AI.enemy && !AI.readonly ? api("/api/ai/enemy_cards", { folder: AI.enemy, text }) : api("/api/ai/cards", { text }));
 
   async function openAI(name) {
     if (AI.dirty && !confirm("Drop the unsaved AI text?")) return;
     try {
       const r = await api("/api/ai/open" + q({ name }));
-      AI.name = name; AI.readonly = false; AI.dirty = false;
+      AI.name = name; AI.enemy = null; AI.readonly = false; AI.dirty = false;
       $("#ainame").innerHTML = "";
       aiTitle("ai\\" + name + (r.source === "txt" ? ".txt" : ".ai (disassembled)"),
         (r.has_ai ? r.block_size + " bytes" : "no .ai yet") + (r.in_sync === false ? " · the .txt and the .ai differ: Save writes the .ai from the text" : ""));
@@ -1372,7 +1451,7 @@
     if (AI.dirty && !confirm("Drop the unsaved AI text?")) return;
     try {
       const r = await api("/api/ai/from_kernel", { kernel_id: AI.over.kernel_id, character: String(g.entry) });
-      AI.name = "entry" + g.entry; AI.readonly = true; AI.dirty = false;
+      AI.name = "entry" + g.entry; AI.enemy = null; AI.readonly = true; AI.dirty = false;
       aiTitle(g.name + "'s game AI", "entry " + g.entry + " of " + AI.over.kernel.label + " (sha1 " + AI.over.kernel.sha1 + "), as entry 0 of a block · read only" + (r.warning ? " · " + r.warning : ""));
       const nm = h("input", { type: "text", placeholder: "NAME", size: 12, title: "the file name: ai\\NAME.ai (then ai = NAME in the Characters file)" });
       $("#ainame").innerHTML = "";
@@ -1465,7 +1544,7 @@
       AI.dirty = true;
       AI.text = r.text;
       $("#aitext").value = r.text;
-      AI.view = boxBodies(r);
+      AI.view = boxBodies(AI.enemy && !AI.readonly ? await aiCards(r.text) : r);
       renderAICards();
     } catch (e) { fail(e); renderAICards(); }
   }
@@ -1475,7 +1554,7 @@
     const r = await api("/api/ai/card_edit", { op: "apply_text", text: AI.text, body: $("#aitext").value });
     AI.text = r.text;
     AI.rawDirty = false;
-    AI.view = boxBodies(r);
+    AI.view = boxBodies(AI.enemy && !AI.readonly ? await aiCards(r.text) : r);
     renderAICards();
   }
   async function setAITab(tab) {
@@ -1496,11 +1575,12 @@
   }
   async function aiCheck() {
     if (AI.tab === "raw" && AI.rawDirty) await applyRawAI();
-    AI.view = boxBodies(await api("/api/ai/cards", { text: AI.text }));
+    AI.view = boxBodies(await aiCards(AI.text));
     renderAICards();
     return AI.view.check;
   }
   async function aiSave() {
+    if (AI.enemy && !AI.readonly) return enemyAISave();
     if (!AI.name || AI.readonly) return toast("open an AI file, or make one with \"New file from this\"", true);
     try {
       const chk = await aiCheck();
@@ -1518,6 +1598,57 @@
     } catch (e) { fail(e); }
   }
 
+  // the enemy folders, each with its effective ai key; a click opens its AI under the enemy's rule (stage C2)
+  function enemyAIGroup() {
+    const g = h("div", { class: "aigroup", id: "enemyai" }, h("h4", { text: "Enemy AI (enemies\\)" }));
+    const list = h("div", {}, h("p", { class: "muted", style: "padding:0 12px", text: "loading..." }));
+    g.appendChild(list);
+    api("/api/ai/enemies").then((r) => {
+      list.innerHTML = "";
+      for (const e of r.enemies) {
+        const a = e.ai;
+        const tag = !a ? "no ai key" : a.none ? "ai = none (the DLL's template)" : !a.text ? "ai = " + a.value + " (refused name)" :
+          "ai = " + a.value + (e.has_text ? "" : " (no " + a.text + ")") + (e.has_block ? "" : " · no " + a.block + " yet") + (e.older ? " · " + a.block + " older than its text" : "");
+        list.appendChild(h("div", { class: "item" + (AI.enemy === e.folder ? " on" : "") + (e.registered ? "" : " none"), "data-enemy": e.folder,
+          onclick: a && a.text ? () => openEnemyAI(e.folder) : null },
+          e.folder, h("div", { class: "tag", text: tag + (e.registered ? "" : " · not registered") })));
+      }
+      if (!r.enemies.length) list.appendChild(h("p", { class: "muted", style: "padding:0 12px", text: "No enemy folder (enemies\\<folder> with enemy.ini or generated.ini)." }));
+    }).catch((e) => { list.textContent = e.message; });
+    return g;
+  }
+  async function openEnemyAI(folder) {
+    if (AI.dirty && !confirm("Drop the unsaved AI text?")) return;
+    try {
+      const r = await api("/api/ai/enemy_open" + q({ folder }));
+      AI.name = null; AI.enemy = r.folder; AI.readonly = false; AI.dirty = r.source === "generated" || r.source === "new";
+      $("#ainame").innerHTML = "";
+      const src = { txt: r.text_file, disasm: r.block_file + " (disassembled: no " + r.text_file + ")", generated: r.generated_text + " (the converter's: Save writes " + r.text_file + ")", new: "(new: no file yet)" }[r.source];
+      aiTitle("enemies\\" + r.folder + ": " + src + (r.block_problem ? " · " + r.block_file + " does not disassemble (" + r.block_problem + ")" : "") +
+        (r.name_problem ? " · " + r.name_problem : ""), "ai = " + r.ai.value + " (" + r.file + " line " + r.ai.line + ") · the DLL reads the block " + r.block_file +
+        " · the enemy's rule: one entry (table 1, entry 0), only its own attack IDs" + (r.older ? " · the block is older than its text: Save assembles it" : "") +
+        " · Save writes " + r.text_file + " and assembles " + r.block_file + " (as tools/ai_tool.py asm)");
+      await loadAIText(r.text);
+      renderAIList();
+    } catch (e) { fail(e); }
+  }
+  async function enemyAISave() {
+    try {
+      const chk = await aiCheck();
+      let force = false;
+      if (!chk.ok) {
+        if (chk.size === undefined) return toast("not saved: the text does not assemble (see the problems)", true);
+        if (!confirm("The block has problems the DLL would refuse (the enemy's scenes would not build). Save anyway?")) return;
+        force = true;
+      }
+      const r = await api("/api/ai/enemy_save", { folder: AI.enemy, text: AI.text, force });
+      AI.dirty = false;
+      toast("Saved " + r.text_file + " and assembled " + r.block_file + " (" + r.size + " bytes)\nThe DLL reads it at the enemy's next battle.", false, r.backup);
+      await openEnemyAI(AI.enemy);
+      refreshProblems().catch(fail);
+    } catch (e) { fail(e); }
+  }
+
   // ---- pages, keys -----------------------------------------------------------------------------------
   // the pages of the sidebar: "files" is the kind page (every .ini kind, Game options, the text files); "game" opens
   // the game file there
@@ -1530,6 +1661,7 @@
     if (p === "problems") { refreshProblems().catch(fail); renderLog(); }
     if (p === "ai") renderAIList();
     if (p === "library") renderLibrary();
+    if (p === "formations") EN.gamePage(H, $("#formationsnote"));
     if (p === "live") window.SpellExtLive.show(); else window.SpellExtLive.hide();
   }
 
@@ -1561,6 +1693,8 @@
     $("#revert").addEventListener("click", async () => {
       if (!S.file) return;
       if ((S.view.dirty || S.secDirty) && !confirm("Drop the unsaved edits of " + S.file + "?")) return;
+      EN.modelForget();        // (stage 4) the Model panel reads the model again (the route's caches are dropped too)
+      PT.forget();             // (portrait panel) so does the Portrait block
       try { setView(await api("/api/file/reload", { path: S.file })); } catch (e) { fail(e); }
     });
     const raw = $("#raw");
@@ -1628,6 +1762,24 @@
     if (n) showPage("problems");
     if (!S.timer) S.timer = setInterval(() => { if (S.page !== "open") api("/api/state").then((x) => { S.state = x; banners(); }).catch(() => {}); }, 5000);
   }
+  function showGameFiles(st) {
+    $("#set_scenebin").textContent = st.scene_bin || "the game folder's";
+    $("#set_scenebin_clear").disabled = !st.scene_bin;
+    $("#set_scenebin_line").textContent = st.scene_line || (S.state && S.state.folder ? "" : "(open a folder to see what is read)");
+    $("#set_scenebin_line").classList.toggle("err", !!(st.scene_line && /^scene\.bin: /.test(st.scene_line) && st.scene_bin));
+    // (model preview) the battle.lgp of the settings; (review F1, minor 4) settings.json that could not be read or written
+    $("#set_battlelgp").textContent = st.battle_lgp || "the game folder's";
+    $("#set_battlelgp_clear").disabled = !st.battle_lgp;
+    $("#set_battlelgp_line").textContent = st.battle_lgp_line || (S.state && S.state.folder ? "" : "(open a folder to see what is read)");
+    $("#set_battlelgp_line").classList.toggle("err", !!(st.battle_lgp_line && /^battle\.lgp: /.test(st.battle_lgp_line) && st.battle_lgp));
+    // (portrait panel) the menu archive of the settings
+    $("#set_menulgp").textContent = st.menu_lgp || "the game folder's";
+    $("#set_menulgp_clear").disabled = !st.menu_lgp;
+    $("#set_menulgp_line").textContent = st.menu_lgp_line || (S.state && S.state.folder ? "" : "(open a folder to see what is read)");
+    $("#set_menulgp_line").classList.toggle("err", !!(st.menu_lgp && st.menu_lgp_line && /could not be read|not found|is not an LGP|is not a/.test(st.menu_lgp_line)));
+    $("#set_problem").hidden = !st.problem;
+    $("#set_problem").textContent = st.problem || "";
+  }
   function wireTop() {
     $("#foldername").addEventListener("click", () => closeFolder().catch(fail));
     $("#toast").addEventListener("click", () => { if (toastBackup) showBackup(toastBackup); });
@@ -1639,8 +1791,39 @@
         $("#set_confirm").checked = st.confirm_save;
         $("#set_openlast").checked = st.open_last;
         $("#set_versions").textContent = "Electron " + (S.state.versions.electron || "?") + ", Node " + S.state.versions.node;
+        showGameFiles(st);
       } catch (e) { fail(e); }
     });
+    // (formation diagrams) the scene.bin read in place of the game folder's: picked with the main process's dialog
+    const gameFile = async (body, key) => {
+      key = key || "scene_bin";
+      try {
+        const st = await invoke("app.game_file", Object.assign({ key }, body));
+        if (S.state) S.state.settings = st;
+        showGameFiles(st);
+        if (st.cancelled) return;
+        if (key === "menu_lgp") {
+          PT.forget();
+          toast(st.menu_lgp_line || (st.menu_lgp ? "menu archive: " + st.menu_lgp : "menu archive: the game folder's"));
+          if (S.page === "files" && S.file && S.view) renderForm();
+          return;
+        }
+        if (key !== "scene_bin") {
+          toast(st.battle_lgp_line || (st.battle_lgp ? "battle.lgp: " + st.battle_lgp : "battle.lgp: the game folder's"));
+          return;
+        }
+        toast(st.scene_line || (st.scene_bin ? "scene.bin: " + st.scene_bin : "scene.bin: the game folder's"));
+        if (S.page === "formations") EN.gamePage(H, $("#formationsnote"));
+        if (S.page === "files" && S.file && S.view && S.view.en_kind === "scene") setView(await api("/api/file" + q({ path: S.file })));
+        refreshProblems().catch(() => {});
+      } catch (e) { fail(e); }
+    };
+    $("#set_scenebin_pick").addEventListener("click", () => gameFile({ pick: true }));
+    $("#set_scenebin_clear").addEventListener("click", () => gameFile({ clear: true }));
+    $("#set_battlelgp_pick").addEventListener("click", () => gameFile({ pick: true }, "battle_lgp"));
+    $("#set_battlelgp_clear").addEventListener("click", () => gameFile({ clear: true }, "battle_lgp"));
+    $("#set_menulgp_pick").addEventListener("click", () => gameFile({ pick: true }, "menu_lgp"));
+    $("#set_menulgp_clear").addEventListener("click", () => gameFile({ clear: true }, "menu_lgp"));
     const set = async (k, v) => {
       try { const st = await invoke("app.settings", { set: { [k]: v } }); if (S.state) S.state.settings = st; } catch (e) { fail(e); }
     };

@@ -421,9 +421,10 @@ static void px_shrink(struct px_box *box, const px_u32 *hist)
             box->lo[r] = (px_u8)lo[r], box->hi[r] = (px_u8)hi[r];
 }
 
-/* Fills `palette` (256 x B,G,R,A) and `indices` (one byte per pixel).
-   Returns 0, or -1 if out of memory. Alpha is ignored: every colour is opaque. */
-static int px_quantize(const px_u8 *rgba, px_u32 pixels, px_u8 *palette, px_u8 *indices)
+/* Fills `palette` (`limit` x B,G,R,A: 256 for px_quantize) and `indices` (one byte per pixel), using at
+   most `limit` (1 to 256) colours; the entries past the colours used are black. Returns 0, or -1 if out
+   of memory. Alpha is ignored: every colour is opaque. (px_quantize is this with limit 256, as before.) */
+static int px_quantize_limit(const px_u8 *rgba, px_u32 pixels, px_u8 *palette, px_u8 *indices, int limit)
 {
     struct px_box *boxes;       /* on the heap: the DLL build has no stack probe for large frames */
     px_u32 *hist, i;
@@ -438,7 +439,7 @@ static int px_quantize(const px_u8 *rgba, px_u32 pixels, px_u8 *palette, px_u8 *
             if (palette[n * 4] == p[2] && palette[n * 4 + 1] == p[1] && palette[n * 4 + 2] == p[0])
                 break;
         if (n == count) {
-            if (count == 256)
+            if (count == limit)
                 break;
             palette[n * 4] = p[2], palette[n * 4 + 1] = p[1], palette[n * 4 + 2] = p[0], palette[n * 4 + 3] = 255;
             count++;
@@ -446,7 +447,7 @@ static int px_quantize(const px_u8 *rgba, px_u32 pixels, px_u8 *palette, px_u8 *
         indices[i] = (px_u8)n;
     }
     if (i == pixels) {
-        for (n = count; n < 256; n++)
+        for (n = count; n < limit; n++)
             palette[n * 4] = palette[n * 4 + 1] = palette[n * 4 + 2] = 0, palette[n * 4 + 3] = 255;
         return 0;
     }
@@ -461,7 +462,7 @@ static int px_quantize(const px_u8 *rgba, px_u32 pixels, px_u8 *palette, px_u8 *
     for (n = 0; n < 3; n++)
         boxes[0].lo[n] = 0, boxes[0].hi[n] = 31;
     px_shrink(&boxes[0], hist);
-    for (count = 1; count < 256; count++) {
+    for (count = 1; count < limit; count++) {
         int best = -1, r, g, b;
         px_u32 best_score = 0, half, running = 0;
         struct px_box *box, *other;
@@ -508,7 +509,7 @@ static int px_quantize(const px_u8 *rgba, px_u32 pixels, px_u8 *palette, px_u8 *
         px_shrink(box, hist);
         px_shrink(other, hist);
     }
-    for (n = 0; n < 256; n++) {
+    for (n = 0; n < limit; n++) {
         px_u32 sum[3] = { 0, 0, 0 }, total = 0;
         int r, g, b;
 
@@ -536,6 +537,11 @@ static int px_quantize(const px_u8 *rgba, px_u32 pixels, px_u8 *palette, px_u8 *
     return 0;
 }
 
+static int px_quantize(const px_u8 *rgba, px_u32 pixels, px_u8 *palette, px_u8 *indices)
+{
+    return px_quantize_limit(rgba, pixels, palette, indices, 256);
+}
+
 /* ---- .tex ---- */
 
 #define PX_TEX_HEADER 0xec
@@ -543,7 +549,8 @@ static int px_quantize(const px_u8 *rgba, px_u32 pixels, px_u8 *palette, px_u8 *
 /* Builds an 8-bit paletted .tex image in fresh memory, laid out like the
    game's own portrait textures: a 0xec-byte header, 256 palette entries
    (B, G, R, A), then one byte per pixel. Returns NULL if out of memory. */
-static px_u8 *px_build_tex(px_u32 width, px_u32 height, const px_u8 *palette, const px_u8 *indices, px_u32 *size)
+static px_u8 *px_build_tex_keyed(px_u32 width, px_u32 height, const px_u8 *palette, const px_u8 *indices, px_u32 *size,
+                                 px_u32 colour_key)
 {
     /* header fields as in cloud.tex, by dword index; all others are zero */
     static const struct { px_u8 index; px_u32 value; } fields[] = {
@@ -561,6 +568,7 @@ static px_u8 *px_build_tex(px_u32 width, px_u32 height, const px_u8 *palette, co
         header[i] = 0;
     for (i = 0; i < sizeof fields / sizeof fields[0]; i++)
         header[fields[i].index] = fields[i].value;
+    header[2] = colour_key;     /* (icons) 1: palette index 0 is not drawn (FFNx: pal2bgra returns 0 for it) */
     header[15] = width;
     header[16] = height;
     for (i = 0; i < PX_TEX_HEADER; i++)
@@ -571,6 +579,11 @@ static px_u8 *px_build_tex(px_u32 width, px_u32 height, const px_u8 *palette, co
         tex[PX_TEX_HEADER + 1024 + i] = indices[i];
     *size = total;
     return tex;
+}
+
+static px_u8 *px_build_tex(px_u32 width, px_u32 height, const px_u8 *palette, const px_u8 *indices, px_u32 *size)
+{
+    return px_build_tex_keyed(width, height, palette, indices, size, 0);
 }
 
 /* ---- Fitting a picture into a frame ---- */
@@ -656,4 +669,151 @@ static px_u8 *px_png_to_tex(const px_u8 *png, px_u32 png_len, px_u32 *tex_len, p
     if (tex)
         *why = NULL;
     return tex;
+}
+
+/* ---- Item icons (custom icons): a PNG with transparency made into a small square .tex ----
+
+   The picture is made square (stretched if it is not) at 32, 64 or 128 pixels a side: the smallest of
+   these at least its longer side, at most 128. Each new pixel is the box average of the source pixels
+   under it, colour weighted by alpha (a fully transparent pixel adds no colour), alpha averaged plainly.
+   Then HARD EDGES: a pixel whose alpha is below PX_ICON_ALPHA_CUT is palette index 0, entry 0 is
+   (0, 0, 0, alpha 0) and the header's colour key flag is set, so index 0 is never drawn; every other
+   pixel is opaque (alpha 255, never 0xfe, which FFNx reads as the "reference alpha") and its colour one of
+   entries 1 to 255 (exact when the opaque pixels have at most 255 colours). */
+
+#define PX_ICON_ALPHA_CUT 128
+#define PX_ICON_SIDE_MAX 128
+
+/* The side of the icon texture for a picture of w x h. */
+static px_u32 px_icon_side(px_u32 w, px_u32 h)
+{
+    px_u32 longer = w > h ? w : h;
+
+    return longer <= 32 ? 32 : longer <= 64 ? 64 : PX_ICON_SIDE_MAX;
+}
+
+/* The picture resampled to side x side (fresh memory), or NULL if out of memory. */
+static px_u8 *px_icon_resample(const px_u8 *rgba, px_u32 w, px_u32 h, px_u32 side)
+{
+    px_u8 *out = PX_ALLOC(side * side * 4);
+    px_u32 dx, dy;
+
+    if (!out)
+        return NULL;
+    for (dy = 0; dy < side; dy++) {
+        px_u32 sy0 = dy * h / side, sy1 = (dy + 1) * h / side;
+
+        if (sy1 <= sy0) sy1 = sy0 + 1;
+        for (dx = 0; dx < side; dx++) {
+            px_u32 sx0 = dx * w / side, sx1 = (dx + 1) * w / side, sum[3] = { 0, 0, 0 }, alpha = 0, n = 0, sx, sy;
+            px_u8 *o = out + (dy * side + dx) * 4;
+
+            if (sx1 <= sx0) sx1 = sx0 + 1;
+            for (sy = sy0; sy < sy1 && sy < h; sy++)
+                for (sx = sx0; sx < sx1 && sx < w; sx++) {
+                    const px_u8 *p = rgba + (sy * w + sx) * 4;
+
+                    sum[0] += p[0] * (px_u32)p[3], sum[1] += p[1] * (px_u32)p[3], sum[2] += p[2] * (px_u32)p[3];
+                    alpha += p[3];
+                    n++;
+                }
+            if (!n)
+                continue;
+            o[3] = (px_u8)((alpha + n / 2) / n);
+            if (alpha) {
+                o[0] = (px_u8)((sum[0] + alpha / 2) / alpha);
+                o[1] = (px_u8)((sum[1] + alpha / 2) / alpha);
+                o[2] = (px_u8)((sum[2] + alpha / 2) / alpha);
+            }
+        }
+    }
+    return out;
+}
+
+/* PNG file bytes in, an icon .tex out (fresh memory), or NULL and a reason. *side is the texture's side,
+   *src_w and *src_h the picture's own size. */
+static px_u8 *px_png_to_icon_tex(const px_u8 *png, px_u32 png_len, px_u32 *tex_len, px_u32 *side, px_u32 *src_w,
+                                 px_u32 *src_h, const char **why)
+{
+    px_u8 *rgba = px_decode_png(png, png_len, src_w, src_h, why), *square, *opaque, *indices, *palette, *tex = NULL;
+    px_u32 pixels, count = 0, i, k;
+
+    if (!rgba)
+        return NULL;
+    *side = px_icon_side(*src_w, *src_h);
+    square = px_icon_resample(rgba, *src_w, *src_h, *side);
+    PX_FREE(rgba);
+    *why = "out of memory";
+    if (!square)
+        return NULL;
+    pixels = *side * *side;
+    /* the opaque pixels alone are reduced to 255 colours: the transparent ones take no colour */
+    opaque = PX_ALLOC(pixels * 4 + pixels + 1024 + pixels);  /* opaque pixels, their indices, the palette, the texture's indices */
+    if (!opaque) {
+        PX_FREE(square);
+        return NULL;
+    }
+    indices = opaque + pixels * 4;
+    palette = indices + pixels;
+    for (i = 0; i < pixels; i++)
+        if (square[i * 4 + 3] >= PX_ICON_ALPHA_CUT) {
+            for (k = 0; k < 4; k++)
+                opaque[count * 4 + k] = square[i * 4 + k];
+            count++;
+        }
+    if (px_quantize_limit(opaque, count, palette + 4, indices, 255) == 0) {
+        px_u8 *out = palette + 1024;
+
+        palette[0] = palette[1] = palette[2] = palette[3] = 0;    /* entry 0: transparent */
+        for (i = 4; i < 1024; i += 4)
+            palette[i + 3] = 255;
+        for (i = 0, k = 0; i < pixels; i++)
+            out[i] = square[i * 4 + 3] >= PX_ICON_ALPHA_CUT ? (px_u8)(indices[k++] + 1) : 0;
+        tex = px_build_tex_keyed(*side, *side, palette, out, tex_len, 1);
+    }
+    PX_FREE(opaque);
+    PX_FREE(square);
+    if (tex)
+        *why = NULL;
+    return tex;
+}
+
+/* Is this a .tex the game's loader can be handed as an icon (a user's own .tex, loaded as it is)? The header
+   (len bytes of it read) is checked against the file's length (file_len): version 1, a side of 1 to 2048,
+   1 to 4 bytes a pixel (1: with a palette of 1 to 256 colours a palette), at most 256 palettes of at most 256
+   colours, and the palette (its palette size, dword 22, in colours of 4 bytes) and the pixels inside the
+   file. Returns NULL, or the reason. */
+static px_u32 px_tex_dword(const px_u8 *data, px_u32 index)
+{
+    return data[index * 4] | data[index * 4 + 1] << 8 | data[index * 4 + 2] << 16 | (px_u32)data[index * 4 + 3] << 24;
+}
+
+static const char *px_icon_tex_problem(const px_u8 *data, px_u32 len, px_u32 file_len, px_u32 *width, px_u32 *height)
+{
+    px_u32 w, h, palettes, entries, palette_size, bpp, palette_bytes, need;
+
+    if (len < PX_TEX_HEADER)
+        return "too short to be a .tex file";
+    if (px_tex_dword(data, 0) != 1)
+        return "not a .tex file (its version is not 1)";
+    w = px_tex_dword(data, 15);
+    h = px_tex_dword(data, 16);
+    if (!w || !h || w > PX_MAX_SIDE || h > PX_MAX_SIDE)
+        return "its size is not 1 to 2048 a side";
+    palettes = px_tex_dword(data, 12);
+    entries = px_tex_dword(data, 13);
+    palette_size = px_tex_dword(data, 22);
+    bpp = px_tex_dword(data, 26);
+    if (bpp < 1 || bpp > 4)
+        return "its header does not fit: bytes per pixel is not 1 to 4";
+    if (palettes > 256 || entries > 256 || palette_size > 256 * 256)
+        return "its header does not fit: more than 256 palettes or 256 colours a palette";
+    if (bpp == 1 && (!px_tex_dword(data, 19) || !palette_size || palette_size > 256 * (palettes ? palettes : 1)))
+        return "its header does not fit: one byte a pixel needs a palette (of 1 to 256 colours a palette)";
+    palette_bytes = palette_size * 4;       /* the file holds palette_size colours (2 palettes of 16 may hold 16) */
+    need = PX_TEX_HEADER + palette_bytes + w * h * bpp;     /* (at most 0xec + 1 MB + 16 MB: no overflow) */
+    if (file_len < need)
+        return "its header does not fit its size: the file is shorter than its palette and pixels";
+    *width = w, *height = h;
+    return NULL;
 }

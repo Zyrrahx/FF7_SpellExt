@@ -102,6 +102,27 @@ export function resolve_in(root, rel) {
   return cand;
 }
 
+// (stage D1, review C2 minor 1) The plain joined path of `rel` ('a/b/c') under `root` (a real path), refused when that
+// path or a folder on the way to it is a symbolic link (or a junction): a write to a scene or enemy file, or to an
+// enemy's AI, never lands on another file through a link inside the folder (a link out of it is rule 4's refusal).
+// The parts that do not exist yet are not links (safety.py no_link).
+export function no_link(root, rel) {
+  let p = root;
+  const done = [];
+  for (const part of rel.split(/[\\/]/)) {
+    p = nodePath.join(p, part);
+    done.push(part);
+    let st = null;
+    try { st = fs.lstatSync(p); } catch (e) { st = null; }
+    if (st && st.isSymbolicLink()) {
+      let to = '?';
+      try { to = fs.readlinkSync(p); } catch (e) { to = '?'; }
+      throw new PathRefused(done.join('/') + ' is a link (to ' + to + '): the editor does not write through a link; nothing was written');
+    }
+  }
+  return p;
+}
+
 // Rule 5: refuses a write to `abs` (a resolved path under `root`).
 export function check_write(root, abs) {
   const base = lower(nodePath.basename(abs));

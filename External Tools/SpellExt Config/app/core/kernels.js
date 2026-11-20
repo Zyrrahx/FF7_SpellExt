@@ -165,10 +165,19 @@ export function utf16_replace(b) {
   return s;
 }
 
-// [[name, flags, offset, size]] of an .iro's directory ([] when it is not an .iro)
+export const IRO_MAX_ENTRIES = 1 << 20;     // (review F2, major 2) an .iro directory of more entries is refused
+
+function iro_bad(message) {
+  return Object.assign(new Error(message), { name: 'ValueError', code: 'EIRO' });
+}
+
+// [[name, flags, offset, size]] of an .iro's directory ([] when it is not an .iro). (review F2, major 2) A count the
+// file cannot hold (an entry is at least 16 bytes), more than IRO_MAX_ENTRIES, an entry shorter than its own fields or
+// one past the file's end: an Error (code EIRO, as kernels.py's ValueError), so a damaged archive never loops
 export function iro_entries(path) {
   const f = new Reader(path);
   try {
+    const fsize = fs.fstatSync(f.fd).size;
     const head = f.read(16);
     if (head.length < 16) return [];
     const sig = head.readUInt32LE(0);
@@ -177,12 +186,17 @@ export function iro_entries(path) {
     if (sig !== 0x534f5249) return [];
     f.seek(directory);
     const n = need(f.read(4), 4).readUInt32LE(0);
+    if (n > Math.floor((fsize - directory - 4) / 16) || n > IRO_MAX_ENTRIES) {
+      throw iro_bad('the .iro directory says ' + n + ' entries: more than the file can hold');
+    }
+    const fixed = 4 + 4 + (version >= 0x10001 ? 8 : 4) + 4;
     const out = [];
     for (let k = 0; k < n; k++) {
       const pos = f.tell();
       const lh = need(f.read(4), 4);
       const ln = lh.readUInt16LE(0);
       const flen = lh.readUInt16LE(2);
+      if (ln < fixed + flen || pos + ln > fsize) throw iro_bad('the .iro directory entry at ' + pos + ' is not one (' + ln + ' bytes)');
       const name = utf16_replace(f.read(flen));
       const fl = need(f.read(4), 4).readUInt32LE(0);
       const off = version >= 0x10001 ? need(f.read(8), 8).readBigInt64LE(0) : BigInt(need(f.read(4), 4).readInt32LE(0));
@@ -196,8 +210,8 @@ export function iro_entries(path) {
   }
 }
 
-export function _lzs(d) {
-  return lzs(d);
+export function _lzs(d, limit) {
+  return lzs(d, limit);
 }
 
 // `entries`: the archive's directory when the caller has read it already (iro_read of every entry of a big archive);
@@ -310,18 +324,36 @@ export function discover(game_dir, mods_dir) {
 }
 
 // settings: a JSON file's path, as the reference; or {load, save}
+// (review F1, minor 4) [keys, null], or [{}, the line saying why] when the file is there and cannot be read or is not a
+// JSON object: then nothing is written to it (kernels.py settings_read)
+export function settings_read(path) {
+  if (!path || !pyIsfile(path)) return [{}, null];
+  let text;
+  try {
+    text = fs.readFileSync(path, 'utf8');
+  } catch (e) {
+    if (!e.code) throw e;
+    return [{}, path + ' could not be read (' + strerror(e) + ')'];
+  }
+  let v;
+  try {
+    v = JSON.parse(text);
+  } catch (e) {
+    return [{}, path + ' is not a settings file (not JSON)'];
+  }
+  if (v === null || typeof v !== 'object' || Array.isArray(v)) return [{}, path + ' is not a settings file (not a JSON object)'];
+  return [v, null];
+}
+
 function settings_store(settings) {
   if (!settings) return null;
   if (typeof settings === 'object') return settings;
   return {
+    problem: null,
     load() {
-      if (!pyIsfile(settings)) return {};
-      try {
-        const v = JSON.parse(fs.readFileSync(settings, 'utf8'));
-        return v !== null && typeof v === 'object' && !Array.isArray(v) ? v : {};
-      } catch (e) {
-        return {};
-      }
+      const [d, why] = settings_read(settings);
+      this.problem = why;
+      return d;
     },
     save(data) {
       fs.writeFileSync(settings, JSON.stringify(data, null, 1));
@@ -363,6 +395,7 @@ export class Kernels {
     if (!this.store || (this.active || '').startsWith('upload:')) return;
     try {
       const data = this._load_settings();
+      if (this.store.problem) return;     // (review F1, minor 4) never written over: the choice holds for this run
       data.kernel = this.active;
       this.store.save(data);
     } catch (e) {
@@ -438,4 +471,41 @@ export class Kernels {
     const where = hit ? hit.where : (kid.startsWith('file:') ? kid.slice(5) : '');
     return { id: kid, label, where, size: data.length, sha1: crypto.createHash('sha1').update(data).digest('hex').slice(0, 10) };
   }
+}
+
+// ---- (stage C2, minor 1 of review C1) the kernel2.bin beside a chosen kernel -----------------------------------------
+// The kernel2.bin beside the KERNEL.BIN `kid` names, for the scene builds' item names: {label, data} (a loose file: the
+// kernel2.bin of its folder, found without case; an .iro entry: the entry of that name in the same archive folder), or
+// {label: null, data: null, why} when there is none. Read only, at most 1 MB.
+export function kernel2_beside(kid) {
+  if (!kid) return null;
+  try {
+    if (kid.startsWith('file:')) {
+      const d = pyDirname(kid.slice(5));
+      for (const n of fs.readdirSync(d).sort(pyCmp)) {
+        if (pyLower(n) === 'kernel2.bin') {
+          const p = pyJoin(d, n);
+          if (pyIsfile(p) && fs.statSync(p).size <= MAX_KERNEL) return { label: p, data: fs.readFileSync(p).subarray(0, MAX_KERNEL + 1) };
+        }
+      }
+      return { label: null, data: null, why: 'no kernel2.bin beside ' + kid.slice(5) };
+    }
+    if (kid.startsWith('iro:')) {
+      const rest = kid.slice(4);
+      const k = rest.indexOf('::');
+      const path = rest.slice(0, k);
+      const name = rest.slice(k + 2).replace(/\//g, '\\');
+      const cut = name.lastIndexOf('\\');
+      const want = (cut >= 0 ? name.slice(0, cut + 1) : '') + 'kernel2.bin';
+      const entries = iro_entries(path);
+      for (const [n] of entries) {
+        if (pyLower(n.replace(/\//g, '\\')) === pyLower(want)) return { label: path + ' : ' + n, data: iro_read(path, n, entries) };
+      }
+      return { label: null, data: null, why: 'no ' + want + ' in ' + pyBasename(path) };
+    }
+  } catch (ex) {
+    if (ex instanceof TypeError || ex instanceof ReferenceError || ex instanceof SyntaxError) throw ex;
+    return { label: null, data: null, why: 'the kernel2.bin beside ' + kid + ' could not be read (' + ex.message + ')' };
+  }
+  return { label: null, data: null, why: 'an uploaded kernel has no kernel2.bin beside it' };
 }

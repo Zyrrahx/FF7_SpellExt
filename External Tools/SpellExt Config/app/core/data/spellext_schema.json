@@ -1,7 +1,7 @@
 {
  "schema_version": 1,
- "dll_source_sha1": "e009e2616fa7436a173b487edd0388ba417d54d6",
- "dll_source_lines": 58000,
+ "dll_source_sha1": "b82c45d642dccdd9431641a959467061e4dd96d5",
+ "dll_source_lines": 63812,
  "note": "Hand-written from FF7_SpellExt/src/spellext.c and the readmes in SpellExtConfig/Readme; held to the source by `spellext_config.py schema-check`.",
  "files": {
   "FF7_SpellExt_Game.ini": {
@@ -13,11 +13,13 @@
     "fields_parse_signed",
     "bl_key_line",
     "test_battle_value",
+    "test_party_damage_value",
+    "enemies_key_line",
+    "battle_menu_key_line",
+    "shop_item_number_ok",
     "wide_items_key",
     "wide_rows_key",
-    "parse_yes_no",
-    "enemies_key_line",
-    "battle_menu_key_line"
+    "parse_yes_no"
    ],
    "log_prefix": "game file line %d: ",
    "grammar": "flat",
@@ -106,146 +108,6 @@
         "debug must be true or false"
        ],
        "source_line": 38007
-      },
-      {
-       "name": "battle_menu",
-       "type": "bool",
-       "true": [
-        "on",
-        "yes"
-       ],
-       "false": [
-        "off",
-        "no"
-       ],
-       "default": "on",
-       "restart": "hot",
-       "group": "Battle menu",
-       "help": "on or off (default on). With debug = true, the SpellExt menu's last row \"Fight: external battles\" lists your DLL scenes (enemies = on) and starts the one you pick from the field you stand in; the field comes back at the same spot. off: no such row. Read at start-up and at Re-init .ini files; a wrong value is said in the log and the default is used. (FF7_SpellExt_BattleMenu_README.txt)",
-       "messages": [
-        "battle_menu must be on or off: on is used"
-       ],
-       "source_line": 46296
-      },
-      {
-       "name": "battle_menu_test",
-       "type": "bool",
-       "true": [
-        "on",
-        "yes"
-       ],
-       "false": [
-        "off",
-        "no"
-       ],
-       "default": "on",
-       "restart": "hot",
-       "group": "Battle menu",
-       "help": "on or off (default on): a battle from that page is a test: no rewards, a loss returns to the field, the party's HP, MP and status are put back afterwards. The master of battle_menu_rewards, battle_menu_lose and battle_menu_restore: each of those, when given, wins over it for its part. off: all three are the game's (rewards given, a loss is a game over, the party stays as the battle leaves it). Read at start-up and at Re-init .ini files; a wrong value is said in the log and the default is used. (FF7_SpellExt_BattleMenu_README.txt)",
-       "messages": [
-        "battle_menu_test must be on or off: on is used"
-       ],
-       "source_line": 46297
-      },
-      {
-       "name": "battle_menu_rewards",
-       "type": "bool",
-       "true": [
-        "on",
-        "yes"
-       ],
-       "false": [
-        "off",
-        "no"
-       ],
-       "default": "off",
-       "restart": "hot",
-       "group": "Battle menu",
-       "help": "on or off; left out, battle_menu_test decides (on: no rewards). on: the battle gives EXP, AP, gil and drops (and the battle-end screen); with battle_menu_restore = party the party's records are put back after it (gil and items kept). Read at start-up and at Re-init .ini files; a wrong value is said in the log and the default is used. (FF7_SpellExt_BattleMenu_README.txt)",
-       "messages": [
-        "battle_menu_rewards must be on or off: battle_menu_test decides"
-       ],
-       "source_line": 46298
-      },
-      {
-       "name": "battle_menu_lose",
-       "type": "enum",
-       "values": [
-        [
-         "return"
-        ],
-        [
-         "game_over"
-        ]
-       ],
-       "default": "return",
-       "restart": "hot",
-       "group": "Battle menu",
-       "help": "return or game_over; left out, battle_menu_test decides (on: return). return: a lost battle from the page goes back to the field. Read at start-up and at Re-init .ini files; a wrong value is said in the log and the default is used. (FF7_SpellExt_BattleMenu_README.txt)",
-       "messages": [
-        "battle_menu_lose must be return or game_over: battle_menu_test decides"
-       ],
-       "source_line": 46299
-      },
-      {
-       "name": "battle_menu_restore",
-       "type": "enum",
-       "values": [
-        [
-         "party"
-        ],
-        [
-         "off"
-        ]
-       ],
-       "default": "party",
-       "restart": "hot",
-       "group": "Battle menu",
-       "help": "party or off; left out, battle_menu_test decides (on: party). party: the party's records (HP, MP, status; EXP, levels and AP of the three party members) are put back after the battle. Read at start-up and at Re-init .ini files; a wrong value is said in the log and the default is used. (FF7_SpellExt_BattleMenu_README.txt)",
-       "messages": [
-        "battle_menu_restore must be party or off: battle_menu_test decides"
-       ],
-       "source_line": 46300
-      },
-      {
-       "name": "battle_menu_fast",
-       "type": "bool",
-       "true": [
-        "on",
-        "yes"
-       ],
-       "false": [
-        "off",
-        "no"
-       ],
-       "default": "off",
-       "restart": "hot",
-       "group": "Battle menu",
-       "help": "on or off (default off). on: no victory fanfare and no victory pose after a battle from the page. Read at start-up and at Re-init .ini files; a wrong value is said in the log and the default is used. (FF7_SpellExt_BattleMenu_README.txt)",
-       "messages": [
-        "battle_menu_fast must be on or off: off is used"
-       ],
-       "source_line": 46301
-      },
-      {
-       "name": "battle_menu_locked",
-       "type": "enum",
-       "values": [
-        [
-         "allow"
-        ],
-        [
-         "refuse"
-        ]
-       ],
-       "default": "allow",
-       "restart": "hot",
-       "group": "Battle menu",
-       "help": "allow or refuse (default allow): whether the page starts a battle in a field whose random battles are off (towns). Read at start-up and at Re-init .ini files; a wrong value is said in the log and the default is used. (FF7_SpellExt_BattleMenu_README.txt)",
-       "messages": [
-        "battle_menu_locked must be allow or refuse: allow is used"
-       ],
-       "source_line": 46302
       },
       {
        "name": "seats",
@@ -363,6 +225,26 @@
         "wide_rows must be 320 or an even number from 510 to %d: 510 is used"
        ],
        "source_line": 37973
+      },
+      {
+       "name": "wide_throw",
+       "type": "enum",
+       "values": [
+        [
+         "on"
+        ],
+        [
+         "off"
+        ]
+       ],
+       "default": "on",
+       "restart": "first_reading",
+       "group": "Wide items and the box",
+       "help": "on (the default) or off: wide throw (FF7_SpellExt_WideItems_README.txt, \"WIDE THROW\"). on: a wide weapon with throw = yes can be thrown in battle, and random Throw looks at every row of the list. off: neither, as before. Needs wide_items = on. Read ONCE, when the game starts.",
+       "messages": [
+        "wide_throw must be on or off: on is used"
+       ],
+       "source_line": 47087
       },
       {
        "name": "box",
@@ -527,26 +409,6 @@
        "source_line": 37687
       },
       {
-       "name": "enemies",
-       "type": "bool",
-       "true": [
-        "on",
-        "yes"
-       ],
-       "false": [
-        "off",
-        "no"
-       ],
-       "default": "off",
-       "restart": "first_reading",
-       "group": "Enemies and scenes",
-       "help": "on or off (default off): battles of your own scenes (256 to 4095; battles 1024 to 16383), made from the text files of SpellExtConfig\\scenes and SpellExtConfig\\enemies, with FF7_SpellExt_Enemies.ini saying which folders count and which battle of the game becomes which of yours. With off, or without the line, no file is read and nothing is hooked for it. Read at start-up only: restart the game after changing it. (FF7_SpellExt_Enemies_README.txt)",
-       "messages": [
-        "enemies must be on or off: off is used"
-       ],
-       "source_line": 43016
-      },
-      {
        "name": "fields_file",
        "type": "text",
        "maxlen": 64,
@@ -696,11 +558,30 @@
        "restart": "next_battle",
        "group": "Testing aids",
        "testing_aid": true,
-       "help": "TESTING AID: every battle the game starts becomes this one, until the line is removed: a battle number 1 to 16383 (like 16), or scene:formation (like 4:0; scene 0 to 4095, formation 0 to 3), or off. 1024 and up (scene 256 and up) are your own scenes' battles: they need enemies = on, else test_battle is off and the log says so at start-up. The music and the field's battle flags stay those of the battle the game chose. A line with a mistake gives nothing. (FF7_SpellExt_Enemies_README.txt)",
+       "help": "TESTING AID: every battle the game starts becomes this one, until the line is removed: a battle number 1 to 16383 (like 16), or scene:formation (like 4:0; scene 0 to 4095, formation 0 to 3), or off. 1024 and up (scene 256 and up) is a DLL scene's battle and needs enemies = on (FF7_SpellExt_Enemies_README.txt): with enemies off the log says so at start-up and test_battle is off. The music and the field's battle flags stay those of the battle the game chose. A line with a mistake gives nothing.",
        "messages": [
         "test_battle takes a battle number 1 to 16383 (like 16; 1024 and up: a DLL scene's, with enemies = on), or scene:formation (like 4:0; scene 0 to 4095, formation 0 to 3), or off: the line gives nothing"
        ],
-       "source_line": 46986
+       "source_line": 51092
+      },
+      {
+       "name": "test_party_damage",
+       "type": "int_or_word",
+       "words": [
+        "off",
+        "no"
+       ],
+       "min": 0,
+       "max": 9999999,
+       "group": "Testing aids",
+       "testing_aid": true,
+       "default": "off",
+       "restart": "hot",
+       "help": "TESTING AID: every hit of a party member's action that takes HP from an enemy takes exactly this much: 1 to 9999999, held to enemy_damage_limit (physical, magic, limits, items, summons, each hit of a multi-hit). Misses, healing, absorbed hits, MP damage and hits on the party stay the game's. off, no, 0 or no line: off. Re-init .ini files reads it; the log says \"TESTING AID: test_party_damage = ...\" when it is on. A line with a mistake gives nothing. Remove the line when done. (FF7_SpellExt_Enemies_README.txt)",
+       "messages": [
+        "test_party_damage takes a number 1 to %d (like 9999), or off: the line gives nothing"
+       ],
+       "source_line": 51099
       },
       {
        "name": "shop_add",
@@ -709,11 +590,171 @@
        "default": "",
        "restart": "hot",
        "group": "Shops",
-       "help": "Entries added to the game's shops: like 37:243 (shop 0 to 79, item ID 0 to 511 or a wide item's number 1024 to 9999) or 37:m49 (a materia ID 0 to 254). Several entries on a line, several lines.",
+       "help": "Entries added to the game's shops: like 37:243 (shop 0 to 79, item ID 0 to 511, a wide item's number 1024 to 9999 or a wide weapon, armour or accessory's number 10000 to 27999) or 37:m49 (a materia ID 0 to 254). Several entries on a line, several lines.",
        "messages": [
-        "shop_add takes entries like 37:243 (shop 0 to 79, item ID 0 to 511 or a wide item's number 1024 to 9999) or 37:m49 (a materia ID)"
+        "shop_add takes entries like 37:243 (shop 0 to 79, item ID 0 to 511, a wide item's number 1024 to 9999 or a wide weapon, armour or accessory's number 10000 to 27999) or 37:m49 (a materia ID)"
        ],
-       "source_line": 37927
+       "source_line": 51073
+      },
+      {
+       "name": "enemies",
+       "type": "bool",
+       "true": [
+        "on",
+        "yes"
+       ],
+       "false": [
+        "off",
+        "no"
+       ],
+       "group": "Enemies and scenes",
+       "default": "off",
+       "restart": "first_reading",
+       "help": "on or off (the default): enemies and scenes of your own (FF7_SpellExt_Enemies_README.txt): the file FF7_SpellExt_Enemies.ini and the folders enemies and scenes; their battles are numbered 1024 to 16383. Read when the game starts only: restart the game after changing it (the log says so if the file now says something else). off, or no line: nothing of it is read or hooked, and the game plays as before.",
+       "messages": [
+        "enemies must be on or off: off is used"
+       ],
+       "source_line": 46139
+      },
+      {
+       "name": "battle_menu",
+       "type": "bool",
+       "true": [
+        "on",
+        "yes"
+       ],
+       "false": [
+        "off",
+        "no"
+       ],
+       "group": "Battle menu",
+       "default": "on",
+       "restart": "hot",
+       "help": "on (the default) or off: the SpellExt menu's page \"Fight: external battles\" (FF7_SpellExt_BattleMenu_README.txt), shown when debug = true. off: no such row. Read at start-up and by Re-init .ini files; a line with a wrong value is said in the log and the key's default is used.",
+       "messages": [
+        "battle_menu must be on or off: on is used"
+       ],
+       "source_line": 49595
+      },
+      {
+       "name": "battle_menu_test",
+       "type": "bool",
+       "true": [
+        "on",
+        "yes"
+       ],
+       "false": [
+        "off",
+        "no"
+       ],
+       "group": "Battle menu",
+       "default": "on",
+       "restart": "hot",
+       "help": "on (the default) or off: the page's test mode, the master of battle_menu_rewards, battle_menu_lose and battle_menu_restore. on: no rewards, a loss returns to the field, the party is put back after the battle. off: all three the game's (rewards given, a loss is a game over, the party stays as the battle leaves it). Read at start-up and by Re-init .ini files; a line with a wrong value is said in the log and the key's default is used.",
+       "messages": [
+        "battle_menu_test must be on or off: on is used"
+       ],
+       "source_line": 49596
+      },
+      {
+       "name": "battle_menu_rewards",
+       "type": "bool",
+       "true": [
+        "on",
+        "yes"
+       ],
+       "false": [
+        "off",
+        "no"
+       ],
+       "group": "Battle menu",
+       "default": "",
+       "restart": "hot",
+       "help": "on or off: whether a battle started from the page gives EXP, AP, gil and drops. Left out: battle_menu_test decides (test on: off). With battle_menu_restore = party the party's records are put back after it all the same (use battle_menu_restore = off to keep everything). Read at start-up and by Re-init .ini files; a line with a wrong value is said in the log and the key's default is used.",
+       "messages": [
+        "battle_menu_rewards must be on or off: battle_menu_test decides"
+       ],
+       "source_line": 49597
+      },
+      {
+       "name": "battle_menu_lose",
+       "type": "enum",
+       "values": [
+        [
+         "return"
+        ],
+        [
+         "game_over"
+        ]
+       ],
+       "group": "Battle menu",
+       "default": "",
+       "restart": "hot",
+       "help": "return or game_over: what a lost battle started from the page does. Left out: battle_menu_test decides (test on: return to the field). Read at start-up and by Re-init .ini files; a line with a wrong value is said in the log and the key's default is used.",
+       "messages": [
+        "battle_menu_lose must be return or game_over: battle_menu_test decides"
+       ],
+       "source_line": 49598
+      },
+      {
+       "name": "battle_menu_restore",
+       "type": "enum",
+       "values": [
+        [
+         "party"
+        ],
+        [
+         "off"
+        ]
+       ],
+       "group": "Battle menu",
+       "default": "",
+       "restart": "hot",
+       "help": "party or off: whether the party's records are put back after a battle started from the page. Left out: battle_menu_test decides (test on: party). Read at start-up and by Re-init .ini files; a line with a wrong value is said in the log and the key's default is used.",
+       "messages": [
+        "battle_menu_restore must be party or off: battle_menu_test decides"
+       ],
+       "source_line": 49599
+      },
+      {
+       "name": "battle_menu_fast",
+       "type": "bool",
+       "true": [
+        "on",
+        "yes"
+       ],
+       "false": [
+        "off",
+        "no"
+       ],
+       "group": "Battle menu",
+       "default": "off",
+       "restart": "hot",
+       "help": "on or off (the default): on gives the page's battles the battle flags 0x20 (no victory fanfare) and 0x100 (no victory pose) as well. Read at start-up and by Re-init .ini files; a line with a wrong value is said in the log and the key's default is used.",
+       "messages": [
+        "battle_menu_fast must be on or off: off is used"
+       ],
+       "source_line": 49600
+      },
+      {
+       "name": "battle_menu_locked",
+       "type": "enum",
+       "values": [
+        [
+         "allow"
+        ],
+        [
+         "refuse"
+        ]
+       ],
+       "group": "Battle menu",
+       "default": "allow",
+       "restart": "hot",
+       "help": "allow (the default) or refuse: whether the page starts a battle in a field whose random battles are off. Read at start-up and by Re-init .ini files; a line with a wrong value is said in the log and the key's default is used.",
+       "messages": [
+        "battle_menu_locked must be allow or refuse: allow is used"
+       ],
+       "source_line": 49601
       }
      ]
     }
@@ -723,13 +764,15 @@
     "game file line %d: test_drop takes up to 4 entries like 448 or 448:2 (an item ID 0 to 511, a wide item's number 1024 to 9999 or wide gear's 10000 to 27999, count 1 to 99): the line gives nothing",
     "game file line %d: test_stitm takes up to 8 entries like 10000 or 1024:3 (an item ID 0 to 511, a wide item's number 1024 to 9999 or wide gear's 10000 to 27999; count 1 to 99, else the script's own): the line gives nothing",
     "game file line %d: test_steal takes up to 8 item IDs like 320 448 (item ID 0 to 511, a wide item's number 1024 to 9999 or wide gear's 10000 to 27999): the line gives nothing",
-    "game file line %d: shop_add takes entries like 37:243 (shop 0 to 79, item ID 0 to 511 or a wide item's number 1024 to 9999) or 37:m49 (a materia ID)",
+    "game file line %d: shop_add takes entries like 37:243 (shop 0 to 79, item ID 0 to 511, a wide item's number 1024 to 9999 or a wide weapon, armour or accessory's number 10000 to 27999) or 37:m49 (a materia ID)",
     "game file line %d: test_battle takes a battle number 1 to 16383 (like 16; 1024 and up: a DLL scene's, with enemies = on), or scene:formation (like 4:0; scene 0 to 4095, formation 0 to 3), or off: the line gives nothing",
+    "game file line %d: test_party_damage takes a number 1 to %d (like 9999), or off: the line gives nothing",
     "game file line %d: seats must be 2 or 4",
     "game file line %d: field_entities must be off, party or seats",
     "game file line %d: field_model_check must be yes or no",
     "game file line %d: wide_items must be off, shadow or on",
     "game file line %d: wide_rows must be 320 or an even number from 510 to %d: 510 is used",
+    "game file line %d: wide_throw must be on or off: on is used",
     "game file line %d: test_fill_rows takes one number, 1 to %d (a testing aid: the rows of the item list to fill at every load)",
     "game file line %d: achievement_materia_view must be yes or no",
     "game file line %d: %s",
@@ -737,7 +780,8 @@
     "game file line %d: unknown key",
     "game file line %d: a limit must be a number from 1 to %d",
     "game file line %d: %lu is above the most allowed; using %lu",
-    "game file line %d: atb_follows_dexterity must be yes or no"
+    "game file line %d: atb_follows_dexterity must be yes or no",
+    "test_battle = %ld (scene %ld, formation %ld) is a DLL scene's battle (1024 and up): it needs enemies = on in the game file (read at start-up); test_battle is off"
    ],
    "returned": [
     "box must be off, on or auto",
@@ -1027,7 +1071,10 @@
     "parse_flags",
     "warn_reflect_with_hits",
     "apply_flag_changes",
-    "set_bytes"
+    "set_bytes",
+    "spell_script_value_problem",
+    "spell_bytes_problem",
+    "spell_bytes_refused_command"
    ],
    "log_prefix": "spell file line %d: ",
    "grammar": "sections",
@@ -1297,6 +1344,96 @@
        "group": "Record fields",
        "messages": [
         "order must be restore, attack, indirect or auto"
+       ]
+      },
+      {
+       "name": "script",
+       "type": "enum",
+       "restart": "hot",
+       "help": "The model script the CASTER plays (a party member), in place of the command's own (Magic 0x1d, Summon 0x1f): one of 0x1c-0x21, 0x23, 0x25, 0x27, 0x29, 0x2b, 0x2d (hex or decimal), or none (the default: the command's own). Example: script = 0x20 Used only when the caster's model as it is at the cast (a transformed form's, a frog's) has that script and it preloads (e8) and plays the effect (ec); otherwise the command's own plays and the log says why, once. A spell that can be reflected may name 0x1c-0x1f only (or add special = -reflectable): a higher one is not used at the cast. Party members only (an enemy's attacks have `script` in the enemies files); not for limits (the limits file's own script is bytes). Refused: 0-0x1b, 0x22 0x24 0x26 0x28 0x2a 0x2c (the game plays the next number when the cast has several targets), 0x2e-0x3b and 0x3c up. (FF7_SpellExt_Spells_README.txt)",
+       "source_line": 15821,
+       "values": [
+        [
+         "none"
+        ],
+        [
+         "0x1c",
+         "28"
+        ],
+        [
+         "0x1d",
+         "29"
+        ],
+        [
+         "0x1e",
+         "30"
+        ],
+        [
+         "0x1f",
+         "31"
+        ],
+        [
+         "0x20",
+         "32"
+        ],
+        [
+         "0x21",
+         "33"
+        ],
+        [
+         "0x23",
+         "35"
+        ],
+        [
+         "0x25",
+         "37"
+        ],
+        [
+         "0x27",
+         "39"
+        ],
+        [
+         "0x29",
+         "41"
+        ],
+        [
+         "0x2b",
+         "43"
+        ],
+        [
+         "0x2d",
+         "45"
+        ]
+       ],
+       "default": "none",
+       "group": "Record fields",
+       "messages": [
+        "script must be a model script number (0x1c-0x21, 0x23, 0x25, 0x27, 0x29, 0x2b or 0x2d), or none",
+        "script must be 0x1c-0x21, 0x23, 0x25, 0x27, 0x29, 0x2b or 0x2d (0x%lx: %s); the spell is kept without it"
+       ]
+      },
+      {
+       "name": "script_bytes",
+       "type": "raw",
+       "restart": "hot",
+       "help": "The CASTER's own script for this spell (a party member), as bytes in hexadecimal, as a limit's `script`: script_bytes = e8 fc ea 06 c9 07 ca 08 ec 09 e5 ee  3 to 128 bytes, or none (the default). It plays in place of the command's own script (Magic 0x1d, Summon 0x1f) for that one cast; the model's own is back for the next. Numbers below 0x2c are the caster's animations. A cast starts with e8, has one ec and ends with ee, once, and uses only e8 ec ea fc ed fa e5 e6 a4 a5 f4 NN f3 c9 ca ee and animations 00-2b; a hold c9 .. ca needs an animation or f4 01 f3 between them and no ec inside; ed needs an fa after it. A refused value (a line in the log) leaves the key as it was. Not used at the cast (the command's own plays, the log says why): an enemy caster, a frog, a model with fewer animations than the script plays, a slot a state lends, a caster other than script_bytes_model. With script as well, script is not used. Up to 64 spells may carry it. Not for limits (a limit has `script`). (FF7_SpellExt_Spells_README.txt)",
+       "default": "none",
+       "group": "Record fields",
+       "messages": [
+        "script_bytes is a spell file key: a limit has `script`",
+        "script_bytes: %s; the spell is kept without it"
+       ]
+      },
+      {
+       "name": "script_bytes_model",
+       "type": "raw",
+       "restart": "hot",
+       "help": "The spell's script_bytes play only when the caster's script file is this one: its first two letters in the battle archive's naming, or its whole name (script_bytes_model = xy or XYAB), any case, or none (the default: any party model whose animations cover the bytes). Another caster (Mime, another member with the materia) then casts the spell the plain way. Given without script_bytes: not used, with a line. (FF7_SpellExt_Spells_README.txt)",
+       "default": "none",
+       "group": "Record fields",
+       "messages": [
+        "script_bytes_model is the caster's script file in the battle archive's naming, its two letters or its name (xy or XYAB), or none",
+        "script_bytes_model is a spell file key"
        ]
       },
       {
@@ -1632,7 +1769,10 @@
     "spell file: %d spells loaded, %d line(s) with problems",
     "first spell: ID %d, record reached through index %08lx",
     "WARNING: %s %d (line %d) is reflectable and hits %d times: the game does not cope when some hits are reflected and others land (a death may not be shown). Add `special = -reflectable` to it.",
-    "spell %d: flags changed from its base: element %04x, target %02x, status %08lx, special %04x (special is stored inverted)"
+    "spell %d: flags changed from its base: element %04x, target %02x, status %08lx, special %04x (special is stored inverted)",
+    "spell file line %d: spell %d has script_bytes and script: script (0x%x) is not used",
+    "spell file line %d: spell %d: script_bytes not used: only %d spells may carry it",
+    "spell file line %d: spell %d: script_bytes_model is not used: the spell has no script_bytes"
    ],
    "returned": [
     "a section must be an ID in brackets, like [3000]",
@@ -1659,7 +1799,37 @@
     "too many materia for one spell",
     "bytes needs 28 two-digit hex values",
     "the offset is not inside the 28-byte record",
-    "unknown key"
+    "unknown key",
+    "0-0x1b are the idles, the KO pose, the reactions the game plays by itself, Defend, Attack and the Cut turns",
+    "the game plays the next number when the cast has several targets (008ff1e8): name that one or another",
+    "the game plays its own script there for every model (0x2e-0x32, 0x34-0x3b); 0x34 also skips the silence and frog checks",
+    "0x33 is the reaction none; 0x3c-0x49 are limits and follow-ups, written by the DLL at a limit's set-up; a model has 74",
+    "a spell's script_bytes may be up to 128 bytes",
+    "a cast is at least 3 bytes (e8, ec, ee)",
+    "a cast starts with e8, the preload of the spell's effect files",
+    "b6 NN aa are an enemy's (a 60-list task and the camera's hold, no party script uses them): write NN as a plain animation byte and drop aa",
+    "XX reloads the model (a2 / ac)",
+    "XX jumps (to a mark of the script)",
+    "XX never finishes (fe c0 / ff): the battle would wait on it",
+    "f1 holds the script on its own byte after the action: the slot is put back under it",
+    "9e waits on the target and the effects: no game cast does, and a 9e end once locked a battle",
+    "XX is not one of the commands the game's own cast scripts use (e8 ec ea fc ed fa e5 e6 a4 a5 f4 f3 c9 ca ee)",
+    "the operands of XX run past the end",
+    "animation XX is a limit pack's (2c-33): a spell loads no pack",
+    "animation XX is past 2b: only the body animations that have a weapon track in the party layout, 00-2b",
+    "ca jumps to just after a c9: there is none before it",
+    "ee before the last byte: a cast ends with ee, once",
+    "the last command is not ee: a cast ends with ee, once",
+    "e8 more than once: a cast has one preload",
+    "ec more than once: a cast has one effect step",
+    "no ec: a cast has one effect step",
+    "a byte c9 inside a command's operand (f4 c9) comes before the hold's c9: ca would jump there",
+    "nothing between c9 and ca waits a frame: while the effect loads the hold would repeat for ever within one frame (the game's own: c9 f4 01 f3 ca, or c9 07 ca)",
+    "ec inside the hold: the effect step could run again",
+    "ed steps the caster forward, one step more each cast: only fa puts it home (an fa after it)",
+    "script_bytes is a spell file key: a limit has `script`",
+    "script_bytes_model is a spell file key",
+    "script_bytes_model is the caster's script file in the battle archive's naming, its two letters or its name (xy or XYAB), or none"
    ],
    "not_keys": [
     "inflict",
@@ -1675,7 +1845,9 @@
    "notes": [
     "The reflect WARNING is forecast only when the file itself sets additional_effect, additional_modifier and special (else the base's bytes decide).",
     "finish_spell's 'has no base' line says \"spell file line\" with the combined text's line number also for a section of the test file (a quirk of the DLL; the tool attaches it to the test file's own line).",
-    "An effect copy the effects file defines without a problem can still be refused by the game (its loader, its names, its files): the spell's animation line is then logged too."
+    "An effect copy the effects file defines without a problem can still be refused by the game (its loader, its names, its files): the spell's animation line is then logged too.",
+    "script: the DLL refuses a reflectable spell's script above 0x1f only at the cast (spell_script_rule, logged as 'spell script: ... NOT used'); the tool says it at reading, as its own note, when the file itself decides the special word's reflectable bit (a byte_1b/word_1a/dword_18/bytes line or a special line); the caster's model (whether the slot holds a cast) is not forecast.",
+    "script_bytes: the reading check (spell_bytes_problem) is forecast; the checks at the cast (a party caster with its own model, the animations present, the slot not lent by a state, script_bytes_model) are the game's, logged as 'spell bytes: ...', not forecast. A spell with script and an accepted script_bytes keeps the bytes; a refused script_bytes leaves script working."
    ]
   },
   "FF7_SpellExt_Characters.ini": {
@@ -1687,7 +1859,8 @@
     "character_portrait_key",
     "curve_from_targets",
     "character_ai_key",
-    "new_character_by_name"
+    "new_character_by_name",
+    "forget_flag_parse"
    ],
    "log_prefix": "character file line %d: ",
    "grammar": "sections",
@@ -1749,6 +1922,26 @@
         "expected yes or no"
        ],
        "source_line": 17609
+      },
+      {
+       "name": "forget_flag",
+       "type": "text",
+       "words": [
+        "none"
+       ],
+       "group": "Joining",
+       "default": "none",
+       "restart": "hot",
+       "help": "BANK:BYTE.BIT, a save bit (the bank as a field script names it: 1, 3, 11, 13 or 15, or B, D, F; a byte 0-255; a bit 0-7), or none (the default). For a GUEST: a character that joins for one scene and joins for real later, made afresh from this sheet then. When a field script turns that bit on, the character is FORGOTTEN at the next party rebuild or the end of a load, if it is out of the party, not shown or locked in the PHS, and untouched (its sheet's gear and materia kinds); otherwise one line in the log says why. Bytes 192-255 of bank 11 and bytes 9-11 of bank 3 are refused. Not copied by copy_of. forget_flag = 3:1.4 (FF7_SpellExt_Characters_README.txt)",
+       "messages": [
+        "forget_flag must be BANK:BYTE.BIT (such as 3:1.4) or none",
+        "forget_flag: the bank must be 1, 3, 11 (B), 13 (D) or 15 (F), the save's banks as a field script names them for its bits",
+        "forget_flag: the byte must be 0 to 255",
+        "forget_flag: the bit must be 0 to 7",
+        "forget_flag: bytes 192-255 of bank 11 hold a character's record (the DLL's own place): not a flag",
+        "forget_flag: bytes 9-11 of bank 3 are the field's copy of the party: not a flag"
+       ],
+       "source_line": 22158
       },
       {
        "name": "base",
@@ -1918,6 +2111,29 @@
        "source_line": 17397
       },
       {
+       "name": "battle_files_when",
+       "type": "text",
+       "default": "none",
+       "restart": "hot",
+       "group": "Looks",
+       "words": [
+        "none"
+       ],
+       "maxlen": 24,
+       "help": "BANK:BYTE.BIT and then two letters, for example 3:62.0 cd: while that bit of the save is on, the character's battle files are cd.. instead of its battle_files (ab..), the skin and weapon model included. Read when a battle loads the model, so every file of one battle is of one look. Needs battle_files. The two _when keys may name the same bit (the usual case) or two different bits (the log says when they differ). none clears it. (FF7_SpellExt_Characters_README.txt)",
+       "messages": [
+        "battle_files_when: ",
+        "expected BANK:BYTE.BIT (such as 3:62.0) and then ",
+        "two letters (such as zs)",
+        ", or none",
+        "the bit: ",
+        "a bit is needed before the letters (to clear the key write none alone)",
+        "the files must be two letters (such as zs)",
+        "the files' letters may only be letters"
+       ],
+       "source_line": 22142
+      },
+      {
        "name": "body_blend",
        "type": "bool",
        "default": "no",
@@ -2004,6 +2220,29 @@
         "field_model may only use letters and digits"
        ],
        "source_line": 17649
+      },
+      {
+       "name": "field_model_when",
+       "type": "text",
+       "default": "none",
+       "restart": "hot",
+       "group": "Looks",
+       "words": [
+        "none"
+       ],
+       "maxlen": 24,
+       "help": "BANK:BYTE.BIT and then four characters, for example 3:62.0 EFGH: while that bit of the save is on, every field names the skeleton EFGH.HRC wherever it would name the character's field_model (ABCD.HRC), and the entity SpellExt adds for the character gets EFGH.HRC too. The bit is read when a field is read, so a look changes at the next field you enter after the bit changes. The two skeletons must have the same bones in the same order, and EFGH.HRC and its parts must be where field_model's are (a mod's char folder): a missing file is said once in the log and the first look stays. Needs field_model, which must name another skeleton and must not be one of the game's own (char.lgp); two characters that share a skeleton cannot use it (both keys are switched off, with one line). none clears it. By convention a mod that uses it holds the whole byte of the bit for outfit looks. (FF7_SpellExt_Characters_README.txt)",
+       "messages": [
+        "field_model_when: ",
+        "expected BANK:BYTE.BIT (such as 3:62.0) and then ",
+        "four characters (ABCD for ABCD.HRC)",
+        ", or none",
+        "the bit: ",
+        "a bit is needed before the letters (to clear the key write none alone)",
+        "the skeleton must be four characters (ABCD for ABCD.HRC)",
+        "a skeleton's name may only use letters and digits"
+       ],
+       "source_line": 22556
       },
       {
        "name": "limits",
@@ -2543,7 +2782,13 @@
     "the values rise too fast between two of the levels for the game's format",
     "this character ID is already defined",
     "unknown key",
-    "weapon must be a weapon's item ID: 128 to 255, 320 to 383 for a new weapon, or 10000 to 15999 for a wide weapon"
+    "weapon must be a weapon's item ID: 128 to 255, 320 to 383 for a new weapon, or 10000 to 15999 for a wide weapon",
+    "forget_flag must be BANK:BYTE.BIT (such as 3:1.4) or none",
+    "forget_flag: the bank must be 1, 3, 11 (B), 13 (D) or 15 (F), the save's banks as a field script names them for its bits",
+    "forget_flag: the byte must be 0 to 255",
+    "forget_flag: the bit must be 0 to 7",
+    "forget_flag: bytes 192-255 of bank 11 hold a character's record (the DLL's own place): not a flag",
+    "forget_flag: bytes 9-11 of bank 3 are the field's copy of the party: not a flag"
    ],
    "not_keys": [
     "cloud",
@@ -2630,13 +2875,14 @@
   "FF7_SpellExt_Shops.ini": {
    "title": "Shops",
    "readers": [
-    "load_shop_file"
+    "load_shop_file",
+    "shop_item_number_ok"
    ],
    "log_prefix": "shop file line %d: ",
    "grammar": "sections",
    "reread": "Read with the game file: at start-up and by \"Re-init .ini files\". The game's own stock is put back first whenever this file is read, so removing a line removes what it added.",
    "readmes": [],
-   "help": "A section is a shop's number in brackets, [0] to [79]; in it, add = ... lists what the shop also sells, with commas or spaces between the entries (add = 243, 244, m49): item IDs (0-127 items, 128-255 weapons, 256-287 armour, 288-319 accessories, 320-383 new weapons, 384-415 new armour, 416-447 new accessories, 105-127 and 448-511 new items, or a wide item's number 1024 to 9999) and materia as m and the materia ID (m49 = Fire). Every shop can hold 32 entries: the game's own (10 at most) and what is added here. The price is the item's own. (the comment block of FF7_SpellExt_Shops.ini)",
+   "help": "A section is a shop's number in brackets, [0] to [79]; in it, add = ... lists what the shop also sells, with commas or spaces between the entries (add = 243, 244, m49): item IDs (0-127 items, 128-255 weapons, 256-287 armour, 288-319 accessories, 320-383 new weapons, 384-415 new armour, 416-447 new accessories, 105-127 and 448-511 new items, a wide item's number 1024 to 9999, or a wide weapon's 10000 to 15999, a wide armour's 16000 to 21999 or a wide accessory's 22000 to 27999) and materia as m and the materia ID (m49 = Fire). Every shop can hold 32 entries: the game's own (10 at most) and what is added here. The price is the item's own. (the comment block of FF7_SpellExt_Shops.ini)",
    "sections": [
     {
      "kind": "shop",
@@ -2654,11 +2900,11 @@
        "restart": "hot",
        "item": "ID or mID",
        "repeatable": true,
-       "help": "What the shop also sells: item IDs (0 to 511, or a wide item's number 1024 to 9999) and materia as m and an ID (m49), separated by commas or spaces. A shop holds 32 entries. The key may be written more than once. (the comment block of FF7_SpellExt_Shops.ini)",
+       "help": "What the shop also sells: item IDs (0 to 511), a wide item's number (1024 to 9999), a wide weapon, armour or accessory's number (10000 to 27999) and materia as m and an ID (m49), separated by commas or spaces. A shop holds 32 entries. The key may be written more than once. A wide piece of gear the gear files do not define, or that cannot be sold, is not offered (the log says so when the kernel is loaded). (the comment block of FF7_SpellExt_Shops.ini)",
        "messages": [
-        "add takes item IDs (0 to 511, or a wide item's number 1024 to 9999) and materia as m and an ID (m49); a shop holds 32 entries"
+        "add takes item IDs (0 to 511), a wide item's number (1024 to 9999), a wide weapon, armour or accessory's number (10000 to 27999) and materia as m and an ID (m49); a shop holds 32 entries"
        ],
-       "source_line": 37333
+       "source_line": 44798
       }
      ]
     }
@@ -2666,7 +2912,7 @@
    "messages": [
     "shop file line %d: a section is a shop's number in brackets, [0] to [79]",
     "shop file line %d: %s",
-    "shop file line %d: add takes item IDs (0 to 511, or a wide item's number 1024 to 9999) and materia as m and an ID (m49); a shop holds 32 entries",
+    "shop file line %d: add takes item IDs (0 to 511), a wide item's number (1024 to 9999), a wide weapon, armour or accessory's number (10000 to 27999) and materia as m and an ID (m49); a shop holds 32 entries",
     "shop file: %d addition(s), %d line(s) with problems"
    ],
    "returned": [
@@ -3288,11 +3534,18 @@
         "item"
        ],
        "group": "Who and where",
-       "help": "Item icon: sword glove gunarm headdress staff spear shuriken megaphone gun, or a kernel weapon number; or armour (also armor), accessory or item for that kind's icon. Only the icon changes: the weapon is still equipped and used as a weapon. Also for wide weapons. Default: as the base.",
+       "help": "Item icon: sword glove gunarm headdress staff spear shuriken megaphone gun, or a kernel weapon number; or armour (also armor), accessory or item for that kind's icon. Only the icon changes: the weapon is still equipped and used as a weapon. Also for wide weapons. Default: as the base. Or file:NAME.png / file:NAME.tex, a picture of your own under SpellExtConfig\\files\\icons (sub-folders: file:potions/blue.png; at most 63 characters with its folders, no .., none of : * ? \" < > | ~) shown in the full-size item lists; the section may give both a word and a file, and the word is the icon shown when the file cannot be. A missing or bad file shows the game's icon.",
        "messages": [
-        "icon must be sword, glove, gunarm, headdress, staff, spear, shuriken, megaphone, gun, armour, accessory, item, or a kernel weapon"
+        "icon must be sword, glove, gunarm, headdress, staff, spear, shuriken, megaphone, gun, armour, accessory, item, or a kernel weapon (or file:NAME.png or file:NAME.tex, a picture of your own)",
+        "icon takes file:NAME.png or file:NAME.tex, a picture in SpellExtConfig\\files\\icons (sub-folders may be given: file:potions/blue.png). The line is not read",
+        "the icon file's name is too long: at most 63 characters with its folders. The line is not read",
+        "the icon file needs a name and the ending .png or .tex. The line is not read",
+        "the icon file's name has a character a file name cannot have here (: * ? \" < > | ~). The line is not read",
+        "the icon file's folders must be inside SpellExtConfig\\files\\icons (no empty folder name, no .., no leading /). The line is not read",
+        "the icon file must be a .png or a .tex. The line is not read",
+        "the icon file needs a name before .png or .tex. The line is not read"
        ],
-       "source_line": 35318
+       "source_line": 40360
       },
       {
        "name": "throw_like",
@@ -3623,11 +3876,18 @@
         "item"
        ],
        "group": "Who and where",
-       "help": "Item icon: sword glove gunarm headdress staff spear shuriken megaphone gun, or a kernel weapon number; or armour (also armor), accessory or item for that kind's icon. Only the icon changes: the weapon is still equipped and used as a weapon. Also for wide weapons. Default: the kernel's.",
+       "help": "Item icon: sword glove gunarm headdress staff spear shuriken megaphone gun, or a kernel weapon number; or armour (also armor), accessory or item for that kind's icon. Only the icon changes: the weapon is still equipped and used as a weapon. Also for wide weapons. Default: the kernel's. Or file:NAME.png / file:NAME.tex, a picture of your own under SpellExtConfig\\files\\icons (sub-folders: file:potions/blue.png; at most 63 characters with its folders, no .., none of : * ? \" < > | ~) shown in the full-size item lists; the section may give both a word and a file, and the word is the icon shown when the file cannot be. A missing or bad file shows the game's icon.",
        "messages": [
-        "icon must be sword, glove, gunarm, headdress, staff, spear, shuriken, megaphone, gun, armour, accessory, item, or a kernel weapon"
+        "icon must be sword, glove, gunarm, headdress, staff, spear, shuriken, megaphone, gun, armour, accessory, item, or a kernel weapon (or file:NAME.png or file:NAME.tex, a picture of your own)",
+        "icon takes file:NAME.png or file:NAME.tex, a picture in SpellExtConfig\\files\\icons (sub-folders may be given: file:potions/blue.png). The line is not read",
+        "the icon file's name is too long: at most 63 characters with its folders. The line is not read",
+        "the icon file needs a name and the ending .png or .tex. The line is not read",
+        "the icon file's name has a character a file name cannot have here (: * ? \" < > | ~). The line is not read",
+        "the icon file's folders must be inside SpellExtConfig\\files\\icons (no empty folder name, no .., no leading /). The line is not read",
+        "the icon file must be a .png or a .tex. The line is not read",
+        "the icon file needs a name before .png or .tex. The line is not read"
        ],
-       "source_line": 35318
+       "source_line": 40360
       },
       {
        "name": "throw_like",
@@ -3953,11 +4213,18 @@
         "item"
        ],
        "group": "Who and where",
-       "help": "Item icon: sword glove gunarm headdress staff spear shuriken megaphone gun, or a kernel weapon number; or armour (also armor), accessory or item for that kind's icon. Only the icon changes: the weapon is still equipped and used as a weapon. Also for wide weapons. Default: as the base.",
+       "help": "Item icon: sword glove gunarm headdress staff spear shuriken megaphone gun, or a kernel weapon number; or armour (also armor), accessory or item for that kind's icon. Only the icon changes: the weapon is still equipped and used as a weapon. Also for wide weapons. Default: as the base. Or file:NAME.png / file:NAME.tex, a picture of your own under SpellExtConfig\\files\\icons (sub-folders: file:potions/blue.png; at most 63 characters with its folders, no .., none of : * ? \" < > | ~) shown in the full-size item lists; the section may give both a word and a file, and the word is the icon shown when the file cannot be. A missing or bad file shows the game's icon.",
        "messages": [
-        "icon must be sword, glove, gunarm, headdress, staff, spear, shuriken, megaphone, gun, armour, accessory, item, or a kernel weapon"
+        "icon must be sword, glove, gunarm, headdress, staff, spear, shuriken, megaphone, gun, armour, accessory, item, or a kernel weapon (or file:NAME.png or file:NAME.tex, a picture of your own)",
+        "icon takes file:NAME.png or file:NAME.tex, a picture in SpellExtConfig\\files\\icons (sub-folders may be given: file:potions/blue.png). The line is not read",
+        "the icon file's name is too long: at most 63 characters with its folders. The line is not read",
+        "the icon file needs a name and the ending .png or .tex. The line is not read",
+        "the icon file's name has a character a file name cannot have here (: * ? \" < > | ~). The line is not read",
+        "the icon file's folders must be inside SpellExtConfig\\files\\icons (no empty folder name, no .., no leading /). The line is not read",
+        "the icon file must be a .png or a .tex. The line is not read",
+        "the icon file needs a name before .png or .tex. The line is not read"
        ],
-       "source_line": 35318
+       "source_line": 40360
       },
       {
        "name": "throw_like",
@@ -4070,12 +4337,14 @@
    "messages": [
     "weapon file line %d: *** wide weapon %d is NOT defined: no memory for more definitions (%d are defined) ***",
     "weapon file line %d: wide weapon %d: throw = yes is not possible for a weapon numbered from 10000 in this version: it cannot be thrown",
+    "weapon file line %d: wide weapon %d: throw = yes: it cannot be thrown in this run (wide throw is not on: see the \"wide throw:\" line at the start)",
     "weapon file line %d: weapon %d has no base; skipped",
     "no weapon file (%s): no new weapons",
     "weapon file could not be read: no new weapons",
     "weapon file line %d: %s",
     "weapon file: %d weapons loaded, %d line(s) with problems",
-    "%s file: %d of the game's own %s changed by their sections ([%d] to [%d])%s%s; %d line(s) of those sections with problems (each said above)"
+    "%s file: %d of the game's own %s changed by their sections ([%d] to [%d])%s%s; %d line(s) of those sections with problems (each said above)",
+    "%s file line %d: icon = file:%s is not used: %d different icon files are named already: the game's icon is shown"
    ],
    "returned": [
     "a weapon has at most 8 slots",
@@ -4085,7 +4354,7 @@
     "equip must be a list of character names or IDs (0 to 11, and 12 to 43 for the character file's), or everyone, none, or a mask as 0x....",
     "expected a number from 0 to 255",
     "expected yes or no",
-    "icon must be sword, glove, gunarm, headdress, staff, spear, shuriken, megaphone, gun, armour, accessory, item, or a kernel weapon",
+    "icon must be sword, glove, gunarm, headdress, staff, spear, shuriken, megaphone, gun, armour, accessory, item, or a kernel weapon (or file:NAME.png or file:NAME.tex, a picture of your own)",
     "price must be a number",
     "raw keys look like byte_04 or word_0e (two hex digits)",
     "slots must be a list of: pair, single, chain3 to chain8, none (add _nogrowth for slots that give no AP)",
@@ -4110,7 +4379,14 @@
     "[%lu]: numbers from 28000 are not given to anything; %s. The section is not read",
     "the game's own weapons cannot be changed in this run: the weapon table was not moved (see the start of the log). The section is not read",
     "base is not used in a section of one of the game's own weapons ([128] to [255]): the section changes that weapon itself, and every key it does not give keeps the kernel's value. The line is not read",
-    "give_on_load is for the weapon file's new weapons; one of the game's own weapons ([128] to [255]) is not given by it. The line is not read"
+    "give_on_load is for the weapon file's new weapons; one of the game's own weapons ([128] to [255]) is not given by it. The line is not read",
+    "icon takes file:NAME.png or file:NAME.tex, a picture in SpellExtConfig\\files\\icons (sub-folders may be given: file:potions/blue.png). The line is not read",
+    "the icon file's name is too long: at most 63 characters with its folders. The line is not read",
+    "the icon file needs a name and the ending .png or .tex. The line is not read",
+    "the icon file's name has a character a file name cannot have here (: * ? \" < > | ~). The line is not read",
+    "the icon file's folders must be inside SpellExtConfig\\files\\icons (no empty folder name, no .., no leading /). The line is not read",
+    "the icon file must be a .png or a .tex. The line is not read",
+    "the icon file needs a name before .png or .tex. The line is not read"
    ],
    "not_keys": [
     "sword",
@@ -4154,7 +4430,9 @@
     "no weapon file (%s): no new weapons",
     "weapon file could not be read: no new weapons",
     "weapon file: %d weapons loaded, %d line(s) with problems",
-    "%s file: %d of the game's own %s changed by their sections ([%d] to [%d])%s%s; %d line(s) of those sections with problems (each said above)"
+    "%s file: %d of the game's own %s changed by their sections ([%d] to [%d])%s%s; %d line(s) of those sections with problems (each said above)",
+    "weapon file line %d: wide weapon %d: throw = yes: it cannot be thrown in this run (wide throw is not on: see the \"wide throw:\" line at the start)",
+    "custom icon file:%s: %s: %s: the game's icon is shown"
    ]
   },
   "FF7_SpellExt_Armour.ini": {
@@ -4441,6 +4719,24 @@
         "expected yes or no"
        ],
        "source_line": 35812
+      },
+      {
+       "name": "icon",
+       "type": "text",
+       "default": "",
+       "restart": "hot",
+       "group": "Who",
+       "help": "icon = file:NAME.png or file:NAME.tex: a picture of your own for this armour in the full-size item lists (Item menu, shops, the battle's Item list, the box), a file under SpellExtConfig\\files\\icons (sub-folders: file:potions/blue.png; a name of at most 63 characters with its folders, no .., none of : * ? \" < > | ~). A PNG is square, 32, 64 or 128 a side (hard edges). A missing or bad file shows the game's icon. Default: the game's icon.",
+       "messages": [
+        "icon takes file:NAME.png or file:NAME.tex, a picture in SpellExtConfig\\files\\icons (sub-folders may be given: file:potions/blue.png). The line is not read",
+        "the icon file's name is too long: at most 63 characters with its folders. The line is not read",
+        "the icon file needs a name and the ending .png or .tex. The line is not read",
+        "the icon file's name has a character a file name cannot have here (: * ? \" < > | ~). The line is not read",
+        "the icon file's folders must be inside SpellExtConfig\\files\\icons (no empty folder name, no .., no leading /). The line is not read",
+        "the icon file must be a .png or a .tex. The line is not read",
+        "the icon file needs a name before .png or .tex. The line is not read"
+       ],
+       "source_line": 41080
       },
       {
        "name": "give_on_load",
@@ -4735,6 +5031,24 @@
        "source_line": 35812
       },
       {
+       "name": "icon",
+       "type": "text",
+       "default": "",
+       "restart": "hot",
+       "group": "Who",
+       "help": "icon = file:NAME.png or file:NAME.tex: a picture of your own for this armour in the full-size item lists (Item menu, shops, the battle's Item list, the box), a file under SpellExtConfig\\files\\icons (sub-folders: file:potions/blue.png; a name of at most 63 characters with its folders, no .., none of : * ? \" < > | ~). A PNG is square, 32, 64 or 128 a side (hard edges). A missing or bad file shows the game's icon. Default: the game's icon.",
+       "messages": [
+        "icon takes file:NAME.png or file:NAME.tex, a picture in SpellExtConfig\\files\\icons (sub-folders may be given: file:potions/blue.png). The line is not read",
+        "the icon file's name is too long: at most 63 characters with its folders. The line is not read",
+        "the icon file needs a name and the ending .png or .tex. The line is not read",
+        "the icon file's name has a character a file name cannot have here (: * ? \" < > | ~). The line is not read",
+        "the icon file's folders must be inside SpellExtConfig\\files\\icons (no empty folder name, no .., no leading /). The line is not read",
+        "the icon file must be a .png or a .tex. The line is not read",
+        "the icon file needs a name before .png or .tex. The line is not read"
+       ],
+       "source_line": 41080
+      },
+      {
        "name": "byte_",
        "type": "raw",
        "default": "",
@@ -5023,6 +5337,24 @@
        "source_line": 35812
       },
       {
+       "name": "icon",
+       "type": "text",
+       "default": "",
+       "restart": "hot",
+       "group": "Who",
+       "help": "icon = file:NAME.png or file:NAME.tex: a picture of your own for this armour in the full-size item lists (Item menu, shops, the battle's Item list, the box), a file under SpellExtConfig\\files\\icons (sub-folders: file:potions/blue.png; a name of at most 63 characters with its folders, no .., none of : * ? \" < > | ~). A PNG is square, 32, 64 or 128 a side (hard edges). A missing or bad file shows the game's icon. Default: the game's icon.",
+       "messages": [
+        "icon takes file:NAME.png or file:NAME.tex, a picture in SpellExtConfig\\files\\icons (sub-folders may be given: file:potions/blue.png). The line is not read",
+        "the icon file's name is too long: at most 63 characters with its folders. The line is not read",
+        "the icon file needs a name and the ending .png or .tex. The line is not read",
+        "the icon file's name has a character a file name cannot have here (: * ? \" < > | ~). The line is not read",
+        "the icon file's folders must be inside SpellExtConfig\\files\\icons (no empty folder name, no .., no leading /). The line is not read",
+        "the icon file must be a .png or a .tex. The line is not read",
+        "the icon file needs a name before .png or .tex. The line is not read"
+       ],
+       "source_line": 41080
+      },
+      {
        "name": "give_on_load",
        "type": "bool",
        "true": [
@@ -5081,7 +5413,15 @@
     "no %s file (%s)",
     "%s file line %d: %s",
     "%s file: %d loaded, %d line(s) with problems",
-    "%s file: %d of the game's own %s changed by their sections ([%d] to [%d])%s%s; %d line(s) of those sections with problems (each said above)"
+    "%s file: %d of the game's own %s changed by their sections ([%d] to [%d])%s%s; %d line(s) of those sections with problems (each said above)",
+    "icon takes file:NAME.png or file:NAME.tex, a picture in SpellExtConfig\\files\\icons (sub-folders may be given: file:potions/blue.png). The line is not read",
+    "the icon file's name is too long: at most 63 characters with its folders. The line is not read",
+    "the icon file needs a name and the ending .png or .tex. The line is not read",
+    "the icon file's name has a character a file name cannot have here (: * ? \" < > | ~). The line is not read",
+    "the icon file's folders must be inside SpellExtConfig\\files\\icons (no empty folder name, no .., no leading /). The line is not read",
+    "the icon file must be a .png or a .tex. The line is not read",
+    "the icon file needs a name before .png or .tex. The line is not read",
+    "%s file line %d: icon = file:%s is not used: %d different icon files are named already: the game's icon is shown"
    ],
    "returned": [
     "a name has at most 31 characters",
@@ -5118,7 +5458,14 @@
     "[%lu]: numbers 512 to 1023 are never used (a gap: the game's own arithmetic makes values there); %s. The section is not read",
     "[%lu]: numbers from 28000 are not given to anything; %s. The section is not read",
     "base is not used in a section of one of the game's own armour ([256] to [287]): the section changes that armour itself, and every key it does not give keeps the kernel's value. The line is not read",
-    "give_on_load is for the armour file's new armour; one of the game's own ([256] to [287]) is not given by it. The line is not read"
+    "give_on_load is for the armour file's new armour; one of the game's own ([256] to [287]) is not given by it. The line is not read",
+    "icon takes file:NAME.png or file:NAME.tex, a picture in SpellExtConfig\\files\\icons (sub-folders may be given: file:potions/blue.png). The line is not read",
+    "the icon file's name is too long: at most 63 characters with its folders. The line is not read",
+    "the icon file needs a name and the ending .png or .tex. The line is not read",
+    "the icon file's name has a character a file name cannot have here (: * ? \" < > | ~). The line is not read",
+    "the icon file's folders must be inside SpellExtConfig\\files\\icons (no empty folder name, no .., no leading /). The line is not read",
+    "the icon file must be a .png or a .tex. The line is not read",
+    "the icon file needs a name before .png or .tex. The line is not read"
    ],
    "not_keys": [
     "sword",
@@ -5162,7 +5509,8 @@
     "%s file not read: the %s table could not be moved",
     "no %s file (%s)",
     "%s file: %d loaded, %d line(s) with problems",
-    "%s file: %d of the game's own %s changed by their sections ([%d] to [%d])%s%s; %d line(s) of those sections with problems (each said above)"
+    "%s file: %d of the game's own %s changed by their sections ([%d] to [%d])%s%s; %d line(s) of those sections with problems (each said above)",
+    "custom icon file:%s: %s: %s: the game's icon is shown"
    ]
   },
   "FF7_SpellExt_Accessories.ini": {
@@ -5386,6 +5734,24 @@
         "expected yes or no"
        ],
        "source_line": 35812
+      },
+      {
+       "name": "icon",
+       "type": "text",
+       "default": "",
+       "restart": "hot",
+       "group": "Who",
+       "help": "icon = file:NAME.png or file:NAME.tex: a picture of your own for this accessory in the full-size item lists (Item menu, shops, the battle's Item list, the box), a file under SpellExtConfig\\files\\icons (sub-folders: file:potions/blue.png; a name of at most 63 characters with its folders, no .., none of : * ? \" < > | ~). A PNG is square, 32, 64 or 128 a side (hard edges). A missing or bad file shows the game's icon. Default: the game's icon.",
+       "messages": [
+        "icon takes file:NAME.png or file:NAME.tex, a picture in SpellExtConfig\\files\\icons (sub-folders may be given: file:potions/blue.png). The line is not read",
+        "the icon file's name is too long: at most 63 characters with its folders. The line is not read",
+        "the icon file needs a name and the ending .png or .tex. The line is not read",
+        "the icon file's name has a character a file name cannot have here (: * ? \" < > | ~). The line is not read",
+        "the icon file's folders must be inside SpellExtConfig\\files\\icons (no empty folder name, no .., no leading /). The line is not read",
+        "the icon file must be a .png or a .tex. The line is not read",
+        "the icon file needs a name before .png or .tex. The line is not read"
+       ],
+       "source_line": 41080
       },
       {
        "name": "give_on_load",
@@ -5617,6 +5983,24 @@
        "source_line": 35812
       },
       {
+       "name": "icon",
+       "type": "text",
+       "default": "",
+       "restart": "hot",
+       "group": "Who",
+       "help": "icon = file:NAME.png or file:NAME.tex: a picture of your own for this accessory in the full-size item lists (Item menu, shops, the battle's Item list, the box), a file under SpellExtConfig\\files\\icons (sub-folders: file:potions/blue.png; a name of at most 63 characters with its folders, no .., none of : * ? \" < > | ~). A PNG is square, 32, 64 or 128 a side (hard edges). A missing or bad file shows the game's icon. Default: the game's icon.",
+       "messages": [
+        "icon takes file:NAME.png or file:NAME.tex, a picture in SpellExtConfig\\files\\icons (sub-folders may be given: file:potions/blue.png). The line is not read",
+        "the icon file's name is too long: at most 63 characters with its folders. The line is not read",
+        "the icon file needs a name and the ending .png or .tex. The line is not read",
+        "the icon file's name has a character a file name cannot have here (: * ? \" < > | ~). The line is not read",
+        "the icon file's folders must be inside SpellExtConfig\\files\\icons (no empty folder name, no .., no leading /). The line is not read",
+        "the icon file must be a .png or a .tex. The line is not read",
+        "the icon file needs a name before .png or .tex. The line is not read"
+       ],
+       "source_line": 41080
+      },
+      {
        "name": "byte_",
        "type": "raw",
        "default": "",
@@ -5842,6 +6226,24 @@
        "source_line": 35812
       },
       {
+       "name": "icon",
+       "type": "text",
+       "default": "",
+       "restart": "hot",
+       "group": "Who",
+       "help": "icon = file:NAME.png or file:NAME.tex: a picture of your own for this accessory in the full-size item lists (Item menu, shops, the battle's Item list, the box), a file under SpellExtConfig\\files\\icons (sub-folders: file:potions/blue.png; a name of at most 63 characters with its folders, no .., none of : * ? \" < > | ~). A PNG is square, 32, 64 or 128 a side (hard edges). A missing or bad file shows the game's icon. Default: the game's icon.",
+       "messages": [
+        "icon takes file:NAME.png or file:NAME.tex, a picture in SpellExtConfig\\files\\icons (sub-folders may be given: file:potions/blue.png). The line is not read",
+        "the icon file's name is too long: at most 63 characters with its folders. The line is not read",
+        "the icon file needs a name and the ending .png or .tex. The line is not read",
+        "the icon file's name has a character a file name cannot have here (: * ? \" < > | ~). The line is not read",
+        "the icon file's folders must be inside SpellExtConfig\\files\\icons (no empty folder name, no .., no leading /). The line is not read",
+        "the icon file must be a .png or a .tex. The line is not read",
+        "the icon file needs a name before .png or .tex. The line is not read"
+       ],
+       "source_line": 41080
+      },
+      {
        "name": "give_on_load",
        "type": "bool",
        "true": [
@@ -5900,7 +6302,15 @@
     "no %s file (%s)",
     "%s file line %d: %s",
     "%s file: %d loaded, %d line(s) with problems",
-    "%s file: %d of the game's own %s changed by their sections ([%d] to [%d])%s%s; %d line(s) of those sections with problems (each said above)"
+    "%s file: %d of the game's own %s changed by their sections ([%d] to [%d])%s%s; %d line(s) of those sections with problems (each said above)",
+    "icon takes file:NAME.png or file:NAME.tex, a picture in SpellExtConfig\\files\\icons (sub-folders may be given: file:potions/blue.png). The line is not read",
+    "the icon file's name is too long: at most 63 characters with its folders. The line is not read",
+    "the icon file needs a name and the ending .png or .tex. The line is not read",
+    "the icon file's name has a character a file name cannot have here (: * ? \" < > | ~). The line is not read",
+    "the icon file's folders must be inside SpellExtConfig\\files\\icons (no empty folder name, no .., no leading /). The line is not read",
+    "the icon file must be a .png or a .tex. The line is not read",
+    "the icon file needs a name before .png or .tex. The line is not read",
+    "%s file line %d: icon = file:%s is not used: %d different icon files are named already: the game's icon is shown"
    ],
    "returned": [
     "a name has at most 31 characters",
@@ -5934,7 +6344,14 @@
     "[%lu]: numbers 512 to 1023 are never used (a gap: the game's own arithmetic makes values there); %s. The section is not read",
     "[%lu]: numbers from 28000 are not given to anything; %s. The section is not read",
     "base is not used in a section of one of the game's own accessories ([288] to [319]): the section changes that accessory itself, and every key it does not give keeps the kernel's value. The line is not read",
-    "give_on_load is for the accessory file's new accessories; one of the game's own ([288] to [319]) is not given by it. The line is not read"
+    "give_on_load is for the accessory file's new accessories; one of the game's own ([288] to [319]) is not given by it. The line is not read",
+    "icon takes file:NAME.png or file:NAME.tex, a picture in SpellExtConfig\\files\\icons (sub-folders may be given: file:potions/blue.png). The line is not read",
+    "the icon file's name is too long: at most 63 characters with its folders. The line is not read",
+    "the icon file needs a name and the ending .png or .tex. The line is not read",
+    "the icon file's name has a character a file name cannot have here (: * ? \" < > | ~). The line is not read",
+    "the icon file's folders must be inside SpellExtConfig\\files\\icons (no empty folder name, no .., no leading /). The line is not read",
+    "the icon file must be a .png or a .tex. The line is not read",
+    "the icon file needs a name before .png or .tex. The line is not read"
    ],
    "not_keys": [
     "sword",
@@ -5978,7 +6395,8 @@
     "%s file not read: the %s table could not be moved",
     "no %s file (%s)",
     "%s file: %d loaded, %d line(s) with problems",
-    "%s file: %d of the game's own %s changed by their sections ([%d] to [%d])%s%s; %d line(s) of those sections with problems (each said above)"
+    "%s file: %d of the game's own %s changed by their sections ([%d] to [%d])%s%s; %d line(s) of those sections with problems (each said above)",
+    "custom icon file:%s: %s: %s: the game's icon is shown"
    ]
   },
   "FF7_SpellExt_Items.ini": {
@@ -6233,6 +6651,24 @@
         "expected yes or no"
        ],
        "source_line": 35812
+      },
+      {
+       "name": "icon",
+       "type": "text",
+       "default": "",
+       "restart": "hot",
+       "group": "In the Item menu",
+       "help": "icon = file:NAME.png or file:NAME.tex: a picture of your own for this item in the full-size item lists (Item menu, shops, the battle's Item list, the box), a file under SpellExtConfig\\files\\icons (sub-folders: file:potions/blue.png; a name of at most 63 characters with its folders, no .., none of : * ? \" < > | ~). A PNG is square, 32, 64 or 128 a side (hard edges). A missing or bad file shows the game's icon. Default: the game's icon.",
+       "messages": [
+        "icon takes file:NAME.png or file:NAME.tex, a picture in SpellExtConfig\\files\\icons (sub-folders may be given: file:potions/blue.png). The line is not read",
+        "the icon file's name is too long: at most 63 characters with its folders. The line is not read",
+        "the icon file needs a name and the ending .png or .tex. The line is not read",
+        "the icon file's name has a character a file name cannot have here (: * ? \" < > | ~). The line is not read",
+        "the icon file's folders must be inside SpellExtConfig\\files\\icons (no empty folder name, no .., no leading /). The line is not read",
+        "the icon file must be a .png or a .tex. The line is not read",
+        "the icon file needs a name before .png or .tex. The line is not read"
+       ],
+       "source_line": 41080
       },
       {
        "name": "give_on_load",
@@ -6510,6 +6946,24 @@
        "source_line": 35812
       },
       {
+       "name": "icon",
+       "type": "text",
+       "default": "",
+       "restart": "hot",
+       "group": "In the Item menu",
+       "help": "icon = file:NAME.png or file:NAME.tex: a picture of your own for this item in the full-size item lists (Item menu, shops, the battle's Item list, the box), a file under SpellExtConfig\\files\\icons (sub-folders: file:potions/blue.png; a name of at most 63 characters with its folders, no .., none of : * ? \" < > | ~). A PNG is square, 32, 64 or 128 a side (hard edges). A missing or bad file shows the game's icon. Default: the game's icon.",
+       "messages": [
+        "icon takes file:NAME.png or file:NAME.tex, a picture in SpellExtConfig\\files\\icons (sub-folders may be given: file:potions/blue.png). The line is not read",
+        "the icon file's name is too long: at most 63 characters with its folders. The line is not read",
+        "the icon file needs a name and the ending .png or .tex. The line is not read",
+        "the icon file's name has a character a file name cannot have here (: * ? \" < > | ~). The line is not read",
+        "the icon file's folders must be inside SpellExtConfig\\files\\icons (no empty folder name, no .., no leading /). The line is not read",
+        "the icon file must be a .png or a .tex. The line is not read",
+        "the icon file needs a name before .png or .tex. The line is not read"
+       ],
+       "source_line": 41080
+      },
+      {
        "name": "give_on_load",
        "type": "bool",
        "true": [
@@ -6569,7 +7023,15 @@
     "%s file line %d: %s",
     "%s file: %d loaded, %d line(s) with problems",
     "item file line %d: *** wide item %d is NOT defined: no memory for more definitions (%d are defined) ***",
-    "item file: %d of them are WIDE ITEMS (sections [%d] to [%d]; the first defined: %d \"%s\"): whether they can enter the item list in this run is said in the \"wide items:\" line"
+    "item file: %d of them are WIDE ITEMS (sections [%d] to [%d]; the first defined: %d \"%s\"): whether they can enter the item list in this run is said in the \"wide items:\" line",
+    "icon takes file:NAME.png or file:NAME.tex, a picture in SpellExtConfig\\files\\icons (sub-folders may be given: file:potions/blue.png). The line is not read",
+    "the icon file's name is too long: at most 63 characters with its folders. The line is not read",
+    "the icon file needs a name and the ending .png or .tex. The line is not read",
+    "the icon file's name has a character a file name cannot have here (: * ? \" < > | ~). The line is not read",
+    "the icon file's folders must be inside SpellExtConfig\\files\\icons (no empty folder name, no .., no leading /). The line is not read",
+    "the icon file must be a .png or a .tex. The line is not read",
+    "the icon file needs a name before .png or .tex. The line is not read",
+    "%s file line %d: icon = file:%s is not used: %d different icon files are named already: the game's icon is shown"
    ],
    "returned": [
     "a name has at most 31 characters",
@@ -6599,7 +7061,14 @@
     "%d to %d belong in the %s file",
     "[%lu] is a %s %s number (%s), not %s's: %s. The section is not read",
     "[%lu]: numbers 512 to 1023 are never used (a gap: the game's own arithmetic makes values there); %s. The section is not read",
-    "[%lu]: numbers from 28000 are not given to anything; %s. The section is not read"
+    "[%lu]: numbers from 28000 are not given to anything; %s. The section is not read",
+    "icon takes file:NAME.png or file:NAME.tex, a picture in SpellExtConfig\\files\\icons (sub-folders may be given: file:potions/blue.png). The line is not read",
+    "the icon file's name is too long: at most 63 characters with its folders. The line is not read",
+    "the icon file needs a name and the ending .png or .tex. The line is not read",
+    "the icon file's name has a character a file name cannot have here (: * ? \" < > | ~). The line is not read",
+    "the icon file's folders must be inside SpellExtConfig\\files\\icons (no empty folder name, no .., no leading /). The line is not read",
+    "the icon file must be a .png or a .tex. The line is not read",
+    "the icon file needs a name before .png or .tex. The line is not read"
    ],
    "not_keys": [
     "sword",
@@ -6644,7 +7113,8 @@
     "no %s file (%s)",
     "%s file: %d loaded, %d line(s) with problems",
     "item file line %d: *** wide item %d is NOT defined: no memory for more definitions (%d are defined) ***",
-    "item file: %d of them are WIDE ITEMS (sections [%d] to [%d]; the first defined: %d \"%s\"): whether they can enter the item list in this run is said in the \"wide items:\" line"
+    "item file: %d of them are WIDE ITEMS (sections [%d] to [%d]; the first defined: %d \"%s\"): whether they can enter the item list in this run is said in the \"wide items:\" line",
+    "custom icon file:%s: %s: %s: the game's icon is shown"
    ]
   },
   "FF7_SpellExt_Limits.ini": {
@@ -6664,13 +7134,13 @@
     "prop_scale_value",
     "finish_limit",
     "finish_states",
-    "state_hide_text",
-    "apply_key",
-    "form_section_start",
     "form_name",
     "form_key",
+    "form_section_start",
     "form_finish",
-    "finish_forms"
+    "finish_forms",
+    "state_hide_text",
+    "apply_key"
    ],
    "log_prefix": "limits file line %d: ",
    "grammar": "sections",
@@ -6678,7 +7148,7 @@
    "readmes": [
     "FF7_SpellExt_Limits_README.txt"
    ],
-   "help": "This file gives a NEW character (one defined in the character file) limit breaks of its own. Each limit belongs to one character. A character with any section here has ONLY the limits defined here. Sections: [12] the character's own settings; [12 1-1] one limit (level 1-4, position 1-3); [12 1-1 setname] a limit of a named set (used when the character's limit_set names it); [12 state NAME] one of the character's states (up to 4); [test] testing aids for the game's own characters. Any attack key from the spell file also works in a limit's section, with the same meaning, and overrides the base limit's value.",
+   "help": "This file gives a NEW character (one defined in the character file) limit breaks of its own. Each limit belongs to one character. A character with any section here has ONLY the limits defined here. Sections: [12] the character's own settings; [12 1-1] one limit (level 1-4, position 1-3); [12 1-1 setname] a limit of a named set (used when the character's limit_set names it); [12 state NAME] one of the character's states (up to 4); [test] testing aids for the game's own characters; [form NAME] a model a limit may turn its user into (16 at most). Any attack key from the spell file also works in a limit's section, with the same meaning, and overrides the base limit's value.",
    "sections": [
     {
      "kind": "character",
@@ -7080,6 +7550,61 @@
        "source_line": 26582
       },
       {
+       "name": "status2",
+       "type": "list",
+       "item": "status names",
+       "words": [
+        "none"
+       ],
+       "default": "none",
+       "restart": "hot",
+       "help": "A second status change, beside the one status and status_mode give: the status names as for status; none = no second change (the default). Not imprisoned. Both use the limit's status_chance. status2 = regen",
+       "messages": [
+        "status2 is a list of status names, as for status (regen barrier ...), or none",
+        "status2 cannot hold imprisoned (the game reads that bit of a status list as something else)"
+       ],
+       "source_line": 32834
+      },
+      {
+       "name": "status2_mode",
+       "type": "enum",
+       "values": [
+        [
+         "inflict"
+        ],
+        [
+         "cure"
+        ],
+        [
+         "toggle"
+        ]
+       ],
+       "default": "inflict",
+       "restart": "hot",
+       "help": "inflict (the default), cure or toggle: what status2 does.",
+       "messages": [
+        "status2_mode must be inflict, cure or toggle"
+       ],
+       "source_line": 32844
+      },
+      {
+       "name": "hits_on_every_target",
+       "type": "bool",
+       "true": [
+        "yes"
+       ],
+       "false": [
+        "no"
+       ],
+       "default": "no",
+       "restart": "hot",
+       "help": "yes or no (the default). For a limit at several targets with several hits (additional_effect 0, additional_modifier N): each of the N hits goes to EVERY target. Such a limit takes `all` entries of spell_effects only: a one-target entry, a hit: entry or an effect entry without all is refused (one line in the log) and the others are kept.",
+       "messages": [
+        "expected yes or no"
+       ],
+       "source_line": 32943
+      },
+      {
        "name": "form",
        "type": "text",
        "maxlen": 15,
@@ -7087,12 +7612,20 @@
         "none"
        ],
        "default": "none",
-       "messages": [
-        "form is the name of a [form NAME] section of this file, 1 to 15 letters, digits or _, or none"
-       ],
-       "help": "NAME. The limit turns its user into the form NAME, a battle model of its own defined in a section [form NAME] of this file (anywhere in it): an AI then takes the character's turns, and when the character is knocked out it changes back. A limit takes form or state, not both, and the character may have no state. The limit needs additional_effect 3 (the game's transformation: a base such as 173, or the key) and a script of its own with an ac command (ac 00 ... a2 11); otherwise it is LEFT OUT, with a line in the log. none = no form (the default). (FF7_SpellExt_Limits_README.txt, \"Transformations\")",
        "restart": "hot",
-       "source_line": 30004
+       "help": "NAME: the [form NAME] section of this file (anywhere in it) whose model the limit turns its user into for the rest of the battle; none = no form (the default). The limit needs additional_effect 3 (a base such as 173, or the key), a script of its own with an ac command (ac 00 ... a2 11), no state = and no state section for its character; otherwise it is LEFT OUT, with a line in the log.",
+       "messages": [
+        "form is the name of a [form NAME] section of this file, 1 to 15 letters, digits or _, or none",
+        "there is no section [form %s] in this file",
+        "that form is not usable (its section, line %d, had a problem)",
+        "it has state = %s too: a transforming limit cannot leave a state",
+        "character %d has a state ([%d state %s], line %d): a form and a state are not held together",
+        "it needs additional_effect 3 (the game's transformation: a base such as 173, or the key); this limit's is %d",
+        "it needs a script of the limit's own with an ac command (ac 00 ... a2 11); it has none",
+        "its script has no ac command (ac 00 stores the form's number before a2 loads its model)",
+        "a command of its script runs past the script's end before any ac"
+       ],
+       "source_line": 32860
       },
       {
        "name": "effect",
@@ -7157,7 +7690,7 @@
       {
        "name": "spell_effects",
        "type": "list",
-       "item": "[limit | effect] number:frame [all] [visual] [skip N], or hit:frame",
+       "item": "[limit | effect] number:frame [all] [visual] [skip N] [room N], or hit:frame",
        "max_entries": 24,
        "default": "",
        "messages": [
@@ -7169,9 +7702,11 @@
         "spell_effects: a `hit:frame` entry (a bare hit, no effect) takes nothing after it: no all, visual or skip",
         "spell_effects: `skip` must be followed by a number of frames",
         "spell_effects: `effect` must be followed by number:frame",
-        "spell_effects: `limit` must be followed by number:frame"
+        "spell_effects: `limit` must be followed by number:frame",
+        "spell_effects: `room` must be followed by a number of free slots, 1 to 100",
+        "spell_effects: `room` must be followed by a number of free slots"
        ],
-       "help": "Up to 24 of  animation:frame , one for each hit in order (or hit:frame, a bare hit: that hit shown with no effect). animation is a magic animation number as in the spell file (0x1b Fire, 0x1e Ice, 0x21 Bolt ...; enemy attack effects are scene effect + 0x4e). frame counts from the limit's effect step (the ec in its script), which is frame 0 of the animation the script plays next. Each effect is shown on its hit's own target and shows that hit's damage.",
+       "help": "Up to 24 of  animation:frame , one for each hit in order (or hit:frame, a bare hit: that hit shown with no effect). animation is a magic animation number as in the spell file (0x1b Fire, 0x1e Ice, 0x21 Bolt ...; enemy attack effects are scene effect + 0x4e). frame counts from the limit's effect step (the ec in its script), which is frame 0 of the animation the script plays next. Each effect is shown on its hit's own target and shows that hit's damage. After a spell or `limit` entry, room N (1 to 100): the step waits until the battle's list of effect tasks has N free places before it starts (for an effect that starts many tasks at once: Avalanche, magic animation 0x6f, about 92). Not for `effect` or `hit:` entries.",
        "restart": "hot",
        "source_line": 26826
       },
@@ -7437,6 +7972,61 @@
        "source_line": 26582
       },
       {
+       "name": "status2",
+       "type": "list",
+       "item": "status names",
+       "words": [
+        "none"
+       ],
+       "default": "none",
+       "restart": "hot",
+       "help": "A second status change, beside the one status and status_mode give: the status names as for status; none = no second change (the default). Not imprisoned. Both use the limit's status_chance. status2 = regen",
+       "messages": [
+        "status2 is a list of status names, as for status (regen barrier ...), or none",
+        "status2 cannot hold imprisoned (the game reads that bit of a status list as something else)"
+       ],
+       "source_line": 32834
+      },
+      {
+       "name": "status2_mode",
+       "type": "enum",
+       "values": [
+        [
+         "inflict"
+        ],
+        [
+         "cure"
+        ],
+        [
+         "toggle"
+        ]
+       ],
+       "default": "inflict",
+       "restart": "hot",
+       "help": "inflict (the default), cure or toggle: what status2 does.",
+       "messages": [
+        "status2_mode must be inflict, cure or toggle"
+       ],
+       "source_line": 32844
+      },
+      {
+       "name": "hits_on_every_target",
+       "type": "bool",
+       "true": [
+        "yes"
+       ],
+       "false": [
+        "no"
+       ],
+       "default": "no",
+       "restart": "hot",
+       "help": "yes or no (the default). For a limit at several targets with several hits (additional_effect 0, additional_modifier N): each of the N hits goes to EVERY target. Such a limit takes `all` entries of spell_effects only: a one-target entry, a hit: entry or an effect entry without all is refused (one line in the log) and the others are kept.",
+       "messages": [
+        "expected yes or no"
+       ],
+       "source_line": 32943
+      },
+      {
        "name": "form",
        "type": "text",
        "maxlen": 15,
@@ -7444,12 +8034,20 @@
         "none"
        ],
        "default": "none",
-       "messages": [
-        "form is the name of a [form NAME] section of this file, 1 to 15 letters, digits or _, or none"
-       ],
-       "help": "NAME. The limit turns its user into the form NAME, a battle model of its own defined in a section [form NAME] of this file (anywhere in it): an AI then takes the character's turns, and when the character is knocked out it changes back. A limit takes form or state, not both, and the character may have no state. The limit needs additional_effect 3 (the game's transformation: a base such as 173, or the key) and a script of its own with an ac command (ac 00 ... a2 11); otherwise it is LEFT OUT, with a line in the log. none = no form (the default). (FF7_SpellExt_Limits_README.txt, \"Transformations\")",
        "restart": "hot",
-       "source_line": 30004
+       "help": "NAME: the [form NAME] section of this file (anywhere in it) whose model the limit turns its user into for the rest of the battle; none = no form (the default). The limit needs additional_effect 3 (a base such as 173, or the key), a script of its own with an ac command (ac 00 ... a2 11), no state = and no state section for its character; otherwise it is LEFT OUT, with a line in the log.",
+       "messages": [
+        "form is the name of a [form NAME] section of this file, 1 to 15 letters, digits or _, or none",
+        "there is no section [form %s] in this file",
+        "that form is not usable (its section, line %d, had a problem)",
+        "it has state = %s too: a transforming limit cannot leave a state",
+        "character %d has a state ([%d state %s], line %d): a form and a state are not held together",
+        "it needs additional_effect 3 (the game's transformation: a base such as 173, or the key); this limit's is %d",
+        "it needs a script of the limit's own with an ac command (ac 00 ... a2 11); it has none",
+        "its script has no ac command (ac 00 stores the form's number before a2 loads its model)",
+        "a command of its script runs past the script's end before any ac"
+       ],
+       "source_line": 32860
       },
       {
        "name": "effect",
@@ -7514,7 +8112,7 @@
       {
        "name": "spell_effects",
        "type": "list",
-       "item": "[limit | effect] number:frame [all] [visual] [skip N], or hit:frame",
+       "item": "[limit | effect] number:frame [all] [visual] [skip N] [room N], or hit:frame",
        "max_entries": 24,
        "default": "",
        "messages": [
@@ -7526,9 +8124,11 @@
         "spell_effects: a `hit:frame` entry (a bare hit, no effect) takes nothing after it: no all, visual or skip",
         "spell_effects: `skip` must be followed by a number of frames",
         "spell_effects: `effect` must be followed by number:frame",
-        "spell_effects: `limit` must be followed by number:frame"
+        "spell_effects: `limit` must be followed by number:frame",
+        "spell_effects: `room` must be followed by a number of free slots, 1 to 100",
+        "spell_effects: `room` must be followed by a number of free slots"
        ],
-       "help": "Up to 24 of  animation:frame , one for each hit in order (or hit:frame, a bare hit: that hit shown with no effect). animation is a magic animation number as in the spell file (0x1b Fire, 0x1e Ice, 0x21 Bolt ...; enemy attack effects are scene effect + 0x4e). frame counts from the limit's effect step (the ec in its script), which is frame 0 of the animation the script plays next. Each effect is shown on its hit's own target and shows that hit's damage.",
+       "help": "Up to 24 of  animation:frame , one for each hit in order (or hit:frame, a bare hit: that hit shown with no effect). animation is a magic animation number as in the spell file (0x1b Fire, 0x1e Ice, 0x21 Bolt ...; enemy attack effects are scene effect + 0x4e). frame counts from the limit's effect step (the ec in its script), which is frame 0 of the animation the script plays next. Each effect is shown on its hit's own target and shows that hit's damage. After a spell or `limit` entry, room N (1 to 100): the step waits until the battle's list of effect tasks has N free places before it starts (for an effect that starts many tasks at once: Avalanche, magic animation 0x6f, about 92). Not for `effect` or `hit:` entries.",
        "restart": "hot",
        "source_line": 26826
       },
@@ -7949,6 +8549,32 @@
        "source_line": 26109
       },
       {
+       "name": "cover",
+       "type": "int",
+       "min": 0,
+       "max": 100,
+       "default": "0",
+       "restart": "hot",
+       "help": "0 to 100 (a % may follow). Default 0. While the state lasts the character covers an ally with this per cent chance, as the Cover materia makes it; the higher of this and the materia's counts. cover = 100",
+       "messages": [
+        "cover is 0 (the default) to 100: the per cent chance the actor covers an ally (takes a single physical hit meant for it), as the Cover materia's, while the state lasts; the Cover materia's own chance if it is higher"
+       ],
+       "source_line": 31754
+      },
+      {
+       "name": "counter",
+       "type": "int",
+       "min": 0,
+       "max": 100,
+       "default": "0",
+       "restart": "hot",
+       "help": "0 to 100 (a % may follow). Default 0. While the state lasts the character counters with Attack, at the enemy that hit it, with this per cent chance, as the Counter Attack materia makes it; the higher of this and the materia's counts. counter = 50",
+       "messages": [
+        "counter is 0 (the default) to 100: the per cent chance the actor counters with Attack when an enemy hits it, as the Counter Attack materia's, while the state lasts; the materia's own chance if it is higher"
+       ],
+       "source_line": 31754
+      },
+      {
        "name": "view_raise",
        "type": "int",
        "min": 0,
@@ -7988,6 +8614,19 @@
        "source_line": 26126
       },
       {
+       "name": "dexterity_per_target",
+       "type": "int",
+       "min": 0,
+       "max": 255,
+       "default": "0",
+       "restart": "hot",
+       "help": "0 to 255. Default 0. While the state lasts the character's battle dexterity is this much higher for each target the limit that began the state put one of its statuses on (255 at most in all). dexterity_per_target = 30",
+       "messages": [
+        "dexterity_per_target is 0 (the default) to 255: how much the actor's battle dexterity rises, while the state lasts, for each target a status of the limit that began the state landed on (255 at most in all)"
+       ],
+       "source_line": 31780
+      },
+      {
        "name": "script_",
        "prefix": true,
        "pattern": "script_NN (NN: two hex digits, 02-17 or 1c-2d)",
@@ -8008,82 +8647,6 @@
        "help": "While the state lasts, the character's model script NN (two hexadecimal digits) is replaced by these bytes, as idle_script replaces script 00. A reaction is a model script: 05 hurt, 06 hurt while defending, 07 the knock-out fall, 08 the dodge, 0a the big recoil, 0b the two-part recoil; casting is a model script too: 1d Magic and W-Magic, 1e Enemy Skill, 1f Summon, 20 and 21 Item (20 at the party's side, 21 at the enemies'), 21 also Throw and Coin; 13 is the Defend pose, 03 / 04 the row change, 10 an interrupted cast (ab_tool.py dump lists the model's own). Up to 16 lines a state, up to 32 bytes each; a later line for the same NN replaces it: script_05 = 22 f2 e5 ee script_08 = 23 e5 ee script_07 = 25 f2 e5 ee script_1d = e8 fc e6 ea 29 2a 2a ec 2d 2d 2d 2d 2d e5 ee (the hurt, the dodge and the fall played from animations 0x22, 0x23, 0x25; Magic as a wind-up, a hold twice, the spell's effect step ec, then animation 0x2d five times while the spell plays.) Not taken: 00 and 01 (idle_script, idle_weak_script), 18 to 1b (the attack scripts' slots), 2e-32 and 34-3b (the game takes those from its exe for every model), 33 and 3c up (the limits and transformations). A script that the battle waits for (every one but 02, 0c, 0d, 0e and 13, the standing poses) must END: one that ends in fe c0 is refused, because it would never say it has finished and the battle would wait for ever. A long one is safe: the action is over when the effect has finished AND the character has, whichever is later. Like idle_script, a script that loops (fe c0) is started again from its first byte as its animation's number. The scripts are lent when the state begins and given back when it ends; a script the character is playing at that moment (the knock-out fall that ends the state with `ends = ko`) plays to its end first, and only then is the model's own put back. Animations 0x2c-0x33 are the loaded limit pack's: a script that names them needs that pack still loaded (a state with limit_gauge = frozen keeps it).",
        "restart": "hot",
        "source_line": 26130
-      }
-     ]
-    },
-    {
-     "kind": "form",
-     "header": "[form NAME]",
-     "id_range": null,
-     "title": "A form: a battle model a limit can turn its user into",
-     "keys": [
-      {
-       "name": "model_enemy",
-       "type": "int",
-       "min": 0,
-       "max": 369,
-       "default": "",
-       "messages": [
-        "model_enemy is the number of an enemy model, 0 to 369 (the battle archive's two letters: 331 = mt..)",
-        "a form's parts are named after one model: model_enemy or model_like, once"
-       ],
-       "help": "The enemy model the form is: its number, 0 to 369 (the battle archive's two letters: 331 = mt). Its skeleton, animations, parts and textures are loaded as the game loads that enemy's: from the battle archive, or from a mod that puts files of those names in its place. Give one of model_enemy and model_like. (FF7_SpellExt_Limits_README.txt)",
-       "restart": "hot",
-       "source_line": 18652
-      },
-      {
-       "name": "model_like",
-       "type": "text",
-       "default": "",
-       "messages": [
-        "model_like is one of the game's own party-slot battle model names (the log lists them)",
-        "model_like: the game's table of battle model names (008ff2f0) is not as expected; use model_enemy",
-        "a form's parts are named after one model: model_enemy or model_like, once"
-       ],
-       "help": "Or: one of the game's own party-slot model names (GALL, DEATHGIG, CLOUD ...: the log lists them; the DLL reads them from the game, so this editor does not check the name). Give one of model_enemy and model_like. (FF7_SpellExt_Limits_README.txt)",
-       "restart": "hot",
-       "source_line": 18652
-      },
-      {
-       "name": "model_script",
-       "type": "text",
-       "maxlen": 4,
-       "default": "",
-       "messages": [
-        "model_script is the form's script file in the battle archive's naming, its two letters or its name (zo or ZOAB: 74 slots in the party layout)"
-       ],
-       "help": "The form's script file, named as the battle archive names files: its two letters or its whole name (zo or ZOAB). It goes where a character's battle_files go (the mod's battle folder, or SpellExtConfig\\files). It must hold 74 scripts in the party layout (an enemy model's own has 32, enemy-numbered: it must be rebuilt). Two letters a character's battle_files already uses are refused. A form needs model_script or model_files. (FF7_SpellExt_Limits_README.txt)",
-       "restart": "hot",
-       "source_line": 18637
-      },
-      {
-       "name": "model_files",
-       "type": "text",
-       "maxlen": 2,
-       "default": "",
-       "messages": [
-        "model_files is two letters: the form's own files in the battle archive's naming (xy: XYAA, XYAB, XYDA and its parts)"
-       ],
-       "help": "Instead (or as well): two letters naming a FULL set of the form's own files (XYAA the skeleton, XYAB the scripts, XYDA the animations, XYAC.. textures, XYAM.. parts), for a model that is not the game's as it is. With both, model_script names the script file and model_files the rest. Two letters a character's battle_files already uses are refused. (FF7_SpellExt_Limits_README.txt)",
-       "restart": "hot",
-       "source_line": 18637
-      },
-      {
-       "name": "weapon",
-       "type": "bool",
-       "true": [
-        "yes"
-       ],
-       "false": [
-        "no"
-       ],
-       "default": "no",
-       "messages": [
-        "weapon is yes (the equipped weapon's model is loaded with the form) or no (the default: none, as the game's beasts)"
-       ],
-       "help": "no (the default): the model has no weapon models, as the game's beasts. yes: the equipped weapon's model is loaded with it, as for a character. (FF7_SpellExt_Limits_README.txt)",
-       "restart": "hot",
-       "source_line": 18679
       }
      ]
     },
@@ -8134,6 +8697,146 @@
        "source_line": 26667
       }
      ]
+    },
+    {
+     "kind": "form",
+     "header": "[form NAME]",
+     "id_range": null,
+     "title": "A form: a model a limit turns its user into",
+     "keys": [
+      {
+       "name": "model_enemy",
+       "type": "int",
+       "min": 0,
+       "max": 369,
+       "default": "",
+       "restart": "hot",
+       "help": "The enemy model the form is: its number, 0 to 369 (the battle archive's two letters: 331 = mt). Its skeleton, animations, parts and textures are loaded as the game loads that enemy's. Give one of model_enemy and model_like, once.",
+       "messages": [
+        "model_enemy is the number of an enemy model, 0 to 369 (the battle archive's two letters: 331 = mt..)",
+        "a form's parts are named after one model: model_enemy or model_like, once"
+       ],
+       "source_line": 20312
+      },
+      {
+       "name": "model_like",
+       "type": "enum",
+       "values": [
+        [
+         "FROG"
+        ],
+        [
+         "CLOUD"
+        ],
+        [
+         "TIFA"
+        ],
+        [
+         "EARITH"
+        ],
+        [
+         "RED13"
+        ],
+        [
+         "YUFI"
+        ],
+        [
+         "KETCY"
+        ],
+        [
+         "CID1"
+        ],
+        [
+         "SEFIROS"
+        ],
+        [
+         "BARRETT"
+        ],
+        [
+         "BARRETT2"
+        ],
+        [
+         "BARRETT3"
+        ],
+        [
+         "BARRETT4"
+        ],
+        [
+         "VINSENT"
+        ],
+        [
+         "VINSENT2"
+        ],
+        [
+         "VINSENT3"
+        ],
+        [
+         "HICLOUD"
+        ],
+        [
+         "GALL"
+        ],
+        [
+         "DEATHGIG"
+        ],
+        [
+         "HELLMASK"
+        ],
+        [
+         "CHAOS"
+        ]
+       ],
+       "default": "",
+       "restart": "hot",
+       "help": "Or: one of the game's own party-slot battle model names (the log lists them; the exe's table at 008ff2f0). Give one of model_enemy and model_like, once.",
+       "messages": [
+        "model_like is one of the game's own party-slot battle model names (the log lists them)",
+        "a form's parts are named after one model: model_enemy or model_like, once"
+       ],
+       "source_line": 20309
+      },
+      {
+       "name": "model_script",
+       "type": "text",
+       "maxlen": 4,
+       "default": "",
+       "restart": "hot",
+       "help": "The form's script file, named as the battle archive names files: its two letters or its whole name (zo or ZOAB). It must hold 74 scripts in the party layout. Two letters a character's battle_files already uses are refused.",
+       "messages": [
+        "model_script is the form's script file in the battle archive's naming, its two letters or its name (zo or ZOAB: 74 slots in the party layout)"
+       ],
+       "source_line": 20294
+      },
+      {
+       "name": "model_files",
+       "type": "text",
+       "maxlen": 2,
+       "default": "",
+       "restart": "hot",
+       "help": "Instead (or as well): two letters naming a FULL set of the form's own files (XYAA the skeleton, XYAB the scripts, XYDA the animations, textures and parts). With both, model_script names the script file and model_files the rest. Two letters a character's battle_files already uses are refused.",
+       "messages": [
+        "model_files is two letters: the form's own files in the battle archive's naming (xy: XYAA, XYAB, XYDA and its parts)"
+       ],
+       "source_line": 20294
+      },
+      {
+       "name": "weapon",
+       "type": "bool",
+       "true": [
+        "yes"
+       ],
+       "false": [
+        "no"
+       ],
+       "default": "no",
+       "restart": "hot",
+       "help": "no (the default): the model has no weapon models, as the game's beasts. yes: the equipped weapon's model is loaded with it, as for a character.",
+       "messages": [
+        "weapon is yes (the equipped weapon's model is loaded with the form) or no (the default: none, as the game's beasts)"
+       ],
+       "source_line": 20323
+      }
+     ]
     }
    ],
    "messages": [
@@ -8141,8 +8844,9 @@
     "limits file line %d: the limit has no base; skipped",
     "limits file line %d: character %d limit %d-%d has prop_offset, prop_turn, prop_scale, prop_frames or prop_animation but no prop: they do nothing",
     "limits file: character %d limit %d-%d: state = %s, but there is no section [%d state %s]: the limit works without a state",
+    "limits file line %d: character %d limit %d-%d has hits_on_every_target: its spell_effects entry %d (%s, frame %d) is refused: such a limit takes `all` entries only",
     "limits file line %d: form %s: %s",
-    "limits file line %d: form %s: %s %s is also character %d's battle_files: the form would load that character's files; give the form two letters of its own",
+    "limits file line %d: form %s: %s %s is also character %d's %s: the form would load that character's files; give the form two letters of its own",
     "limits file line %d: [%d %d-%d] form = %s: %s: the limit is LEFT OUT (not learned, not in the menu)"
    ],
    "returned": [
@@ -8225,13 +8929,19 @@
     "this state is already defined for the character",
     "a character may have up to 4 states",
     "prop_frames and prop_animation are a limit's keys: a state's prop is there for as long as the state lasts (see prop_hide)",
-    "a state's section takes: hits, commands, ends (battle ko frog), retarget, hit_gap, stop_step, camera, attack_script / _next / _next2 / _last / _only, idle_script, idle_weak_script, prop (a name, or weapon), prop_bone, prop_offset, prop_turn, prop_scale, prop_hide, prop_colour, attack_targets, attack_element, long_range, physical_evade, script_NN, view_raise, view_back, pointer_raise",
+    "a state's section takes: hits, commands, ends (battle ko frog), retarget, hit_gap, stop_step, camera, attack_script / _next / _next2 / _last / _only, idle_script, idle_weak_script, prop (a name, or weapon), prop_bone, prop_offset, prop_turn, prop_scale, prop_hide, prop_colour, attack_targets, attack_element, long_range, physical_evade, cover, counter, script_NN, view_raise, view_back, pointer_raise, dexterity_per_target",
+    "spell_effects: `room` must be followed by a number of free slots, 1 to 100",
+    "spell_effects: `room` must be followed by a number of free slots",
+    "status2 is a list of status names, as for status (regen barrier ...), or none",
+    "status2 cannot hold imprisoned (the game reads that bit of a status list as something else)",
+    "status2_mode must be inflict, cure or toggle",
     "form is the name of a [form NAME] section of this file, 1 to 15 letters, digits or _, or none",
+    "cover is 0 (the default) to 100: the per cent chance the actor covers an ally (takes a single physical hit meant for it), as the Cover materia's, while the state lasts; the Cover materia's own chance if it is higher",
+    "counter is 0 (the default) to 100: the per cent chance the actor counters with Attack when an enemy hits it, as the Counter Attack materia's, while the state lasts; the materia's own chance if it is higher",
+    "dexterity_per_target is 0 (the default) to 255: how much the actor's battle dexterity rises, while the state lasts, for each target a status of the limit that began the state landed on (255 at most in all)",
     "a form's section looks like [form NAME]: the word form, a name of 1 to 15 letters, digits or _",
     "this form is already defined above: this section is passed over",
     "too many forms (16 at most): this section is passed over",
-    "the form has neither model_enemy nor model_like (the model whose files it loads): no limit transforms into it",
-    "the form has neither model_script (its script file in the party layout) nor model_files (a full set of its own): the model's own script file is not in the party layout, so no limit transforms into it",
     "model_script is the form's script file in the battle archive's naming, its two letters or its name (zo or ZOAB: 74 slots in the party layout)",
     "model_files is two letters: the form's own files in the battle archive's naming (xy: XYAA, XYAB, XYDA and its parts)",
     "a form's parts are named after one model: model_enemy or model_like, once",
@@ -8239,14 +8949,1075 @@
     "model_like: the game's table of battle model names (008ff2f0) is not as expected; use model_enemy",
     "model_like is one of the game's own party-slot battle model names (the log lists them)",
     "weapon is yes (the equipped weapon's model is loaded with the form) or no (the default: none, as the game's beasts)",
-    "a form's section takes: model_enemy or model_like, model_script, model_files, weapon"
+    "a form's section takes: model_enemy or model_like, model_script, model_files, weapon",
+    "the form has neither model_enemy nor model_like (the model whose files it loads): no limit transforms into it",
+    "the form has neither model_script (its script file in the party layout) nor model_files (a full set of its own): the model's own script file is not in the party layout, so no limit transforms into it",
+    "a spell's script_bytes may be up to 128 bytes"
    ],
    "not_keys": [
     "materia",
     "dead",
     "shown"
    ],
-   "runtime_only": []
+   "runtime_only": [
+    "transformations are off (form hooks: see the start of the log)",
+    "forms: %d section(s), %d limit(s) name one, %d problem(s)",
+    "form %s (line %d) is number 0x%02x but is NOT usable (a problem above): no limit transforms into it",
+    "forms: the game's table of battle model names (008ff2f0) is not as expected: model_like is refused, model_enemy works"
+   ]
+  },
+  "FF7_SpellExt_Enemies.ini": {
+   "title": "Enemies and scenes registry",
+   "readers": [
+    "en_registry_parse",
+    "en_map_entry",
+    "en_reg_attack_section",
+    "en_reg_attack_key",
+    "enemies_models_entry",
+    "enemies_read_registry"
+   ],
+   "log_prefix": "enemies: %s line %d: ",
+   "grammar": "sections",
+   "reread": "Read only when the game file says enemies = on (read at start-up): then at start-up and by \"Re-init .ini files\", with the folders enemies and scenes. Optional: without it every enemy folder and scene file is registered.",
+   "readmes": [
+    "FF7_SpellExt_Enemies_README.txt"
+   ],
+   "help": "Optional, read only with enemies = on in the game file. [enemies] load = all or enemy folder names, [scenes] load = all or scene file names (several load lines add up, 512 names at most); [battle_map] lines WHERE : BATTLE = DLL BATTLE, which battle of the game becomes one of a DLL scene (field N, world or any; the game's battle 0 to 65535; the DLL battle 1024 to 16383; 256 lines at most); [models] 365 to 369 = folder or none (a testing aid); [attack N] with N an attack ID 0x00-0x7f or 0x100-0x7fff (256 sections at most): effect, effect_all, camera, camera_multi, script, its extras in any battle. Any other section is skipped, with a line in the log. Anything after a ; or # (at the start or after a space) is a comment. Each line with a mistake is skipped with a line in FF7_SpellExt.log. (FF7_SpellExt_Enemies_README.txt)",
+   "sections": [
+    {
+     "kind": "enemies",
+     "header": "[enemies]",
+     "id_range": null,
+     "title": "Enemy folders",
+     "keys": [
+      {
+       "name": "load",
+       "type": "list",
+       "item": "name",
+       "repeatable": true,
+       "default": "all",
+       "restart": "hot",
+       "help": "all, or enemy folder names (SpellExtConfig\\enemies\\<folder>), separated by commas or spaces: only those are registered. The key may be given on several lines: the names add up (512 at most). load = all after names makes it all again; names after all make it the list again. Each name is 1 to 31 letters, digits, _ or -. (FF7_SpellExt_Enemies_README.txt)",
+       "messages": [
+        "[%s] has one key, load = all, or names: skipped",
+        "\"%s\" is no folder or scene name (1 to 31 letters, digits, _ or -): skipped",
+        "more than %d names in load: the rest are skipped"
+       ],
+       "source_line": 48365
+      }
+     ]
+    },
+    {
+     "kind": "scenes",
+     "header": "[scenes]",
+     "id_range": null,
+     "title": "Scene files",
+     "keys": [
+      {
+       "name": "load",
+       "type": "list",
+       "item": "name",
+       "repeatable": true,
+       "default": "all",
+       "restart": "hot",
+       "help": "all, or scene file names without .ini (SpellExtConfig\\scenes and scenes\\generated), separated by commas or spaces: only those are registered. The key may be given on several lines: the names add up (512 at most). load = all after names makes it all again; names after all make it the list again. Each name is 1 to 31 letters, digits, _ or -. (FF7_SpellExt_Enemies_README.txt)",
+       "messages": [
+        "[%s] has one key, load = all, or names: skipped",
+        "\"%s\" is no folder or scene name (1 to 31 letters, digits, _ or -): skipped",
+        "more than %d names in load: the rest are skipped"
+       ],
+       "source_line": 48365
+      }
+     ]
+    },
+    {
+     "kind": "battle_map",
+     "header": "[battle_map]",
+     "id_range": null,
+     "title": "Battle map",
+     "keys": [],
+     "free_keys": {
+      "form": "where : battle = dll battle",
+      "key_type": "text",
+      "value_type": "int",
+      "min": 1024,
+      "max": 16383,
+      "help": "WHERE : BATTLE = DLL BATTLE: field 123 : 268 = 1200 (in field 123 the game's battle 268 becomes battle 1200: scene 300, formation 0), world : 140 = 1204 (on the world map), any : 16 = 1028 (anywhere; a line for the place wins over an any line). The game's battle 0 to 65535, the DLL battle 1024 to 16383 (scene x 4 + formation). 256 lines at most. (FF7_SpellExt_Enemies_README.txt)"
+     }
+    },
+    {
+     "kind": "models",
+     "header": "[models]",
+     "id_range": null,
+     "title": "Pool models (testing aid)",
+     "keys": [],
+     "free_keys": {
+      "form": "365 = folder",
+      "key_type": "int",
+      "min": 365,
+      "max": 369,
+      "value_type": "text",
+      "maxlen": 31,
+      "help": "TESTING AID: a pool model number, 365 to 369 (decimal or 0x), = an enemy folder of SpellExtConfig\\enemies (1 to 31 letters, digits, _ or -), or none (off): that model is served from enemies\\<folder>\\model\\ in EVERY battle, and while one is assigned the driver's file opens pass through this DLL for the whole run. Each number once. (FF7_SpellExt_Enemies_README.txt, \"Beside FFNx\")"
+     }
+    },
+    {
+     "kind": "attack",
+     "header": "[attack 0x1b]",
+     "id_range": null,
+     "title": "Attack extras (IDs 0x00-0x7f and 0x100-0x7fff)",
+     "keys": [
+      {
+       "name": "effect",
+       "type": "int",
+       "min": 256,
+       "max": 65535,
+       "default": "",
+       "restart": "hot",
+       "help": "A SpellExt effect, 0x100 to 0xffff ([effect 0x...] of FF7_SpellExt_Effects.ini), played for this attack ID in any battle (a DLL scene's own extras for it win). Optional. Given once in the section (a second line is skipped with a line). (FF7_SpellExt_Enemies_README.txt, \"Enemy attacks with SpellExt's effects\")",
+       "messages": [
+        "effect and effect_all are SpellExt effects, 0x100 to 0xffff"
+       ],
+       "source_line": 48232
+      },
+      {
+       "name": "effect_all",
+       "type": "int",
+       "min": 256,
+       "max": 65535,
+       "default": "",
+       "restart": "hot",
+       "help": "The SpellExt effect played when the attack hits several targets, 0x100 to 0xffff (effect's on one). It needs effect. Optional. Given once in the section (a second line is skipped with a line). (FF7_SpellExt_Enemies_README.txt, \"Enemy attacks with SpellExt's effects\")",
+       "messages": [
+        "effect and effect_all are SpellExt effects, 0x100 to 0xffff",
+        "effect_all needs effect"
+       ],
+       "source_line": 48232
+      },
+      {
+       "name": "camera",
+       "type": "int",
+       "min": 0,
+       "max": 65534,
+       "default": "",
+       "restart": "hot",
+       "help": "The camera on one target, 0 to 0xfffe (the camera on several too, unless camera_multi is given). Optional. Given once in the section (a second line is skipped with a line). (FF7_SpellExt_Enemies_README.txt, \"Enemy attacks with SpellExt's effects\")",
+       "messages": [
+        "a camera is a number, 0 to 0xfffe"
+       ],
+       "source_line": 48232
+      },
+      {
+       "name": "camera_multi",
+       "type": "int",
+       "min": 0,
+       "max": 65534,
+       "default": "",
+       "restart": "hot",
+       "help": "The camera on several targets, 0 to 0xfffe. It needs camera. Optional. Given once in the section (a second line is skipped with a line). (FF7_SpellExt_Enemies_README.txt, \"Enemy attacks with SpellExt's effects\")",
+       "messages": [
+        "a camera is a number, 0 to 0xfffe",
+        "camera_multi needs camera (the camera on one target)"
+       ],
+       "source_line": 48232
+      },
+      {
+       "name": "script",
+       "type": "int",
+       "min": 3,
+       "max": 63,
+       "default": "",
+       "restart": "hot",
+       "help": "The model script the attacker plays, 3 to 0x3f (0 and 1 are idle loops, 2 the death). Optional. Given once in the section (a second line is skipped with a line). (FF7_SpellExt_Enemies_README.txt, \"Enemy attacks with SpellExt's effects\")",
+       "messages": [
+        "script is a model script, 3 to 0x3f (0 and 1 are idle loops, 2 the death)"
+       ],
+       "source_line": 48232
+      }
+     ]
+    }
+   ],
+   "messages": [
+    "enemies: %s line %d: [attack N]: N is an attack ID, 0x00-0x7f (the kernel's) or 0x100-0x7fff (a scene's): the section is skipped",
+    "enemies: %s line %d: [attack %04lx] is given twice: the first is kept, this one is skipped",
+    "enemies: %s line %d: more than %d [attack N] sections: this one is skipped",
+    "enemies: %s line %d: section %s is not one of this DLL's ([enemies] [scenes] [battle_map] [models] [attack N]): skipped",
+    "enemies: %s line %d: a line here is KEY = VALUE: skipped",
+    "enemies: %s line %d: [%s] has one key, load = all, or names: skipped",
+    "enemies: %s line %d: \"%s\" is no folder or scene name (1 to 31 letters, digits, _ or -): skipped",
+    "enemies: %s line %d: more than %d names in load: the rest are skipped",
+    "enemies: %s line %d: [attack %04x]: %s: skipped",
+    "enemies: %s line %d: %s: skipped",
+    "enemies: %s line %d: more than %d map lines: this one is dropped",
+    "enemies: %s line %d: model %d is given twice: the first line is kept",
+    "enemies: %s line %d: [attack %04x]: %s: the section is skipped",
+    "enemies: no %s: every enemy folder and scene file is registered, no battle of the game is mapped, no pool model is assigned for the run"
+   ],
+   "returned": [
+    "a map line is WHERE : BATTLE = DLL BATTLE (field 123 : 268 = 1200, world : 140 = 1204, any : 16 = 1004)",
+    "field takes the field's number (field 123 : ...)",
+    "world and any take no number",
+    "where is field N, world or any",
+    "the game's battle number (before =) is a number 0 to 65535",
+    "the DLL battle (after =) is a number 1024 to 16383 (scene x 4 + formation)",
+    "the key must be a model number of the pool, 365 to 369",
+    "the value must be a folder name of SpellExtConfig\\enemies (1 to 31 letters, digits, _ or -), or none",
+    "an [attack N] section's keys are effect, effect_all, camera, camera_multi and script",
+    "the key is given twice in the section (the first is kept)",
+    "effect and effect_all are SpellExt effects, 0x100 to 0xffff",
+    "a camera is a number, 0 to 0xfffe",
+    "script is a model script, 3 to 0x3f (0 and 1 are idle loops, 2 the death)",
+    "no key: nothing to do",
+    "effect_all needs effect",
+    "camera_multi needs camera (the camera on one target)"
+   ],
+   "not_keys": [],
+   "runtime_only": [
+    "enemies: model %d (%s..) = %s: the path is too long; nothing is served for it",
+    "enemies: [models] model %d (files %s..) is served from %s\\%s\\model\\ for the run (outside the battles of DLL scenes)",
+    "enemies: [models] model %d (files %s..) = %s: %s\\%s\\model\\aa (the skeleton) is MISSING: each file the folder lacks comes from wherever the driver finds it (the archive holds a model of these letters)",
+    "enemies: %s: enemies %s, scenes %s, %d battle map line(s), [models] %d of %d pool models for the run, %d [attack N] section(s), %d problem line(s)"
+   ],
+   "notes": [
+    "Lines end at LF, as in the main files; the comment rule and the trimming take any of en_space's characters (space, tab, CR, LF, VT, FF, 0x1c-0x1f) as a space; a UTF-8 byte-order mark at the start is skipped.",
+    "A section that is not one of the five is logged (\"is not one of this DLL's\") but not counted as a problem line: the tool shows it as a note.",
+    "The scene and enemy files (scenes\\, enemies\\<folder>\\) have their own grammar (en_parse): only ; starts a comment. Their start-up scan is forecast by sxcfg/enemyscan.py, not by this file's reader."
+   ]
+  }
+ },
+ "en_files": {
+  "scene": {
+   "title": "DLL scene (scenes\\NAME.ini over scenes\\generated\\NAME.ini)",
+   "paths": [
+    "scenes\\<name>.ini",
+    "scenes\\generated\\<name>.ini"
+   ],
+   "readers": [
+    "en_build",
+    "en_read_pair",
+    "en_load",
+    "en_parse",
+    "en_overlay",
+    "en_number",
+    "en_split",
+    "en_sur_assign",
+    "ai_block_check"
+   ],
+   "tables": [
+    "en_kinds",
+    "en_formation_keys"
+   ],
+   "log_prefix": "enemies: battle %ld (DLL scene %ld '%s', formation %ld; %s) refused: ",
+   "grammar": "en_parse",
+   "reread": "Read when a battle of the scene is handed over (no restart, no Re-init): the scene file, its enemy folders' files, their AI blocks and model folders, all again at every battle.",
+   "readmes": [
+    "FF7_SpellExt_Enemies_README.txt"
+   ],
+   "help": "A scene of yours: up to three enemies, where they stand, and up to four formations (battle = scene x 4 + formation). The generated file is the converter's; a key of your file (scenes\\NAME.ini) wins, a section only in yours is added. Only ; starts a comment (# is text). The first mistake refuses every battle of the scene, with one line naming the file and the line; the game's own battle plays. (FF7_SpellExt_Enemies_README.txt)",
+   "sections": [
+    {
+     "kind": "scene",
+     "header": "[scene]",
+     "title": "The scene",
+     "keys": [
+      {
+       "name": "number",
+       "type": "int",
+       "default": "",
+       "restart": "next_battle",
+       "help": "The scene number: 256 to 4095 is a DLL scene (registered at start-up and by Re-init; its battles are number x 4 + 0..3). 0-254 are scene.bin's; 255 is refused. Required. (FF7_SpellExt_Enemies_README.txt)",
+       "min": 0,
+       "max": 4095,
+       "required": true,
+       "messages": [
+        "scene %.320s [scene]: key \"number\" missing",
+        "%.320s: scene 255 is never reached by the game's lookup (0-254 scene.bin, 256-4095 DLL scenes)",
+        "%.320s: the scene's number is %d now, not %d"
+       ]
+      },
+      {
+       "name": "enemies",
+       "type": "list",
+       "default": "",
+       "restart": "next_battle",
+       "help": "One to three enemy folder names (SpellExtConfig\\enemies\\<folder>), split at spaces or commas: enemy slots 0-2, drawn as models 365, 366, 367 in a DLL scene. Each a registered folder (1 to 31 letters, digits, _ or -). Required. (FF7_SpellExt_Enemies_README.txt)",
+       "item": "name",
+       "max_entries": 3,
+       "required": true,
+       "messages": [
+        "scene %.320s [scene]: key \"enemies\" missing",
+        "%.320s: 1 to 3 enemies",
+        "enemy \"%.320s\": a folder name of enemies\\ is 1 to %d letters, digits, _ or -",
+        "enemy %.320s is not registered: no enemy.ini or generated.ini in enemies\\%.320s, or [enemies] load of FF7_SpellExt_Enemies.ini leaves it out",
+        "enemy %.320s: no generated.ini or enemy.ini in enemies\\%.320s"
+       ]
+      }
+     ]
+    },
+    {
+     "kind": "formation",
+     "header": "[formation 0]",
+     "id_range": [
+      0,
+      3
+     ],
+     "title": "Formations 0-3 ([formation 0] required; 1-3 copy it, changed by their own keys)",
+     "keys": [
+      {
+       "name": "stage",
+       "type": "int",
+       "default": "",
+       "restart": "next_battle",
+       "help": "The battle location, 0 to 89. Required (in [formation 0]). (FF7_SpellExt_Enemies_README.txt)",
+       "min": 0,
+       "max": 89,
+       "required": true,
+       "messages": [
+        "scene %.320s [formation %d]: key \"%.320s\" missing"
+       ]
+      },
+      {
+       "name": "camera",
+       "type": "text",
+       "default": "",
+       "restart": "next_battle",
+       "help": "scene:formation of the game's own scene.bin (scene 0-254, formation 0-3, like 79:2): the stand-in battle the game loads first, whose camera placement and pre-battle camera the formation takes. Required. (FF7_SpellExt_Enemies_README.txt)",
+       "required": true,
+       "pattern": "^[0-9xXa-fA-F]+:[0-9xXa-fA-F]+$",
+       "messages": [
+        "%.320s: camera is scene:formation (like 79:2)",
+        "%.320s: camera %d:%d is no scene:formation of the game's scene.bin (scene 0-%d, formation 0-3)"
+       ]
+      },
+      {
+       "name": "rows",
+       "type": "list",
+       "default": "",
+       "restart": "next_battle",
+       "help": "One to six enemy:x,y,z, optionally :row and :cover (x, y, z -32768 to 32767; row 0 to 65535, 1 if not given; cover 0 to 65535, 0 if not given), split at spaces only. The enemy is one of the scene's `enemies` names, exactly. Required. (FF7_SpellExt_Enemies_README.txt)",
+       "item": "row",
+       "max_entries": 6,
+       "required": true,
+       "messages": [
+        "%.320s: 1 to 6 rows",
+        "%.320s: \"%.320s\" is not one of the scene's enemies (%.320s)",
+        "%.320s: \"%.320s\" needs x,y,z"
+       ]
+      },
+      {
+       "name": "kind",
+       "type": "enum",
+       "default": "normal",
+       "restart": "next_battle",
+       "help": "normal, preemptive, back, side, pincer or surrounded (any case). surrounded: a normal battle to the game whose actors the DLL turns: the party at party_radius round the arena's origin, party_front the leader's direction; at most 2 enemies in front of each party place. (FF7_SpellExt_Enemies_README.txt)",
+       "values": [
+        "normal",
+        "preemptive",
+        "back",
+        "side",
+        "pincer",
+        "surrounded"
+       ],
+       "messages": [
+        "%.320s: kind is one of %.320s",
+        "scene %.320s [formation %d]: kind = surrounded: party place %d has %d enemies in front of it (at most %d)"
+       ]
+      },
+      {
+       "name": "escape_counter",
+       "type": "int",
+       "default": "1",
+       "restart": "next_battle",
+       "help": "The escape counter word, 0 to 65535. (FF7_SpellExt_Enemies_README.txt)",
+       "min": 0,
+       "max": 65535
+      },
+      {
+       "name": "flags",
+       "type": "int",
+       "default": "0xfffd",
+       "restart": "next_battle",
+       "help": "The formation's flags word, 0 to 65535 (0xfffd as the game's field battles). (FF7_SpellExt_Enemies_README.txt)",
+       "min": 0,
+       "max": 65535
+      },
+      {
+       "name": "next",
+       "type": "int_or_word",
+       "default": "none",
+       "restart": "next_battle",
+       "help": "A chained battle: none, a battle 0-1019 (the game's scenes 0-254) or 1024-16383 (a DLL scene's). (FF7_SpellExt_Enemies_README.txt)",
+       "words": [
+        "none"
+       ],
+       "min": 0,
+       "max": 16383,
+       "messages": [
+        "%.320s: next is none, a battle 0-1019 (the game's scenes 0-254) or 1024-16383 (a DLL scene's)"
+       ]
+      },
+      {
+       "name": "party_radius",
+       "type": "int",
+       "default": "600",
+       "restart": "next_battle",
+       "help": "(kind = surrounded) how far from the arena's origin the party stands, 200 to 3000. Read and checked for every kind. (FF7_SpellExt_Enemies_README.txt)",
+       "min": 200,
+       "max": 3000
+      },
+      {
+       "name": "party_front",
+       "type": "int",
+       "default": "0",
+       "restart": "next_battle",
+       "help": "(kind = surrounded) the direction of party place 0 (the leader), 0 to 359 degrees; places 1 and 2 at +120 and +240. Read and checked for every kind. (FF7_SpellExt_Enemies_README.txt)",
+       "min": 0,
+       "max": 359
+      }
+     ]
+    },
+    {
+     "kind": "other",
+     "header": "[origin]",
+     "title": "Any other section (the converter's [origin]): not read",
+     "keys": []
+    }
+   ],
+   "messages": [
+    "scene \"%.320s\": a scene file's name is 1 to %d letters, digits, _ or -",
+    "scene %.320s: no [scene] section",
+    "%.320s: unknown key \"%.320s\" (keys: number enemies)",
+    "scene %.320s [scene]: key \"number\" missing",
+    "%.320s: scene 255 is never reached by the game's lookup (0-254 scene.bin, 256-4095 DLL scenes)",
+    "%.320s: the scene's number is %d now, not %d",
+    "scene %.320s [scene]: key \"enemies\" missing",
+    "%.320s: 1 to 3 enemies",
+    "enemy \"%.320s\": a folder name of enemies\\ is 1 to %d letters, digits, _ or -",
+    "%.320s: \"model = pool\" works in a DLL scene (number 256 and up) only: scene %d is a scene.bin scene",
+    "enemy %.320s: model %d is already enemy slot %d",
+    "attack ID %04x is given two different records in this scene (%.320s)",
+    "the scene has more than %d attack records: FF7 holds 32",
+    "the scene has %d attack records: FF7 holds 32",
+    "scene %.320s: no [formation 0]",
+    "%.320s: unknown key \"%.320s\" (keys: %.320s)",
+    "scene %.320s [formation %d]: key \"%.320s\" missing",
+    "%.320s: camera is scene:formation (like 79:2)",
+    "%.320s: camera %d:%d is no scene:formation of the game's scene.bin (scene 0-%d, formation 0-3)",
+    "%.320s: kind is one of %.320s",
+    "%.320s: next is none, a battle 0-1019 (the game's scenes 0-254) or 1024-16383 (a DLL scene's)",
+    "%.320s: 1 to 6 rows",
+    "%.320s: \"%.320s\" is not one of the scene's enemies (%.320s)",
+    "%.320s: \"%.320s\" needs x,y,z",
+    "scene %.320s [formation %d]: kind = surrounded: party place %d has %d enemies in front of it (at most %d)",
+    "the AI does not fit in the scene's 4090 bytes",
+    "the scene's AI area fails the AI check: %.320s (entry %d, section %d, at %04lx)",
+    "%.320s: too many files for one scene",
+    "%.320s: cannot be read (or it is larger than %d bytes)",
+    "%.320s line %d: section [%.320s] appears twice",
+    "%.320s line %d: more than %d sections in one file",
+    "%.320s line %d: \"%.320s\" is not \"key = value\"",
+    "%.320s line %d: a key before any [section]",
+    "%.320s line %d: key \"%.320s\" appears twice in this section",
+    "%.320s line %d: too many keys",
+    "%.320s: more than %d sections with the generated file's",
+    "%.320s: \"%.320s\" is not a number",
+    "%.320s: %.320s is outside %.320s..%.320s"
+   ],
+   "runtime_only": [
+    "enemies: battle %ld (%s) refused: the Battle Square plays no DLL scene; the game's own battle %u (scene %u, formation %u) plays",
+    "DLL scene %d is not registered: no scene file of SpellExtConfig\\scenes says number = %d (or [scenes] load leaves it out; a number changed inside a file is seen after Re-init .ini files)"
+   ],
+   "notes": [
+    "Every battle of a scene reads all four formations: a mistake in any refuses them all, with the same line.",
+    "Not reachable from files (the C keeps them as guards): \"the scene has more than %d attack records: FF7 holds 32\" (63 attack sections an enemy at most, so 189 records) and \"the scene's AI area fails the AI check: %.320s (entry %d, section %d, at %04lx)\" (each entry is checked alone first, at the same relative offsets).",
+    "The tool forecasts with the game folder's data/lang-en/battle/scene.bin and kernel2.bin; without them a scene attack's base and an item by name are \"not forecast\" (a tool line), never passed."
+   ]
+  },
+  "enemy": {
+   "title": "Enemy (enemies\\FOLDER\\enemy.ini over enemies\\FOLDER\\generated.ini)",
+   "paths": [
+    "enemies\\<folder>\\enemy.ini",
+    "enemies\\<folder>\\generated.ini"
+   ],
+   "readers": [
+    "en_load_enemy",
+    "en_enemy_record",
+    "en_attack",
+    "en_attack_extras",
+    "en_enemy_ai",
+    "en_ai_attacks",
+    "en_model_check",
+    "en_bits",
+    "en_item",
+    "en_encode",
+    "en_words_none",
+    "ai_script_check",
+    "ai_block_check"
+   ],
+   "tables": [
+    "en_elements",
+    "en_statuses",
+    "en_rate_names",
+    "en_enemy_keys",
+    "en_scene_attack_keys",
+    "en_kernel_attack_keys"
+   ],
+   "log_prefix": "enemies: battle %ld (DLL scene %ld '%s', formation %ld; %s) refused: ",
+   "grammar": "en_parse",
+   "reread": "Read when a battle of the scene is handed over (no restart, no Re-init): the scene file, its enemy folders' files, their AI blocks and model folders, all again at every battle.",
+   "readmes": [
+    "FF7_SpellExt_Enemies_README.txt"
+   ],
+   "help": "An enemy of yours, read inside each scene that names it. The generated file is the converter's; a key of your file (enemy.ini) wins, a section only in yours is added. Only ; starts a comment (# is text). Its AI is the assembled block beside it (ai = ai.ai.txt means ai.ai: tools/ai_tool.py asm); its model folder model\\ must hold every file its aa lists. (FF7_SpellExt_Enemies_README.txt)",
+   "sections": [
+    {
+     "kind": "enemy",
+     "header": "[enemy]",
+     "title": "The enemy",
+     "keys": [
+      {
+       "name": "name",
+       "type": "text",
+       "default": "",
+       "restart": "next_battle",
+       "help": "The name shown in battle: printable ASCII, at most 30 characters (the game's names end in a space, added here). Required. (FF7_SpellExt_Enemies_README.txt)",
+       "maxlen": 30,
+       "required": true,
+       "messages": [
+        "%.320s: name \"%.320s\": printable ASCII only, at most %d characters"
+       ]
+      },
+      {
+       "name": "model",
+       "type": "int_or_word",
+       "default": "",
+       "restart": "next_battle",
+       "help": "The FF7 enemy model number 0 to 369, or pool. Not read in a DLL scene (number 256 and up): enemy slot i there is model 365 + i, served from the folder's model\\ files. Required. (FF7_SpellExt_Enemies_README.txt)",
+       "words": [
+        "pool"
+       ],
+       "min": 0,
+       "max": 369,
+       "required": true,
+       "messages": [
+        "%.320s: \"model = pool\" works in a DLL scene (number 256 and up) only: scene %d is a scene.bin scene",
+        "enemy %.320s: model %d is already enemy slot %d"
+       ]
+      },
+      {
+       "name": "level",
+       "type": "int",
+       "default": "",
+       "restart": "next_battle",
+       "help": "Level, 1 to 99. Required. (FF7_SpellExt_Enemies_README.txt)",
+       "min": 1,
+       "max": 99,
+       "required": true
+      },
+      {
+       "name": "hp",
+       "type": "int",
+       "default": "",
+       "restart": "next_battle",
+       "help": "HP, 1 to 4294967295. Required. (FF7_SpellExt_Enemies_README.txt)",
+       "min": 1,
+       "max": 4294967295,
+       "required": true
+      },
+      {
+       "name": "mp",
+       "type": "int",
+       "default": "0",
+       "restart": "next_battle",
+       "help": "MP, 0 to 65535. (FF7_SpellExt_Enemies_README.txt)",
+       "min": 0,
+       "max": 65535
+      },
+      {
+       "name": "str",
+       "type": "int",
+       "default": "0",
+       "restart": "next_battle",
+       "help": "Strength, 0 to 255. (FF7_SpellExt_Enemies_README.txt)",
+       "min": 0,
+       "max": 255
+      },
+      {
+       "name": "def",
+       "type": "int",
+       "default": "0",
+       "restart": "next_battle",
+       "help": "Defence, 0 to 255. (FF7_SpellExt_Enemies_README.txt)",
+       "min": 0,
+       "max": 255
+      },
+      {
+       "name": "mag",
+       "type": "int",
+       "default": "0",
+       "restart": "next_battle",
+       "help": "Magic, 0 to 255. (FF7_SpellExt_Enemies_README.txt)",
+       "min": 0,
+       "max": 255
+      },
+      {
+       "name": "mdef",
+       "type": "int",
+       "default": "0",
+       "restart": "next_battle",
+       "help": "Magic defence, 0 to 255. (FF7_SpellExt_Enemies_README.txt)",
+       "min": 0,
+       "max": 255
+      },
+      {
+       "name": "spd",
+       "type": "int",
+       "default": "0",
+       "restart": "next_battle",
+       "help": "Speed, 0 to 255. (FF7_SpellExt_Enemies_README.txt)",
+       "min": 0,
+       "max": 255
+      },
+      {
+       "name": "eva",
+       "type": "int",
+       "default": "0",
+       "restart": "next_battle",
+       "help": "Evade, 0 to 255. (FF7_SpellExt_Enemies_README.txt)",
+       "min": 0,
+       "max": 255
+      },
+      {
+       "name": "luck",
+       "type": "int",
+       "default": "0",
+       "restart": "next_battle",
+       "help": "Luck, 0 to 255. (FF7_SpellExt_Enemies_README.txt)",
+       "min": 0,
+       "max": 255
+      },
+      {
+       "name": "exp",
+       "type": "int",
+       "default": "0",
+       "restart": "next_battle",
+       "help": "EXP given, 0 to 4294967295. (FF7_SpellExt_Enemies_README.txt)",
+       "min": 0,
+       "max": 4294967295
+      },
+      {
+       "name": "ap",
+       "type": "int",
+       "default": "0",
+       "restart": "next_battle",
+       "help": "AP given, 0 to 65535. (FF7_SpellExt_Enemies_README.txt)",
+       "min": 0,
+       "max": 65535
+      },
+      {
+       "name": "gil",
+       "type": "int",
+       "default": "0",
+       "restart": "next_battle",
+       "help": "Gil given, 0 to 4294967295. (FF7_SpellExt_Enemies_README.txt)",
+       "min": 0,
+       "max": 4294967295
+      },
+      {
+       "name": "elements",
+       "type": "list",
+       "default": "none",
+       "restart": "next_battle",
+       "help": "Up to 8 element:rate (split at spaces or commas), or none. Elements: fire ice bolt earth poison gravity water wind holy restorative cut hit punch shoot shout hidden. Rates: death double weak half nullify immune absorb fullcure (any case). (FF7_SpellExt_Enemies_README.txt)",
+       "item": "element:rate",
+       "max_entries": 8,
+       "messages": [
+        "%.320s: at most 8 element entries",
+        "%.320s: \"%.320s\" is not element:rate",
+        "%.320s: \"%.320s\" is no element (%.320s)",
+        "%.320s: \"%.320s\" is no rate (%.320s)"
+       ]
+      },
+      {
+       "name": "immune",
+       "type": "list",
+       "default": "none",
+       "restart": "next_battle",
+       "help": "Status names (any case), or none: death near_death sleep poison sadness fury confusion silence haste slow stop frog small slow_numb petrify regen barrier mbarrier reflect dual shield death_sentence manipulate berserk peerless paralysis darkness dual_drain death_force resist lucky_girl imprisoned. (FF7_SpellExt_Enemies_README.txt)",
+       "item": "status",
+       "messages": [
+        "%.320s: \"%.320s\" is no %.320s (%.320s)"
+       ]
+      },
+      {
+       "name": "drops",
+       "type": "list",
+       "default": "none",
+       "restart": "next_battle",
+       "help": "item:rate (rate in 64ths, 0 to 63, 8 if not given), item by its FF7 name (lower case compared, a space written _: phoenix_down) or number 0 to 0x13f; drops and steals together hold 4. (FF7_SpellExt_Enemies_README.txt)",
+       "item": "item:rate",
+       "messages": [
+        "enemy %.320s: drops and steals together hold 4 items"
+       ]
+      },
+      {
+       "name": "steals",
+       "type": "list",
+       "default": "none",
+       "restart": "next_battle",
+       "help": "As drops: what can be stolen. (FF7_SpellExt_Enemies_README.txt)",
+       "item": "item:rate",
+       "messages": [
+        "enemy %.320s: drops and steals together hold 4 items"
+       ]
+      },
+      {
+       "name": "manipulate",
+       "type": "list",
+       "default": "none",
+       "restart": "next_battle",
+       "help": "Up to three of its [attack NAME] names (exactly as the section's, lower case), or none. (FF7_SpellExt_Enemies_README.txt)",
+       "item": "attack",
+       "max_entries": 3,
+       "messages": [
+        "%.320s: at most 3",
+        "%.320s: \"%.320s\" is not one of its attacks (%.320s)"
+       ]
+      },
+      {
+       "name": "back_multiplier",
+       "type": "int",
+       "default": "16",
+       "restart": "next_battle",
+       "help": "The back attack multiplier, 0 to 255. (FF7_SpellExt_Enemies_README.txt)",
+       "min": 0,
+       "max": 255
+      },
+      {
+       "name": "morph",
+       "type": "text",
+       "default": "none",
+       "restart": "next_battle",
+       "help": "An item (by name or number, as drops), or none. (FF7_SpellExt_Enemies_README.txt)"
+      },
+      {
+       "name": "ai",
+       "type": "text",
+       "default": "",
+       "restart": "next_battle",
+       "help": "The AI file beside enemy.ini: ai.ai.txt means its assembled block ai.ai (the DLL has no assembler; a block older than its text is a note), any other name an .ai block; one entry (table 1, entry 0), using only its own attack IDs. none: attack a random party member with the first attack. Required. (FF7_SpellExt_Enemies_README.txt)",
+       "required": true,
+       "messages": [
+        "%.320s: ai = none needs at least one attack (the template uses the first)",
+        "%.320s: the AI file is a name beside enemy.ini (ai.ai.txt, or an .ai block)",
+        "%.320s: enemies\\%.320s\\%.320s not found: assemble %.320s (tools/ai_tool.py asm)",
+        "%.320s: enemies\\%.320s\\%.320s not found",
+        "enemies\\%.320s\\%.320s fails the AI check: %.320s (entry %d, section %d, at %04lx)",
+        "enemies\\%.320s\\%.320s: an enemy's AI is one entry (table 1, entry 0)",
+        "%.320s/%.63s: the AI uses attack(s) %.320s that %.320s does not have",
+        "the AI does not fit in the scene's 4090 bytes"
+       ]
+      }
+     ]
+    },
+    {
+     "kind": "attack",
+     "header": "[attack NAME]",
+     "title": "An attack (NAME at most 31 characters; 16 at most, in the enemy's action order)",
+     "keys": [
+      {
+       "name": "id",
+       "type": "int",
+       "default": "",
+       "restart": "next_battle",
+       "help": "0x00-0x7f: a kernel attack (the kernel's record; only id, script, camera, effect, effect_all and camera_multi may be given); 0x100-0x7fff: a scene attack of this scene. Required. (FF7_SpellExt_Enemies_README.txt)",
+       "min": 0,
+       "max": 32767,
+       "required": true,
+       "messages": [
+        "[attack %.320s]: no id",
+        "%.320s: an attack ID is 00-7f (the kernel's) or 0100-7fff (the game reads an AI's attack ID as signed)",
+        "%.320s: [attack %.320s] is kernel attack %02x: the game uses the kernel's own record, so \"%.320s\" cannot change it (keys here: %.320s)",
+        "%.320s: kernel IDs are 00-7f"
+       ]
+      },
+      {
+       "name": "name",
+       "type": "text",
+       "default": "",
+       "restart": "next_battle",
+       "help": "(scene attacks) the name shown: printable ASCII, at most 31. Required for a scene attack. (FF7_SpellExt_Enemies_README.txt)",
+       "maxlen": 31,
+       "messages": [
+        "[attack %.320s]: a scene attack needs base and name",
+        "%.320s: name \"%.320s\": printable ASCII only, at most %d characters"
+       ]
+      },
+      {
+       "name": "base",
+       "type": "int",
+       "default": "",
+       "restart": "next_battle",
+       "help": "(scene attacks) a scene attack ID of the game's own scene.bin, 0x100 to 0xfffe, whose 28 bytes are copied first. Required for a scene attack. (FF7_SpellExt_Enemies_README.txt)",
+       "min": 256,
+       "max": 65534,
+       "messages": [
+        "[attack %.320s]: a scene attack needs base and name",
+        "%.320s: no scene of the game's scene.bin has attack %04x"
+       ]
+      },
+      {
+       "name": "power",
+       "type": "int",
+       "default": "",
+       "restart": "next_battle",
+       "help": "(scene) power, 0 to 255. (FF7_SpellExt_Enemies_README.txt)",
+       "min": 0,
+       "max": 255
+      },
+      {
+       "name": "accuracy",
+       "type": "int",
+       "default": "",
+       "restart": "next_battle",
+       "help": "(scene) accuracy, 0 to 255. (FF7_SpellExt_Enemies_README.txt)",
+       "min": 0,
+       "max": 255
+      },
+      {
+       "name": "target",
+       "type": "int",
+       "default": "",
+       "restart": "next_battle",
+       "help": "(scene) the target flags byte, 0 to 255. (FF7_SpellExt_Enemies_README.txt)",
+       "min": 0,
+       "max": 255
+      },
+      {
+       "name": "mp",
+       "type": "int",
+       "default": "",
+       "restart": "next_battle",
+       "help": "(scene) MP cost, 0 to 999. (FF7_SpellExt_Enemies_README.txt)",
+       "min": 0,
+       "max": 999
+      },
+      {
+       "name": "element",
+       "type": "list",
+       "default": "",
+       "restart": "next_battle",
+       "help": "(scene) element names, or none. (FF7_SpellExt_Enemies_README.txt)",
+       "item": "element",
+       "messages": [
+        "%.320s: \"%.320s\" is no %.320s (%.320s)"
+       ]
+      },
+      {
+       "name": "status",
+       "type": "list",
+       "default": "",
+       "restart": "next_battle",
+       "help": "(scene) status names, or none (no status: chance ff). (FF7_SpellExt_Enemies_README.txt)",
+       "item": "status",
+       "messages": [
+        "%.320s: \"%.320s\" is no %.320s (%.320s)"
+       ]
+      },
+      {
+       "name": "status_chance",
+       "type": "int",
+       "default": "",
+       "restart": "next_battle",
+       "help": "(scene) the status chance, 0 to 63 (63 with status if not given). (FF7_SpellExt_Enemies_README.txt)",
+       "min": 0,
+       "max": 63
+      },
+      {
+       "name": "formula",
+       "type": "int_or_word",
+       "default": "",
+       "restart": "next_battle",
+       "help": "(scene) physical, magical, or the raw byte 0 to 255. (FF7_SpellExt_Enemies_README.txt)",
+       "words": [
+        "physical",
+        "magical"
+       ],
+       "min": 0,
+       "max": 255
+      },
+      {
+       "name": "effect",
+       "type": "int_or_word",
+       "default": "",
+       "restart": "next_battle",
+       "help": "Scene attack: none, the effect byte 0 to 0xff, or a SpellExt effect 0x100 to 0xffff (the record then gets enemy effect 0x94). Kernel attack: a SpellExt effect 0x100 to 0xffff, on magic 00-37 only. (FF7_SpellExt_Enemies_README.txt)",
+       "words": [
+        "none"
+       ],
+       "min": 0,
+       "max": 65535,
+       "messages": [
+        "%.320s: kernel attack %02x is no magic (00-37): the game plays an enemy's summon, enemy skill or limit as one, so effect = is for kernel magic and scene attacks only"
+       ]
+      },
+      {
+       "name": "impact",
+       "type": "int_or_word",
+       "default": "",
+       "restart": "next_battle",
+       "help": "(scene) none or the impact byte 0 to 255. (FF7_SpellExt_Enemies_README.txt)",
+       "words": [
+        "none"
+       ],
+       "min": 0,
+       "max": 255
+      },
+      {
+       "name": "sound",
+       "type": "int_or_word",
+       "default": "",
+       "restart": "next_battle",
+       "help": "(scene) none or the sound number 0 to 0xfffe. (FF7_SpellExt_Enemies_README.txt)",
+       "words": [
+        "none"
+       ],
+       "min": 0,
+       "max": 65534
+      },
+      {
+       "name": "script",
+       "type": "int",
+       "default": "3",
+       "restart": "next_battle",
+       "help": "The model script the action plays, 3 to 0x3f (0 and 1 are idle loops, 2 the death): 3 the attack, 4 the cast. (FF7_SpellExt_Enemies_README.txt)",
+       "min": 3,
+       "max": 63,
+       "messages": [
+        "%.320s: script is a model script, 3 to 0x3f (0 and 1 are idle loops, 2 the death)"
+       ]
+      },
+      {
+       "name": "camera",
+       "type": "int_or_word",
+       "default": "default",
+       "restart": "next_battle",
+       "help": "default (the game's own) or a camera number 0 to 0xfffe (0x190 and up: SpellExt's cameras). (FF7_SpellExt_Enemies_README.txt)",
+       "words": [
+        "default"
+       ],
+       "min": 0,
+       "max": 65534
+      },
+      {
+       "name": "camera_multi",
+       "type": "int",
+       "default": "",
+       "restart": "next_battle",
+       "help": "The camera on several targets, 0 to 0xfffe; needs a numeric camera. (FF7_SpellExt_Enemies_README.txt)",
+       "min": 0,
+       "max": 65534,
+       "messages": [
+        "%.320s: camera_multi needs camera, a camera number (the camera on one target), in [attack %.320s]"
+       ]
+      },
+      {
+       "name": "effect_all",
+       "type": "int",
+       "default": "",
+       "restart": "next_battle",
+       "help": "The SpellExt effect when the attack has results on several targets, 0x100 to 0xffff; needs effect 0x100 and up. (FF7_SpellExt_Enemies_README.txt)",
+       "min": 256,
+       "max": 65535,
+       "messages": [
+        "%.320s: effect_all needs effect, a SpellExt effect (0x100 and up), in [attack %.320s]"
+       ]
+      }
+     ]
+    }
+   ],
+   "messages": [
+    "scene \"%.320s\": a scene file's name is 1 to %d letters, digits, _ or -",
+    "enemy \"%.320s\": a folder name of enemies\\ is 1 to %d letters, digits, _ or -",
+    "enemy %.320s is not registered: no enemy.ini or generated.ini in enemies\\%.320s, or [enemies] load of FF7_SpellExt_Enemies.ini leaves it out",
+    "enemy %.320s: no generated.ini or enemy.ini in enemies\\%.320s",
+    "enemy %.320s: no [enemy] section",
+    "%.320s: unknown key \"%.320s\" (keys: %.320s)",
+    "enemy %.320s: key \"%.320s\" missing",
+    "enemy %.320s: an attack section's name is at most %d characters (one has %d)",
+    "[attack %.320s]: no id",
+    "%.320s: an attack ID is 00-7f (the kernel's) or 0100-7fff (the game reads an AI's attack ID as signed)",
+    "%.320s: script is a model script, 3 to 0x3f (0 and 1 are idle loops, 2 the death)",
+    "%.320s: [attack %.320s] is kernel attack %02x: the game uses the kernel's own record, so \"%.320s\" cannot change it (keys here: %.320s)",
+    "%.320s: kernel IDs are 00-7f",
+    "%.320s: unknown key \"%.320s\" (keys: %.320s)",
+    "[attack %.320s]: a scene attack needs base and name",
+    "%.320s: no scene of the game's scene.bin has attack %04x",
+    "%.320s: kernel attack %02x is no magic (00-37): the game plays an enemy's summon, enemy skill or limit as one, so effect = is for kernel magic and scene attacks only",
+    "%.320s: effect_all needs effect, a SpellExt effect (0x100 and up), in [attack %.320s]",
+    "%.320s: camera_multi needs camera, a camera number (the camera on one target), in [attack %.320s]",
+    "%.320s: name \"%.320s\": printable ASCII only, at most %d characters",
+    "%.320s: \"%.320s\" is no %.320s (%.320s)",
+    "%.320s: at most 8 element entries",
+    "%.320s: \"%.320s\" is not element:rate",
+    "%.320s: \"%.320s\" is no element (%.320s)",
+    "%.320s: \"%.320s\" is no rate (%.320s)",
+    "enemy %.320s: %d attacks, an enemy record holds 16",
+    "enemy %.320s: drops and steals together hold 4 items",
+    "%.320s: at most 3",
+    "%.320s: \"%.320s\" is not one of its attacks (%.320s)",
+    "%.320s: ai = none needs at least one attack (the template uses the first)",
+    "%.320s: the AI file is a name beside enemy.ini (ai.ai.txt, or an .ai block)",
+    "%.320s: enemies\\%.320s\\%.320s not found: assemble %.320s (tools/ai_tool.py asm)",
+    "%.320s: enemies\\%.320s\\%.320s not found",
+    "enemies\\%.320s\\%.320s fails the AI check: %.320s (entry %d, section %d, at %04lx)",
+    "enemies\\%.320s\\%.320s: an enemy's AI is one entry (table 1, entry 0)",
+    "%.320s/%.63s: the AI uses attack(s) %.320s that %.320s does not have",
+    "enemies\\%.320s\\model\\aa: %d bytes, not a battle skeleton (its header is 52)",
+    "enemies\\%.320s\\model\\aa: not a battle skeleton the game can read (%lu bones, %lu textures, %lu weapons, %d bytes)",
+    "enemies\\%.320s\\model\\ has aa but not %.320s (%.320s): the archive's file of the same name would be taken with it; the scene is refused",
+    "enemies\\%.320s\\model\\aa lists %c%c (%.320s %lu) and the folder has no such file: the archive's file of the same name would be taken with it; the scene is refused",
+    "%.320s: \"model = pool\" works in a DLL scene (number 256 and up) only: scene %d is a scene.bin scene",
+    "enemy %.320s: model %d is already enemy slot %d",
+    "attack ID %04x is given two different records in this scene (%.320s)",
+    "the scene has more than %d attack records: FF7 holds 32",
+    "%.320s: too many files for one scene",
+    "%.320s: cannot be read (or it is larger than %d bytes)",
+    "%.320s line %d: section [%.320s] appears twice",
+    "%.320s line %d: more than %d sections in one file",
+    "%.320s line %d: \"%.320s\" is not \"key = value\"",
+    "%.320s line %d: a key before any [section]",
+    "%.320s line %d: key \"%.320s\" appears twice in this section",
+    "%.320s line %d: too many keys",
+    "%.320s: more than %d sections with the generated file's",
+    "%.320s: \"%.320s\" is not a number",
+    "%.320s: %.320s is outside %.320s..%.320s"
+   ],
+   "returned": [
+    "a debug text (a0) has no 00 before the end of the block",
+    "a debug text (a0) runs past the end of the block",
+    "a jump does not land on an instruction of its script",
+    "larger than 65535 bytes",
+    "its table has no entry",
+    "the entry starts at an odd offset",
+    "an opcode the interpreter does not have",
+    "an operand runs past the end of the block",
+    "runs past the end of the block (no end, 73)",
+    "the script starts past the end of the block",
+    "the entry's 16 section offsets run past the end of the block",
+    "too small to hold a table",
+    "the lowest entry offset is not the end of the table",
+    "a text (93) has no ff before the end of the block"
+   ],
+   "logged_notes": [
+    "enemies: %.95s: [attack %.31s] has effect %04x and script 3: a converted monster's script 3 shows its result with f7 and has no effect step, so the effect is never played (script 4 is the cast)",
+    "enemies: %.31s: %.63s is older than %.63s: assemble it (tools/ai_tool.py asm); the block is used as it is"
+   ],
+   "runtime_only": [],
+   "notes": [
+    "An enemy is read inside each scene that names it: its lines name its own file and line.",
+    "Item names are the running game's (kernel2.bin, with a SpellExt new item's or limit item's name over it): the tool reads the game folder's kernel2.bin; a mod's kernel2.bin that renames items is not seen here."
+   ]
   }
  }
 }

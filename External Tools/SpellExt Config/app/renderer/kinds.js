@@ -6,6 +6,7 @@
   const low = (s) => String(s).toLowerCase();       // file names are compared without case, as the DLL opens them
   const GAME = "FF7_SpellExt_Game.ini";
   const FIELDS = "FF7_SpellExt_Fields.ini";
+  const ENEMIES = "FF7_SpellExt_Enemies.ini";
 
   // One entry per kind, in the order of design 3.2. `file` names the one file of a kind page (`also`: a second file
   // shown under it when the folder has it); `group` takes every file of list_files' group not claimed by an entry
@@ -25,9 +26,13 @@
     { id: "limits", label: "Limits", file: "FF7_SpellExt_Limits.ini" },
     { id: "shops", label: "Shops", file: "FF7_SpellExt_Shops.ini" },
     { id: "fields", label: "Fields", file: FIELDS, fields: true },
+    { id: "enemiesfile", label: "Enemies file", file: ENEMIES },
     { id: "other", label: "Other text", group: "config" },
     { id: "cameras", label: "Cameras", group: "cameras" },
     { id: "effscripts", label: "Effect scripts", group: "effects" },
+    { id: "scenes", label: "Scenes", group: "scenes" },
+    { id: "formations", label: "Game formations", page: "formations" },     // (formation diagrams) read only
+    { id: "enemies", label: "Enemies", group: "enemies" },
     { id: "ai", label: "AI", page: "ai", group: "ai", only: ".txt" },
     { id: "readme", label: "Readme", group: "Readme" },
     { id: "problems", label: "Problems", page: "problems" },
@@ -62,6 +67,14 @@
         (!e.only || low(f.path).endsWith(e.only)));
     }
     return out;
+  }
+
+  // The name a file of a group is listed under: its path without the group's folder for the scene and enemy files
+  // (an enemy folder holds enemy.ini and generated.ini: the folder is the name), else the file's own name.
+  function subLabel(f) {
+    const parts = String(f.path).split("/");
+    if ((f.group === "scenes" || f.group === "enemies") && parts.length > 1) return parts.slice(1).join("/");
+    return parts[parts.length - 1];
   }
 
   // the entry a file belongs to (null when none: a file list_files does not give)
@@ -101,12 +114,13 @@
     return out;
   }
 
-  // the badge beside a section in the list (design 3.3): wide, test, state, set
+  // the badge beside a section in the list (design 3.3): wide, test, state, form, set
   function kindBadge(kind) {
     if (!kind) return null;
     if (kind.startsWith("wide_")) return "wide";
     if (kind === "test") return "test";
     if (kind === "state") return "state";
+    if (kind === "form") return "form";        // (2026-11-13) [form NAME] of the limits file
     if (kind === "set_limit") return "set";
     return null;
   }
@@ -167,6 +181,6 @@
     return ok ? { value: d, placeholder: "" } : { value: "", placeholder: "absent: " + d };
   }
 
-  root.SpellExtKinds = Object.freeze({ ENTRIES, GAME, FIELDS, sidebar, entryOf, splitRaw, rangeText, shopPlaces, kindBadge,
-                                       listedSections, sectionRange, addAfterLine, advancedValue });
+  root.SpellExtKinds = Object.freeze({ ENTRIES, GAME, FIELDS, ENEMIES, sidebar, entryOf, subLabel, splitRaw, rangeText,
+                                       shopPlaces, kindBadge, listedSections, sectionRange, addAfterLine, advancedValue });
 })(typeof window !== "undefined" ? window : globalThis);

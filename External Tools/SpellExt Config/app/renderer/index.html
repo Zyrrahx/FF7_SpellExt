@@ -19,6 +19,22 @@
     <div class="menubox">
       <label><input type="checkbox" id="set_confirm"> Show the changes before Save (Ctrl+S)</label>
       <label><input type="checkbox" id="set_openlast"> Open the last folder at start</label>
+      <div class="setfile" title="read in place of the game folder's for the scene build forecast, the Game formations page and the formation's camera record 0 (the view at the start)">
+        <div>scene.bin: <span id="set_scenebin" class="setpath"></span></div>
+        <div><button id="set_scenebin_pick">Choose a file...</button> <button id="set_scenebin_clear">Use the game folder's</button></div>
+        <div id="set_scenebin_line" class="muted setline"></div>
+      </div>
+      <div class="setfile" title="read in place of the game folder's data\battle\battle.lgp for the battle models (the archive the game reads a model's files from when no mod serves them)">
+        <div>battle.lgp: <span id="set_battlelgp" class="setpath"></span></div>
+        <div><button id="set_battlelgp_pick">Choose a file...</button> <button id="set_battlelgp_clear">Use the game folder's</button></div>
+        <div id="set_battlelgp_line" class="muted setline"></div>
+      </div>
+      <div class="setfile" title="read in place of the game folder's data\menu\menu_us.lgp for the portraits of the game's own characters (the archive the game reads them from); another language's exe has menu_fr.lgp, menu_gm.lgp or menu_sp.lgp">
+        <div>menu archive: <span id="set_menulgp" class="setpath"></span></div>
+        <div><button id="set_menulgp_pick">Choose a file...</button> <button id="set_menulgp_clear">Use the game folder's</button></div>
+        <div id="set_menulgp_line" class="muted setline"></div>
+      </div>
+      <div id="set_problem" class="setproblem" hidden></div>
       <div class="muted" id="set_versions"></div>
     </div>
   </details>
@@ -100,6 +116,13 @@
     <aside id="libdrawer" class="libdrawer" hidden></aside>
   </section>
 
+  <section id="page-formations" class="page">
+    <div class="pagewrap">
+      <div class="pagehead"><h2>Game formations <span class="muted">the battles of the scene.bin read: shown, never written</span></h2></div>
+      <div id="formationsnote"></div>
+    </div>
+  </section>
+
   <section id="page-library" class="page">
     <div class="pagewrap">
       <div class="pagehead"><h2>Library</h2></div>
@@ -136,6 +159,9 @@
 <script src="live.js"></script>
 <script src="open.js"></script>
 <script src="templates.js"></script>
+<script src="modelview.js"></script>
+<script src="enpage.js"></script>
+<script src="portrait.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

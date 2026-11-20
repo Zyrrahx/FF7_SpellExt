@@ -10,6 +10,7 @@ import fs from 'node:fs';
 import nodePath from 'node:path';
 import { Host } from './ipc.js';
 import { LiveHost } from './livehost.js';
+import { PortraitHost } from './portraithost.js';
 import { Store, settings_dir } from './store.js';
 import { serve_path, parse_argv, ORIGIN, CSP } from './paths.js';
 
@@ -47,7 +48,8 @@ export function start(opts) {
   let host = null;
   let win = null;
   const live = new LiveHost(o.live || {});      // the Live tables reader: a worker thread, started on its first request
-  app.on('will-quit', () => live.close());
+  const portrait = new PortraitHost(o.portrait || {});   // (portrait panel) the Portrait block's worker thread, started on its first request
+  app.on('will-quit', () => { live.close(); portrait.close(); });
 
   app.on('web-contents-created', (e, contents) => {
     const keep_in = (ev, url) => { if (!String(url).startsWith(ORIGIN)) ev.preventDefault(); };
@@ -56,8 +58,9 @@ export function start(opts) {
     contents.on('will-attach-webview', ev => ev.preventDefault());
     contents.setWindowOpenHandler(({ url }) => {
       if (String(url).startsWith(ORIGIN + 'aiwin.html')) {
+        // (formation diagrams stage) hidden like the main window when the caller asks (the smoke tests: show:false)
         return { action: 'allow', overrideBrowserWindowOptions: { width: 1300, height: 850, icon: ICON, autoHideMenuBar: true,
-                                                                  webPreferences: WEBPREFS } };
+                                                                  show: o.show !== false, webPreferences: WEBPREFS } };
       }
       return { action: 'deny' };
     });
@@ -75,7 +78,7 @@ export function start(opts) {
     });
     const store = new Store(settings_dir(app.getPath('userData'), process.resourcesPath));
     host = new Host({
-      store, argv, live,
+      store, argv, live, portrait,
       versions: { node: process.versions.node, electron: process.versions.electron, chrome: process.versions.chrome },
       dialogs: {
         pick_folder: (title) => {
@@ -87,7 +90,13 @@ export function start(opts) {
         open_file: (title, kind) => {
           const filters = kind === 'kernel'
             ? [{ name: 'KERNEL.BIN', extensions: ['bin', 'BIN'] }, { name: 'All files', extensions: ['*'] }]
-            : [{ name: 'Templates', extensions: ['txt'] }, { name: 'All files', extensions: ['*'] }];
+            : kind === 'scene_bin'        // (formation diagrams) the Settings menu's scene.bin
+              ? [{ name: 'scene.bin', extensions: ['bin', 'BIN'] }, { name: 'All files', extensions: ['*'] }]
+              : kind === 'battle_lgp'     // (model preview) the Settings menu's battle.lgp
+                ? [{ name: 'battle.lgp', extensions: ['lgp', 'LGP'] }, { name: 'All files', extensions: ['*'] }]
+                : kind === 'menu_lgp'     // (portrait panel) the Settings menu's menu archive
+                  ? [{ name: 'menu_us.lgp', extensions: ['lgp', 'LGP'] }, { name: 'All files', extensions: ['*'] }]
+                  : [{ name: 'Templates', extensions: ['txt'] }, { name: 'All files', extensions: ['*'] }];
           const r = dialog.showOpenDialogSync(win, { title, properties: ['openFile'], filters });
           return r && r.length ? r[0] : null;
         },

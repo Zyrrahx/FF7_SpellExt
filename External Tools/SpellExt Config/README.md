@@ -168,7 +168,192 @@ compares the CSP header and both meta tags with the design's text; `tests/unit/s
 `main/main.js` ends with its autostart line. `tools/sync_external_tools.sh config` copies the app's source into the repo's
 `External Tools/SpellExt Config/` (`app/`, this README, `build/build.sh`, `zip_release.sh`, `verify.sh`, the two
 README texts, the example file); `fuses.py` and `make_icon.py` stay here (no Python enters `External Tools`), so the build runs from
-`tools/`. The version is 0.8.3 (2026-10-29: the character file's `portrait = NAME` for the game's own menu portraits, with the DLL; 0.8.2 added the wide and new gear ranges).
+`tools/`. The version is 0.11.0 (2026-11-15: the Portrait block of a character's page, stages 1 and 2, and the 3D view beside the formation diagram, stages 1 to 3, both below; their words for the user are in `build/README_*.txt`; 0.10.0, 2026-11-14: the formation diagrams, the Game formations page, the scene.bin and battle.lgp of the Settings menu and the enemy Model block, stages 1 to 4 below; 0.9.0, 2026-11-13: the config refresh, stages A to D2 below: the DLL's newer keys, the Enemies file, the scene and enemy pages, the scene checks, the enemy AI, the save safety; 0.8.3, 2026-10-29, added the character file's `portrait = NAME` for the game's own menu portraits, with the DLL; 0.8.2 the wide and new gear ranges).
+
+**Config refresh 2026-11-13, stage B (the version stays 0.8.3 until the release).** Three more sidebar entries:
+**Enemies file** (`FF7_SpellExt_Enemies.ini`, a kind page like the others), **Scenes** (`scenes\*.ini` and
+`scenes\generated\*.ini`) and **Enemies** (each enemy folder's `enemy.ini` and `generated.ini`), the last two listed as
+the DLL's start-up scan sees them (names without case; no model, AI or other file of those folders; a link out of the
+config folder not listed). They open as Raw text, editable, generated files too: the file's line says that these files
+have their own grammar (only `;` starts a comment) and, on a generated file, that running the converter again
+overwrites it. Problems has the scan's forecast (each scene file it would skip, on that file, and its counts). The port:
+`app/core/rules/enemies.js`, `app/core/enemyscan.js`, `EnDocument` in `app/core/document.js`; the harness module
+`enemyscan`.
+
+**Config refresh 2026-11-13, stage C1 (the version stays 0.8.3).** Problems now also has every registered scene's
+build as the DLL makes it when one of its battles is handed over: a refusal on the file and line it names (a scene
+file's or an enemy file's view shows it), the build's notes, "not forecast" (a tool line) where the game's scene.bin
+or kernel2.bin is needed and the game folder does not have it, and a summary line under the Enemies file. The port:
+`app/core/scenebuild.js`, `app/core/gamedata.js` (of `sxcfg/scenebuild.py`, `sxcfg/gamedata.py`); the CLI's `scene`;
+the harness module `scenebuild`. The scene and enemy form pages are stage C2.
+
+**Config refresh 2026-11-13, stage C2 (the version stays 0.8.3).** The scene and enemy files have a **Form** tab like
+the main files' kind pages: the section list (each section's kind: `[scene]`, `[formation 0]`-`[formation 3]`,
+`[enemy]`, `[attack NAME]`, any other one marked "not read"), a row per key with its help, range and default from the
+schema's `en_files`, Advanced, Add a key, Section text, and the problems on their rows, in the files' own grammar
+(EnDocument: a line the form does not change keeps its bytes). Each row says where its value stands in the DLL's
+overlay: in your file "wins over the generated line N: VALUE" (with "use the generated value", which removes your line)
+or "only in your file"; in the generated file "NOT USED: your file's line N gives VALUE" or "used", with "override in
+your file", which writes the key into your file (`scenes\NAME.ini`, `enemies\FOLDER\enemy.ini`), made when the folder
+has none and written by its first Save (Reload drops it). The keys a section takes from the other file are listed
+under the rows ("override here"), and a section only the other file has is in the section list, greyed. A generated
+file says at the top that a converter run overwrites it. A formation of `kind = surrounded` (its own, or formation 0's)
+shows the party's triangle and which row stands before which place, as the build assigns them (at most 2 a place);
+`party_radius` and `party_front` given with another kind are said to be read and unused. **Check this scene** (on an
+enemy file: the scenes that use it) and **Check all scenes** (also on Problems, with a count) give the build's verdict
+in the DLL's words. The AI page lists **Enemy AI** (each enemy folder with its `ai` key): one opens under the enemy's
+rule (one entry; only its own attack IDs, in en_ai_attacks' words); Save writes the text and assembles the block the
+DLL reads (`ai.ai.txt` -> `ai.ai`, as `tools/ai_tool.py asm`). Minors of review C1: the item names come from the
+kernel2.bin beside the KERNEL.BIN the AI page is set to (the game folder's when it has none; the summary line names
+the file); the log page files a refusal with no file label under its enemy's file (and where the check files the same
+problem) and the scene name `-` as no name; with none of the game's data the check says "not forecast" once, in the
+summary line (a scene's own page still shows its line); the Problems page's sentence. The port: `app/core/enform.js`
+(of `sxcfg/enform.py`), `app/renderer/enpage.js` (the same bytes as the Python page's `sxcfg/static/enpage.js`); the
+routes `scene.check`, `scene.range`, `ai.enemies`, `ai.enemy_open`, `ai.enemy_cards`, `ai.enemy_save` and the edit
+op `en_override`; the harness module `enform` (`tests/oracle_c2.py`, `tests/run_diff_c2.js`); the hidden-window smoke
+`tests/smoke/run_smoke_c2.sh` (it plants a scene and two enemies of its own in the copy).
+
+**Config refresh 2026-11-13, stage D1 (save safety; the version stays 0.8.3).** The minors of review C2, the same in
+both ports (`tests/test_enform.py` class StageD1 and `tests/unit/stage_d1.test.js` hold the same cases and words; the
+harness module `enform` has a case `d1`): no write through a link inside the config folder (the Enemy AI Save, an
+override's user file, a scene or enemy file's Save: refused when the file or a folder on the way is a symbolic link,
+`paths.js no_link` / `safety.no_link`); the AI text and block written through two `.tmp` files and renamed text then
+block, the old text put back when the block's rename fails, a `.tmp` in the way refused before the backup, no `.tmp`
+left; an `ai` name that is `.` or `..`, ends in a dot or a space, breaks another Windows name rule, or names an `.ini`
+block, refused before anything (`enform.ai_save_problem`, shown in the AI title); a block that does not disassemble
+opens from `ai.generated.txt` (or empty) with the error in the title; a scene or enemy file with a CR not followed by
+LF flagged on the form (`en.lone_cr`) and overrides refused on it (Raw as before); "use the generated value" (the edit
+op `en_use_generated`) removes the section too when it is one an override added (nothing but blank lines left, no
+comment on its header, not in the file as last opened or saved), and then the blank line before it that the override
+added; so an override taken back gives the file's bytes back. A real write error is a refusal (the backup, a `.tmp`). The Python reference also refuses a character the file cannot hold before its backup
+(the app did already) and clamps Check all scenes' start at 0.
+
+**Config refresh 2026-11-13, stage D2 (the 0.9.0 release).** `app/package.json` says 0.9.0; the user READMEs (`build/README_linux.txt`, `README_windows.txt`) open with "What's new in 0.9.0" (the new keys, the Enemies file, the scene and enemy pages with the surrounded panel, the scene checks, the enemy AI, the save safety: no user content named) and say that `--game` also serves the scene checks. Built with `build/build.sh` from the pinned Electron v44.7.0 in `build/downloads` (nothing downloaded); the zips `SpellExt_Config_0.9.0_linux64.zip` and `..._win64.zip` are in `build/out/release/` with `SHA256SUMS.txt`, checked by `tests/check_release.py` (every file of `app/` must be in each zip, so `app/renderer/enpage.js` and the other stage B-D1 files are; its user-content words now also hold the config copy's scenes and enemies: the names of the files in `scenes\` and `scenes\generated\`, of the folders in `enemies\`, and a `[scene]` or `[enemy]` section's `name`, each unless the DLL's Readme uses it, with a substring test before each word's regex; `--self-test` plants a scene file's, an enemy folder's and an enemy's name). The S6 smoke was not run for this release: its AI section window comes from `window.open`, which `main.js` allows with no `show: false`, so it would be a visible window. Nothing is installed by the build: `tools/sync_external_tools.sh config` and the user's own copy of the app are later steps.
+
+**Formation diagrams, stage 1 (2026-11-13, still 0.9.0).** Ports of the Python reference's stage 1, field for field:
+`app/core/formation.js` (one formation's layout for every kind: the party's places for 3, 2 and 1 members with the
+back-row spots and facings, from the game's four place tables written in with their exe addresses; the enemies'
+facings; the DLL's surrounded triangle; the formation's camera record 0, the view at the start; the notes), `enform.view`'s `formations` (from the keys, the
+camera of the `camera = S:F` stand-in), `gamedata.js` keeping every scene's formations and enemy names, `discover.js`
+`scene_bin_mods` (an active 7th Heaven mod's own `battle\scene.bin`, seen, not read). The page: every `[formation N]`
+of a scene form shows the diagram (`EN.formation` in the shared `enpage.js`; seen from above, front at the top, +x to
+the LEFT, as the game's camera shows it), and a sidebar entry **Game formations** after Scenes lists the 1,024 battles
+of the scene.bin read and draws the chosen one. The **Settings** menu's **scene.bin**: "Choose a file..." (the main
+process's dialog, route `app.game_file`; the page never sends a path) or "Use the game folder's"; kept in settings.json
+(`scene_bin`); read in place of the game folder's for the scene build forecast, the Game formations page and the
+formation's camera record 0; the menu's line, the check's summary and the page name the file read; a file that cannot be read or is not a
+scene.bin is said, never replaced by the game folder's. `sxcfg-cli.js` gains `formations [BATTLE]` and `--scene-bin
+FILE` (check, scene, formations). Routes `app.game_file`, `game.formations`, `game.formation` (preload allowlist).
+`main.js`: the AI section window (`window.open`) is now made with the main window's `show` (hidden in the smoke tests),
+so smoke S6 no longer maps a window. Tests: `tests/unit/formation.test.js`, the harness module `formation`
+(`tests/oracle_f1.py`, `run_diff_f1.js`), smoke F1 (`tests/smoke/run_smoke_f1.sh`, `f1/`: every DLL kind, kinds 0-8 of
+the game, the Settings menu's scene.bin set, cleared, a bad file, the good one again; PNG pictures of the diagrams), the
+command lines side by side in `run_tests.sh`.
+
+**Model preview, stage 2 (2026-11-13, still 0.9.0): the files, read and parsed; no drawing yet.** Ports of the Python
+reference's `archives`, `battlemodel`, `mods7h` and `modelsrc`, field for field (the differential compares their whole
+descriptions; floats as float32 bits, textures by the sha256 of their RGBA): `app/core/archives.js` (an LGP's table of
+contents only, an .iro's directory and entries), `battlemodel.js` (the skeleton, frame 0 of the first animation, the
+parts posed with a sine table made with + - * / only, the textures at every depth as RGBA, the problems in the
+reference's words), `mods7h.js` (7th Heaven's current profile, each active mod's `mod.xml`, with the reference's small
+XML reader), `modelsrc.js` (each file's source in the order the running game asks: SpellExt's pool [read from the
+code], 7th Heaven's active mods [read from 7th Heaven 4.6.1's code, by review F2], FFNx's direct folder [read from the code], the archive; what each file
+overrides). The **Settings** menu gains **battle.lgp** ("Choose a file..." / "Use the game folder's", kept in
+settings.json as `battle_lgp`): read in place of the game folder's `data\battle\battle.lgp` for the models; a file that
+is not an LGP is said, never replaced by the game folder's. `sxcfg-cli.js` gains `model FOLDER|LETTERS|NUMBER` (and
+`--all`, `--json`, `--battle-lgp FILE`, `--7th-heaven DIR`, `--no-mods`), the Python tool's `model` byte for byte.
+Review F1's minors: enemy names read through FF7's characters from 0x60 (`gamedata.display_name`: the dot between
+"Jenova" and "BIRTH"); `--scene-bin` and `--battle-lgp` refused where they are not read and a relative FILE named in full;
+an app settings.json (or the Python tool's settings file) that cannot be read is said in the Settings menu and never
+written over; the camera's words ("the formation's camera record 0 (the view at the start)"); `discover.active_mods`
+now takes only the mods the profile has switched on (`IsModActive`). Tests: `tests/unit/models.test.js`, the harness
+module `model` (`tests/oracle_m2.py`, `run_diff_m2.js`, the planted world of `spellext_config/tests/model_fixtures.py`),
+smoke F1's battle.lgp steps, and the `model` command lines side by side in `run_tests.sh`. After review F2: a part
+whose polygon groups overlap is refused (its triangles were unbounded), `kernels.iro_entries` refuses a directory the
+file cannot hold or an entry shorter than its fields (it looped for ever: this also guards stage 1's scene.bin check
+and the AI page's kernel finder), an LZS entry stops at 64 MB (`lzs.js` writes into a Buffer), an `ActiveWhen` nested
+more than 32 deep is not understood, a mod's top folder is used when none of its folders is active (7th Heaven
+4.6.1's rule), a settings value that is not a path is said, and `app.game_file` takes only a game file of the settings.
+
+**Model preview, stage 3 (2026-11-14, still 0.9.0): the renderer; no panel yet.** `app/renderer/modelview.js` (the
+same bytes as the Python page's `sxcfg/static/modelview.js`; no page loads it yet): a small software rasteriser on a
+2D canvas, no library. `prepare(description)` checks and decodes a model as `battlemodel` describes it (posed in
+frame 0; the textures' pixels as bytes or base64); `render(mesh, view, width, height)` draws it into RGBA, the same
+bytes in Node, Firefox and Electron (no transcendental Math: the sines are battlemodel's table); `attach(canvas,
+mesh)` turns it with the mouse (drag, wheel, double click or a reset button, the arrow keys and + - 0). It looks as
+the game looks: the game's own look-at (up -y, no mirror), the model's front at -z, v = 0 the texture's first row,
+the nearest texel wrapped, alpha 0 not drawn, texture times vertex colour, a tie in depth to the later triangle (as
+FFNx draws), no culling. Its work is bounded whatever it is given (a side of 1024, a zoom of 2.5 so the eye stays
+outside the model, 200,000 triangles, 600,000 vertices, coordinates within 1,000,000, the near plane, triangles filled
+row by row over the pixels they can cover, 14 visits a pixel, a visit being a span's pixel or a row examined;
+review F3), each limit said. Tests:
+`tests/unit/modelview.test.js` (the copies, the Math scan, the sine table, the decoding of every model, every texture
+depth and the colour key, real models, the worst frame of the costliest models at 48 views, no real model cut short,
+hostile input (review F3's coplanar textured model and its off-canvas one among it), the widget), `tests/modelview_fixtures.mjs` (the
+fixed models and views), smoke MV (`tests/smoke/run_smoke_mv.sh`, `mv/`: the same sha256 for every picture in Node,
+in the Python page in a headless Firefox and in the app's page in a hidden window), and the Python tool's
+`tests/test_modelview.py` (the posed geometry against `tools/anim_retarget.py`).
+
+**Portrait panel, stages 1 and 2 (2026-11-14): the Portrait block of a character's page.** On a character's section in the Characters
+file ([12] to [43], not commented out), `PT.block` in `portrait.js` (same bytes in both pages) asks the route `character.portrait`
+(`{id, have}`, in `ipc.js`'s table and the preload's allowlist; the Python page's `/api/character/portrait?id=NN`) and draws the
+answer: the character's picture in the main menu's size and in the `_l` size, the part the game draws marked (a dashed line where
+the main menu stops, 80 of 84 pixels), the lines that say where each comes from (marked read or inferred), the base's picture when
+the character has none of its own. It never offers to write. `core/portrait.js` makes the answer (the Python port's `portrait.py`,
+field for field, the same words): the rules' record (`rules/characters.js` keeps `portrait`, `portrait_form`, `portrait_number`,
+`portrait_fit`, `base_used`...), the loose-file index of `files\` as the DLL walks it (depth 12, 100-byte names, the 320-byte game
+path of a folder, the first of two equal names), the PNG header's verdict in the DLL's words (`core/pnghead.js`), the DLL's crop
+box, the menu archive (the `menu_lgp` setting, FFNx's override folder, the game folder's; `archives.js` `read(name, cap)` refuses an
+entry over the cap before reading it). Picture (B): a PNG is decoded by the page's browser, a `.tex` by the core. The route runs in a
+worker thread (`main/portraithost.js`, `portraitworker.js`: one job at a time, a newer request for the same character replaces a
+queued one), so a large decode never freezes the window; the worker keeps the last answers up to 32 MB; `file.reload` drops them. The
+Settings menu gains **menu archive** (`menu_lgp`). The command line: `node tools/sxcfg-cli.js portrait [--menu-lgp FILE] [--7th-heaven DIR] [--json]
+ID`, the Python tool's `portrait` byte for byte. Tests: `tests/unit/portrait.test.js`, the differential's `oracle_p1.py` /
+`run_diff_p1.js`, smoke P1 (`tests/smoke/run_smoke_p1.sh`, `p1/`: the block in a hidden window and in the Python page in a headless
+Firefox, each canvas against Node's pixels), the `portrait` command lines side by side in `run_tests.sh`.
+**Stage 2 adds picture (A), what the game draws:** FFNx's replacement texture where one is served, else stage 1's picture. `core/dds.js` reads a DDS
+(uncompressed RGB with or without alpha, 32 and 24 bits, and BC7, decoded as stored; the header judged before any pixel is read, only the drawn rows
+or blocks read), `core/mods7h.js` `lookup` finds a file in the active 7th Heaven mods (profile order, then mod.xml's folder order; case-blind, every
+folder listed once and kept by stamp), `core/pnghead.js` `dims` judges an FFNx `.png` replacement (the page's browser draws it), and `core/portrait.js`
+reads `FFNx.toml`'s `mod_path`, `mod_ext`, `override_mod_path` and `direct_mode_path`, looks up `<name>_00.<ext>` (`<p>` for the character's own file,
+`menu/<stem>` for a texture read from the menu archive), FFNx's direct menu folder before the archive, and fills each picture's `served`
+(`replacement` or `texture`), `replacement` and its source lines (marked read or inferred). The 7th Heaven is the one the config folder sits in, else
+the page's `--mods`; the command line has `--7th-heaven DIR`. Tests: `tests/unit/dds.test.js` and `portrait_repl.test.js`, the differential's `ddshead`,
+`bc7` and `panel_repl_*` cases, smoke P1 in two passes (planted replacements, then the user's own, read only), the `portrait --7th-heaven` command
+lines on the user's real tree (read only, the same stat before and after).
+
+**Model preview, stage 4 (2026-11-14, the 0.10.0 release): the Model block of an enemy file's form.** On the `[enemy]`
+section of an enemy file (the user's `enemy.ini` and the converter's `generated.ini` alike; also when that section is
+only the other file's), `EN.model` in `enpage.js` (same bytes in both pages) asks the route `enemy.model` (`{name,
+have}`, in `ipc.js`'s table and the preload's allowlist; the Python page's `/api/enemy/model?name=FOLDER`) and draws
+the answer with `modelview.js` on a 400 x 400 canvas scaled by CSS, never by the device pixel ratio (every bound of the
+renderer is per canvas pixel): the first frame at once (a window never shown has no animation frames), then the
+widget. Beside it: the model's number (`model 183 (files hb..)`, or `pool (365 + slot): shown as slot 1, model 365
+(files ob..)`), the lines of `modelsrc.describe` (the DLL's refusal, "has no aa", a file in none of the sources), the
+model's problems and notes, the renderer's own notes, a row per file (where from, its mark, what it overrode), the
+sources looked in (with 7th Heaven's lines, a runtime-conditional folder among them) and what is not shown (FFNx's
+texture replacements, the battle lighting, semi-transparency drawn opaque, the pose). It has one control, Reset
+view: it never offers to write. `core/modelsrc.js` `panel()` makes the answer (the Python port's `panel()`, field for
+field): the enemy's folder must be one the scan lists (`enemy_files`: no path is made from the name before), `have` a
+64-digit digest; the model is carried as `battlemodel.portable` gives it (the textures' pixels as base64), and not at
+all when the page's digest is the answer's (`same`). The caches (PLAN D8, `modelsrc.Caches`, one per process): 7th
+Heaven's data (the active mods as read) kept while every file and folder that read looked at keeps its stamp (`mods7h`
+notes them, `tracked`); the last 8 models described kept while what decides their sources (`Sources.fingerprint`) and
+every file read keep their stamps, at most 128 MB of them (an entry larger than that is answered and never kept; each
+keeps one form of the pixels, the base64 it sends: review F4); each model's textures are decoded only up to 24 MB of
+RGBA in all (`battlemodel.describe`'s `tex_budget`, the panel's only: the command line is unchanged), a texture past
+that drawn untextured with a note ("obad: drawn untextured (the panel's texture budget of 24 MB is used)"), and (review F4
+round 2) its parts parsed only up to what the renderer draws (`geo_budget`: `MV.MAX_TRIANGLES` and `MV.MAX_VERTICES`,
+read from `renderer/modelview.js` itself), a part past that not parsed, with a note ("obao: not drawn (the panel's
+200,000-triangle budget is used)"); the LGP and .iro indexes are `archives.open_cached`'s. The form's Reload
+(`file.reload`) drops them all, and the page forgets its model (`EN.modelForget`). Tests: `tests/unit/modelpanel.test.js`
+(every line of PLAN D9 through the route on the Python fixtures' `panel_world`, the payload, the digest, the refusals,
+the caches: kept, a changed texture, a changed `mod.xml`, Reload, at most 8; nothing written), the harness module
+`model` gains `panel` (both ports' answers byte for byte on the panel world and on real enemies of the copy, each asked
+twice through one cache), and smoke M1 (`tests/smoke/run_smoke_m1.sh`, `m1/`: a DLL enemy, a numbered model's user and
+generated files and a planted enemy with no `model\aa`, in the app's page in a hidden window and in the Python page in
+a headless Firefox: the words against Node's answer, the canvas's sha256 against Node's render of the same answer,
+Reload, no control but Reset view, no page error, the copy unchanged; pictures of each block to a folder given).
 
 ## Where S6a differs from the design, and why
 
@@ -200,7 +385,7 @@ README texts, the example file); `fuses.py` and `make_icon.py` stay here (no Pyt
 ```
 app/core/            the port (ES modules, Node built-ins only, no Electron import)
 app/core/data/       spellext_schema.json (the Python tool's copy, unchanged)
-tools/sxcfg-cli.js   check, set, roundtrip, get, diff: the port's command line (writes nothing)
+tools/sxcfg-cli.js   check, set, roundtrip, get, diff, scene, formations: the port's command line (writes nothing)
 tests/oracle.py      python3 -I: the corpus and the reference's answers -> tests/_work/{corpus,expected}, and
                      tests/_work/manifest.json (cases per module; run_diff.js fails on a module missing or short)
 tests/corpus.py      the corpus generator (fixed seed), used by oracle.py
@@ -255,6 +440,36 @@ tests/check_release.py    S7: the zips' contents checked (--self-test: planted f
 tests/smoke/run_smoke_s7.sh, s7/  S7: the Linux release build itself launched hidden once on a copy, read only
 tests/unit/kinds.test.js  kinds.js in a vm context: the sidebar, the Section text's raw range (CRLF to LF, a blank
                      last line kept) put back through file.apply_text on a CRLF file, the shops table, the badges
+app/core/rules/enemies.js, app/core/enemyscan.js  stage B (2026-11-13): the enemies registry's reader and the DLL's
+                     start-up scan of scenes\ and enemies\ (ports of sxcfg/rules/enemies.py, sxcfg/enemyscan.py)
+tests/unit/enemies.test.js  stage B: the scene and enemy files through the routes (listing, grammar, a generated file
+                     saved with its note, the scan's lines on their file, the gate refusing a model file)
+app/core/scenebuild.js, app/core/gamedata.js  stage C1 (2026-11-13): a DLL scene's build and the game data it reads
+                     (ports of sxcfg/scenebuild.py, sxcfg/gamedata.py)
+tests/unit/scenes.test.js  stage C1: a scene's build through the routes (its line on the enemy file's line, an unsaved
+                     edit, "not forecast" without the game, the CLI's scene)
+app/core/enform.js, app/renderer/enpage.js  stage C2 (2026-11-13): the scene and enemy files' form pages (the overlay,
+                     the override, the surrounded triangle, an enemy's AI rule; enpage.js is the Python page's file)
+tests/unit/enform.test.js  stage C2: the form pages through the routes (round trips, the override and its new file,
+                     the triangle, Check this scene / all scenes, an enemy's AI saved as ai_tool.py asm assembles it)
+tests/oracle_c2.py, tests/run_diff_c2.js  stage C2: the harness module enform
+tests/smoke/run_smoke_c2.sh, c2/  stage C2: the form pages and the Enemy AI in a hidden window (a planted scene)
+app/core/formation.js  formation diagrams stage 1: one formation's layout (port of sxcfg/formation.py)
+tests/unit/formation.test.js  stage 1: the places table, the notes, the scene.bin setting through the routes
+tests/oracle_f1.py, tests/run_diff_f1.js  stage 1: the harness module formation
+tests/smoke/run_smoke_f1.sh, f1/  stage 1: the diagrams, the Game formations page and the Settings menu's scene.bin
+                     in a hidden window (five planted scenes; PNG pictures to a folder given); stage 2: its battle.lgp
+app/core/archives.js, battlemodel.js, mods7h.js, modelsrc.js  model preview stage 2: the files of a battle model, where
+                     each comes from, parsed (ports of sxcfg/archives.py, battlemodel.py, mods7h.py, modelsrc.py)
+tests/unit/models.test.js  stage 2: the LGP index, no transcendental Math, the settings.json never written over
+tests/oracle_m2.py, tests/run_diff_m2.js  stage 2: the harness module model
+app/renderer/modelview.js  model preview stage 3: the renderer (the Python page's sxcfg/static/modelview.js, same bytes)
+tests/unit/modelview.test.js, tests/modelview_fixtures.mjs  stage 3: the renderer's tests and their fixed models
+tests/smoke/run_smoke_mv.sh, mv/  stage 3: the same pictures in Node, the Python page (headless Firefox) and the app's
+                     page (hidden window)
+tests/unit/modelpanel.test.js  model preview stage 4: the route enemy.model, every D9 line, the caches, the refusals
+tests/smoke/run_smoke_m1.sh, m1/  stage 4: the enemy Model block in a hidden window and in the Python page (headless
+                     Firefox), its canvas against Node's render; PNG pictures to a folder given
 ```
 
 ## Running
@@ -268,6 +483,10 @@ node tools/sxcfg-cli.js roundtrip /some/scratch/SpellExtConfig
 node tools/sxcfg-cli.js get  --config /some/scratch/SpellExtConfig FF7_SpellExt_Game.ini - debug
 node tools/sxcfg-cli.js diff --config /some/scratch/SpellExtConfig FF7_SpellExt_Game.ini - debug no
 node tools/sxcfg-cli.js diff OLD.ini NEW.ini
+node tools/sxcfg-cli.js formations --config /some/scratch/SpellExtConfig --game "<game folder>" 982
+node tools/sxcfg-cli.js check --config /some/scratch/SpellExtConfig --scene-bin /some/other/scene.bin
+node tools/sxcfg-cli.js model --config /some/scratch/SpellExtConfig --game "<game folder>" --no-mods rt
+node tools/sxcfg-cli.js model --config /some/scratch/SpellExtConfig --game "<game folder>" --7th-heaven "<7th Heaven>" --all
 ```
 
 `diff --config ... FILE SECTION KEY VALUE` prints what `spellext_config.py set` (without `--write`) prints before
@@ -461,3 +680,9 @@ of Node 22, so the rule stands; `tests/unit/build.test.js` scans `app/` for the 
   draft: reported for the coordinator, not changed here).
 - The readers' shared state is a `Map`; where Python tested membership with `in`, `pyIn` accepts a Set, a Map or an
   Array, as Python's `in` does for the shapes the limits and materia ports document.
+
+**Release 0.11.0 (2026-11-15): the Portrait block and the 3D formation view, one release.** `app/package.json` says 0.11.0;
+`build/README_linux.txt` and `README_windows.txt` open with "What's new in 0.11.0" (the Portrait block: which picture, the two sizes,
+the part the game draws, where it comes from, read or inferred, read only; the 3D view: frame 0 of each enemy's idle, the party as
+markers numbered from 0 like the diagram, floor and shadows, no battle stage, the picture at 4:3, the scene.bin read, the mouse
+controls). One wording change besides: the 3D view's note on the markers (`renderer/enpage.js` line 317, and its byte copy `sxcfg/static/enpage.js`) and a comment in `modelview.js` (both copies, line 835) said "wedge", which is also the name of an enemy in the user's own config, so `check_release.py` (unchanged) refused both zips; they now say "pointer". No logic changed. `tests/check_release.py` and its `--self-test` ran unchanged on both zips.

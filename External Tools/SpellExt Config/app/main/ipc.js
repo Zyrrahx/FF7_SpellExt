@@ -22,11 +22,17 @@ import * as aiexplain from '../core/aiexplain.js';
 import * as ailibrary from '../core/ailibrary.js';
 import * as kernels from '../core/kernels.js';
 import * as chars from '../core/rules/characters.js';
-import { EditRefused, Document } from '../core/document.js';
+import { EditRefused, Document, is_en_path } from '../core/document.js';
+import * as enform from '../core/enform.js';
+import * as gamedata from '../core/gamedata.js';
+import * as modelsrc from '../core/modelsrc.js';
+import * as mods7h from '../core/mods7h.js';
+import * as portrait from '../core/portrait.js';
+import * as archives from '../core/archives.js';
 import { Schema, RESTART_TEXT } from '../core/schema.js';
 import { Workspace } from '../core/workspace.js';
-import { pyStrip, pyLstrip, pyLower } from '../core/py.js';
-import { gate, split_rel, resolve_in, check_write, backups_dir, config_dir_of, backup_path, inside, PathRefused, ORIGIN } from './paths.js';
+import { pyStrip, pyLstrip, pyLower, pyIsfile } from '../core/py.js';
+import { gate, split_rel, resolve_in, check_write, no_link, backups_dir, config_dir_of, backup_path, inside, PathRefused, ORIGIN } from './paths.js';
 export { ORIGIN };
 import { save_files, write_file } from './save.js';
 
@@ -87,6 +93,23 @@ function check_field(name, spec, v) {
       return;
     case 'obj':
       check_shape(spec.shape, v, name + '.');
+      return;
+    case 'mrefs':           // (3D formation view, stage 2) 1 to 3 model references: {folder, slot, dll} (dll optional) or {number}
+      if (!Array.isArray(v) || v.length < 1 || v.length > 3) throw new BadRequest(name + ' must be a list of 1 to 3 model references');
+      v.forEach((x, i) => {
+        const at = name + '[' + i + ']';
+        if (!plain_object(x)) throw new BadRequest(at + ' must be {folder, slot, dll} or {number}');
+        const ks = Object.keys(x).sort().join(',');
+        if (ks === 'number') {
+          check_field(at + '.number', int(0, 65535), x.number);
+        } else if (ks === 'folder,slot' || ks === 'dll,folder,slot') {
+          check_field(at + '.folder', str(64), x.folder);
+          check_field(at + '.slot', int(0, 2), x.slot);
+          if (ks !== 'folder,slot' && typeof x.dll !== 'boolean') throw new BadRequest(at + '.dll must be true or false');
+        } else {
+          throw new BadRequest(at + ' must be {folder, slot, dll} or {number}');
+        }
+      });
       return;
     case 'values':          // a template's values: {NAME: text}
       if (!plain_object(v) || Object.keys(v).length > 1000 ||
@@ -154,6 +177,8 @@ const OPS = {
   set_key: { header: str(4096), key: str(1024, true), value: str(MAX_SMALL, true) },
   remove_key: { header: str(4096), key: str(1024, true), comment: bool() },
   set_slots: { section_line: LINE, slots: { t: 'bytes8', req: true } },
+  en_override: { header: str(4096, true), key: str(1024, true), value: str(MAX_SMALL, true) },
+  en_use_generated: { line: LINE },
   add_section: { header: str(4096, true), keys: { t: 'pairs' } },
   remove_section: { section_line: LINE, with_limits: bool() },
   comment_block: { section_line: LINE },
@@ -241,6 +266,27 @@ export const SHAPES = {
   'ai.rename': { name: AI_NAME, new: AI_NAME, update_refs: bool() },
   'ai.delete': { name: AI_NAME, force: bool() },
   'lib.reference': { id: TPL_ID },
+  // stage C2: the scene and enemy forms' checks, an enemy's AI (sxcfg/server.py's /api/scene/*, /api/ai/enem*)
+  'scene.check': { name: str(64), enemy: str(64) },
+  'scene.range': { start: str(16), count: str(16) },
+  'ai.enemies': {},
+  'ai.enemy_open': { folder: str(64, true) },
+  'ai.enemy_cards': { folder: str(64, true), text: str(MAX_TEXT, true) },
+  'ai.enemy_save': { folder: str(64, true), text: str(MAX_TEXT, true), force: bool() },
+  // formation diagrams: a game file of the settings (gamedata.GAME_FILES: scene.bin; stage 2 adds battle.lgp), picked
+  // with the main process's dialog or cleared, never a path from the page; the Game formations page (server.py's
+  // /api/settings/game_file, /api/game/*)
+  'app.game_file': { key: { t: 'enum', of: gamedata.GAME_FILES.map(x => x[0]), req: true }, pick: bool(), clear: bool() },
+  'game.formations': {},
+  'game.formation': { battle: str(16, true) },
+  // (model preview, stage 4) the Model block of an enemy file's form, read only (server.py's /api/enemy/model)
+  'enemy.model': { name: str(64, true), have: str(64) },
+  // (3D formation view, stage 2) the models of ONE scene for the 3D view, read only (server.py's /api/formation/models): 1 to 3
+  // references ({folder, slot} a listed enemy folder and its pool slot 0-2, or {number} 0-65535: 0-369 are models), `have` a digest
+  'formation.models': { refs: { t: 'mrefs', req: true }, have: str(64) },
+  // (portrait panel, stage 1) the Portrait block of a character's page, read only (server.py's /api/character/portrait):
+  // `id` two decimal digits (12 to 43), `have` a digest
+  'character.portrait': { id: str(2, true), have: str(64) },
 };
 
 export const ROUTES = Object.freeze(Object.keys(SHAPES).concat(Object.keys(LATER)));
@@ -283,7 +329,16 @@ const BOTH = {
 
 // why settings.json was not written, for settings.problem
 function unwritten(e, what) {
+  if (e.code === 'EUNREADABLE') return e.message;       // (review F1, minor 4) kept as it is: it could not be read
   return 'settings.json could not be written (' + (e.code || e.name) + '): ' + what;
+}
+
+// (formation diagrams) a battle number of game.formation (server.py battle_number)
+function battle_number(v) {
+  const t = pyStrip(typeof v === 'string' ? v : '');
+  const n = /^[+-]?[0-9]+$/.test(t) ? parseInt(t, 10) : -1;
+  if (!(n >= 0 && n <= 4095)) throw new EditRefused('a battle is a number 0 to 4095');
+  return n;
 }
 
 function is_dir(p) {
@@ -352,6 +407,8 @@ export class Host {
       }
       // the Live tables: a promise of the worker's answer (the reads never hold up this thread)
       if (route.startsWith('live.')) return this.live_answer(route, body);
+      // the Portrait block: the files are read and decoded in the portrait worker, never on this thread
+      if (route === 'character.portrait') return this.portrait_answer(body);
       return { ok: to_plain(this.route(route, body)) };
     } catch (e) {
       return error_answer(e);
@@ -399,6 +456,7 @@ export class Host {
         }
         return this.settings();
       }
+      case 'app.game_file': return this.game_file(b);
       case 'app.show_backup': {
         const ws = this.need_ws();
         const real = backup_path(fs.realpathSync.native(ws.config_dir), b.path);
@@ -451,6 +509,9 @@ export class Host {
       }
       case 'file.reload': {
         const rel = this.rel(b.path);
+        modelsrc.clear_caches();       // (stage 4) the Model panel's caches: Reload reads every model file again
+        archives.clear_cache();        // (portrait panel) and the Portrait block's: the worker's answers, and the archives' indexes
+        if (this.o.portrait) this.o.portrait.clear();
         const e = this.ws.docs.get(rel);
         if (e && e.stamp === null && !fs.existsSync(this.ws.path(rel))) {
           // made by an Add and never saved: Revert drops it, and the folder is again without the file
@@ -464,6 +525,24 @@ export class Host {
         return this.file_view(rel);
       }
       case 'check.run': return { problems: this.need_ws().check() };
+      case 'scene.check': return { result: this.need_ws().scene_check(b.name || null, b.enemy || null) };
+      case 'scene.range': {
+        const start = parseInt(b.start || '0', 10);
+        const count = parseInt(b.count || '50', 10);
+        if (!(start >= 0) || !(count >= 1)) throw new EditRefused('start and count are whole numbers');
+        return this.need_ws().scene_range(start, Math.min(count, 1000));
+      }
+      case 'game.formations': return this.need_ws().game_formations();
+      case 'game.formation': return this.need_ws().game_formation(battle_number(b.battle));
+      case 'enemy.model': return this.enemy_model(b.name, b.have || null);
+      case 'formation.models': return this.formation_models(b.refs, b.have || null);
+      case 'ai.enemies': return { enemies: this.enemy_ai_list() };
+      case 'ai.enemy_open': return this.enemy_open(b.folder);
+      case 'ai.enemy_cards': {
+        refuse_wide_chars(b.text);
+        return this.enemy_cards(b.folder, b.text);
+      }
+      case 'ai.enemy_save': return this.enemy_save(b.folder, b.text, Boolean(b.force));
       case 'log.read': return this.log();
       case 'lib.list': return this.lib_list();
       case 'lib.suggest': {
@@ -559,6 +638,7 @@ export class Host {
           if (e instanceof kernels.KernelRefused) throw new EditRefused(e.message);
           throw e;
         }
+        this.items_kernel();
         return this.ai_overview();
       }
       case 'ai.kernel_pick': return this.ai_kernel_pick();
@@ -1083,6 +1163,14 @@ export class Host {
     return this._kernels;
   }
 
+  // (minor 1 of review C1) The scene builds' item names from the kernel2.bin beside the KERNEL.BIN the AI page is set
+  // to (the choice made or remembered; none: the game folder's, as before)
+  items_kernel() {
+    if (!this.ws) return;
+    const kid = this.kernels().active;
+    this.ws.items_kernel = kid ? kernels.kernel2_beside(kid) : null;
+  }
+
   // A kernel id from a route's body: one of the chooser's list (found, or picked this session), or the choice in use
   // (a typed path kept in settings.json). Anything else is refused before a file is opened: an id names a path, and
   // the page only ever sends ids from the list (design 1.4 rule 6).
@@ -1115,6 +1203,7 @@ export class Host {
     const ws = this.need_ws();
     const files = aitool.list_ai(ws.config_dir);
     const cs = aicards.character_ai(this.ai_texts(), files.filter(f => f.ai).map(f => f.name));
+    aicards.add_served(cs, mods7h.served_ai(ws.config_dir, aicards.ai_values(cs)));
     for (const [name] of this.pending_ai) {
       const hit = files.find(f => f.name === name);
       if (hit) hit.pending = true;
@@ -1257,6 +1346,7 @@ export class Host {
       if (e instanceof kernels.KernelRefused) throw new EditRefused(e.message);
       throw e;
     }
+    this.items_kernel();
     return this.ai_overview();
   }
 
@@ -1321,6 +1411,33 @@ export class Host {
                                                        e => error_answer(e));
   }
 
+  // (portrait panel, stage 1) The Portrait block of a character's page (portrait.panel), READ ONLY. `id` is two decimal digits
+  // (12 to 43) of a live section of the Characters file as it stands in the workspace (unsaved edits included); `have`
+  // the digest the page holds. The workspace's text is taken here; the files are read and decoded in the worker, one job
+  // at a time (portraithost.js).
+  portrait_answer(b) {
+    const o = this.o.portrait;
+    if (!o) return { refused: 'Portrait: there is no reader in this run' };
+    try {
+      const ws = this.need_ws();
+      if (!/^[0-9]{2}$/.test(b.id) || parseInt(b.id, 10) < portrait.FIRST_ID || parseInt(b.id, 10) > portrait.LAST_ID) {
+        throw new EditRefused('id is two digits, ' + portrait.FIRST_ID + ' to ' + portrait.LAST_ID);
+      }
+      if (b.have !== undefined && b.have !== null && b.have !== '' && !/^[0-9a-f]{64}$/.test(b.have)) throw new EditRefused('have is a digest (64 hex digits)');
+      let text;
+      try { text = ws.text(portrait.CHAR_FILE); } catch (e) { text = ''; }
+      if (portrait.record_of(text, parseInt(b.id, 10)) === null) {       // a section that is not live: refused here, before the worker is asked
+        throw new EditRefused('character ' + parseInt(b.id, 10) + ' is not a live section of ' + portrait.CHAR_FILE);
+      }
+      const body = { ident: parseInt(b.id, 10), have: b.have || null, chosen: ws.menu_lgp, text, config_dir: ws.config_dir, game_dir: ws.game_dir,
+                    seventh: this.mods_dir ? nodePath.dirname(nodePath.resolve(this.mods_dir)) : null };
+      return o.request(body).then(r => (r.ok !== undefined ? { ok: to_plain(r.ok) } : r.superseded ? { ok: { superseded: true } } : r),
+                                  e => error_answer(e));
+    } catch (e) {
+      return error_answer(e);
+    }
+  }
+
   // ---- folders -------------------------------------------------------------------------------------------------------
   refuse_dirty(discard) {
     if (!this.ws || discard) return;
@@ -1334,7 +1451,10 @@ export class Host {
     const picked = this.path_of(b.token);
     const config = config_dir_of(picked);
     const game = b.game ? this.path_of(b.game) : (this.o.argv && this.o.argv.game) || null;
-    const ws = new Workspace(config, game);
+    const sb = this.store && typeof this.store.get('scene_bin') === 'string' ? this.store.get('scene_bin') : null;
+    const bl = this.store && typeof this.store.get('battle_lgp') === 'string' ? this.store.get('battle_lgp') : null;
+    const ml = this.store && typeof this.store.get('menu_lgp') === 'string' ? this.store.get('menu_lgp') : null;
+    const ws = new Workspace(config, game, sb || null, bl || null, ml || null);
     let mods = b.mods ? this.path_of(b.mods) : (this.o.argv && this.o.argv.mods) || null;
     if (!mods) {
       const sh = discover.seventh_heaven(ws.config_dir);
@@ -1347,6 +1467,7 @@ export class Host {
     this._kernels = null;
     this._kernel_bytes = undefined;
     this.pending_ai = new Map();
+    this.items_kernel();
     if (this.store) {
       // the folder is open: a settings file that cannot be written does not refuse it (portable mode in a read-only
       // folder); the page shows the reason through settings.problem
@@ -1379,7 +1500,36 @@ export class Host {
   settings() {
     const d = this.store.data;
     return { confirm_save: d.confirm_save !== false, live_auto: !!d.live_auto, open_last: !!d.open_last,
-             last_folder: d.last_folder || null, window: d.window || null, problem: this.store.problem };
+             last_folder: d.last_folder || null, window: d.window || null, problem: this.store.problem,
+             scene_bin: typeof d.scene_bin === 'string' && d.scene_bin ? d.scene_bin : null,
+             scene_line: this.ws ? this.ws.game_data().scene_line() : null,
+             battle_lgp: typeof d.battle_lgp === 'string' && d.battle_lgp ? d.battle_lgp : null,
+             battle_lgp_line: this.ws ? this.ws.model_sources(false).lgp_line : null,
+             menu_lgp: typeof d.menu_lgp === 'string' && d.menu_lgp ? d.menu_lgp : null,
+             menu_lgp_line: this.ws ? portrait.menu_archive(this.ws.game_dir, this.ws.menu_lgp, portrait.ffnx_override(this.ws.game_dir)[0]).line : null };
+  }
+
+  // (formation diagrams) Set (a file picked with the main process's dialog) or clear a game file of the settings; the
+  // open workspace reads it at once. The answer is settings() (and cancelled when the dialog was closed).
+  game_file(b) {
+    // (review F2, minor 6) only a game file of the settings (server.py set_game_file's refusal, its words)
+    if (!gamedata.GAME_FILES.some(x => x[0] === b.key)) throw new EditRefused('not a game file of the settings: ' + b.key);
+    if (!this.store) throw new PathRefused('no settings file in this run');
+    let p = null;
+    if (!b.clear) {
+      if (!b.pick) throw new EditRefused('pick a file or clear the setting');
+      p = this.dialogs.open_file ? this.dialogs.open_file('A ' + gamedata.GAME_FILES.find(x => x[0] === b.key)[1] +
+        " to read in place of the game folder's", b.key) : null;
+      if (!p) return Object.assign({ cancelled: true }, this.settings());
+    }
+    try {
+      this.store.set({ [b.key]: p });
+    } catch (e) {
+      if (!e.code) throw e;
+      this.store.problem = unwritten(e, 'the change holds until the app closes');
+    }
+    if (this.ws) this.ws.set_game_file(b.key, p);
+    return this.settings();
   }
 
   game_running() {
@@ -1458,12 +1608,15 @@ export class Host {
   reader_of(rel) {
     const ws = this.ws;
     const name = nodePath.posix.basename(rel);
+    const top = rel.indexOf('/') < 0;          // (a scene file may be called FF7_SpellExt_Game)
+    const fk = is_en_path(rel) ? enform.file_kind(rel) : null;
+    if (fk) return [null, name, enform.header_kinds(fk)];       // (stage C2) a scene or enemy file's own section kinds
     const ff = ws.fields_file();
-    let entry = ws.schema.file(name, ff);
-    if (pyLower(name) === 'ff7_spellext_spells_test.ini') entry = ws.schema.file('FF7_SpellExt_Spells.ini');
+    let entry = top ? ws.schema.file(name, ff) : null;
+    if (pyLower(name) === 'ff7_spellext_spells_test.ini' && top) entry = ws.schema.file('FF7_SpellExt_Spells.ini');
     let reader_name = name;
-    if (ff && pyLower(name) === pyLower(ff)) reader_name = 'FF7_SpellExt_Fields.ini';
-    if (pyLower(name) === 'ff7_spellext_spells_test.ini') reader_name = 'FF7_SpellExt_Spells.ini';
+    if (ff && pyLower(name) === pyLower(ff) && top) reader_name = 'FF7_SpellExt_Fields.ini';
+    if (pyLower(name) === 'ff7_spellext_spells_test.ini' && top) reader_name = 'FF7_SpellExt_Spells.ini';
     let kinds = null;
     if (entry !== null && entry.grammar !== 'flat') kinds = header => validate.section_kind(reader_name, header);
     return [entry, reader_name, kinds];
@@ -1476,7 +1629,13 @@ export class Host {
     const name = nodePath.posix.basename(rel);
     const [entry, reader_name, kinds] = this.reader_of(rel);
     const outline = doc.outline(kinds);
+    const fk = is_en_path(rel) ? enform.file_kind(rel) : null;
     for (const s of outline) {
+      if (fk) {
+        s.kind = s.header !== null ? kinds(s.header) : null;
+        s.name = s.header !== null ? enform.section_name(s.header) : null;
+        continue;
+      }
       if (entry === null) s.kind = null;
       else if (entry.grammar === 'flat') s.kind = 'flat';
       else if (s.header === null) s.kind = null;
@@ -1494,7 +1653,9 @@ export class Host {
       schema_file: entry !== null ? name : null, grammar: entry ? (entry.grammar === undefined ? null : entry.grammar) : null,
       schema_name: entry !== null ? reader_name : null,
       readonly: pyLower(rel).startsWith('readme/') || pyLower(rel).endsWith('.ai'),
-      read_by_dll: entry !== null,
+      read_by_dll: entry !== null || this.en_read_by_dll(rel),
+      en_grammar: is_en_path(rel), generated_note: Workspace.generated_note(rel),
+      en_kind: fk, en: fk ? ws.en_view(rel) : null,
       changed_on_disk: ws.changed_on_disk(rel), stamp: e.stamp, problems,
       raw_refused: lone ? 'line ' + lone + ' holds a CR not followed by LF: a text box cannot give it back' : null,
       newline: doc.majority_newline().replace(/\r/g, '\\r').replace(/\n/g, '\\n'),
@@ -1517,7 +1678,9 @@ export class Host {
       return;
     }
     const names = new Set(this.ai_names(true).map(x => pyLower(x)));
-    const users = new Map(aicards.character_ai(this.ai_texts(), [...names]).map(c => [c.id, c]));
+    const ucs = aicards.character_ai(this.ai_texts(), [...names]);
+    aicards.add_served(ucs, mods7h.served_ai(this.ws.config_dir, aicards.ai_values(ucs)));
+    const users = new Map(ucs.map(c => [c.id, c]));
     for (const s of outline) {
       if (s.header === null || s.commented || s.kind !== 'character') continue;
       const n = gc_number(s.header);
@@ -1527,9 +1690,10 @@ export class Host {
       for (const g of T.character_checks(f, n).equip_lines) gear.push({ file: g.file, header: g.header, line: g.line });
       s.linked = {
         limits: groups.get(n) || [],
-        ai: eff === null ? null : { key: eff.key, value: eff.value,
+        ai: eff === null ? null : Object.assign({ key: eff.key, value: eff.value,
                                     exists: eff.key === 'ai' ? names.has(pyLower(eff.value)) : null,
                                     pending: eff.key === 'ai' ? [...this.pending_ai.keys()].some(x => pyLower(x) === pyLower(eff.value)) : null },
+                                  eff.key === 'ai' && eff.served ? { served: eff.served } : {}),
         gear,
       };
     }
@@ -1542,7 +1706,9 @@ export class Host {
     if (same_name(rel, CHARACTERS)) {
       const names = new Set(this.ai_names(true).map(x => pyLower(x)));
       for (const k of this.pending_ai.keys()) names.add(pyLower(k));
-      for (const c of aicards.character_ai(this.ai_texts(), [...names])) {
+      const tcs = aicards.character_ai(this.ai_texts(), [...names]);
+      aicards.add_served(tcs, mods7h.served_ai(this.ws.config_dir, aicards.ai_values(tcs)));
+      for (const c of tcs) {
         const e = c.effective;
         if (e && e.key === 'ai' && e.missing) {
           const l = c.own.find(x => x.key === 'ai');
@@ -1562,9 +1728,21 @@ export class Host {
     return out;
   }
 
+  // A scene or enemy file: whether the start-up scan reads it (list_en_files' read_by_dll)
+  en_read_by_dll(rel) {
+    if (!is_en_path(rel)) return false;
+    return this.ws.list_en_files().some(f => f.path === rel && f.read_by_dll);
+  }
+
   problems_for(rel) {
     const name = nodePath.posix.basename(rel);
-    if (rel.indexOf('/') >= 0) return [];
+    if (rel.indexOf('/') >= 0) {
+      if (!is_en_path(rel)) return [];
+      // a scene or enemy file: the start-up scan's lines about it (Workspace.check files them under its path)
+      const out = [];
+      for (const [, ps] of this.ws.check()) for (const p of ps) if (pyLower(p.file) === pyLower(rel)) out.push(p);
+      return out.concat(this.ws.quiet_for(rel));
+    }
     if (same_name(rel, CHARACTERS) || same_name(rel, LIMITS)) return this.problems_for_dll(rel).concat(this.tool_problems(rel));
     return this.problems_for_dll(rel);
   }
@@ -1623,10 +1801,12 @@ export class Host {
       }
     }
     const idx = typeof body.line === 'number' ? body.line - 1 : null;
-    const entry = ws.schema.file(nodePath.posix.basename(rel), ws.fields_file());
+    const entry = rel.indexOf('/') < 0 ? ws.schema.file(nodePath.posix.basename(rel), ws.fields_file()) : null;
     const flat = Boolean(entry) && entry.grammar === 'flat';
-    if (pyLower(nodePath.posix.basename(rel)) === 'ff7_spellext_characters.ini') refuse_both_ai_keys(doc, body);
+    if (pyLower(nodePath.posix.basename(rel)) === 'ff7_spellext_characters.ini' && rel.indexOf('/') < 0) refuse_both_ai_keys(doc, body);
     const val = k => (body[k] === undefined ? null : body[k]);
+    if (op === 'en_override') return this.en_override(rel, body);
+    if (op === 'en_use_generated') return this.en_use_generated(rel, idx);
     if (op === 'set') doc.set_value(idx, body.value);
     else if (op === 'remove') doc.remove_line(idx);
     else if (op === 'comment') doc.comment_out(idx);
@@ -1641,7 +1821,7 @@ export class Host {
       const sl = body.section_line;
       const hdr = doc.lines[sl - 1].header_text();
       if (hdr === null) throw new EditRefused('line ' + sl + ' is not a section header');
-      const sk = validate.section_kind(nodePath.posix.basename(rel), hdr) || '';
+      const sk = (rel.indexOf('/') < 0 ? validate.section_kind(nodePath.posix.basename(rel), hdr) : null) || '';
       const kind = Object.prototype.hasOwnProperty.call(slots.KINDS, sk) ? slots.KINDS[sk] : undefined;
       if (kind === undefined) throw new EditRefused(hdr + ' is not a weapon or armour section');
       const bytes = body.slots.slice();
@@ -1697,13 +1877,219 @@ export class Host {
     }
   }
 
+  // ---- (stage C2) the scene and enemy forms (server.py en_override, enemy_*) ------------------------------------------
+  // A key written into the user's file of the pair `rel` belongs to (rel itself when it is the user's): made when the
+  // folder has none (written by its first Save). Returns the view of `rel`.
+  en_override(rel, body) {
+    const ws = this.ws;
+    if (!enform.file_kind(rel)) throw new EditRefused(rel + ' is not a scene or enemy file');
+    let target = rel;
+    if (enform.role_of(rel) === enform.GENERATED) target = enform.partner_of(ws.en_folder(), rel)[0];
+    // the paths' rules (paths.js 1, 4, 5) for a file that may not be there yet
+    const root = fs.realpathSync.native(ws.config_dir);
+    // (stage D1) the user's file is written later by Save: through no link (minor 1); neither file of the pair may
+    // hold a lone CR (minor 4: the form does not read it as the DLL does)
+    no_link(root, split_rel(target));
+    check_write(root, resolve_in(root, split_rel(target)));
+    this.refuse_readonly(target);
+    this.refuse_lone_cr(rel, target);
+    const e = ws.create(target);
+    if (e.doc.constructor._key_refused(body.key)) throw new EditRefused('not a key the DLL would read: ' + JSON.stringify(body.key));
+    enform.set_key(e.doc, body.header, body.key, body.value);
+    ws.mark(target);
+    return this.file_view(rel);
+  }
+
+  // (stage D1, review C2 minor 4) an override (or "use the generated value") is refused on a pair whose file holds a CR
+  // not followed by LF (server.py _refuse_lone_cr)
+  refuse_lone_cr(...rels) {
+    const ws = this.ws;
+    for (const r of rels) {
+      if (ws.docs.has(r) || pyIsfile(ws.path(r))) {
+        const p = enform.lone_cr_problem(r, ws.text(r));
+        if (p !== null) throw new EditRefused(p.text);
+      }
+    }
+  }
+
+  // (stage D1, review C2 minor 8) "use the generated value" on a user's scene or enemy file (server.py en_use_generated)
+  en_use_generated(rel, idx) {
+    if (enform.file_kind(rel) === null || enform.role_of(rel) !== enform.USER) throw new EditRefused(rel + " is not a user's scene or enemy file");
+    if (idx === null) throw new EditRefused('missing line');
+    this.refuse_lone_cr(rel, enform.partner_of(this.ws.en_folder(), rel)[0]);     // the pair (review D1 minor 4)
+    const e = this.ws.docs.get(rel);
+    enform.use_generated(e.doc, idx, Buffer.from(e.saved_bytes).toString('latin1'));
+    this.ws.mark(rel);
+    return this.file_view(rel);
+  }
+
+  // The listed files of an enemy folder (found without case): [its real name, {'enemy.ini': rel, ...}]
+  enemy_files(folder) {
+    const out = {};
+    let real = null;
+    for (const f of this.need_ws().list_en_files()) {
+      const parts = f.path.split('/');
+      if (f.group === 'enemies' && pyLower(parts[1]) === pyLower(folder)) {
+        real = parts[1];
+        out[pyLower(parts[2])] = f.path;
+      }
+    }
+    if (real === null) throw new EditRefused('no enemy folder ' + folder + ' (enemies\\' + folder + ' with enemy.ini or generated.ini)');
+    return [real, out];
+  }
+
+  // (stage 4) the Model block of an enemy file's form (modelsrc.panel), READ ONLY: `name` must be an enemy folder found
+  // among the listed ones (enemy_files: no path is made from it before that); `have` the digest the page holds
+  enemy_model(name, have) {
+    if (!(name.length > 0 && name.length <= 64)) throw new EditRefused('an enemy folder\'s name is 1 to 64 characters');
+    if (have !== null && !/^[0-9a-f]{64}$/.test(have)) throw new EditRefused('have is a digest (64 hex digits)');
+    const [real] = this.enemy_files(name);
+    return modelsrc.panel(this.need_ws(), real, have);
+  }
+
+  // (3D formation view, stage 2) the models of ONE scene (modelsrc.scene_models), READ ONLY: each reference {folder, slot, dll} names a
+  // listed enemy folder (found as enemy_model finds it) and its pool slot, or {number} a model 0-369; `have` the digest the
+  // page holds. Like enemy.model it runs on this thread through the panel's caches; its parts and textures are cut to one
+  // scene's budget before anything is sent.
+  formation_models(refs, have) {
+    if (have !== null && !/^[0-9a-f]{64}$/.test(have)) throw new EditRefused('have is a digest (64 hex digits)');
+    const ws = this.need_ws();
+    const resolved = modelsrc.scene_refs_resolve(refs, name => this.enemy_files(name)[0]);
+    return modelsrc.scene_models(ws, resolved, have);
+  }
+
+  enemy_ai_list() {
+    const ws = this.need_ws();
+    const folder = ws.en_folder();
+    const groups = new Map();
+    for (const f of ws.list_en_files(folder)) {
+      if (f.group !== 'enemies') continue;
+      const n = f.path.split('/')[1];
+      if (!groups.has(n)) groups.set(n, []);
+      groups.get(n).push(f);
+    }
+    const out = [];
+    const mt = p => Number(fs.statSync(ws.path(p), { bigint: true }).mtimeNs);
+    for (const [name, files] of groups) {
+      const texts = {};
+      for (const f of files) texts[pyLower(f.path.split('/')[2])] = ws.text(f.path);
+      const secs = enform.overlay(enform.lenient(texts['generated.ini'] || ''), enform.lenient(texts['enemy.ini'] || ''), enform.ENEMY);
+      const ai = enform.ai_of(secs);
+      const row = { folder: name, registered: files.some(f => f.read_by_dll), ai, has_text: false, has_block: false, older: false };
+      if (ai && ai.text) {
+        const tp = folder.resolve('enemies/' + name + '/' + ai.text);
+        const bp = folder.resolve('enemies/' + name + '/' + ai.block);
+        row.has_text = Boolean(tp && folder.is_file(tp));
+        row.has_block = Boolean(bp && folder.is_file(bp));
+        if (row.has_text && row.has_block) row.older = mt(bp) < mt(tp);
+      }
+      out.push(row);
+    }
+    return out;
+  }
+
+  enemy_open(name) {
+    const ws = this.need_ws();
+    const [real, files] = this.enemy_files(name);
+    const rel = files['enemy.ini'] || files['generated.ini'];
+    const v = ws.en_view(rel);
+    const ai = v.ai;
+    if (ai === null) throw new EditRefused('enemy ' + real + ' has no ai key: give one in its [enemy] section (ai = ai.ai.txt)');
+    const folder = ws.en_folder();
+    const out = { folder: real, ai, file: ai.from === enform.USER ? v.user : v.generated, text_file: null, block_file: null,
+                  has_text: false, has_block: false, older: false, text: '', source: ai.none ? 'none' : 'new',
+                  generated_text: null, block_size: null, name_problem: enform.ai_save_problem(ai), block_problem: null };
+    if (ai.none || ai.text === null) return out;
+    const base = folder.resolve('enemies/' + real) || 'enemies/' + real;
+    // (stage D1, minors 3 and 7) a name Save refuses is not looked up: the page starts from ai.generated.txt
+    const tp = out.name_problem ? null : folder.resolve(base + '/' + ai.text);
+    const bp = out.name_problem ? null : folder.resolve(base + '/' + ai.block);
+    out.text_file = tp || base + '/' + ai.text;
+    out.block_file = bp || base + '/' + ai.block;
+    out.has_text = Boolean(tp && folder.is_file(tp));
+    out.has_block = Boolean(bp && folder.is_file(bp));
+    const gp = folder.resolve(base + '/ai.generated.txt');
+    if (gp && folder.is_file(gp)) out.generated_text = gp;
+    const mt = p => Number(fs.statSync(ws.path(p), { bigint: true }).mtimeNs);
+    let block = null;
+    if (out.has_block) {
+      block = fs.readFileSync(ws.path(bp));
+      out.block_size = block.length;
+    }
+    if (out.has_text) {
+      out.text = fs.readFileSync(ws.path(tp)).toString('latin1');
+      out.source = 'txt';
+      if (out.has_block) out.older = mt(bp) < mt(tp);
+    } else if (out.has_block) {
+      try {
+        out.text = aitool.disasm(block, real + '/' + ai.block);
+        out.source = 'disasm';
+      } catch (e) {         // (stage D1, minor 7) a block that does not disassemble: start again
+        out.block_problem = e.message || e.name;
+      }
+    }
+    if (out.source === 'new' && out.generated_text) {
+      out.text = fs.readFileSync(ws.path(gp)).toString('latin1');
+      out.source = 'generated';
+    }
+    return out;
+  }
+
+  // the assembled text under the enemy's rule: [bytes or null, [problems {line, text}]]
+  enemy_rule(real, text) {
+    const r = aitool.assemble_check(text);
+    if (r.bytes === null) return [null, r.problems];
+    const probs = r.problems.slice();
+    for (const p of enform.ai_rule(this.ws.en_folder(), real, r.bytes)) probs.push({ line: 0, text: p.text, enemy_rule: true });
+    return [r.bytes, probs];
+  }
+
+  enemy_cards(name, text) {
+    const [real] = this.enemy_files(name);
+    const out = this.ai_cards(text);
+    const [block, probs] = this.enemy_rule(real, text);
+    if (block !== null) {
+      const extra = probs.filter(p => p.enemy_rule);
+      out.check.problems = (out.check.problems || []).concat(extra);
+      out.check.ok = out.check.ok && !extra.length;
+      out.check.enemy_rule = extra.map(p => p.text);
+    }
+    return out;
+  }
+
+  enemy_save(name, text, force) {
+    const ws = this.need_ws();
+    if (!ws.writable) throw new safety.WriteRefused('the config folder is not writable: read-only mode');
+    refuse_wide_chars(text);
+    const o = this.enemy_open(name);
+    if (o.text_file === null) {
+      throw new safety.WriteRefused('enemy ' + o.folder + ': ai = ' + o.ai.value + ' has no file to write (' +
+        (o.ai.none ? "the DLL's template" : 'the DLL refuses the name') + ')');
+    }
+    if (o.name_problem) throw new safety.WriteRefused(o.name_problem);     // (stage D1, minors 3 and 7) before the backup
+    const [block, probs] = this.enemy_rule(o.folder, text);
+    if (block === null || (probs.length && !force)) throw new safety.WriteRefused('not saved: ' + probs.map(p => p.text).join('; '));
+    const root = fs.realpathSync.native(ws.config_dir);
+    // (stage D1, minor 1) no link on the way (a link in or out of the folder: the same refusal in both ports), the
+    // rules on the real path, and the write to the plain joined path
+    const abs = [o.text_file, o.block_file].map(rel => {
+      const joined = no_link(root, split_rel(rel));
+      check_write(root, resolve_in(root, split_rel(rel)));
+      return joined;
+    });
+    backups_dir(root);
+    const backup = aitool.write_pair(ws.config_dir, abs[0], abs[1], text, block, 'enemies/' + o.folder);
+    return { backup, size: block.length, problems: probs, text_file: o.text_file, block_file: o.block_file };
+  }
+
   log() {
     const ws = this.need_ws();
     const ff = ws.fields_file();
-    const log = gamelog.read(ws.game_dir, ff);
+    const log = gamelog.read(ws.game_dir, ff, ws.list_files().map(f => f.path));
     if (log === null) return { log: null, game_dir: ws.game_dir };
     const probs = [];
     for (const [, ps] of ws.check()) for (const p of ps) probs.push(p);
+    gamelog.refile(log, probs);
     const [agree, only_tool, only_log] = gamelog.compare(probs, log);
     const newer = [];
     for (const f of ws.list_files()) {

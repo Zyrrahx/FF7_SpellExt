@@ -1,11 +1,14 @@
-// FF7_SpellExt_Shops.ini: port of sxcfg/rules/shops.py. load_shop_file (spellext.c 37293), called from the game file's
-// reader (load_game_settings, after its own lines: shop_add entries of the game file count first).
+// FF7_SpellExt_Shops.ini: port of sxcfg/rules/shops.py. load_shop_file (spellext.c 44751) with shop_item_number_ok
+// (44739), called from the game file's reader (load_game_settings, after its own lines: shop_add entries of the game
+// file count first).
 //
 // Not forecast: the cap of SHOP_ADD_MAX (2560) entries counts the game file's shop_add entries too; the port counts
-// only this file's (a cap no real file reaches).
+// only this file's (a cap no real file reaches). Nor the kernel load's notes on a wide gear entry
+// (shop_adds_gear_check 44603: not defined, or cannot be sold): they are said after the gear files are read.
 import { lines, trim, parse_number, word_is, next_word } from '../grammar.js';
 import { register } from '../validate.js';
 import { pyFind } from '../py.js';
+import { shop_item_number_ok } from './game.js';
 
 export const FILE = 'FF7_SpellExt_Shops.ini';
 export const SHOP_COUNT = 80;
@@ -52,9 +55,9 @@ export function check(r) {
       let ok;
       let ident;
       [ok, p, ident] = parse_number(s, p, word_end);
-      if (!ok || (ident > (materia ? 254 : 511) && (materia || !(1024 <= ident && ident <= 9999))) ||
+      if (!ok || (materia ? ident > 254 : !shop_item_number_ok(ident)) ||
           p !== word_end || count === SHOP_ADD_MAX) {
-        r.log(n, 'shop file line %d: add takes item IDs (0 to 511, or a wide item\'s number 1024 to 9999) and materia as m and an ID (m49); a shop holds 32 entries', n);
+        r.log(n, 'shop file line %d: add takes item IDs (0 to 511), a wide item\'s number (1024 to 9999), a wide weapon, armour or accessory\'s number (10000 to 27999) and materia as m and an ID (m49); a shop holds 32 entries', n);
         break;
       }
       count += 1;

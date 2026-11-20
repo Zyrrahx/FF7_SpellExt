@@ -109,6 +109,84 @@ Record fields (offset in the 28-byte attack record)
                              Super Nova (the DLL makes Blue Light safe on
                              several targets and Super Nova safe outside
                              Safer Sephiroth's arena).
+  script               -     the model script the CASTER plays, in place of
+                             the command's own (Magic 0x1d, Summon 0x1f): a
+                             party member's battle model has 74 scripts, and
+                             this picks the one that shows the casting (the
+                             wind-up before the effect, and the effect step,
+                             ec).
+                               script = 0x20
+                             0x1c-0x21, 0x23, 0x25, 0x27, 0x29, 0x2b or 0x2d
+                             (hex as here, or decimal); none (the default):
+                             the command's own.
+                             Used only when the caster's model, as it is at
+                             that moment (a transformed form's, a frog's),
+                             has that script and it preloads (e8) and plays
+                             the effect (ec); otherwise the command's own
+                             script plays, and the log says why, once. So a
+                             spell that only a form's model has a gesture for
+                             is cast the plain way by anyone else.
+                             A spell that can be reflected may use 0x1c-0x1f
+                             only (a reflected cast gives the number to the
+                             actor that reflects it, and an enemy has 32): a
+                             higher number is not used at the cast. Give such
+                             a spell `special = -reflectable`, or a lower one.
+                             For party members only (an enemy's attacks have
+                             `script` in the enemies files). Not for limits:
+                             the limits file has its own `script` (bytes).
+                             Refused, with a line in the log and the spell
+                             kept without it: 0-0x1b (idles, reactions,
+                             Attack and the Cut turns), 0x22 0x24 0x26 0x28
+                             0x2a 0x2c (the game plays the next number when
+                             the cast has several targets), 0x2e-0x3b (the
+                             game's own scripts for every model) and 0x3c up
+                             (limits).
+  script_bytes         -     the CASTER's own script for this spell, as
+                             bytes in hexadecimal (as a limit's `script`),
+                             so a new gesture needs no edit of the model's
+                             script file:
+                               script_bytes = e8 fc ea 06 07 ec 09 e5 ee
+                             3 to 128 bytes, or none (the default). It plays
+                             in place of the command's own script (Magic
+                             0x1d, Summon 0x1f) for that one cast; the
+                             model's own is back for the next. The bytes
+                             below 0x2c are the CASTER's animations: the
+                             model it plays on must have them.
+                             A cast starts with e8 (the preload), has one ec
+                             (the effect step) and ends with ee, once. It
+                             may use only what the game's own casts use:
+                             e8 ec ea fc ed fa e5 e6 a4 a5 f4 NN f3 c9 ca ee
+                             and the animations 00-2b. A hold c9 .. ca needs
+                             something that waits a frame between the two
+                             (an animation, as in c9 07 ca, or f4 01 f3) and
+                             no ec inside it; ed needs an fa after it.
+                             b6 NN aa in an enemy's script are written NN.
+                             Refused at reading, with a line in the log and
+                             the spell kept without it (bytes an earlier
+                             line gave stay).
+                             Not used at the cast (the command's own script
+                             plays, and the log says why, once): an enemy
+                             caster, a frog, a model with fewer animations
+                             than the script plays, a slot a state lends, a
+                             caster that is not script_bytes_model.
+                             With script and script_bytes both, script is
+                             not used (a line in the log). Up to 64 spells
+                             may carry it. For party members only; not for
+                             limits (a limit has its own `script`).
+  script_bytes_model   -     ties a spell's script_bytes to one model: they
+                             play only when the caster's script file is
+                             this one, given as its two letters in the
+                             battle archive's naming or its whole name, in
+                             any case:
+                               script_bytes_model = zo
+                             Any other caster (Mime, or another member given
+                             the materia) then casts the spell the plain
+                             way. none (the default): any party model whose
+                             animations cover the bytes. A caster this
+                             refuses is named in the log ("the caster's
+                             script file is XY..AB"): those are the letters
+                             to write. Without script_bytes it is not
+                             used (a line in the log).
   damage_formula       0x0e  damage calculation (see below)
   strength             0x0f  power used by the damage formula
   condition            0x10  hp, mp, status, none, or a number

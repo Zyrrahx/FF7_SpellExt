@@ -4,12 +4,26 @@
 // Node 22 language level.
 import { PyIndexError } from './py.js';
 
-export function lzs(d) {
-  const out = [];
+// (review F2, minor 1) limit: refuse (an Error with code ELZSLIMIT) once the output passes that many bytes, at the
+// reference's own check points; the output grows in a Buffer, not an array of numbers
+export function lzs(d, limit) {
+  const lim = limit === undefined || limit === null ? null : limit;
+  let out = Buffer.alloc(Math.max(64, Math.min(d.length * 4, 1 << 20)));
+  let n = 0;
+  const put = (c) => {
+    if (n >= out.length) {
+      const bigger = Buffer.alloc(out.length * 2);
+      out.copy(bigger, 0, 0, n);
+      out = bigger;
+    }
+    out[n++] = c;
+  };
+  const over = () => Object.assign(new Error('an LZS stream past ' + lim + ' bytes'), { code: 'ELZSLIMIT' });
   const buf = new Uint8Array(4096);
   let bp = 0xfee;
   let i = 0;
   while (i < d.length) {
+    if (lim !== null && n > lim) throw over();
     const flags = d[i];
     i += 1;
     for (let bit = 0; bit < 8; bit++) {
@@ -17,7 +31,7 @@ export function lzs(d) {
       if ((flags >> bit) & 1) {
         const c = d[i];
         i += 1;
-        out.push(c);
+        put(c);
         buf[bp] = c;
         bp = (bp + 1) & 0xfff;
       } else {
@@ -28,12 +42,13 @@ export function lzs(d) {
         const off = a | ((b & 0xf0) << 4);
         for (let k = 0; k < (b & 0xf) + 3; k++) {
           const c = buf[(off + k) & 0xfff];
-          out.push(c);
+          put(c);
           buf[bp] = c;
           bp = (bp + 1) & 0xfff;
         }
       }
     }
   }
-  return Buffer.from(out);
+  if (lim !== null && n > lim) throw over();
+  return Buffer.from(out.subarray(0, n));
 }

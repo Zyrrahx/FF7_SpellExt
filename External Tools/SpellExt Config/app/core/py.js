@@ -22,6 +22,11 @@ export class PyTypeError extends TypeError {
   constructor(message) { super(message); this.name = 'TypeError'; }
 }
 
+// Python's KeyError where the port raises it (document.js section_at: a header index that is no section's)
+export class PyKeyError extends Error {
+  constructor(message) { super(message); this.name = 'KeyError'; }
+}
+
 // ---- 32-bit helpers ------------------------------------------------------------------------------------------------
 export function u32(x) { return x >>> 0; }
 export function shl(x, n) { return n >= 32 ? 0 : (x << n) >>> 0; }

@@ -549,8 +549,9 @@ export function check_value(t, v, folder, values) {
   if (b === 'shop_entry') {
     const m = v.slice(0, 1) === 'm' || v.slice(0, 1) === 'M';
     const n = number_of(m ? v.slice(1) : v);
-    if (n === null || (m && n > 254) || (!m && n > 511 && !(n >= 1024 && n <= 9999))) {
-      return ['expected an item ID (0 to 511, or a wide item 1024 to 9999) or m and a materia ID (m49)', null];
+    if (n === null || (m && n > 254) || (!m && n > 511 && !(n >= 1024 && n <= 9999) && !(n >= 10000 && n <= 27999))) {
+      return ['expected an item ID (0 to 511), a wide item 1024 to 9999, wide gear 10000 to 27999 (a weapon, armour ' +
+              'or accessory), or m and a materia ID (m49)', null];
     }
     return [null, null];
   }
@@ -2256,6 +2257,9 @@ function defined_item(shared, n, materia) {
   if (n >= 320 && n <= 383) return shared_set(shared, 'weapons_defined').has(n);
   if (n >= 384 && n <= 415) return shared_set(shared, 'armour_defined').has(n);
   if (n >= 416 && n <= 447) return shared_set(shared, 'accessories_defined').has(n);
+  if (n >= 10000 && n <= 15999) return shared_set(shared, 'weapons_defined').has(n);     // (wide shop) wide gear: a wide section of its gear file
+  if (n >= 16000 && n <= 21999) return shared_set(shared, 'armour_defined').has(n);
+  if (n >= 22000 && n <= 27999) return shared_set(shared, 'accessories_defined').has(n);
   return false;
 }
 
@@ -2375,6 +2379,7 @@ export function tool_warnings(t, filled, steps, after, before) {
           out.push(where + ': ' + header + ' names ' + w + ', which no file defines (the DLL puts it on sale unchecked)');
         }
         if (!m && n >= 1024 && n <= 9999) out.push(where + ': ' + w + ' is a wide item: sold only once the shops are enlarged');
+        else if (!m && n >= 10000 && n <= 27999) out.push(where + ': ' + w + ' is wide gear: sold only once the shops are enlarged');
       }
       const shop = header_number(header || '');
       if (shop !== null) {

@@ -386,3 +386,82 @@ details.sectext textarea { width: 100%; font: 13px/1.45 var(--mono); white-space
 .tprereq .ok { color: var(--ok); }
 .tnote { margin: 2px 0; font-size: 13px; }
 .aiacts { display: flex; gap: 8px; }
+
+/* ---- the scene and enemy forms (stage C2, enpage.js) ---------------------------------------------------- */
+.enhead { margin: 0 0 8px; }
+.enrole { padding: 6px 10px; border-radius: 6px; margin-bottom: 6px; }
+.enrole.user { background: var(--sel); }
+.enrole.generated { background: var(--warn-bg); color: var(--warn); }
+.enrole button.link, .ennote button.link { padding: 0 4px; }
+.ennote { font-size: 12px; color: var(--muted); margin-top: 2px; }
+.ennote.shadowed { color: var(--warn); font-weight: 600; }
+.ennote.bad { color: var(--bad); }
+.ennote code, .row.other code { font-family: var(--mono); background: var(--code); padding: 0 3px; border-radius: 3px; }
+.eninherit { margin-top: 10px; }
+.eninherit h4 { margin: 6px 0 2px; font-size: 12px; color: var(--muted); font-weight: 600; }
+.row.other { opacity: .85; }
+.sections .sec.other { color: var(--muted); font-style: italic; }
+.encheck { margin: 6px 0; }
+.encheck .addkey { margin: 0; }
+.encheckres .prob.okline { color: var(--ok); }
+.ensur { margin: 8px 0; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px; }
+.ensur h4 { margin: 0 0 4px; }
+.ensvg { width: 260px; height: 260px; display: block; color: var(--ink); background: var(--code); border-radius: 6px; }
+.ensurlist .dotc { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 6px; }
+
+/* (formation diagrams, stage 1) every formation's layout, the Game formations page, the scene.bin setting */
+.enfm { margin: 8px 0; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px; }
+.enfm > summary { cursor: pointer; font-weight: 600; }
+.enfmbar { margin: 6px 0; display: flex; gap: 6px; align-items: baseline; flex-wrap: wrap; }
+.enfmsvg { width: 340px; height: 340px; }
+.enfmlist > div { margin: 2px 0; }
+.enfmlist .dotc { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 6px; }
+.enfmcam.clamped { color: #7a3fb0; }
+.enfmview { display: flex; flex-wrap: wrap; gap: 6px 14px; align-items: flex-start; }
+.enfmview > .enfmbar, .enfmview > .enfmlist { flex: 1 1 100%; }
+.enfmview > .enfmpic { flex: 0 0 340px; max-width: 100%; }
+.enfm3d { flex: 1 1 453px; min-width: 0; }
+.enfm3d > summary { cursor: pointer; font-weight: 600; margin-bottom: 4px; }
+.enfm3dcanvas { display: block; width: 453px; max-width: 100%; height: auto; aspect-ratio: 4 / 3; border: 1px solid var(--line); border-radius: 4px; cursor: grab; touch-action: none; }
+.enfm3dbar { margin: 4px 0; display: flex; gap: 6px; flex-wrap: wrap; }
+.enfm3dinfo > div, .enfm3dhint { margin: 2px 0; font-size: 12px; }
+.gfhead { margin: 4px 0 8px; display: flex; flex-direction: column; gap: 3px; }
+.gfbar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin: 6px 0; }
+.gfsplit { display: grid; grid-template-columns: minmax(260px, 380px) 1fr; gap: 12px; min-height: 0; }
+.gflist { max-height: 70vh; overflow: auto; border: 1px solid var(--line); border-radius: 6px; }
+.gfrow { display: grid; grid-template-columns: 3.5em 9em 1fr; gap: 6px; padding: 3px 6px; cursor: pointer; border-bottom: 1px solid var(--line); }
+.gfrow:hover { background: var(--code); }
+.gfrow.on { background: var(--code); font-weight: 600; }
+.gfnum { text-align: right; color: var(--muted, inherit); }
+.gfview { min-width: 0; }
+.setfile { display: flex; flex-direction: column; gap: 4px; border-top: 1px solid var(--line); padding-top: 6px; }
+.setfile .setpath { word-break: break-all; font-family: monospace; }
+.setfile .setline { word-break: break-all; }
+.setproblem { color: var(--bad); word-break: break-all; }      /* (review F1, minor 4) the settings file could not be read */
+.setproblem[hidden] { display: none; }
+/* (portrait panel, stage 1) the Portrait block of a character's page: each picture at a whole zoom, the main menu's edge dashed */
+.ptblock { margin: 8px 0; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px; }
+.ptblock > summary { cursor: pointer; font-weight: 600; }
+.ptbody { margin-top: 8px; }
+.ptpics { display: flex; flex-wrap: wrap; gap: 16px; }
+.ptfig { flex: 0 1 auto; max-width: 100%; }
+.ptcap { margin-bottom: 4px; }
+.ptwrap { position: relative; display: inline-block; line-height: 0; border: 1px solid var(--line); border-radius: 2px;
+  background: repeating-conic-gradient(#bbb 0 25%, #eee 0 50%) 0 0 / 12px 12px; }
+.ptcanvas { display: block; image-rendering: pixelated; max-width: 100%; height: auto; }
+.ptmenu { position: absolute; top: 0; bottom: 0; width: 0; border-left: 1px dashed #d22; pointer-events: auto; }
+.ptarea { font-size: 12px; margin: 2px 0; }
+.ptnone { padding: 16px 0; }
+.ptline { max-width: 560px; }
+/* (model preview, stage 4) the Model block of an enemy file's form: the canvas is 400 x 400 pixels, scaled by CSS */
+.enmodel { margin: 8px 0; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px; }
+.enmodel > summary { cursor: pointer; font-weight: 600; }
+.enmodelbody { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 8px; }
+.enmodelpic { flex: 0 1 400px; min-width: 200px; }
+.enmodelcanvas { display: block; width: 100%; max-width: 400px; height: auto; aspect-ratio: 1 / 1; border: 1px solid var(--line); border-radius: 4px; cursor: grab; touch-action: none; }
+.enmodelbar { margin: 4px 0; }
+.enmodelinfo { flex: 1 1 320px; min-width: 260px; }
+.enmodelinfo h4 { margin: 10px 0 4px; }
+.enmodelfiles { border-collapse: collapse; font-size: 12px; }
+.enmodelfiles th, .enmodelfiles td { text-align: left; padding: 2px 6px; border-bottom: 1px solid var(--line); vertical-align: top; }
+.enmodelfiles tr.bad td { background: rgba(200, 40, 40, .08); }

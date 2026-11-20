@@ -10,6 +10,7 @@
 // here, so Python's Unicode \d and int() of other digits never differ from these.
 // Node 22 language level.
 import fs from 'node:fs';
+import nodePath from 'node:path';
 import zlib from 'node:zlib';
 import { pyRepr, pyInt, pyLower, pySplit, pySplitlines, pyRstrip, pyIsdigit, pyJoin, pyIsfile, pyIsdir, pyCmp, PyValueError,
          PyIndexError, PyTypeError } from './py.js';
@@ -1133,21 +1134,110 @@ export function save_ai(config_dir, name, text, force) {
   fs.mkdirSync(d, { recursive: true });
   const txt = _path(config_dir, name, '.txt');
   const ai = _path(config_dir, name, '.ai');
-  const backup = safety.make_backup(config_dir, [txt, ai], 'ai/' + name);
-  for (const [p, data] of [[txt, Buffer.from(text, 'latin1')], [ai, r.bytes]]) {
-    safety.check_writable_path(config_dir, p);
-    const tmp = p + '.tmp';
-    try { fs.unlinkSync(tmp); } catch (e) { if (e.code !== 'ENOENT') throw e; }
-    const fd = fs.openSync(tmp, 'wx');
+  const backup = write_pair(config_dir, txt, ai, text, r.bytes, 'ai/' + name);
+  return { backup, size: r.bytes.length, problems: r.problems };
+}
+
+// (stage D1, review C2 minor 2) An AI text and its assembled block written as a pair (aipage.py write_pair): both paths
+// checked and a .tmp left from before removed (refused, with nothing written, when one cannot be); both files backed
+// up; both .tmp files written; then the text renamed into place and the block after it (so the block is never older
+// than its text). When the block's rename fails, the old text is put back (its bytes and times) or the new one removed
+// when there was none, so the pair is never the new text with the old block; no .tmp is left behind. Returns the
+// backup folder.
+export function write_pair(config_dir, txt, ai, text, block, label) {
+  for (let i = 0; i < text.length; i++) {
+    if (text.codePointAt(i) > 0xff) {
+      let line = 1;
+      for (let j = 0; j < i; j++) if (text.charCodeAt(j) === 10) line++;
+      throw new safety.WriteRefused('the file cannot hold U+' + text.codePointAt(i).toString(16).toUpperCase().padStart(4, '0') +
+                                    ' at line ' + line + ': the DLL reads bytes');
+    }
+  }
+  const real_cfg = fs.realpathSync.native(config_dir);
+  const show = p => nodePath.relative(real_cfg, p).split(nodePath.sep).join('/');
+  const code = e => e.code || e.name;
+  const pairs = [[txt, Buffer.from(text, 'latin1')], [ai, block]];
+  for (const [p] of pairs) safety.check_writable_path(config_dir, p);
+  for (const [p] of pairs) {
+    try {
+      fs.unlinkSync(p + '.tmp');   // a .tmp left from before, or planted as a link: removed, never written through
+    } catch (e) {
+      if (e.code !== 'ENOENT') {
+        throw new safety.WriteRefused(show(p + '.tmp') + ' is in the way and cannot be removed (' + code(e) + '); nothing was written');
+      }
+    }
+  }
+  let old = null;
+  let lst = null;
+  try { lst = fs.lstatSync(txt, { bigint: true }); } catch (e) { lst = null; }
+  if (lst && lst.isFile()) old = [fs.readFileSync(txt), lst.atimeNs, lst.mtimeNs];
+  const bk = nodePath.join(real_cfg, safety.BACKUP_DIR_NAME);
+  let bst = null;
+  try { bst = fs.statSync(bk); } catch (e) { bst = null; }
+  if ((bst && !bst.isDirectory()) || (!bst && (() => { try { fs.lstatSync(bk); return true; } catch (e) { return false; } })())) {
+    throw new safety.WriteRefused('the backup could not be made (' + safety.BACKUP_DIR_NAME + ' is not a folder); nothing was written');
+  }
+  let backup;
+  try {
+    backup = safety.make_backup(config_dir, [txt, ai], label);
+  } catch (e) {            // (review D1 minor 3) a real error is a refusal, not a tool bug
+    if (!e.code) throw e;
+    throw new safety.WriteRefused('the backup could not be made (' + code(e) + '); nothing was written');
+  }
+  const made = [];
+  const drop_tmps = () => {
+    for (const t of made.splice(0)) { try { fs.unlinkSync(t); } catch (e) { /* already gone */ } }
+  };
+  const write_tmp = (tmp, data) => {
+    const fd = fs.openSync(tmp, 'wx');     // created here, or refused if anything appeared there since
+    made.push(tmp);
     try {
       fs.writeSync(fd, data);
       fs.fsyncSync(fd);
     } finally {
       fs.closeSync(fd);
     }
-    fs.renameSync(tmp, p);
+  };
+  let at = txt;
+  try {
+    for (const [p, data] of pairs) {
+      at = p;
+      write_tmp(p + '.tmp', data);
+    }
+    at = txt;
+    fs.renameSync(txt + '.tmp', txt);
+    made.splice(made.indexOf(txt + '.tmp'), 1);
+  } catch (e) {
+    drop_tmps();
+    if (!e.code) throw e;
+    throw new safety.WriteRefused(show(at) + ' could not be written (' + code(e) + '); nothing was written' +
+                                  (backup ? ' (the backup is in ' + backup + ')' : ''));
   }
-  return { backup, size: r.bytes.length, problems: r.problems };
+  try {
+    fs.renameSync(ai + '.tmp', ai);
+    made.splice(made.indexOf(ai + '.tmp'), 1);
+  } catch (e) {
+    drop_tmps();
+    try {
+      if (old === null) fs.unlinkSync(txt);
+      else {
+        const tmp = txt + '.tmp';
+        write_tmp(tmp, old[0]);
+        const sec = ns => Number(ns / 1000000000n) + Number(ns % 1000000000n) / 1e9;
+        fs.utimesSync(tmp, sec(old[1]), sec(old[2]));
+        fs.renameSync(tmp, txt);
+        made.splice(made.indexOf(tmp), 1);
+      }
+    } catch (e2) {
+      drop_tmps();
+      throw new safety.WriteRefused(show(ai) + ' could not be written (' + code(e) + '), and ' + show(txt) + ' could not be put back (' +
+                                    code(e2) + '): the old files are in the backup ' + backup);
+    }
+    throw new safety.WriteRefused(show(ai) + ' could not be written (' + code(e) + '): ' + show(txt) + ' ' +
+                                  (old !== null ? 'was put back, so both files are as they were' : 'was removed again, so neither file was written') +
+                                  (backup ? ' (the backup is in ' + backup + ')' : ''));
+  }
+  return backup;
 }
 
 export function kernel_candidates(game_dir) {

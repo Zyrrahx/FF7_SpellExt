@@ -2,7 +2,8 @@
 //
 // the flag tables (9739-9768), parse_flags (9890), slot_word and slots_problem (1804-1830), equip_flags (35123),
 // new_character_by_name (35141), parse_equip (35203), parse_kernel_weapon (35270), gear_wide_sections (28556, from
-// the game file's `box` key), section_refusal (35514) and section_used.
+// the game file's `box` key), wide_items_on (the game file's `wide_items` key, read the same way), ci_file_problem and
+// ci_take (the custom icons, 9580-9660), section_refusal (35514) and section_used.
 // No module registers here: the readers are weapons.js, gear.js and materia.js.
 import { lines, trim, parse_number, word_is, next_word, split_key } from '../grammar.js';
 import { cfmt } from '../cfmt.js';
@@ -238,6 +239,114 @@ export function gear_wide_sections(shared) {
   }
   shared.set('_gear_wide_sections', on);
   return on;
+}
+
+// wide_items_mode == WIDE_ON: the game file's `wide_items` is on. No game file, no line, or a line that is not off,
+// shadow or on (the DLL refuses it and keeps what it had): not on. Read as gear_wide_sections reads `box` (the last good
+// line wins); the game file as it is now: a change only counts after a restart.
+export function wide_items_on(shared) {
+  if (shared.has('_wide_items_on')) return shared.get('_wide_items_on');
+  let on = false;
+  const texts = shared.get('texts') || new Map();
+  for (const [k, s] of texts) {
+    if (pyLower(k) !== 'ff7_spellext_game.ini' || s === null || s === undefined) continue;
+    for (const ln of lines(s)) {
+      const start = ln.start;
+      const stop = ln.stop;
+      if (start === stop || s[start] === '[') continue;
+      const [ks, ke, vs, ve] = split_key(s, start, stop);
+      if (word_is(s, ks, ke, 'wide_items')) {
+        if (word_is(s, vs, ve, 'on')) on = true;
+        else if (word_is(s, vs, ve, 'off') || word_is(s, vs, ve, 'shadow')) on = false;
+      }
+    }
+  }
+  shared.set('_wide_items_on', on);
+  return on;
+}
+
+// (custom icons) `icon = file:NAME.png` or file:NAME.tex: ci_file_problem, ci_take and ci_fail of spellext.c
+export const CI_FILE_ROOM = 64;
+export const CI_FILES_MAX = 1024;
+export const ICON_BAD_PREFIX = 'icon takes file:NAME.png or file:NAME.tex, a picture in SpellExtConfig\\files\\icons (sub-folders may be given: file:potions/blue.png). The line is not read';
+export const ICON_TOO_LONG = "the icon file's name is too long: at most 63 characters with its folders. The line is not read";
+export const ICON_NO_NAME = 'the icon file needs a name and the ending .png or .tex. The line is not read';
+export const ICON_BAD_CHAR = "the icon file's name has a character a file name cannot have here (: * ? \" < > | ~). The line is not read";
+export const ICON_BAD_FOLDER = "the icon file's folders must be inside SpellExtConfig\\files\\icons (no empty folder name, no .., no leading /). The line is not read";
+export const ICON_BAD_ENDING = 'the icon file must be a .png or a .tex. The line is not read';
+export const ICON_NO_STEM = 'the icon file needs a name before .png or .tex. The line is not read';
+export const FMT_ICON_NOT_USED = "%s file line %d: icon = file:%s is not used: %d different icon files are named already: the game's icon is shown";
+export const FMT_ICON_MISSING = "custom icon file:%s: %s: %s: the game's icon is shown";
+export const ICON_WORDS = 'icon must be sword, glove, gunarm, headdress, staff, spear, shuriken, megaphone, gun, armour, accessory, item, or a kernel weapon (or file:NAME.png or file:NAME.tex, a picture of your own)';
+
+// The weapon reader's test that an icon value is a file (the first five characters are file:, any case).
+export function icon_is_file(s, value, end) {
+  if (end - value < 5) return false;
+  for (let i = 0; i < 4; i++) if ((s.charCodeAt(value + i) | 0x20) !== 'file'.charCodeAt(i)) return false;
+  return s[value + 4] === ':';
+}
+
+// ci_file_problem(value, end, out): [null, NAME with '\' between folders], or [why the line is not read, null].
+export function ci_file_problem(s, value, end) {
+  let p = value;
+  for (const c of 'file:') {
+    if (p >= end || (s.charCodeAt(p) | 0x20) !== c.charCodeAt(0)) return [ICON_BAD_PREFIX, null];
+    p += 1;
+  }
+  while (p < end && (s[p] === ' ' || s[p] === '\t')) p += 1;
+  if (end - p >= CI_FILE_ROOM) return [ICON_TOO_LONG, null];
+  if (end - p < 5) return [ICON_NO_NAME, null];
+  const name = [];
+  let part = 0;
+  while (p < end) {
+    const c = s[p] === '/' ? '\\' : s[p];
+    const o = c.charCodeAt(0);
+    if (o < 0x20 || o > 0x7e || ':*?"<>|~'.includes(c)) return [ICON_BAD_CHAR, null];
+    if (c === '\\') {
+      if (!part || (part === 2 && name[name.length - 1] === '.' && name[name.length - 2] === '.')) return [ICON_BAD_FOLDER, null];
+      part = 0;
+    } else {
+      part += 1;
+    }
+    name.push(c);
+    p += 1;
+  }
+  const full = name.join('');
+  const ending = pyLower(full.slice(-4));
+  if (ending !== '.png' && ending !== '.tex') return [ICON_BAD_ENDING, null];
+  if (part < 5) return [ICON_NO_STEM, null];
+  return [null, full];
+}
+
+// ci_take (and, for the file, the first draw's ci_fail): a finished section names `icon` ('' for none). Nothing to say
+// when the file is there. When shared has 'icon_files' (the Set of the files under SpellExtConfig/files/icons, lower
+// case, '\\' between folders) and 'icon_dir' (that folder's path), a file that is not in it is a WARNING with the DLL's
+// own words, once per file (the DLL says it when the icon is first drawn, not when the file is read: no line number
+// there; the icon line's is used). More than CI_FILES_MAX different files: the DLL's refusal.
+export function ci_take(r, icon, what, line) {
+  if (!icon) return;
+  const shared = r.shared;
+  if (!shared.has('_icon_files')) shared.set('_icon_files', []);
+  if (!shared.has('_icon_told')) shared.set('_icon_told', new Set());
+  const names = shared.get('_icon_files');
+  const low = pyLower(icon);
+  if (!names.includes(low)) {
+    if (names.length >= CI_FILES_MAX) {
+      r.log(line, FMT_ICON_NOT_USED, what, line, icon, CI_FILES_MAX);
+      return;
+    }
+    names.push(low);
+  }
+  const have = shared.get('icon_files');
+  const told = shared.get('_icon_told');
+  if (have !== undefined && have !== null && !told.has(low)) {
+    told.add(low);
+    if (!have.has(low)) {
+      const folder = shared.has('icon_dir') ? shared.get('icon_dir') : '';
+      const sep = folder.includes('\\') && !folder.includes('/') ? '\\' : '/';
+      r.log_with({ kind: 'warning' }, line, FMT_ICON_MISSING, icon, folder + sep + icon.split('\\').join(sep), 'no such file');
+    }
+  }
 }
 
 export const SECTION_USED = 'this item ID is already used: an earlier section of this file has it. The section is not read';

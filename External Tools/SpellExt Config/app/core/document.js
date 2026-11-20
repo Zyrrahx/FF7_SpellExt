@@ -6,7 +6,7 @@
 // must: a value's span, one inserted line, one removed line. Nothing is ever normalised.
 import * as grammar from './grammar.js';
 import { SequenceMatcher } from './difflib.js';
-import { pyRepr, pyStrip, pyLstrip, pyLower, PyIndexError, PyTypeError } from './py.js';
+import { pyRepr, pyStrip, pyLstrip, pyLower, pyFind, PyIndexError, PyTypeError, PyKeyError } from './py.js';
 
 // An edit the document will not make (the message says why, in the DLL's terms).
 export class EditRefused extends Error {
@@ -122,10 +122,12 @@ export function _split_raw(text) {
 function inSet(ch, set) { return ch !== undefined && ch !== '' && set.indexOf(ch) >= 0; }
 
 export class Document {
+  static LINE = LineView;       // the line rule (EnDocument: en_parse's)
+
   constructor(data) {
     if (data === undefined) data = '';
     data = latin1(data);
-    this._lines = _split_raw(data).map((raw, i) => new LineView(i, raw));
+    this._lines = _split_raw(data).map((raw, i) => new this.constructor.LINE(i, raw));
   }
 
   // ---- reading -----------------------------------------------------------------------------------------------------
@@ -166,7 +168,7 @@ export class Document {
     for (const s of this.sections()) {
       if (s.header_index === header_index) return s;
     }
-    throw new Error('KeyError: ' + header_index);
+    throw new PyKeyError('KeyError: ' + header_index);
   }
 
   key_lines(section) {
@@ -199,7 +201,16 @@ export class Document {
 
   _replace_line(index, body, newline) {
     const old = this._lines[index];
-    this._lines[index] = new LineView(index, body + (newline === undefined || newline === null ? old.newline : newline));
+    this._lines[index] = new this.constructor.LINE(index, body + (newline === undefined || newline === null ? old.newline : newline));
+  }
+
+  static _key_refused(key) {
+    let bad = !key || key.indexOf('=') >= 0 || inSet(key[0], '[;#') || key !== pyStrip(key, ' \t') ||
+      key.indexOf('\n') >= 0 || key.indexOf('\r') >= 0;
+    for (let i = 1; !bad && i < key.length; i++) {
+      if (inSet(key[i], ';#') && grammar.is_space(key[i - 1])) bad = true;
+    }
+    return bad;
   }
 
   static _check_value(value) {
@@ -221,7 +232,7 @@ export class Document {
   set_value(index, value) {
     const l = this._at(index);
     if (l.kind !== 'key') throw new EditRefused('line ' + (index + 1) + ' is not a key = value line');
-    Document._check_value(value);
+    this.constructor._check_value(value);
     const [vs, ve] = l.value;
     const b = l.body;
     let nw;
@@ -230,7 +241,7 @@ export class Document {
     } else {
       nw = b.slice(0, vs) + value + b.slice(ve);
     }
-    const check = new LineView(index, nw);
+    const check = new this.constructor.LINE(index, nw);
     if (check.kind !== 'key' || check.key_text() !== l.key_text() || check.value_text() !== value) {
       throw new EditRefused('the line would not read back as ' + l.key_text() + ' = ' + value);
     }
@@ -241,13 +252,13 @@ export class Document {
   replace_key(index, key, value) {
     const l = this._at(index);
     if (l.kind !== 'key') throw new EditRefused('line ' + (index + 1) + ' is not a key = value line');
-    Document._check_value(value);
+    this.constructor._check_value(value);
     const [ks, ke] = l.key;
     const [vs, ve] = l.value;
     const b = l.body;
     if (vs === ve && value && vs > 0 && b[vs - 1] === '=') value = ' ' + value;
     const nw = b.slice(0, ks) + key + b.slice(ke, vs) + value + b.slice(ve);
-    const check = new LineView(index, nw);
+    const check = new this.constructor.LINE(index, nw);
     if (check.kind !== 'key' || check.key_text() !== key || check.value_text() !== pyStrip(value)) {
       throw new EditRefused('the line would not read back as ' + key + ' = ' + value);
     }
@@ -275,7 +286,7 @@ export class Document {
       nl = '';
     }
     if (nl === null) nl = this._newline_for_insert(at);
-    this._lines.splice(at, 0, new LineView(at, body + nl));
+    this._lines.splice(at, 0, new this.constructor.LINE(at, body + nl));
     this._reclassify();
     return at;
   }
@@ -332,13 +343,8 @@ export class Document {
 
   // Insert `key = value` after the last key line of the section (else after its header). Returns the index.
   add_key(section, key, value) {
-    Document._check_value(value);
-    let bad = !key || key.indexOf('=') >= 0 || inSet(key[0], '[;#') || key !== pyStrip(key, ' \t') ||
-      key.indexOf('\n') >= 0 || key.indexOf('\r') >= 0;
-    for (let i = 1; !bad && i < key.length; i++) {
-      if (inSet(key[i], ';#') && grammar.is_space(key[i - 1])) bad = true;
-    }
-    if (bad) throw new EditRefused('not a key the DLL would read: ' + pyRepr(key));
+    this.constructor._check_value(value);
+    if (this.constructor._key_refused(key)) throw new EditRefused('not a key the DLL would read: ' + pyRepr(key));
     let last = null;
     for (let i = section.first; i <= section.last; i++) {
       const k = this._lines[i].kind;
@@ -403,7 +409,7 @@ export class Document {
     }
     const at = this.insert_line(this._lines.length, header);
     for (const [k, v] of keys) {
-      Document._check_value(v);
+      this.constructor._check_value(v);
       this.insert_line(this._lines.length, k + ' = ' + v);
     }
     return at;
@@ -432,7 +438,7 @@ export class Document {
     const s = l.comment;
     const rest = b.slice(s + 1);
     if (!rest || grammar.is_space(rest[0])) return null;
-    const probe = new LineView(index, b.slice(0, s) + rest);
+    const probe = new this.constructor.LINE(index, b.slice(0, s) + rest);
     if (probe.kind !== 'section') return null;
     const h = probe.header_text();
     return section_kind(h) ? h : null;
@@ -525,7 +531,7 @@ export class Document {
       const li = this._lines[i];
       if (Document._is_note(li) || (i > last_key && Document._is_bare(li)) || (
           li.kind === 'comment' &&
-          new LineView(i, li.body.slice(0, li.comment) + li.body.slice(li.comment + 1)).kind === 'nokey')) {
+          new this.constructor.LINE(i, li.body.slice(0, li.comment) + li.body.slice(li.comment + 1)).kind === 'nokey')) {
         continue;                   // left a comment by uncomment_block too, so the two stay exact
       }
       const b = li.body;
@@ -555,7 +561,7 @@ export class Document {
     for (let i = a + 1; i <= b; i++) {
       const l = this._lines[i];
       if (!Document._is_note(l) &&
-          new LineView(i, l.body.slice(0, l.comment) + l.body.slice(l.comment + 1)).kind === 'key') {
+          new this.constructor.LINE(i, l.body.slice(0, l.comment) + l.body.slice(l.comment + 1)).kind === 'key') {
         last_key = i;
       }
     }
@@ -563,7 +569,7 @@ export class Document {
     for (let i = a; i <= b; i++) {
       const l = this._lines[i];
       const body = l.body.slice(0, l.comment) + l.body.slice(l.comment + 1);
-      if (Document._is_note(l) || (i > last_key && Document._is_bare(l)) || new LineView(i, body).kind === 'nokey') {
+      if (Document._is_note(l) || (i > last_key && Document._is_bare(l)) || new this.constructor.LINE(i, body).kind === 'nokey') {
         continue;
       }
       this._replace_line(i, body);
@@ -575,7 +581,7 @@ export class Document {
   // The whole file replaced, byte for byte as given (line endings included).
   set_text(data) {
     data = latin1(data);
-    this._lines = _split_raw(data).map((raw, i) => new LineView(i, raw));
+    this._lines = _split_raw(data).map((raw, i) => new this.constructor.LINE(i, raw));
   }
 
   // The line number (1-based) of the first line that holds a CR not followed by LF, or 0. The DLL reads such a CR as
@@ -642,7 +648,7 @@ export class Document {
       let nl = nl0;
       if (at_end && k === out.length - 1) nl = typed_nl ? (nl || above || majority) : '';
       else if (!nl) nl = above || majority;
-      lines.push(new LineView(first + k, body + nl));
+      lines.push(new this.constructor.LINE(first + k, body + nl));
       above = nl;
     });
     this._lines.splice(first, last + 1 - first, ...lines);
@@ -657,7 +663,7 @@ export class Document {
     const b = l.body;
     const s = in_block ? l.comment : 0;
     if (b.length <= s + 1 || !inSet(b[s], ';#') || grammar.is_space(b[s + 1]) || inSet(b[s + 1], ';#')) return null;
-    const probe = new LineView(i, b.slice(0, s) + b.slice(s + 1));
+    const probe = new this.constructor.LINE(i, b.slice(0, s) + b.slice(s + 1));
     if (probe.kind === 'key' && probe.key_text() && probe.key_text().indexOf(' ') < 0) {
       return { line: i + 1, key: probe.key_text(), value: probe.value_text(), kind: 'commented', comment: '' };
     }
@@ -718,4 +724,89 @@ function firstMax(m) {
     }
   }
   return best;
+}
+
+// ---- the scene and enemy files (SpellExtConfig\scenes, \scenes\generated, \enemies\<folder>) ----------------------------
+// en_space (spellext.c 46501): Python's str.strip() and split(), for ASCII
+function en_space(c) {
+  return c === ' ' || c === '\t' || c === '\n' || c === '\r' || c === '\x0b' || c === '\x0c' || (c >= '\x1c' && c <= '\x1f');
+}
+
+function en_trim(s, a, b) {
+  while (a < b && en_space(s[a])) a += 1;
+  while (b > a && en_space(s[b - 1])) b -= 1;
+  return [a, b];
+}
+
+// A line of a scene or enemy file classified by en_parse (spellext.c 46710), not by the main files' rule: only ; starts
+// a comment, anywhere (# is text: `name = A #2` keeps `#2`); en_space's characters are the spaces; a section is `[...]`
+// of 3 characters at least with no ] inside (`[ab` and `[a]b]` are not: the DLL takes them as key lines and refuses
+// them); a UTF-8 byte-order mark at the start of line 1 is skipped. The DLL also ends a line at a lone CR; here it stays
+// inside the line (lone_cr_line names it, and the Raw view refuses such a file). (document.py EnLineView)
+export class EnLineView extends LineView {
+  constructor(index, raw) {
+    super(index, raw);
+    const b = this.body;
+    const first = index === 0 && b.startsWith('\xef\xbb\xbf') ? 3 : 0;
+    const c = b.indexOf(';', first);
+    this.comment = c >= 0 ? c : null;
+    const [start, stop] = en_trim(b, first, c >= 0 ? c : b.length);
+    this.start = start;
+    this.stop = stop;
+    this.key = this.value = null;
+    if (start === stop) {
+      this.kind = this.comment !== null ? 'comment' : 'blank';
+    } else if (b[start] === '[' && stop - start >= 3 && b[stop - 1] === ']' && b.slice(start + 1, stop - 1).indexOf(']') < 0) {
+      this.kind = 'section';
+    } else {
+      const eq = pyFind(b, '=', start, stop);
+      if (eq < 0) {
+        this.key = [start, stop];
+        this.kind = 'nokey';
+      } else {
+        let ke = eq;
+        let vs = eq + 1;
+        while (ke > start && en_space(b[ke - 1])) ke -= 1;
+        while (vs < stop && en_space(b[vs])) vs += 1;
+        this.key = [start, ke];
+        this.value = [vs, stop];
+        this.kind = 'key';
+      }
+    }
+  }
+}
+
+// A scene or enemy file: the same byte-preserving model, its lines read by en_parse's rule (EnLineView). The main files
+// never use it (Document).
+export class EnDocument extends Document {
+  static LINE = EnLineView;
+
+  static _check_value(value) {
+    if (value.indexOf('\n') >= 0 || value.indexOf('\r') >= 0) throw new EditRefused('a value is one line');
+    if (value.indexOf(';') >= 0) {
+      throw new EditRefused('a value cannot hold ;: in a scene or enemy file the DLL reads a comment from there');
+    }
+    const [a, b] = en_trim(value, 0, value.length);
+    if (a !== 0 || b !== value.length) throw new EditRefused('a value cannot start or end with a space (the DLL trims it)');
+  }
+
+  static _key_refused(key) {
+    const [a, b] = en_trim(key, 0, key.length);
+    return !key || key.indexOf('=') >= 0 || key.indexOf(';') >= 0 || key[0] === '[' || a !== 0 || b !== key.length;
+  }
+}
+
+// Whether a file of the config folder is read by en_parse: an .ini under scenes\ (scenes\generated\ too) or
+// enemies\<folder>\ (names without case, as Windows opens them)
+export function is_en_path(rel) {
+  const parts = rel.replace(/\\/g, '/').split('/');
+  const low = parts.map(p => pyLower(p));
+  if (!low[low.length - 1].endsWith('.ini')) return false;
+  return (low.length === 2 && low[0] === 'scenes') || (low.length === 3 && low[0] === 'scenes' && low[1] === 'generated') ||
+    (low.length === 3 && low[0] === 'enemies');
+}
+
+// The document model of a config file by its path: EnDocument for the scene and enemy files, else Document
+export function document_for(rel, data) {
+  return is_en_path(rel) ? new EnDocument(data) : new Document(data);
 }
