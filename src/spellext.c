@@ -269,8 +269,8 @@ struct spell {
     BYTE plain_summon;                  /* `party_vanishes = no`: cast without the summon presentation */
     BYTE order_group;                   /* `order`: 1 restore, 2 attack, 3 indirect; 0 = worked out from the record */
     BYTE script;                        /* `script`: the caster's model script for it (a party member); 0 = not given */
-    BYTE bytes_entry;                   /* `script_bytes`: 1 + its entry of spell_bytes; 0 = not given */
-    BYTE unused[1];
+    BYTE bytes_entry;                   /* `script_bytes`: 1 + its first line in spell_bytes; 0 = not given */
+    BYTE bytes_lines;                   /* and its lines there (consecutive) */
     DWORD fixed_damage;                 /* `fixed_damage`: every hit does exactly this much; 0 = not set */
     WORD animation_copy;                /* `animation = 0x100` and up: an effect copy of the effects file (the record
                                            holds its base's number); 0 = none */
@@ -12245,19 +12245,37 @@ static const struct flag_name special_flags[] = {
 
 /* What one [section] of the file has set so far. */
 /* `script_bytes` (see "A spell's caster script bytes", after "A spell's caster script"): the spells' bytes */
-#define SPELL_BYTES_MAX         255          /* bytes of a spell's script_bytes (the lent buffer keeps one ee after them) */
+#define SPELL_BYTES_MAX         255          /* bytes of one script_bytes line (the lent buffer keeps one ee after them) */
 #define SPELL_BYTES_SPELLS      64           /* spells that may carry script_bytes */
+#define SPELL_BYTES_SPELL_LINES 8            /* script_bytes lines of one spell */
+#define SPELL_BYTES_LINES       128          /* the lines of all the spells together (the table, about 38 KB) */
+#define SPELL_BYTES_LINE_MODELS 16           /* model codes on one line */
 #define SPELL_BYTES_BUFFER      256          /* a lent copy: the interpreter's position is a byte, it cannot read past this */
 #define SPELL_BYTES_SLOT_MAGIC  0x1d         /* the command's own script lent: Magic (and `party_vanishes = no`) */
 #define SPELL_BYTES_SLOT_SUMMON 0x1f         /* and Summon with the presentation */
-static struct spell_bytes_entry {
-    WORD id;
+/* SPELL BYTES TYPES BEGIN  (copied into the native test with the PURE block) */
+/* One script_bytes line. A spell's lines are consecutive in spell_bytes[], in the file's order once settled. */
+struct spell_bytes_entry {
+    WORD id;                            /* its spell */
     BYTE length;
+    BYTE models;                        /* model codes on the line; 0 = the line for every model */
     short max_animation;                /* the highest animation the bytes play (a byte, or a7 / a9 / b6's operand); -1 none */
-    char model[3];                      /* `script_bytes_model`: the caster's script file's two letters, upper case; "" = any */
+    int line;                           /* its spell file line (the log names it) */
+    char model[SPELL_BYTES_LINE_MODELS][2];   /* the script files' two letters, upper case, no terminator */
     BYTE bytes[SPELL_BYTES_MAX];
-} spell_bytes[SPELL_BYTES_SPELLS];
-static int spell_bytes_count;           /* entries taken by this reading of the spell file */
+};
+/* spell_bytes_settle's notes, for finish_spell's log lines */
+#define SPELL_BYTES_MODEL_APPLIED 1          /* line `line` (for every model) is for `code` now; the spell has no line for every model */
+#define SPELL_BYTES_MODEL_UNUSED  2          /* no line for every model: script_bytes_model not used */
+#define SPELL_BYTES_CODE_TAKEN    3          /* line `line`'s `code` is named by line `earlier` already: taken off it */
+#define SPELL_BYTES_LINE_EMPTY    4          /* line `line` names no model an earlier line does not: dropped */
+#define SPELL_BYTES_NOTES         (SPELL_BYTES_SPELL_LINES * (SPELL_BYTES_LINE_MODELS + 1) + 1)   /* the most of one spell */
+struct spell_bytes_note { BYTE kind; char code[2]; int line, earlier; };
+static const char spell_bytes_lines_full[] = "a spell may carry 8 script_bytes lines: this one is not used";   /* (SPELL_BYTES_SPELL_LINES) */
+/* SPELL BYTES TYPES END */
+static struct spell_bytes_entry spell_bytes[SPELL_BYTES_LINES];
+static int spell_bytes_count;           /* lines taken by this reading of the spell file */
+static int spell_bytes_spells;          /* spells that carry lines */
 
 struct spell_draft {
     int id, line;
@@ -12269,9 +12287,10 @@ struct spell_draft {
     DWORD flag_add[4], flag_remove[4];  /* element, target, status, special: flags to turn on and off
                                            in whatever the record otherwise holds (+name / -name) */
     struct spell spell;                 /* everything except the record */
-    BYTE bytes[SPELL_BYTES_MAX];        /* `script_bytes`, accepted; bytes_length 0 = not given */
-    BYTE bytes_length;
+    struct spell_bytes_entry lines[SPELL_BYTES_SPELL_LINES];   /* `script_bytes`, accepted, in the file's order */
+    BYTE line_count;                    /* 0 = not given */
     char bytes_model[3];                /* `script_bytes_model`, upper case; "" = not given */
+    int key_line;                       /* the spell file line of the key being applied (load_spells) */
 };
 
 static BOOL is_space(char c)
@@ -15741,6 +15760,12 @@ static const char *spell_script_value_problem(DWORD value);  /* ("A spell's cast
 static void spell_script_forget(void);
 static const char *spell_bytes_problem(const BYTE *b, int length, int *max_animation);    /* ("A spell's caster script bytes") */
 static int spell_bytes_shows_results(const BYTE *b, int length);
+static const char *spell_bytes_codes(const char *s, const char *end, char code[][2], int *count);
+static const char *spell_bytes_add_line(struct spell_bytes_entry *lines, BYTE *count, int id, int line, char *value,
+                                        char *end, int *replaced);
+static int spell_bytes_settle(struct spell_bytes_entry *lines, int count, const char *model,
+                              struct spell_bytes_note *notes, int *note_count);
+static int spell_bytes_codes_text(const struct spell_bytes_entry *e, char *out);
 static void spell_bytes_forget_log(void);
 static const char *state_bytes(BYTE *out, BYTE *out_length, int most, char *value, char *stop);   /* (a state's scripts, after the forms) */
 
@@ -15927,32 +15952,36 @@ static const char *apply_key(struct spell_draft *draft, char *key, char *key_end
         return NULL;
     }
     if (word_is(key, key_end, "script_bytes")) {
-        /* the caster's own script as bytes (see "A spell's caster script bytes"); a refused value leaves the key
-           as it was */
+        /* a line of the caster's own script as bytes (see "A spell's caster script bytes"): `xy zw: e8 ...` for
+           those models, without a colon for every model; a refused line leaves the spell's other lines as they were */
         static char refused[400];
-        BYTE bytes[SPELL_BYTES_MAX], length;
         const char *why;
-        int max_animation;
+        int replaced;
 
         if (!spell_file_reading)
             return "script_bytes is a spell file key: a limit has `script`";
         if (word_is(value, end, "none")) {
-            draft->bytes_length = 0;
+            draft->line_count = 0;      /* drops the lines given before it */
             return NULL;
         }
-        why = state_bytes(bytes, &length, SPELL_BYTES_MAX, value, end);
-        if (!why)
-            why = spell_bytes_problem(bytes, length, &max_animation);
-        if (why) {
-            wsprintfA(refused, "script_bytes: %s; the spell is kept without it", why);
+        why = spell_bytes_add_line(draft->lines, &draft->line_count, draft->id, draft->key_line, value, end, &replaced);
+        if (why == spell_bytes_lines_full) {
+            wsprintfA(refused, "script_bytes: %s", why);
             return refused;
         }
-        copy_bytes(draft->bytes, bytes, length);
-        draft->bytes_length = length;
+        if (why) {
+            wsprintfA(refused, "script_bytes: %s; the spell is kept without this line", why);
+            return refused;
+        }
+        if (replaced) {
+            wsprintfA(refused, "script_bytes: replaces the line for every model of spell file line %d", replaced);
+            return refused;
+        }
         return NULL;
     }
     if (word_is(key, key_end, "script_bytes_model")) {
-        /* the bytes play only on a caster whose script file is XY..AB (its two letters, or the whole name) */
+        /* the spell's line without model codes is for a caster whose script file is XY..AB (its two letters, or the
+           whole name), as `xy:` before it would make it */
         BOOL whole = end - value == 4 && (value[2] | 0x20) == 'a' && (value[3] | 0x20) == 'b';
 
         if (!spell_file_reading)
@@ -16105,32 +16134,68 @@ static void finish_spell(struct spell_draft *draft)
             spell->record[i] = draft->value[i];
     apply_flag_changes(draft, spell->record);
     warn_reflect_with_hits(spell->record, "spell", draft->id, draft->line);
-    spell->bytes_entry = 0;
-    if (draft->bytes_length && spell_bytes_count >= SPELL_BYTES_SPELLS) {
-        log_line("spell file line %d: spell %d: script_bytes not used: only %d spells may carry it",
-                 draft->line, draft->id, SPELL_BYTES_SPELLS);
-    } else if (draft->bytes_length) {
-        /* (taken here, after the returns above: a skipped spell takes no entry) */
-        struct spell_bytes_entry *e = &spell_bytes[spell_bytes_count];
-        int max_animation, shows;
+    spell->bytes_entry = spell->bytes_lines = 0;
+    if (draft->line_count) {
+        /* (taken here, after the returns above: a skipped spell takes no line) */
+        struct spell_bytes_note notes[SPELL_BYTES_NOTES];
+        char code[3], low[3];
+        int kept, n, k, shows;
 
-        if (spell->script) {
-            log_line("spell file line %d: spell %d has script_bytes and script: script (0x%x) is not used",
-                     draft->line, draft->id, spell->script);
-            spell->script = 0;
+        kept = spell_bytes_settle(draft->lines, draft->line_count, draft->bytes_model, notes, &n);
+        for (k = 0; k < n; k++) {
+            code[0] = notes[k].code[0];
+            code[1] = notes[k].code[1];
+            code[2] = 0;
+            low[0] = (char)(code[0] | 0x20);
+            low[1] = (char)(code[1] | 0x20);
+            low[2] = 0;
+            switch (notes[k].kind) {
+            case SPELL_BYTES_MODEL_APPLIED:
+                log_line("spell file line %d: spell %d: script_bytes_model %s: the script_bytes of spell file line %d is for %s now; the spell has no line for every model (write %s: on the line)",
+                         draft->line, draft->id, code, notes[k].line, code, low);
+                break;
+            case SPELL_BYTES_MODEL_UNUSED:
+                log_line("spell file line %d: spell %d: script_bytes_model is not used: every script_bytes line names its models (write %s: before the bytes)",
+                         draft->line, draft->id, low);
+                break;
+            case SPELL_BYTES_CODE_TAKEN:
+                log_line("spell file line %d: spell %d: script_bytes: %s is named by spell file line %d already (a model plays the first line naming it): not used for %s here",
+                         notes[k].line, draft->id, code, notes[k].earlier, code);
+                break;
+            case SPELL_BYTES_LINE_EMPTY:
+                log_line("spell file line %d: spell %d: script_bytes: the line names no model an earlier line does not: not used",
+                         notes[k].line, draft->id);
+                break;
+            }
         }
-        e->id = (WORD)draft->id;
-        e->length = draft->bytes_length;
-        copy_bytes(e->bytes, draft->bytes, draft->bytes_length);
-        spell_bytes_problem(e->bytes, e->length, &max_animation);     /* (accepted when read: for its highest animation) */
-        e->max_animation = (short)max_animation;
-        if ((shows = spell_bytes_shows_results(e->bytes, e->length)) >= 0)
-            log_line("spell file line %d: spell %d: script_bytes: %02x shows the results itself; the spell's effect shows its hits too: each number may show twice (time the hit with the ec or d6 instead)",
-                     draft->line, draft->id, (unsigned)shows);
-        e->model[0] = draft->bytes_model[0];
-        e->model[1] = draft->bytes_model[1];
-        e->model[2] = 0;
-        spell->bytes_entry = (BYTE)(++spell_bytes_count);
+        if (!kept) {
+            ;                           /* every line dropped (logged above) */
+        } else if (spell_bytes_spells >= SPELL_BYTES_SPELLS) {
+            log_line("spell file line %d: spell %d: script_bytes not used: only %d spells may carry it",
+                     draft->line, draft->id, SPELL_BYTES_SPELLS);
+        } else if (spell_bytes_count + kept > SPELL_BYTES_LINES) {
+            /* all or none: some lines only would give a model the line for every model in place of its own */
+            log_line("spell file line %d: spell %d: script_bytes not used: the spells' script_bytes lines may be %d in all (%d taken, this spell has %d)",
+                     draft->line, draft->id, SPELL_BYTES_LINES, spell_bytes_count, kept);
+        } else {
+            if (spell->script) {
+                log_line("spell file line %d: spell %d has script_bytes and script: script (0x%x) is not used",
+                         draft->line, draft->id, spell->script);
+                spell->script = 0;
+            }
+            for (k = 0; k < kept; k++) {
+                struct spell_bytes_entry *e = &spell_bytes[spell_bytes_count + k];
+
+                copy_bytes((BYTE *)e, (const BYTE *)&draft->lines[k], sizeof *e);
+                if ((shows = spell_bytes_shows_results(e->bytes, e->length)) >= 0)
+                    log_line("spell file line %d: spell %d: script_bytes: %02x shows the results itself; the spell's effect shows its hits too: each number may show twice (time the hit with the ec or d6 instead)",
+                             e->line, draft->id, (unsigned)shows);
+            }
+            spell->bytes_entry = (BYTE)(spell_bytes_count + 1);
+            spell->bytes_lines = (BYTE)kept;
+            spell_bytes_count += kept;
+            spell_bytes_spells++;
+        }
     } else if (draft->bytes_model[0]) {
         log_line("spell file line %d: spell %d: script_bytes_model is not used: the spell has no script_bytes",
                  draft->line, draft->id);
@@ -16306,7 +16371,7 @@ static void load_spells(void)
     spells = NULL;
     spell_count = 0;
     spell_script_forget();              /* a re-read value is logged again at its next cast */
-    spell_bytes_count = 0;              /* script_bytes: the table is filled again (a lend points into a party slot's own copy) */
+    spell_bytes_count = spell_bytes_spells = 0;   /* script_bytes: the table is filled again (a lend points into a party slot's own copy) */
     spell_bytes_forget_log();
     for (character = 0; character < 3; character++) {
         if (spell_list[character])
@@ -16387,6 +16452,7 @@ static void load_spells(void)
             } else {
                 trim(&start, &key_end);
                 trim(&value, &stop);
+                draft.key_line = line_number;   /* (script_bytes keeps each line's own) */
                 problem = apply_key(&draft, start, key_end, value, stop);
             }
         }
@@ -16417,23 +16483,54 @@ static void load_spells(void)
             log_line("spells: %d spell(s) name a caster script (script =):%s%s", named, list, named > 24 ? ", ..." : "");
     }
     {
-        /* the spells that carry their caster's script (script_bytes), in one line (the first 24); each ID once */
-        char list[24 * 32 + 8];
-        int carried = 0, n = 0, i;
+        /* the spells that carry their caster's script (script_bytes), in one line (the first 24, as many as fit in
+           900 characters: log_line writes 1024); each ID once, each piece at most 60 characters */
+        char list[900 + 8], piece[24 + SPELL_BYTES_SPELL_LINES * 24], codes[24];
+        int carried = 0, shown = 0, n = 0, p, i, k;
+        BOOL full = FALSE;
 
+        list[0] = 0;
         for (i = 0; i < spell_count; i++) {
             const struct spell_bytes_entry *e;
 
             if (!spells[i].bytes_entry)
                 continue;
+            carried++;
+            if (full)
+                continue;
             e = &spell_bytes[spells[i].bytes_entry - 1];
-            if (carried++ < 24)
-                n += wsprintfA(list + n, e->model[0] ? "%s %u (%u bytes, model %s)" : "%s %u (%u bytes)", n ? "," : "",
-                               spells[i].id, (unsigned)e->length, e->model);
+            p = wsprintfA(piece, "%s %u (", n ? "," : "", spells[i].id);
+            if (spells[i].bytes_lines == 1) {
+                p += wsprintfA(piece + p, "%u bytes", (unsigned)e->length);
+                if (e->models) {
+                    spell_bytes_codes_text(e, codes);
+                    p += wsprintfA(piece + p, e->models > 1 ? ", models %s" : ", model %s", codes);
+                }
+            } else {
+                p += wsprintfA(piece + p, "%u lines: ", (unsigned)spells[i].bytes_lines);
+                for (k = 0; k < spells[i].bytes_lines; k++) {
+                    spell_bytes_codes_text(&e[k], codes);
+                    p += wsprintfA(piece + p, "%s%s", k ? "; " : "", codes);
+                }
+            }
+            p += wsprintfA(piece + p, ")");
+            if (p > 60) {
+                piece[56] = piece[57] = piece[58] = '.';
+                piece[59] = ')';
+                piece[p = 60] = 0;
+            }
+            if (shown == 24 || n + p > 900) {
+                full = TRUE;
+                continue;
+            }
+            for (k = 0; k <= p; k++)
+                list[n + k] = piece[k];
+            n += p;
+            shown++;
         }
         if (carried)
             log_line("spells: %d spell(s) carry their caster's script (script_bytes):%s%s", carried, list,
-                     carried > 24 ? ", ..." : "");
+                     carried > shown ? ", ..." : "");
     }
     if (spell_count)
         log_line("first spell: ID %d, record reached through index %08lx", spells[0].id,
@@ -30867,7 +30964,7 @@ static void state_lend_end(int actor, BOOL task, char *said)
    look at its first bytes. */
 static int archive_name_state;          /* 0 not looked at, 1 as expected (or another module's jump), -1 not */
 
-/* FUN_005e2460 may be called at its own address (prop = weapon, script_bytes_model): looked at once. */
+/* FUN_005e2460 may be called at its own address (prop = weapon, script_bytes model codes): looked at once. */
 static BOOL archive_name_usable(void)
 {
     static const BYTE first[6] = { 0x55, 0x8b, 0xec, 0x81, 0xec, 0x04 };
@@ -30878,7 +30975,7 @@ static BOOL archive_name_usable(void)
         archive_name_state = 1;
         for (i = 0; i < 6 && at[0] != 0xe9; i++)
             if (at[i] != first[i]) {
-                log_line("prop = weapon: off: %08lx does not start as expected (byte %d is %02x); states run without such a prop, and script_bytes_model knows only forms and new characters",
+                log_line("prop = weapon: off: %08lx does not start as expected (byte %d is %02x); states run without such a prop, and script_bytes model codes know only forms and new characters",
                          FN_ARCHIVE_NAME, i, at[i]);
                 archive_name_state = -1;
                 break;
@@ -32092,10 +32189,13 @@ static void spell_script_apply(int *action, int spell)
    (+0xc); for bytes with an animation 34 up, a0 / af, d6, e2 or a move, the animations' records (+4 frames, +8
    bones): a body's bones for 34 up (not a weapon track), a0 / af at a bone the model has, enough frames after
    d6, every move over before the last fa, each e2's fade-out over before its e1 / e7 NN
-   (spell_bytes_cast_problem); the slot not lent by a state nor played now, the last lend back; with
-   `script_bytes_model = XY`, the caster's script file is XY.. (a form's
-   model_script / model_files, a new character's battle_files of this battle, else the battle archive's name
-   for the slot's data file). Otherwise the command's own script plays, with one log line per spell and model. */
+   (spell_bytes_cast_problem); the slot not lent by a state nor played now, the last lend back.
+   A spell may carry up to 8 lines (SPELL_BYTES_SPELL_LINES), each checked at reading on its own; a line may start
+   with model codes and a colon (`xy zw: e8 ...`; `script_bytes_model = XY` makes the line without codes XY's), and
+   the caster plays the first line naming its script file's letters (a form's model_script / model_files, a new
+   character's battle_files of this battle, else the battle archive's name for the slot's data file; looked up only
+   for a spell with such a line), else the line without codes; the checks above run on that line. Otherwise the
+   command's own script plays, with one log line per spell and model. */
 #define SPELL_BYTES_LOGS        64           /* "spell bytes:" lines, per run of the game */
 #define SPELL_BYTES_ANIMATIONS  256          /* the animation numbers a script may play (a byte, or a7 / a9 / b6's operand) */
 
@@ -32622,7 +32722,7 @@ static int spell_bytes_cast_problem(const BYTE *b, int length, const int *frames
     return SPELL_CAST_FINE;
 }
 
-/* script_bytes_model: whether the two letters `have` (the caster's script file, "" = not known) are `want`. */
+/* script_bytes model codes: whether the two letters `have` (the caster's script file, "" = not known) are `want`. */
 static BOOL spell_bytes_model_is(const char *want, const char *have)
 {
     int k;
@@ -32631,6 +32731,252 @@ static BOOL spell_bytes_model_is(const char *want, const char *have)
         if (!have[k] || (have[k] & ~0x20) != (want[k] & ~0x20))
             return FALSE;
     return TRUE;
+}
+
+/* script_bytes: the model codes before a line's colon, [s, end): a script file's two letters (xy) or its name
+   (xyab), in any case, apart by spaces, tabs or commas; into code[] (SPELL_BYTES_LINE_MODELS) upper case, each
+   once, and their number into *count. NULL, or why not. */
+static const char *spell_bytes_codes(const char *s, const char *end, char code[][2], int *count)
+{
+    int n = 0, k;
+
+    *count = 0;
+    for (;;) {
+        const char *t;
+        char c0, c1;
+
+        while (s < end && (*s == ' ' || *s == '\t' || *s == '\r' || *s == ','))
+            s++;
+        if (s == end)
+            break;
+        for (t = s; t < end && *t != ' ' && *t != '\t' && *t != '\r' && *t != ','; t++)
+            ;
+        if ((t - s != 2 && !(t - s == 4 && (s[2] | 0x20) == 'a' && (s[3] | 0x20) == 'b')) ||
+            !((s[0] | 0x20) >= 'a' && (s[0] | 0x20) <= 'z') || !((s[1] | 0x20) >= 'a' && (s[1] | 0x20) <= 'z'))
+            return "a model code is a script file's two letters or its name (xy or XYAB), apart by spaces or commas";
+        c0 = (char)(s[0] & ~0x20);
+        c1 = (char)(s[1] & ~0x20);
+        for (k = 0; k < n && !(code[k][0] == c0 && code[k][1] == c1); k++)
+            ;
+        if (k == n) {                   /* (a code given twice counts once) */
+            if (n == SPELL_BYTES_LINE_MODELS)
+                return "a line may name up to 16 models";
+            code[n][0] = c0;
+            code[n][1] = c1;
+            n++;
+        }
+        s = t;
+    }
+    if (!n)
+        return "a colon needs a model code before it (a line without a colon is for every model)";
+    *count = n;
+    return NULL;
+}
+
+/* apply_key's script_bytes line other than `none`: [value, end) (trimmed), `xy zw: e8 ...` for those models or
+   `e8 ...` for every model, checked on its own (spell_bytes_codes, state_bytes, spell_bytes_problem: the widened
+   rules) and added to a spell's `lines` (*count of them, SPELL_BYTES_SPELL_LINES at most) with its spell `id` and
+   file `line`. A line for every model replaces the one before it (a repeated key's rule): that one's file line into
+   *replaced, else 0. NULL, or why the line is not used (spell_bytes_lines_full: the spell has all its lines). */
+static const char *spell_bytes_add_line(struct spell_bytes_entry *lines, BYTE *count, int id, int line, char *value,
+                                        char *end, int *replaced)
+{
+    BYTE bytes[SPELL_BYTES_MAX], length = 0;
+    char code[SPELL_BYTES_LINE_MODELS][2];
+    struct spell_bytes_entry *e;
+    const char *why = NULL;
+    char *colon;
+    int max_animation = -1, models = 0, k, i;
+
+    *replaced = 0;
+    for (colon = value; colon < end && *colon != ':'; colon++)
+        ;
+    if (colon < end) {
+        why = spell_bytes_codes(value, colon, code, &models);
+        for (value = colon + 1; value < end && is_space(*value); value++)
+            ;
+        while (end > value && is_space(end[-1]))
+            end--;
+        if (!why && end - value == 4 && (value[0] | 0x20) == 'n' && (value[1] | 0x20) == 'o' &&
+            (value[2] | 0x20) == 'n' && (value[3] | 0x20) == 'e')
+            why = "none takes no model code (script_bytes = none drops the spell's lines)";
+    }
+    if (!why)
+        why = state_bytes(bytes, &length, SPELL_BYTES_MAX, value, end);
+    if (!why)
+        why = spell_bytes_problem(bytes, length, &max_animation);
+    if (why)
+        return why;
+    if (!models)
+        for (k = 0; k < *count; k++)
+            if (!lines[k].models) {
+                *replaced = lines[k].line;
+                for (; k + 1 < *count; k++) {
+                    const BYTE *from = (const BYTE *)&lines[k + 1];
+                    BYTE *to = (BYTE *)&lines[k];
+
+                    for (i = 0; i < (int)sizeof lines[k]; i++)
+                        to[i] = from[i];
+                }
+                (*count)--;
+                break;
+            }
+    if (*count >= SPELL_BYTES_SPELL_LINES)
+        return spell_bytes_lines_full;
+    e = &lines[(*count)++];
+    e->id = (WORD)id;
+    e->length = length;
+    e->models = (BYTE)models;
+    for (k = 0; k < models; k++) {
+        e->model[k][0] = code[k][0];
+        e->model[k][1] = code[k][1];
+    }
+    e->max_animation = (short)max_animation;
+    e->line = line;
+    for (i = 0; i < length; i++)
+        e->bytes[i] = bytes[i];
+    return NULL;
+}
+
+/* The line a caster plays: the first of a spell's `count` settled `lines` that names `two` (the caster's script
+   file's letters, "" = not known), else its line for every model; -1 if neither. */
+static int spell_bytes_choose(const struct spell_bytes_entry *lines, int count, const char *two)
+{
+    int k, j, every = -1;
+
+    for (k = 0; k < count; k++) {
+        if (!lines[k].models) {
+            if (every < 0)
+                every = k;
+            continue;
+        }
+        for (j = 0; two[0] && j < lines[k].models; j++)
+            if (spell_bytes_model_is(lines[k].model[j], two))
+                return k;
+    }
+    return every;
+}
+
+/* Whether any of a spell's lines names its models (the caster's letters are looked up only then). */
+static BOOL spell_bytes_has_models(const struct spell_bytes_entry *lines, int count)
+{
+    int k;
+
+    for (k = 0; k < count; k++)
+        if (lines[k].models)
+            return TRUE;
+    return FALSE;
+}
+
+static void spell_bytes_add_note(struct spell_bytes_note *notes, int *note_count, int kind, const char *code, int line,
+                                 int earlier)
+{
+    struct spell_bytes_note *t;
+
+    if (*note_count >= SPELL_BYTES_NOTES)
+        return;
+    t = &notes[(*note_count)++];
+    t->kind = (BYTE)kind;
+    t->code[0] = code[0];
+    t->code[1] = code[1];
+    t->line = line;
+    t->earlier = earlier;
+}
+
+/* finish_spell's settling of a spell's lines (the draft's, in the file's order, at most one for every model:
+   apply_key's rule), in place: `model` (script_bytes_model, "" none) makes the line for every model a line for it
+   at that line's place; then a code an earlier line names is taken off a later line, and a line left with none is
+   dropped (the first line naming a model is the one it plays). Each change is a note (SPELL_BYTES_NOTES at most);
+   returns the lines kept, at the front of `lines`. */
+static int spell_bytes_settle(struct spell_bytes_entry *lines, int count, const char *model,
+                              struct spell_bytes_note *notes, int *note_count)
+{
+    int k, j, i, m, kept = 0, every = -1, coded = 0;
+
+    *note_count = 0;
+    for (k = 0; k < count; k++)
+        if (!lines[k].models && every < 0)
+            every = k;
+        else if (lines[k].models)
+            coded++;
+    if (model[0]) {
+        if (every < 0)
+            spell_bytes_add_note(notes, note_count, SPELL_BYTES_MODEL_UNUSED, model, 0, 0);
+        else {
+            lines[every].models = 1;
+            lines[every].model[0][0] = (char)(model[0] & ~0x20);
+            lines[every].model[0][1] = (char)(model[1] & ~0x20);
+            if (coded)                  /* (the old form, the only line and the model, says nothing new) */
+                spell_bytes_add_note(notes, note_count, SPELL_BYTES_MODEL_APPLIED, model, lines[every].line, 0);
+        }
+    }
+    for (k = 0; k < count; k++) {
+        struct spell_bytes_entry *e = &lines[k];
+        BOOL was_coded = e->models != 0;
+
+        if (!was_coded) {
+            for (i = 0; i < kept && lines[i].models; i++)
+                ;
+            if (i < kept) {             /* a second line for every model (apply_key keeps one): the first stays */
+                spell_bytes_add_note(notes, note_count, SPELL_BYTES_LINE_EMPTY, "  ", e->line, lines[i].line);
+                continue;
+            }
+        }
+        for (j = 0; j < e->models; ) {
+            for (i = 0; i < kept; i++) {
+                for (m = 0; m < lines[i].models && !spell_bytes_model_is(lines[i].model[m], e->model[j]); m++)
+                    ;
+                if (m < lines[i].models)
+                    break;
+            }
+            if (i == kept) {
+                j++;
+                continue;
+            }
+            spell_bytes_add_note(notes, note_count, SPELL_BYTES_CODE_TAKEN, e->model[j], e->line, lines[i].line);
+            for (m = j; m + 1 < e->models; m++) {
+                e->model[m][0] = e->model[m + 1][0];
+                e->model[m][1] = e->model[m + 1][1];
+            }
+            e->models--;
+        }
+        if (was_coded && !e->models) {
+            spell_bytes_add_note(notes, note_count, SPELL_BYTES_LINE_EMPTY, "  ", e->line, 0);
+            continue;
+        }
+        if (kept != k) {
+            const BYTE *from = (const BYTE *)e;
+            BYTE *to = (BYTE *)&lines[kept];
+
+            for (i = 0; i < (int)sizeof *e; i++)
+                to[i] = from[i];
+        }
+        kept++;
+    }
+    return kept;
+}
+
+/* The start-up line's and the log's name of a line's models: up to 4 codes ("XY ZW .. .. ..."), or "every model";
+   into `out` (24 bytes). Returns its length. */
+static int spell_bytes_codes_text(const struct spell_bytes_entry *e, char *out)
+{
+    static const char every[] = "every model";
+    int n = 0, k;
+
+    if (!e->models)
+        for (k = 0; every[k]; k++)
+            out[n++] = every[k];
+    for (k = 0; k < e->models && k < 4; k++) {
+        if (k)
+            out[n++] = ' ';
+        out[n++] = e->model[k][0];
+        out[n++] = e->model[k][1];
+    }
+    if (e->models > 4)
+        for (k = 0; k < 4; k++)
+            out[n++] = " ..."[k];
+    out[n] = 0;
+    return n;
 }
 
 /* The lend: slot `slot` of `table` points at the copy, the rest of the buffer ee. */
@@ -32772,12 +33118,17 @@ static BOOL spell_bytes_model_letters(int actor, char *two)
 /* Rule 9's refusal: the slot still holds the actor's last lent copy, which plays for this cast. */
 static const char spell_bytes_still_lent[] = "its last cast's script is still lent (the slot was played at this set-up)";
 
-/* One line per spell and model (the model's script table as drawn now), SPELL_BYTES_LOGS a run. */
-static void spell_bytes_log(int actor, int spell, int slot, const struct spell_bytes_entry *e, const char *why, int count)
+/* One line per spell and model (the model's script table as drawn now), SPELL_BYTES_LOGS a run. `e` is the line
+   chosen (NULL if a check before the choice refused); `two` the caster's letters if they were looked up ("" = not
+   known), else NULL. */
+static void spell_bytes_log(int actor, int spell, int slot, const struct spell_bytes_entry *e, const char *two,
+                            const char *why, int count)
 {
     DWORD table = actor >= 0 && actor < 10 ? (DWORD)actor_script_table(actor) : 0;
-    char name[32], model[16], animations[48];
+    char name[32], model[40], animations[48], codes[24], which[96];
     int i;
+
+    codes[0] = 0;
 
     for (i = 0; i < spell_bytes_logged_count; i++)
         if (spell_bytes_logged[i].id == spells[spell].id && spell_bytes_logged[i].table == table)
@@ -32789,25 +33140,32 @@ static void spell_bytes_log(int actor, int spell, int slot, const struct spell_b
     if (!spell_bytes_line())
         return;
     game_text(name, spells[spell].name, sizeof name);
+    which[0] = 0;
+    if (e) {
+        spell_bytes_codes_text(e, codes);
+        wsprintfA(which, " (the line of spell file line %d, for %s)", e->line, codes);
+    }
     if (why == spell_bytes_still_lent) {
-        log_line("spell bytes: actor %d casts %u '%s': its own script NOT used: %s; the last lent script plays",
-                 actor, spells[spell].id, name, why);
+        log_line("spell bytes: actor %d casts %u '%s': its own script NOT used: %s%s; the last lent script plays",
+                 actor, spells[spell].id, name, why, which);
         return;
     }
     if (why) {
-        log_line("spell bytes: actor %d casts %u '%s': its own script NOT used: %s; the game's %x plays",
-                 actor, spells[spell].id, name, why, slot);
+        log_line("spell bytes: actor %d casts %u '%s': its own script NOT used: %s%s; the game's %x plays",
+                 actor, spells[spell].id, name, why, which, slot);
         return;
     }
     model[0] = 0;
-    if (e->model[0])
-        wsprintfA(model, " (%s..AB)", e->model);
+    if (two && two[0])
+        wsprintfA(model, " (%s..AB)", two);
+    else if (two)
+        wsprintfA(model, " (its script file not known)");
     if (e->max_animation >= 0)
         wsprintfA(animations, "animations up to %02x; the model has %d", (unsigned)e->max_animation, count);
     else
         wsprintfA(animations, "no animation of the model; it has %d", count);
-    log_line("spell bytes: actor %d casts %u '%s': its own script (%u bytes) plays as script %x of its model%s (%s)",
-             actor, spells[spell].id, name, (unsigned)e->length, slot, model, animations);
+    log_line("spell bytes: actor %d casts %u '%s': its own script (%u bytes, spell file line %d, for %s) plays as script %x of its model%s (%s)",
+             actor, spells[spell].id, name, (unsigned)e->length, e->line, codes, slot, model, animations);
 }
 
 /* One animation's record (array entry `a` of the caster's model, `count` entries): its frames (+4) and bones (+8)
@@ -32847,18 +33205,19 @@ static BOOL spell_bytes_read_records(const DWORD *animations, int count, const B
    Called by action_setup_hook after spell_script_apply. Lends only when every check passes. */
 static void spell_bytes_apply(int *action, int spell)
 {
-    int actor = action[ACT_ACTOR], slot = action[ACT_SCRIPT], count = 0, missing, k, v[3];
-    const struct spell_bytes_entry *e;
+    int actor = action[ACT_ACTOR], slot = action[ACT_SCRIPT], count = 0, missing, k, v[3], lines_count;
+    const struct spell_bytes_entry *e = NULL, *lines;
     const DWORD *record = NULL;
     DWORD *table = NULL;
-    const char *why;
+    const char *why, *letters = NULL;
     static char text[200];
     char two[3];
     BOOL bone_zero;
 
     if (spell < 0 || !spells[spell].bytes_entry || slot < 0)   /* not given, or the game shows nothing (-1) */
         return;
-    e = &spell_bytes[spells[spell].bytes_entry - 1];
+    lines = &spell_bytes[spells[spell].bytes_entry - 1];
+    lines_count = spells[spell].bytes_lines;
     why = spell_bytes_rule(actor, action[ACT_COMMAND_TYPE], slot);
     if (!why && *(const signed char *)(ADDR_SHOWN_MODEL + (DWORD)actor * 0x74) != actor)
         why = "the model is drawn by another (a frog)";
@@ -32870,13 +33229,23 @@ static void spell_bytes_apply(int *action, int spell)
         else
             count = (int)record[2];
     }
-    if (!why && e->model[0]) {
-        if (!spell_bytes_model_letters(actor, two))
-            why = "script_bytes_model: the letters of the caster's script file are not known";
-        else if (!spell_bytes_model_is(e->model, two)) {
-            wsprintfA(text, "script_bytes_model is %s: the caster's script file is %s..AB", e->model, two);
-            why = text;
+    if (!why) {
+        /* the line: the first naming the caster's model, else the one for every model (the letters are looked up
+           only for a spell with a line that names models) */
+        two[0] = two[1] = two[2] = 0;
+        if (spell_bytes_has_models(lines, lines_count)) {
+            if (!spell_bytes_model_letters(actor, two))
+                two[0] = 0;
+            letters = two;
         }
+        if ((k = spell_bytes_choose(lines, lines_count, two)) >= 0)
+            e = &lines[k];
+        else if (two[0]) {
+            wsprintfA(text, "no script_bytes line names %s (the caster's script file is %s..AB), and none is for every model",
+                      two, two);
+            why = text;
+        } else
+            why = "the letters of the caster's script file are not known, and no script_bytes line is for every model";
     }
     if (!why && e->max_animation >= 0) {
         if (count <= e->max_animation) {
@@ -32935,7 +33304,7 @@ static void spell_bytes_apply(int *action, int spell)
         why = spell_bytes_still_lent;
     if (!why)
         spell_bytes_lend_one(&spell_bytes_lent[actor], table, slot, e->bytes, e->length);
-    spell_bytes_log(actor, spell, slot, e, why, count);
+    spell_bytes_log(actor, spell, slot, e, letters, why, count);
 }
 
 static void restore_followup_script(int actor)

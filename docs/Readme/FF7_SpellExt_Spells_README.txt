@@ -222,8 +222,8 @@ Record fields (offset in the 28-byte attack record)
                              68-9b or d0-ff, and 68-8d play from their first
                              frame as a plain byte.
                              Refused at reading, with a line in the log and
-                             the spell kept without it (bytes an earlier
-                             line gave stay).
+                             the spell kept without that line (its other
+                             lines stay).
                              Not used at the cast (the command's own script
                              plays, and the log says why, once): an enemy
                              caster, a frog, a model without an animation
@@ -232,29 +232,46 @@ Record fields (offset in the 28-byte attack record)
                              with too few frames after it, a move not over
                              before the last fa, an e2 whose fade is not
                              over before its e1, a slot a state lends, a
-                             caster that is not script_bytes_model. The
+                             caster no line is for. The
                              frames are counted from the caster's model:
                              an animation's frames less one, f4 NN .. f3 as
                              NN, c5 .. f3 as the last c6's NN, a7 a9 b6 as
                              none, nothing a b3 may skip.
+                             One line per model: start a line with the
+                             model's code and a colon, the two letters of
+                             its script file (as the log names it, any
+                             case) or the whole name; several codes apart
+                             by spaces or commas:
+                               script_bytes = zo: e8 fc ea ... e5 ee
+                               script_bytes = zp zq, zr: e8 fc ... e5 ee
+                               script_bytes = e8 fc ea 06 07 ec 09 e5 ee
+                             A line without codes is for every other
+                             model. At the cast the caster plays the
+                             first line naming its model, else the line
+                             for every model, else the command's own
+                             script (and the log says which line played,
+                             or why none). Mime plays the mimic's line.
+                             Each line is checked on its own: a refused
+                             line is not used, the others are. Up to 8
+                             lines a spell and 16 codes a line; a later
+                             line for every model replaces the earlier;
+                             a code a line names again is not used there;
+                             none drops the lines given before it. All
+                             the spells' lines together: 128.
                              With script and script_bytes both, script is
                              not used (a line in the log). Up to 64 spells
                              may carry it. For party members only; not for
                              limits (a limit has its own `script`).
-  script_bytes_model   -     ties a spell's script_bytes to one model: they
-                             play only when the caster's script file is
-                             this one, given as its two letters in the
-                             battle archive's naming or its whole name, in
-                             any case:
+  script_bytes_model   -     the older way to write one model's line:
                                script_bytes_model = zo
-                             Any other caster (Mime, or another member given
-                             the materia) then casts the spell the plain
-                             way. none (the default): any party model whose
-                             animations cover the bytes. A caster this
-                             refuses is named in the log ("the caster's
-                             script file is XY..AB"): those are the letters
-                             to write. Without script_bytes it is not
-                             used (a line in the log).
+                             makes the spell's line without codes the
+                             line for zo (as `zo:` on it would). Any other
+                             caster then plays the spell's other lines, or
+                             the plain way. Without a line with no codes
+                             it is not used (a line in the log). A caster
+                             with no line is named in the log ("the
+                             caster's script file is XY..AB"): those are
+                             the letters to write.
   damage_formula       0x0e  damage calculation (see below)
   strength             0x0f  power used by the damage formula
   condition            0x10  hp, mp, status, none, or a number
