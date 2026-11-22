@@ -90,7 +90,7 @@ copy_of         The ID of a character defined EARLIER in this file: this one
                 equip what an `equip` list names its original for.
                     [14]
                     copy_of = 12
-                    name    = Newcomer 2
+                    name    = Newchar 2
 name            Up to 11 characters.
 keep_seat       yes: the character always has a seat, and its seat is never
                 given to another (not when someone is put in the party, not
@@ -258,14 +258,26 @@ ai_like         One of cloud barret tifa aeris red yuffie caitsith vincent
                 character's: a script that switches to another entry ("link")
                 switches inside the copy.
 ai              A file name, without extension, of 1 to 31 letters, digits,
-                _ or -: the character's block is SpellExtConfig\ai\NAME.ai,
-                in the kernel's own layout (a table of entry offsets, each
-                entry 16 section offsets, then the scripts; 65535 bytes at
-                most). Entry 0 is the character; further entries are what
-                its scripts may link to. The project's tool tools\ai_tool.py
-                writes such files from text and checks them. A new file in
-                the ai folder is seen only after the game restarts (like any
-                new file of a mod).
+                _ or -: the character's block is the file NAME.ai, in the
+                kernel's own layout (a table of entry offsets, each entry 16
+                section offsets, then the scripts; 65535 bytes at most).
+                Entry 0 is the character; further entries are what its
+                scripts may link to. The project's tool tools\ai_tool.py
+                writes such files from text and checks them.
+                The file is looked for in two places, the first that has it
+                is used:
+                  1. <game>\direct\ai\NAME.ai: where a mod manager serves
+                     a mod's files. Under 7th Heaven that is the file
+                     ai\NAME.ai of an active folder of a mod (for this mod a
+                     <ModFolder> of mod.xml), so a mod option can switch a
+                     character's AI on or off (a folder with ActiveWhen).
+                     Asked with or without FFNx: the DLL opens it itself.
+                  2. SpellExtConfig\ai\NAME.ai.
+                With neither, the log says "no file is served or found for
+                it" and the character has no AI of its own, as without the
+                key (not an error: a mod option may simply be off). A new
+                file is seen only after the game restarts (like any new
+                file of a mod).
                 Or none (default).
 
 Both keys in one section: the second is ignored, with a line in the log.
@@ -467,6 +479,58 @@ party_slot      1-3: testing only. Also put the character into this party
 
 Once a save holds the character, it is loaded from the save and none of the
 starting-record or joining keys apply to it any more.
+
+forget_flag     BANK:BYTE.BIT, a save bit (the bank as a field script names
+                it: 1, 3, 11, 13 or 15, or B, D, F; a byte 0-255; a bit 0-7),
+                or none (the default). For a GUEST: a character that joins
+                for one scene (a fight, say) and joins for real later, made
+                afresh from this sheet then, as if the first time had never
+                happened.
+                    forget_flag = 3:1.4
+                When a field script turns that bit ON, the DLL looks at every
+                character whose forget_flag names it, at the next party
+                rebuild (a menu, a battle, the PHS) or at the end of a load.
+                A character is FORGOTTEN only when all of this holds:
+                  - it is not in the party (nor in the field's copy of it),
+                    and the PHS neither shows it nor locks it in the party
+                    (so the field script hides it, MMBud 0, BEFORE it turns
+                    the bit on);
+                  - it is untouched: it wears exactly its sheet's weapon,
+                    armour and accessory (a wide piece of the sheet through
+                    its lent slot), and holds materia of the sheet's kinds in
+                    the sheet's slots (their AP is not compared: a fight adds
+                    AP).
+                Forgotten: its record goes (level, experience, stats,
+                equipment, materia and their AP, limits learned, kills, the
+                limit gauge), and the wide pieces its sheet made for it go
+                with it (they are made again when it joins: none is added to
+                or lost from the item list or the box). Its seat stays its
+                own with keep_seat = yes; it stays hidden. The next time a
+                field script adds it to the party or shows it in the PHS it
+                is made from this sheet, at the level the sheet says then.
+                Anything else is NOT forgotten and nothing is lost: one line
+                in the log says why (in the party, shown, locked, another
+                piece worn, its wide piece not worn, other materia, a gear
+                key the sheet leaves out while it has a base, wide gear not
+                at work in this run). Either way the bit is then turned OFF:
+                it is a one-shot request, and a character refused keeps its
+                record for good. (Only while a load is still putting its wide
+                pieces on does the bit stay on, to the next look.)
+                Several characters may name one bit. A bit no character
+                names is left alone. Bytes 192-255 of bank 11 (a character's
+                record) and bytes 9-11 of bank 3 (the field's party) are
+                refused. Not copied by copy_of.
+                Use it with keep_seat = yes, and only for a character whose
+                real join cannot come before the bit is turned on: the DLL
+                cannot tell a guest from a member who really joined, was
+                hidden again and still wears exactly its starting gear and
+                materia. Install the DLL AND the forget_flag lines before
+                the bit can be turned on (for a guest scene in a playthrough:
+                before the playthrough reaches that scene): a DLL without
+                this key, or a sheet without the line, leaves the bit on,
+                and a later look could then forget the character once it
+                has really joined and is hidden again. Do not add the line
+                to a game that is already past that scene.
 
 
 Known limits

@@ -199,7 +199,8 @@ What works (read from the code; the first test is to see it)
 What does not, yet
     - rows: still 320. A wide item uses a row like any item; the longer list is a later stage.
     - quantity: 99, as for every item.
-    - Throw: a wide item is never throwable.
+    - Throw: a wide item is never throwable, and will not be: Throw throws WEAPONS (it reads a weapon's record, thrown
+      model and effect, and an item has none). A thing to throw is a WIDE WEAPON with throw = yes: "WIDE THROW" below.
     - materia with wide numbers: a later stage. (Weapons, armour and accessories with wide numbers: the gear files and
       FF7_SpellExt_Box_README.txt, "WIDE GEAR".)
     - "use on all", reviving, curing, sources, tents from the Item menu: not for a new item (as for [448]).
@@ -298,9 +299,8 @@ THE LONG LIST (stages 3 and 4)           key: wide_rows = 510 (default) | 320 | 
         picked up, bought or won until you are back with 510 rows (each refusal is a *** line: THE LIST IS FULL (320 rows):
         NOTHING is added); the same holds in the unmodified game.
 
-    What stays as it was: the quantity (99); random Throw (the "Throw" a confused character or an enemy skill makes) picks only
-    among the first 320 rows; more than 3350 rows; the Equip menu offers at most 320 pieces of one kind (it can only matter if
-    one piece lies in hundreds of rows).
+    What stays as it was: the quantity (99); more than 3350 rows; the Equip menu offers at most 320 pieces of one kind (it
+    can only matter if one piece lies in hundreds of rows).
 
     MORE THAN 510 ROWS (stage 4)   wide_rows = 1020 (any EVEN number from 512 to 3350; 321-509 and odd numbers are refused
     with one line, "wide_rows must be 320 or an even number from 510 to 3350: 510 is used", and the list has 510 rows).
@@ -364,3 +364,44 @@ THE LONG LIST (stages 3 and 4)           key: wide_rows = 510 (default) | 320 | 
         While the line is in the file EVERY load fills again, so a load never shows what the save itself holds: take the
         line out and choose "Re-init .ini files" in the debug menu (the key is read again at every reading of the file),
         or restart, before you check a save or load one without its companion file.
+
+================================================================================================================================
+WIDE THROW (stages T1 and T2)    key: wide_throw = on (default) | off  (FF7_SpellExt_Game.ini)
+                                 read from the code and shown by native tests; NOT yet seen in the game
+================================================================================================================================
+    Needs wide_items = on. Read at start-up only. With wide_items = off nothing of this is done and the log says nothing of it.
+
+    A WIDE WEAPON THROWN (T1). A wide weapon ([10000] to [15999] of the weapon file, wide gear at work: the Box readme, "WIDE
+    GEAR") with throw = yes (or without the key, when its base can be thrown) is offered in the battle's Throw list, bright,
+    by its own name and icon. Thrown, its damage is worked out from its own power, as the game does for every thrown weapon; the
+    thrown model and the effect are those of its throw_like, or of its base (kernel weapons 0, 16-31, 48-61 and 127 have no
+    throw effect: nothing is drawn, the damage is done). The banner names it. One is taken from its row, as the game takes a
+    thrown weapon, and the battle's end writes the row back. If the thrower falls before the throw, the game gives it back.
+    Inside the battle the weapon borrows one of the 64 weapon slots 128-191 that worn wide weapons use (the one it holds if
+    someone wears another of it); the slot is given back at the battle's end.
+    If all 64 are in use, it is not thrown: the turn passes, the log has a *** line, and nothing is taken from its row.
+    It is still dimmed in Item and W-Item; a shop buys it from you only with sell = yes (or a base that can be sold); and it
+    now counts as a weapon that can be thrown for Store gear, a piece that comes off and box_throwables (the Box readme).
+    Armour and accessories are never thrown.
+    A thing that is ONLY thrown: a wide weapon with throw = yes, equip = none, icon = item, its own power and a throw_like.
+
+    RANDOM THROW OVER THE WHOLE LIST (T2). The "Throw" a confused character makes chooses at random among the things that can
+    be sold AND thrown. The game's own routine looks at the first 320 rows only and throws only the game's weapons (128-255).
+    Now every row of the list is looked at (all 3350 with wide_rows = 3350), with the game's own rule for a candidate, the
+    game's own random number and the game's own outcome when there is none (nothing is thrown, the turn passes); it may also
+    choose the mod's new weapons 320-383 and wide weapons with throw = yes. A weapon with sell = no is never chosen, as in the
+    game. The game picks with one random byte: with more than 256 candidates that byte can reach only every
+    (candidates / 256)th of them; that is the game's own formula, kept (with 256 or fewer, exactly the game's choice).
+
+    At start-up the log says, after the "box: wide gear" line:
+        wide throw: ON (stage T1): the Throw set-up (handler 0x19, table entry 008feeac -> 005c904d) is the DLL's ...
+        wide throw: random Throw (stage T2): the call at 005c905f -> 004333c4 is the DLL's ...
+    or, for either:
+        *** wide throw: NOT ON (stage T1): <why>. A wide weapon is never thrown in this run (Throw dims it, as before) ***
+        *** wide throw: NOT ON (stage T2): <why>. Random Throw is the game's: it looks at rows 0 to 319 only ... ***
+    NOT ON is not dangerous: nothing of that stage was written (another mod holds the place, wide gear is not at work, or
+    wide_throw = off) and that part of the game is as before. The two stages are independent. Each throw says one line
+    (the first 50 of a run):
+        wide throw: actor 0 throws wide weapon 10000 "Edge" through lent slot 128 (lent for the throw) (power 30, ...)
+        wide throw: random Throw: 3 candidate(s) in 3350 rows, candidate 1 chosen: wide weapon 10000 "Edge"
+    Send the lines with any report.

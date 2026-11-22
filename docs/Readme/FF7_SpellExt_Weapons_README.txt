@@ -138,10 +138,15 @@ equip           Who can equip it: cloud barret tifa aeris red yuffie
                 A number written as 0x.... is the raw mask instead (one bit
                 per ID up to 15; 0x1000 is the same as 12).
                 A new character can be given by the name its section of the
-                character file has, too:  equip = newcomer   (one word; capital
+                character file has, too:  equip = newchar   (one word; capital
                 letters do not matter).
 sell            yes or no. Default: as the base.
-throw           yes or no. Default: as the base.
+throw           yes or no. Default: as the base. Also for wide weapons
+                (10000-15999): with throw = yes the battle's Throw list offers
+                one and it is thrown with its own power (it needs
+                wide_throw = on, the default: FF7_SpellExt_WideItems_README.txt,
+                "WIDE THROW"). A wide weapon with throw = yes, equip = none and
+                icon = item is a thing that is only ever thrown.
 price           Buying price in gil; selling pays half. Default: as the base.
 icon            Item icon: sword glove gunarm headdress staff spear shuriken
                 megaphone gun, or a kernel weapon number; or armour (also
@@ -149,10 +154,16 @@ icon            Item icon: sword glove gunarm headdress staff spear shuriken
                 character who has no weapon of their own). Only the icon
                 changes: the weapon is still equipped and used as a weapon.
                 Also for wide weapons. Default: as the base.
+                icon = file:NAME.png (or file:NAME.tex) shows a picture of
+                your own instead: see "Icon (a picture of your own)" below.
 throw_like      Kernel weapon whose thrown model and effect to use.
                 Default: the base. Kernel weapons 0, 16-31, 48-61 and 127
                 have no throw effect; name another one here if the weapon
-                is to be throwable.
+                is to be throwable. Also for wide weapons.
+                A confused character's Throw (random Throw) may throw a new
+                weapon 320-383 and a wide weapon with throw = yes too (the
+                game's own threw only the game's weapons); like the game's, it
+                never chooses a weapon that cannot be sold (sell = no).
 
 
 Advanced
@@ -166,6 +177,28 @@ word_XX         Set two bytes.
                 e.g.  byte_04 = 99   is the same as  power = 99
 
 
+Icon (a picture of your own)
+----------------------------
+icon = file:NAME.png or file:NAME.tex, in a section of the game's own weapons
+[128]-[255], a new weapon [320]-[383] or a wide weapon [10000]-[15999]: the
+weapon shows the picture SpellExtConfig\files\icons\NAME in the Item menu's
+list, the shop's buy and sell lists, the box screen and the battle's Item,
+W-Item and Throw list. The Equip menu draws no item icons, so nothing changes
+there.
+
+It goes beside the icon words, which keep their meaning: a section may have
+both lines, e.g.
+
+    icon = gun
+    icon = file:rifle.png
+
+and the word (or, without one, the base's icon) is what shows where the
+picture cannot be (a missing or unusable file: the log says why).
+
+Sizes, transparency, the cache, how many, "Re-init .ini files" and the rest
+are as in FF7_SpellExt_Items_README.txt, "Icon (a picture of your own)".
+
+
 Testing aid
 -----------
 give_on_load    yes puts one of the weapon in the stock whenever a save is
@@ -177,7 +210,8 @@ give_on_load    yes puts one of the weapon in the stock whenever a save is
 Known limits
 ------------
 - 64 new weapons (item IDs 320-383).
-- Shops show a new weapon as a plain item when buying: no comparison panel.
+- Shops show a new weapon (and a wide weapon, 10000-15999) as a plain item when
+  buying: no comparison panel.
 - The equip menu's Optimize-style search ignores new weapons.
 - A save that contains a new weapon needs the DLL and the weapon file to
   load correctly.

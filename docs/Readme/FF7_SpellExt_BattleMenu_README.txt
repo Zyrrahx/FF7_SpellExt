@@ -20,12 +20,12 @@ It needs:
 
 The page
 --------
-    Again      battle 1320   scene 330   f0   my_scene_074
-    Next       battle 1324   scene 331   f0   my_scene_075
-    Previous   battle 1316   scene 329   f0   my_scene_073
+    Again      battle 1320   scene 330   f0   myscene
+    Next       battle 1324   scene 331   f0   ff8_e075
+    Previous   battle 1316   scene 329   f0   ff8_e073
     Battle  Scene  F  File            Enemies                   Stage
-    1024    256    0  my_scene_000    Sentry                    24
-    1028    257    0  my_scene_001    Sentry                    24
+    1024    256    0  ff8_e000        G-Soldier                 24
+    1028    257    0  ff8_e001        G-Soldier                 24
     ...
 
 - Again: the last battle started from this page (grey "none yet" before the
@@ -147,9 +147,9 @@ The log
 -------
     battle menu: the SpellExt menu's "Fight: external battles" is on; test mode on: ...
     battle menu: TEST MODE SET: 00cc0dc5 (a loss is no game over) 0 -> 1 in field 117
-    battle menu: START battle 1320 (DLL scene 330 'my_scene_074', formation 0) asked from field 117 (...)
+    battle menu: START battle 1320 (DLL scene 330 'myscene', formation 0) asked from field 117 (...)
     battle menu: the field started battle 1320, the page's (...); TEST MODE SET: battle flags 00db958a 0000 -> 0080 (...)
-    enemies: battle 1320 -> 1320 (DLL scene 330 'my_scene_074' formation 0; battle menu): enemies ...
+    enemies: battle 1320 -> 1320 (DLL scene 330 'myscene' formation 0; battle menu): enemies ...
     battle menu: back on the field after the test battle (result word 00db958a = ...): the party is put back:
     battle menu:   character 0: HP 120 -> 314, MP ...
     battle menu: TEST MODE RESTORED: 3 of 3 record(s) put back; the menu's party copy (...) of 3 made the same

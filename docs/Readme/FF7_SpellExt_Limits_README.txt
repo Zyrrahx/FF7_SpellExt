@@ -170,11 +170,11 @@ effect_file     NAME:LOOSE. While this limit is carried out, the effect's reques
                 model, to give it one of your own:
                     base        = 159            Cid's Dynamite
                     effect      = base
-                    effect_file = KAYAKU.P:ZAEAFX
+                    effect_file = KAYAKU.P:MYBOMBFX
                 An effect draws its models at a scale of its own (Dynamite's
                 about 20 times), so the loose file must be the model made
-                small: ZAEAFX is her grenade ZAEA at 0.06 of its size
-                (tools\scale_model.py ZAEA ZAEAFX 0.06). KAYAKU.P is the
+                small: MYBOMBFX is your model MYBOMB at 0.06 of its size
+                (tools\scale_model.py MYBOMB MYBOMBFX 0.06). KAYAKU.P is the
                 stick in the hand; DYNAMITE.P is the blast.
                 The log lists the files an effect asks for while a swap is
                 set, which is how to find the right NAME.
@@ -336,13 +336,18 @@ What a state does:
   - it sends each attack at every enemy at once, with an element and a
     range of its own (attack_targets, attack_element, long_range);
   - it makes every physical hit on the character miss (physical_evade);
+  - it raises the character's chances to cover an ally and to counter
+    with Attack, as the Cover and Counter Attack materia do (cover,
+    counter);
   - it replaces some of the model's scripts while it lasts: its
     reactions to being hit, its casting (script_NN);
   - it raises the battle's resting view while it lasts, so a body held
     up in the air stays in the picture (view_raise, view_back);
   - it raises the yellow pointer over the character when its command
     menu is open, so it stays above a body held up in the air
-    (pointer_raise).
+    (pointer_raise);
+  - it raises the character's dexterity for each target the limit's
+    status landed on (dexterity_per_target).
 Every part is optional: a state may be only a pose, or only a prop.
 
 Two words first. A TURN is one attack of an action: Attack has one turn,
@@ -570,12 +575,12 @@ prop            A model that stays with the character while the state lasts,
                 same name in the magic folder: ZACK.RSD and ZACK.P for
                 weapon model 0, and so on. The tool
                     make_weapon_props.py BATTLE_FOLDER ZA OUT_FOLDER
-                (in tools\work\akimbo\stageC)
+                (in the SpellExt tools folder)
                 writes them all from the model's battle files (and, for a
                 textured weapon model, the RSD's texture lines and a copy of
                 the texture). Put them in the magic folder of the SAME mod
-                folder the battle model is in (model_standard\magic beside
-                model_standard\battle), so that a 7th Heaven option that
+                folder the battle model is in (its magic folder beside its
+                battle folder), so that a 7th Heaven option that
                 swaps the model swaps the props with it. A file that is
                 missing or does not load: one line in the log, and the
                 state works without the prop.
@@ -692,6 +697,43 @@ physical_evade  normal or 100. Default normal. 100: while the state lasts
                 is a frog. A party member covering the character is hit by
                 the usual rule.
                     physical_evade = 100
+cover           0 to 100. Default 0. While the state lasts the character
+                covers an ally with this per cent chance: it steps in front
+                of a party member and takes a hit meant for it, exactly as
+                the Cover materia makes it (the materia's chance is 20 to
+                100 by its level). The higher of the two counts: with a
+                Cover materia of 40 and cover = 100 the chance is 100; with
+                no Cover materia it is this key's. Everything else is the
+                game's own rule for Cover: only a single-target physical hit
+                on another party member can be covered, never while the
+                character is knocked out, asleep, confused, stopped, a
+                frog, small, petrified, berserk, paralysed, darkened or
+                imprisoned (the game's status mask 86805c45), and with two
+                who can cover one of them is chosen at random. The
+                materia's chance is never changed: the state's is used only
+                while the game rolls for Cover, so it is the materia's own
+                again at once, and the menus, a save and the next battle
+                never see it.
+                    cover = 100
+counter         0 to 100. Default 0. While the state lasts the character
+                counters with Attack, at the enemy that hit it, with this
+                per cent chance, exactly as the Counter Attack materia makes
+                it (20 to 100 by its level). The higher counts again: a
+                Counter Attack materia of 60 with counter = 50 rolls 60; with
+                a lower one the state's chance is rolled in its place (once,
+                not twice); with none the state's chance is rolled as if a
+                Counter Attack materia were there. Counter, Magic Counter and
+                any other Counter Attack the character has are rolled as
+                always, besides. The game's rules stay: only a hit by an
+                enemy is countered, and not while the character is asleep,
+                confused, stopped, a frog, petrified, berserk, paralysed or
+                imprisoned (the game's status mask 82804c44). As
+                with cover, the materia's values are used and put back
+                around the game's roll and are never left changed. A
+                character whose counter list is full (eight counter entries
+                from materia, none of them Counter Attack) cannot be given
+                the state's counter: the log says so once a battle.
+                    counter = 50
 script_NN       While the state lasts, the character's model script NN (two
                 hexadecimal digits) is replaced by these bytes, as idle_script
                 replaces script 00. A reaction is a model script: 05 hurt,
@@ -767,6 +809,37 @@ pointer_raise   0 to 6000. Default 0. While the character is in the state,
                 and need nothing; the status marks over the head (sleep,
                 silence, a countdown) are not moved.
                     pointer_raise = 1563
+dexterity_per_target  0 to 255. Default 0. While the state lasts the
+                character's battle dexterity (its hit rate, its evasion
+                and how fast its time gauge fills) is this much higher for
+                EACH TARGET the limit that began the state put one of its
+                statuses on: with 30 and a Haste on the whole party that
+                lands on all three, +90. "Landed" is the game's own word
+                for it: a hit that did not miss and gave the target a
+                status of the limit's (`status`, `status_mode = inflict`)
+                it did not have; the statuses of its `status2` with
+                `status2_mode = inflict` count too (the hit inflicts both
+                lists as one). A target that had it already, or a hit
+                that missed, does not count; several hits
+                on one target count once. 255 is the most. The raise is
+                made when the state begins (the limit's effect step, ec)
+                and taken off when it ends (`ends`: ko, frog); at the end
+                of the battle the game's own stats come back by themselves,
+                so the raise never reaches the menus or a save. If a
+                battle script (a character AI's `store` to 40a0) has
+                changed the dexterity in between, only the state's part
+                is taken off. Using the limit again while in the state
+                changes nothing (no second raise). The time gauge follows
+                the new dexterity at the next action's set-up when
+                atb_follows_dexterity = yes is in FF7_SpellExt_Game.ini
+                (otherwise only when the game works the gauge out again: a
+                KO, a revive, Haste or Slow).
+                    dexterity_per_target = 30
+                In the log, when the state begins: "state haste_up actor
+                0: dexterity_per_target 30: a status of the limit landed on
+                3 target(s) (actors 007): dexterity 61 -> 151 (+90); ..."
+                and when it ends: "... dexterity 151 -> 61: the state's +90
+                taken off (the value before the state)".
 
 A section written for the older meaning (hits = 2 and three scripts, each
 with one f7) still loads and gives the same numbers of hits: Attack 2, 2x-Cut
@@ -821,8 +894,10 @@ early: "state akimbo actor 0: ENDED: knocked out (ends = ko), as it was
 shown (frame 812 of the state); its prop ZACK.RSD was drawn on 800 of 812
 frames; idle slots 0 1 put back; attack script slots not lent; the actor's
 attacks are the game's again".
-The keys attack_targets, attack_element, long_range, physical_evade,
-script_NN, view_raise, view_back and pointer_raise, when a state has any: one
+The keys attack_targets, attack_element, long_range, physical_evade, cover,
+counter, script_NN, view_raise, view_back, pointer_raise and
+dexterity_per_target, when a state has
+any: one
 line when the file is read
 ("character 13 state aloft: attack_targets all_enemies, attack_element 8000,
 long_range, physical_evade 100, scripts lent: 05 07 08 0a 1d"), the same
@@ -832,8 +907,18 @@ turn (target flags 23 -> 27); element 2001 -> 8000; long range (short-range
 bit 0x20 cleared)", then "turn 1 of 1 goes at every living enemy: 0010 ->
 00f0"). The first physical hit it makes miss in a battle: "state aloft actor
 1: physical_evade: a physical hit on it by actor 4 is a miss (said once a
-battle)". At start-up: "limit states: the physical hit check (hit-step table
-entry 007b77a8 -> 005ddbb0) is followed" and "limit states: the battle
+battle)". With cover, the first hit in a battle the character could
+cover: "state sentinel actor 1: cover 100% (its materia's 0%) for a hit on
+actor 0: nobody covers (the game's rules: ...)", and each cover it makes:
+"state sentinel actor 1: cover 100% (its materia's 0%): it covers actor 0
+(takes the hit)". With counter, once a battle: "state sentinel actor 1:
+counter 50%: the counter list's entry 0 (empty) is a Counter Attack of the
+state's chance while the list is rolled (put back after ...)". At most 12
+such lines a battle. At start-up: "limit states: the physical hit check (hit-step table
+entry 007b77a8 -> 005ddbb0) is followed", "limit states: the Cover check's
+call (005da613 -> 005db1d6) is followed: a state's cover applies", "limit
+states: the counter list's call (00436969 -> 005c8cfa) is followed: a
+state's counter applies" and "limit states: the battle
 menu's target set-up (006d95ba, 006d95fe -> 006e5c52) is followed". The first
 time in a battle the menu aims such an attack: "state aloft actor 1: the
 battle menu's target cursor for attack is every enemy (target flags 23 -> 26,
@@ -876,6 +961,23 @@ and overrides the base limit's value:
     strength  element  target  status  status_mode  status_chance  special
     accuracy  damage_formula  mp  animation  byte_XX  word_XX  ...
 See FF7_SpellExt_Spells_README.txt.
+
+status2         A second status change, beside the one `status` and
+                `status_mode` give (an attack has one status list and one
+                mode; a limit with status2 has two). The names as for
+                `status`; none = no second change (the default).
+                    status        = sleep poison silence
+                    status_mode   = cure
+                    status2       = regen
+                    status2_mode  = inflict
+                cures those three and puts Regen on, in the same hit. Both
+                use the limit's status_chance (with no `status` at all:
+                always). As in the game, a target's immunities hold, and
+                nothing is inflicted on a petrified target (it can still be
+                cured). Not `imprisoned`. Only the limit's own hits: a
+                follow-up hit keeps its own record's status.
+status2_mode    inflict (default), cure or toggle: what status2 does.
+(Read from the code. NOT YET SEEN IN THE GAME.)
 
 
 The game's limits (for `base`)
@@ -1073,6 +1175,32 @@ An entry of spell_effects may also be written with these words:
     ... visual        after an entry: for show only. The result (damage,
                       statuses) is not shown by this effect. Use it when two
                       effects go on the same targets, so only one shows it.
+                      This holds also for the hits an effect shows from
+                      tasks it starts later (Bolt, Bolt2, Bolt3 and most
+                      spells show each target's hit from a task started for
+                      that target): the DLL follows each task to the one
+                      that started it (new: a `visual` Regen 0x03 beside
+                      the entry that shows the result no longer shows it a
+                      second time). Not held back (the hit is shown): a
+                      hit an effect shows from the battle's other effect
+                      lists (the split beam and some limits do); one from a
+                      task whose first data word the effect overwrites with
+                      the target's number (Comet 0x2d, Break 0x30, Full Cure
+                      0x33, 0x3e, enemy effect 0x96 and some limits do: as
+                      `visual` entries they still show their result, as
+                      before); and one from a task still running 900 frames
+                      after the limit's last entry (with a line in the
+                      log). A `visual` entry starts only while the battle's
+                      list of effect tasks has 16 free places and 10 more
+                      for each of its targets and for each target of an
+                      earlier `visual` entry that may still be starting
+                      tasks (a rule of thumb taken from Bolt; an effect that
+                      starts more tasks can still fill the list); otherwise
+                      it is passed over, with a line in the log: only its
+                      drawing is lost, never a result. Leave about 28 frames
+                      between `visual` Bolts on 5-6 targets (18 on 4, 12 on
+                      3), or some are passed over. Read from the code; not
+                      yet seen in the game.
     ... skip N        after an entry: the effect starts N frames in (0-255).
                       Some effects show nothing at first, waiting for their
                       own character's animation: Clear Tranquil's water comes
@@ -1112,6 +1240,44 @@ An entry of spell_effects may also be written with these words:
         hits for the hits of a flurry that one long effect draws: a second
         native effect would end the first, and a game effect would draw its
         own flash over it.
+    ... room N        after a spell or `limit` entry: the step waits until the
+                      battle's list of effect tasks has N free places (1-100)
+                      before it starts, and the limit's frames wait with it,
+                      so the later entries keep their distance from it. For an
+                      effect that starts many tasks at once (Avalanche, magic
+                      animation 0x6f, about 92). After 300 frames of waiting
+                      the effect is passed over and its hit shown at once. One
+                      line in the log when it waits, one when it starts. Not
+                      for `effect` or `hit:` entries. Read from the code; not
+                      yet seen in the game.
+hits_on_every_target
+                yes or no. Default no. For a limit at several targets with
+                several hits (additional_effect 0, additional_modifier N):
+                each of the N hits goes to EVERY target, not to one of them at
+                random as the game has it. N x the targets results in all (64
+                at most; with more the game's own random pick is kept, with a
+                line in the log). With it:
+                - hit_elements go by hit: the first set for every target's
+                  first hit, the second for every second hit, and so on;
+                - each `all` entry of spell_effects shows its own hit: the
+                  first entry the first hit on every target, the second the
+                  second, and so on (each target is shown its results in
+                  order, so give the effects frames far enough apart that one
+                  has shown its results before the next starts);
+                - an enemy a hit has killed is left out of the later entries'
+                  effects; if one shows a result on it all the same, only the
+                  number is shown (no second death).
+                Such a limit takes `all` entries only: a one-target entry, a
+                `hit:` entry or an `effect` entry without `all` would show
+                another hit's result, so it is refused (left out, one line
+                in the log) and the other entries are kept.
+                    target              = 0x17
+                    additional_effect   = 0
+                    additional_modifier = 3
+                    hits_on_every_target = yes
+                    hit_elements  = fire, ice, ice
+                    spell_effects = 0xc7:65 all, 0x6f:140 all room 92, 0x6b:255 all
+                Read from the code; not yet seen in the game.
 Effects may overlap or start on the same frame. Only one NATIVE effect plays
 at a time: a second `effect` entry that starts while the first still plays
 ends the first (its hits are shown then).

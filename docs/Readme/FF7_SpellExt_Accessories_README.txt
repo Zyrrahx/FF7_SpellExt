@@ -116,13 +116,26 @@ equip           Who can equip it: cloud barret tifa aeris red yuffie
                 A number written as 0x.... is the raw mask instead (one bit
                 per ID up to 15; 0x1000 is the same as 12).
                 A new character can be given by the name its section of the
-                character file has, too:  equip = newcomer   (one word; capital
+                character file has, too:  equip = newchar   (one word; capital
                 letters do not matter).
 
 Shops and selling
 -----------------
 price           Shop price. Selling pays half. Default: the base's.
 sell            yes or no: whether it can be sold. Default: as the base.
+
+
+Icon (a picture of your own)
+----------------------------
+icon            file:NAME.png or file:NAME.tex: the accessory shows the picture
+                SpellExtConfig\files\icons\NAME instead of the game's accessory
+                icon, in the Item menu's list, the shop's buy and sell lists,
+                the box screen and the battle's item list. For the game's own
+                [288]-[319], the new [416]-[447] and the wide [22000]-[27999].
+                A missing or unusable file: the game's icon, and the log says
+                why. The Equip menu draws no item icons. Sizes, transparency,
+                the cache, how many, "Re-init .ini files" and the rest:
+                FF7_SpellExt_Items_README.txt, "Icon (a picture of your own)".
 
 
 Testing aid

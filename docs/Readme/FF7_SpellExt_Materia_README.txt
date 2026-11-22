@@ -197,6 +197,10 @@ What a level past the fifth does depends on the kind:
                 level 5.
   command       The commands are those of levels 1 to 5; further levels
                 add nothing by themselves.
+                Give a command materia at least one ap total (two
+                levels), as the game's own do: with no ap line it has one
+                level, and the Materia screen then draws its command grey
+                and a stray "MaxMP" line (the battle row still works).
 
 Limits to know about:
 - A few of the game's materia use the level NUMBER itself, not a value from

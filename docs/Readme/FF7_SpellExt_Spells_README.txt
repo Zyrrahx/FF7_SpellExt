@@ -59,9 +59,6 @@ Record fields (offset in the 28-byte attack record)
   camera_multi         0x0a  camera movement, multiple targets (2 bytes)
   target               0x0c  targeting flags (list, see below)
   animation            0x0d  attack effect: the kernel spell whose animation plays
-                             (0x100 and up: an effect copy from
-                             FF7_SpellExt_Effects.ini, a game effect with
-                             files of your own; see its readme)
   list                 -     magic (the default) or summon. A summon sits in
                              the Summon list instead of the Magic list and
                              has a limited number of uses per battle: one
@@ -146,29 +143,100 @@ Record fields (offset in the 28-byte attack record)
                              so a new gesture needs no edit of the model's
                              script file:
                                script_bytes = e8 fc ea 06 07 ec 09 e5 ee
-                             3 to 128 bytes, or none (the default). It plays
+                             3 to 255 bytes, or none (the default). It plays
                              in place of the command's own script (Magic
                              0x1d, Summon 0x1f) for that one cast; the
-                             model's own is back for the next. The bytes
-                             below 0x2c are the CASTER's animations: the
-                             model it plays on must have them.
-                             A cast starts with e8 (the preload), has one ec
-                             (the effect step) and ends with ee, once. It
-                             may use only what the game's own casts use:
-                             e8 ec ea fc ed fa e5 e6 a4 a5 f4 NN f3 c9 ca ee
-                             and the animations 00-2b. A hold c9 .. ca needs
-                             something that waits a frame between the two
-                             (an animation, as in c9 07 ca, or f4 01 f3) and
-                             no ec inside it; ed needs an fa after it.
-                             b6 NN aa in an enemy's script are written NN.
+                             model's own is back for the next.
+                             Any command of the battle model scripts may be
+                             used, under these rules (a refusal names it):
+                             - one e8 (the preload), before one effect step:
+                               ec, or d6 NN (the effect step NN frames
+                               later; what plays after it must last NN + 2
+                               frames). The last byte is ee (or ff), once.
+                             - a command that moves the caster (ed e4 b0 b1
+                               d1 d0 cc cf d5 e9 99 c4 c8 d4 9a fb bd fd a8
+                               ab) needs an fa after the last of them: fa
+                               puts the caster home (ab puts the caster on
+                               the target's spot; its a6 moves only the
+                               target back). a8 NN MM walks it home over
+                               MM frames after NN, but not on a cast at the
+                               caster itself: put it before the fa. A move
+                               over frames (d1 d0 cc cf d5 e9 99 c4 c8 d4 a8)
+                               must be over before that fa: what plays
+                               between them must last its frames (and
+                               delay) and one more. Their frame counts are
+                               not 0, d0's NN is 0-7, and at most three of
+                               them start with no animation or wait between.
+                             - what lasts needs its undo after it: b6 NN ..
+                               aa (the camera held), e7 00 or b8 .. e7 01 or
+                               e1 (hidden), e2 .. e1 (faded; both need a
+                               c6 NN before them: the fade's frames), a0/af
+                               NN .. ae (the target held at bone NN), ab ..
+                               a6 (the target moved), 8e .. 8f.
+                             - c6 NN is 01-7f, and the last c6 is c6 0e:
+                               the value stays for the rest of the battle
+                               and every fade (the game's own too) divides
+                               by it; 0e is the battle's own.
+                             - e2 .. e1: wait the fade out between them, as
+                               the game does (c5 f3 waits the c6's frames):
+                               what plays between must last the largest c6
+                               NN from the one before the e2 to the e1, and
+                               two more (three before an e7 01), else the
+                               caster stays hidden for the battle (a c6 just
+                               after the e2 sets the fade's frames: put the
+                               c6 0e after the e1).
+                             - a hold c9 .. ca needs something that waits a
+                               frame between the two (an animation, a7, a9,
+                               b6, or f4 01 f3) and no effect step inside.
+                               b3 (skip to the next b2 while the caster is
+                               small) needs that b2, and may not skip the
+                               preload, the effect step, the end, a hold, fa,
+                               a8, an undo or a c6.
+                             - b9 NN (one of the game's built-in cameras) is
+                               00-66; ad's first byte is 00-0f; d7's second
+                               (the hit mark) is 00-47.
+                             - f7 be c2 a1 show the results and are allowed,
+                               with a line in the log: the spell's effect
+                               shows its hits too, so each number may show
+                               twice. Place the ec (or d6) at the hit instead.
+                             Refused: 9e f1 fe c1 (never finish, or end the
+                             cast early), a2 ac (reload the model), eb (the
+                             Item / Throw step), da (changes the effect), 9d
+                             (a limit's effect), bf dc f5 f8 90 (write or read
+                             past a table), 92 93 bc e3 (stop the clock, white
+                             out, change the resting camera or the home for
+                             the battle), b7 c3 f6 97 (deaths), c7 (another
+                             actor's script), ce (an enemy's), 98 a3 (not
+                             known yet), and bb c0 cd d2 d3 d9 ef, which are
+                             not commands: the game plays them as animation
+                             numbers (write a7 bb to play animation bb).
+                             The animation numbers are the CASTER's: 00-2b
+                             and 34-8d as a byte, any number as a7 NN (it
+                             starts as many frames in as the animation
+                             before it has run: after a one-frame one such
+                             as 06, at its frame 1), a9 xx NN (0-15 frames
+                             in) or b6 NN. 2c-33 are a limit pack's and are
+                             refused: a spell loads no pack. On a party
+                             model 34-67 are weapon tracks, not animations;
+                             animations added with anim_tool's slots get
+                             68-9b or d0-ff, and 68-8d play from their first
+                             frame as a plain byte.
                              Refused at reading, with a line in the log and
                              the spell kept without it (bytes an earlier
                              line gave stay).
                              Not used at the cast (the command's own script
                              plays, and the log says why, once): an enemy
-                             caster, a frog, a model with fewer animations
-                             than the script plays, a slot a state lends, a
-                             caster that is not script_bytes_model.
+                             caster, a frog, a model without an animation
+                             the script plays (or with a weapon track
+                             there), a0/af with a bone the model lacks, d6
+                             with too few frames after it, a move not over
+                             before the last fa, an e2 whose fade is not
+                             over before its e1, a slot a state lends, a
+                             caster that is not script_bytes_model. The
+                             frames are counted from the caster's model:
+                             an animation's frames less one, f4 NN .. f3 as
+                             NN, c5 .. f3 as the last c6's NN, a7 a9 b6 as
+                             none, nothing a b3 may skip.
                              With script and script_bytes both, script is
                              not used (a line in the log). Up to 64 spells
                              may carry it. For party members only; not for

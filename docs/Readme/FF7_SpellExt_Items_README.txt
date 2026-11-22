@@ -19,7 +19,11 @@ behaves as a [448] item does. What is different about it:
     save itself, which holds an empty row in its place;
   - without the switch it is defined but cannot enter the bag (one line in
     the log says so), and wide items a save already holds wait unseen;
-  - it is never throwable;
+  - it is never throwable (Throw throws WEAPONS: it reads a weapon's record,
+    thrown model and effect, and an item has none of them). For a thing to
+    throw, number it as a WIDE WEAPON from 10000 in the weapon file with
+    throw = yes, equip = none, icon = item, its own power and a throw_like
+    (FF7_SpellExt_Weapons_README.txt);
   - [512] to [1023] are never used; [10000] to [27999] are the numbers of
     WIDE GEAR (weapons 10000-15999, armour 16000-21999, accessories
     22000-27999, in their own files) and are not read here; 28000 and up
@@ -89,6 +93,70 @@ menu_mp         MP restored likewise.
                 is not already full. Other menu effects of the game's items
                 (reviving, curing, stat sources, tents) belong to their item
                 numbers and are not available to a new item yet.
+
+A teaching item (stage 9b of the commands file; read from the code, not
+yet seen in game): an item that a list command's entry names
+(spells = ID:item:ITEM in FF7_SpellExt_Commands.ini) teaches that entry
+to the character it is used on in the Item menu, as the game's limit
+manuals do. Give it no menu_hp or menu_mp (an item that restores
+something is not taken as a teaching item, with a line in the log) and
+base = 87 (a limit manual), so that the menu aims it at one character.
+It is used from the Item menu only, never in battle, whatever its base
+says. It must not be a character's limit item. See the commands file's
+readme, "Entries learned".
+
+Icon (a picture of your own)
+----------------------------
+icon            file:NAME.png or file:NAME.tex: the item shows this picture
+                instead of the game's item icon. The file is in
+                SpellExtConfig\files\icons\ (make the folder); NAME may give
+                sub-folders: icon = file:potions/blue.png. Any number of
+                sections (of this file and of the weapon, armour and accessory
+                files) may name the same file.
+                For new items [105]-[127], [448]-[511] and wide items
+                [1024]-[9999]. The weapon, armour and accessory files take the
+                same key (see their readmes).
+                - Shown in the Item menu's list, the shop's buy and sell lists,
+                  the box screen and the battle's Item, W-Item and Throw list,
+                  for the game's numbers and the wide ones alike. Also in the
+                  game's half-size display mode (its low-resolution settings),
+                  at half size; with FFNx that mode is never used.
+                - A PNG of any size up to 2048 a side is made square (stretched
+                  if it is not) at 32, 64 or 128 pixels; 128 x 128 is best (the
+                  size of the Enhanced Stock UI's icons). It is drawn at the size
+                  of the game's icons.
+                - Transparency: a pixel whose alpha is below 128 is not drawn;
+                  every other pixel is drawn solid (hard edges, like the game's
+                  own icons). Up to 255 colours are kept exactly.
+                - The converted picture is kept in SpellExtConfig\cache as
+                  sxicon_NAME.tex (folders become ~) and made again whenever the
+                  PNG's date is not the cached file's (also when you put back an
+                  older PNG); the cache is safe to delete.
+                - A .tex is used as it is, once its header has been checked
+                  against the file (version 1, a size of 1 to 2048, 1 to 4 bytes
+                  a pixel, a palette for 1 byte a pixel, and a file long enough
+                  for its palette and pixels).
+                - A missing or unusable file: the item shows the game's icon
+                  and FF7_SpellExt.log says why ("custom icon file:...").
+                - Up to 1024 different files may be named. At most 64 pictures
+                  are kept loaded at once; for a new one the one shown least
+                  recently is let go (and loaded again when it is shown again).
+                  A list that shows more than 64 different pictures at the same
+                  moment (no list of the game shows that many) shows the game's
+                  icon for the rest, and the log says so once ("custom icons:
+                  ... shows more than 64 different icon files at once").
+                - "Re-init .ini files" (in the SpellExt debug menu) reads the
+                  icon lines again and looks at every picture again: a changed
+                  or new `icon =` line and a changed PNG or .tex show without
+                  restarting the game.
+                - With Enhanced Stock UI's "Expanded Icons" on, that mod hides
+                  the game's icons in these lists and draws its own: no custom
+                  icon is drawn there, and the log says so once
+                  ("custom icons: ... another mod hides the game's icons").
+                - The icons folder is inside SpellExtConfig\files, whose files
+                  also replace the game's archive files of the same name: an
+                  icon file named like a game file (cloud.png, say) ALSO
+                  replaces that file. Give icons names of their own.
 
 Shops and selling
 -----------------

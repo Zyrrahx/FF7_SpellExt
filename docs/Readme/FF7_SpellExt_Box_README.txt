@@ -140,8 +140,22 @@ WIDE GEAR (stage B5): WEAPONS, ARMOUR AND ACCESSORIES NUMBERED FROM 10000
     companion file holds the row). In the Item menu its row is GREY and OK buzzes, as a Buster
     Sword's does; Arrange by Type puts wide gear after the wide items, by Name after everything
     that has a name, both in number order. In a battle's Item and W-Item it is listed dimmed and
-    cannot be used. A WIDE WEAPON CANNOT BE THROWN in this version (throw = yes is ignored, with
-    a line). It cannot be sold or bought in a shop in this version. With box = auto a wide piece
+    cannot be used. A WIDE WEAPON WITH throw = yes CAN BE THROWN (wide_throw = on, the default:
+    see "WIDE THROW" in FF7_SpellExt_WideItems_README.txt): the battle's Throw list offers it by
+    its own name and icon, it is thrown with its own power and the thrown model and effect of its
+    throw_like (or its base), and one is taken from its row as the game takes a thrown weapon.
+    Such a weapon then counts as a weapon that can be thrown for Store gear, for a piece that comes
+    off and for box_throwables, as the game's own throwable weapons do (with box_throwables = list
+    it stays in the item list). Without throw = yes (or a base that can be thrown), or with
+    wide_throw = off, it is dimmed in Throw too and never thrown, as before. Armour and accessories
+    are never thrown. A SHOP sells it when a line of FF7_SpellExt_Shops.ini names its number
+    (add = 10101) and its section is defined while wide gear is at work; the price is its own
+    `price` (else its base's), and it arrives by the rules above. The buy window shows it with
+    its name, icon, description, owned and equipped counts, but with no Slot / Growth panel and
+    the row of faces without A / D (as for the new weapons 320-383). A piece with sell = yes (or
+    a base that can be sold) can be SOLD from the item list for half its price; with sell = no
+    it is grey in the sell list. A shop line that names a piece with sell = no is offered all
+    the same, with a log line. With box = auto a wide piece
     you receive goes to the item list, and to the box only when the list has no row for it (the
     box wakes then: overflow); with box = on it goes to the box, as all gear. Take out and Take
     all out move wide gear to the item list. give_on_load = yes gives one at a load unless you
@@ -334,8 +348,9 @@ Not yet in this stage / known limits
 ------------------------------------
   * Wide gear (numbers from 10000): at most 64 wide weapons, 96 wide armours and 96 wide
     accessories WORN at one moment; the Equip menu's list holds 320 entries of a kind for a
-    character (above); a wide weapon cannot be thrown; a wide piece is not sold in a shop and
-    cannot be sold; the shop's panels do not show it. No selling from the box, no sorting by
+    character (above); a wide weapon is thrown only with throw = yes and wide_throw = on (the
+    WideItems readme, "WIDE THROW"); the shop's buy window shows a wide piece with no Slot /
+    Growth panel and no A / D in the row of faces. No selling from the box, no sorting by
     name. The window was not seen in the game under Enhanced Stock UI's other layouts than the
     owner's (it reads the rows on screen from the game's code: 8, or the 12 that mod writes).
   * A save made INSIDE the Nibelheim flashback (the game puts Cloud's weapon and armour away

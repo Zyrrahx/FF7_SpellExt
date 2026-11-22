@@ -57,7 +57,7 @@ field_entities        = off
 --- for FF7_SpellExt_Characters_README.txt, section "Looks", after equip_like ---------
 
 field_model     Four characters: the name of the character's FIELD skeleton,
-                without .HRC (YUAA for YUAA.HRC). Default: none, and then the
+                without .HRC (NEWC for NEWC.HRC). Default: none, and then the
                 character has no body in the field whatever field_entities
                 says. Used only when field_entities in FF7_SpellExt_Game.ini
                 is party or seats.
@@ -87,8 +87,8 @@ field_model     Four characters: the name of the character's FIELD skeleton,
                 its body at the next field.
 
     [12]
-    name         = Newcomer
-    field_model  = YUAA
+    name         = Newchar
+    field_model  = NEWC
 README additions, round 2 (for the mod's README; written for people who edit fields)
 ====================================================================================
 

@@ -40,7 +40,7 @@ A camera text
 
 The commands, and what each operand means, are listed by
     tools/cam_tool.py list FILE --words
-and in Claude Notes/Battle_Camera_Scripts.md. cam_tool.py export writes any
+and in the SpellExt developer notes. cam_tool.py export writes any
 of the game's cameras out in this form, to start from.
 
 
