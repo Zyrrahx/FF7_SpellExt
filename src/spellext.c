@@ -352,7 +352,7 @@ static const BYTE *limit_text(int entry, int description);
 
 /* Testing aid: materia of any ID (kernel ones included) named in the materia
    file's [test] section, given the same way, each with a starting AP. */
-#define MAX_TEST_MATERIA        16
+#define MAX_TEST_MATERIA        24           /* (new commands, stage 7) 16 -> 24: the test materia of stages 0-7 */
 static DWORD test_materia[MAX_TEST_MATERIA];    /* ID in the low byte, AP above, as the game stores them */
 static int test_materia_count;
 
@@ -582,12 +582,13 @@ static BYTE id_to_handle(int id)
 }
 
 /* Frees every handle that no character's magic slots hold any more. */
+static BOOL command_list_pinned(int id);    /* ("New commands", stage 8) */
 static void release_unused_handles(void)
 {
     int i, character;
 
     for (i = 0; i < HANDLE_COUNT; i++) {
-        if (!handle_ids[i])
+        if (!handle_ids[i] || command_list_pinned(handle_ids[i]))   /* (new commands, stage 8) a live list's spell keeps its handle */
             continue;
         for (character = 0; character < 3; character++)
             if (find_magic_slot(character, (BYTE)(HANDLE_FIRST + i)) >= 0 ||
@@ -658,6 +659,9 @@ static void atb_dex_follow(void);      /* atb_follows_dexterity (game file): see
    [2] actor, [3] command, [4..5] 16-bit ID. A magic command picked from an
    extended spell's slot arrives holding the handle and is queued under the
    spell's real ID. */
+static void command_item_reserve(const BYTE *entry);  /* ("New commands", stage 5) */
+static void command_w_issued(const BYTE *entry);    /* ("New commands", stage 7) */
+static void command_list_enqueue(BYTE *entry);      /* ("New commands", stage 8) */
 static void __cdecl enqueue_hook(BYTE *entry)
 {
     WORD *id = (WORD *)(entry + 4);
@@ -668,6 +672,9 @@ static void __cdecl enqueue_hook(BYTE *entry)
         log_line("queue: actor %d %s, handle %02x -> ID %d", entry[2], command == 3 ? "summon" : "magic", *id, real_id);
         *id = (WORD)real_id;
     }
+    command_list_enqueue(entry);    /* (new commands, stage 8) a list command's handle -> its spell's ID; the actor's Magic list put back */
+    command_item_reserve(entry);    /* (new commands, stage 5) an item command's item reserved, as 00432aa2 does for Item */
+    command_w_issued(entry);        /* (new commands, stage 7) an issue by the actor of a stored W- first pick: disarmed */
     ((void (__cdecl *)(BYTE *))FN_ENQUEUE)(entry);
 }
 
@@ -675,14 +682,20 @@ static void __cdecl enqueue_hook(BYTE *entry)
    and stores its index in the action. That misses an extended ID, and any
    spell that is outside the window; for those the slot is found here. A
    spell outside the window is lent the scratch slot until action setup. */
+static void command_gate_fields(int *action);  /* ("New commands", stage 4) */
+static void command_all_use(int actor, int *action);  /* ("New commands", stage 6) */
+static void command_view_slot_match(int actor);  /* ("New commands", stage 8) */
 static void __cdecl slot_match_hook(int actor)
 {
     int *action;
     int id, slot, entry;
 
     atb_dex_follow();           /* (the pre_action scripts of all ten actors have just run) */
+    command_view_slot_match(actor); /* (new commands, stage 8) a Magic / W-Magic action: the actor's Magic list back in its slots first */
     ((void (__cdecl *)(int))FN_SLOT_MATCH)(actor);
     action = current_action();
+    command_gate_fields(action);    /* (new commands, stage 4) [0x14] [0x18] [0x19] of a command 0x26-0x3f: the builder's gates skip 0x20 and up */
+    command_all_use(actor, action); /* (new commands, stage 6) a new command's All use, as the builder spends Steal's */
     id = action[ACT_QUEUED_ID];
     if (action[ACT_COMMAND] == 3 && actor >= 0 && actor <= 2 && spell_is_summon(id)) {
         /* an extended summon: its slot is the summon slot holding its handle */
@@ -1848,10 +1861,13 @@ static void spell_script_apply(int *action, int spell);  /* ("A spell's caster s
 static void spell_bytes_apply(int *action, int spell);   /* ("A spell's caster script bytes", after it) */
 static void spell_bytes_put_back(void);
 static void spell_bytes_forget(void);
+static int command_action_setup(int *action);   /* ("New commands", after the materia file code) */
+static void command_mp_turbo(int *action);      /* ("New commands", stage 6) */
 
 static void __cdecl action_setup_hook(void)
 {
     int *action = current_action();
+    int command_way = command_action_setup(action);    /* (new commands) first: the attack ID read below is then the command's spell */
     int id = action[ACT_ATTACK_ID];
     const BYTE *record = ext_record(id);
     int index = record ? index_reaching(record) : 0;
@@ -1871,8 +1887,16 @@ static void __cdecl action_setup_hook(void)
     if (action[ACT_ACTOR] >= 0 && action[ACT_ACTOR] < 10)
         cast_animation[action[ACT_ACTOR]].set = 0;
     effect_copy_note(action, -1);       /* no effect copy, unless an extended spell's below names one */
+    if (command_way < 0) {
+        /* (new commands) an enemy's action of a new command: script -1, the hit loop does nothing; the game's set-up
+           is not run (its ID may name no record: FUN_005c94d3 reads a NULL one for an enemy's ID from 0x80 up) */
+        note_limit_action(action[ACT_ACTOR], action[ACT_COMMAND_TYPE], id);
+        return_scratch_slot(action[ACT_ACTOR]);
+        return;
+    }
     if (!record || action[ACT_COMMAND_TYPE] == 0x20) {
         ((void (__cdecl *)(void))FN_ACTION_SETUP)();
+        command_mp_turbo(action);       /* (new commands, stage 6) MP Turbo on a spell command's row: the cost as a spell slot's */
         note_limit_action(action[ACT_ACTOR], action[ACT_COMMAND_TYPE], id);
         return_scratch_slot(action[ACT_ACTOR]);
         enemies_attack_note(action);    /* an enemy's attack with extras of the enemies files (nothing with enemies off) */
@@ -1927,6 +1951,7 @@ static void __cdecl action_setup_hook(void)
 
         action[0xe] = (int)mp_cost_of(record, slot[7]);
     }
+    command_mp_turbo(action);           /* (new commands, stage 6) MP Turbo on a spell command's row (it has no slot) */
     {
         /* `animation_all`: another effect when the cast has more than one target. Chosen here from
            the targets asked for, and again at the effect step from the targets the game kept
@@ -2465,6 +2490,8 @@ static BOOL slot_word(const char *p, const char *word_end, int *first, int *coun
 static const char slots_problem[] =
     "slots must be a list of: pair, single, chain3 to chain8, none (add _nogrowth for slots that give no AP)";
 
+static int __cdecl command_add_guard(int command);     /* ("New commands": the build-list guard) */
+
 /* FUN_005cf0fc copies the staged kernel spells into the slots, just before
    the battle command list is built. The game only gives a character the
    Magic command for a magic materia, so add it here when an extended spell
@@ -2485,12 +2512,12 @@ static void __cdecl fill_magic_slots_hook(void)
                 magic = 1;
         }
     if (magic) {
-        ((int (__cdecl *)(char))FN_ADD_COMMAND)(2);
+        command_add_guard(2);   /* (the build-list guard: FUN_005cece9 unless the list is full) */
         if (*(BYTE *)ADDR_HAS_MAGIC_FLAG == 0)
             *(BYTE *)ADDR_HAS_MAGIC_FLAG = 1;
     }
     if (summon) {
-        ((int (__cdecl *)(char))FN_ADD_COMMAND)(3);
+        command_add_guard(3);
         if (*(BYTE *)ADDR_HAS_SUMMON_FLAG == 0)
             *(BYTE *)ADDR_HAS_SUMMON_FLAG = 1;
     }
@@ -2616,6 +2643,19 @@ static BOOL materia_grants(int i, BYTE materia, DWORD ap)
 }
 
 static void new_characters_joining(void);
+static void command_rebuild_start(int character);  /* ("New commands", stage 6) */
+static void command_view_forget(int character);    /* ("New commands", stage 8) */
+static void command_snapshot_take(int character);  /* ("New commands", stage 9a) */
+static void command_learn_poll(const char *moment);    /* ("New commands", stage 9b: learned list entries) */
+static void command_learn_after_load(void);
+static void command_learn_hit(const int *action);
+static BOOL command_teaches_item(int item);
+static void command_item_use(int item, int who);
+static BOOL command_learn_wanted(void);
+static void command_learned_forget(void);
+static DWORD command_cmdl_bytes(void);
+static BYTE *command_cmdl_write(BYTE *p);
+static BOOL command_cmdl_met(const BYTE *head, BOOL fallback);
 
 static void __cdecl rebuild_start_hook(int character, int record)
 {
@@ -2626,6 +2666,10 @@ static void __cdecl rebuild_start_hook(int character, int record)
     clear_spell_support();
     rebuild_party_slot = (signed char)character;
     new_characters_joining();
+    command_rebuild_start(character);   /* (new commands, stage 6) the slot's Quadra Magic counts of the new commands */
+    command_view_forget(character);     /* (new commands, stage 8) the rebuild rewrites the slots: a lent list is forgotten */
+    command_snapshot_take(character);   /* (new commands, stage 9a) the slot's level and materia, from the record the rebuild reads next */
+    command_learn_poll("a party slot rebuilt");     /* (new commands, stage 9b) a field request's two save bytes */
     ((void (__cdecl *)(int, int))FN_REBUILD_START)(character, record);
 }
 
@@ -2681,11 +2725,13 @@ static void __cdecl flags_magic_hook(unsigned materia, DWORD ap)
 
 /* FUN_005ccf03 runs for each equipped materia; for Mega All it adds its
    level to the All uses of every magic slot. */
+static void command_mega_all(DWORD materia);  /* ("New commands", stage 6) */
 static void __cdecl mega_all_hook(DWORD materia)
 {
     BYTE id = (BYTE)materia;
 
     ((void (__cdecl *)(DWORD))FN_MEGA_ALL)(materia);
+    command_mega_all(materia);      /* (new commands, stage 6) its level onto the new commands' rows too */
     if (id != 0xff && (materia_base[id * MATERIA_RECORD_SIZE + 0x0d] & 0x0f) == MATERIA_TYPE_MEGA_ALL)
     {
         int level = materia_level(id, materia >> 8);
@@ -2917,10 +2963,12 @@ static void window_load(int character)
     }
 }
 
+static void command_view_put_back(int character, BOOL with_grid);  /* ("New commands", stage 8) */
 static void set_window_base(int character, int base)
 {
     int last = list_rows(character) - WINDOW_ROWS;
 
+    command_view_put_back(character, TRUE);     /* (new commands, stage 8) a lent list goes before Magic's window moves */
     if (base > last)
         base = last;
     if (base < 0)
@@ -3063,14 +3111,17 @@ static void mark_slot_flags_stale(int actor)
    between one target and all, reading the kernel record of the slot's
    one-byte ID. Redo that step for extended spells from their own records,
    in the window and in the rest of the list. */
+static void command_battle_slots(int character);  /* ("New commands", stage 6) */
 static void __cdecl battle_slots_hook(int character)
 {
     BYTE saved[WINDOW_SLOTS];
     BYTE *slots;
     int first, i;
 
+    command_view_put_back(character, TRUE);     /* (new commands, stage 8) a lent list goes before FUN_005cfe67 edits the slots */
     if (character < 0 || character > 2 || !spell_list[character]) {
         ((void (__cdecl *)(int))FN_BATTLE_SLOTS)(character);
+        command_battle_slots(character);    /* (new commands, stage 6) a new command's row with no toggle keeps no All use */
         return;
     }
     slots = spell_slots(character);
@@ -3091,16 +3142,18 @@ static void __cdecl battle_slots_hook(int character)
         if (record && !(record[REC_TARGET_FLAGS] & 8) && (i < first || i >= first + WINDOW_SLOTS))
             entry->image[2] = 0;
     }
+    command_battle_slots(character);    /* (new commands, stage 6) the same rule for a new command's row */
 }
 
 /* FUN_006f4db2(grid): cursor movement and scrolling for one grid. */
+static BOOL command_view_shown(int character);     /* ("New commands", stage 8) */
 static void __cdecl battle_grid_input_hook(int *grid)
 {
     DWORD offset = (DWORD)grid - ADDR_BATTLE_MAGIC_GRID;
     int actor = (int)(offset / BATTLE_GRID_STRIDE);
 
     ((void (__cdecl *)(int *))FN_GRID_INPUT)(grid);
-    if (offset % BATTLE_GRID_STRIDE == 0 && actor < 3 && slide_window(actor, grid)) {
+    if (offset % BATTLE_GRID_STRIDE == 0 && actor < 3 && !command_view_shown(actor) && slide_window(actor, grid)) {  /* (new commands, stage 8) no sliding under a lent list */
         mark_slot_flags_stale(actor);
         ((void (__cdecl *)(int, int))FN_REFRESH_SLOT_FLAGS)(actor, 1);
     }
@@ -3121,7 +3174,7 @@ static void draw_list_scrollbar(int character, short *bar, DWORD alpha, DWORD dr
 {
     short total = bar[BAR_TOTAL_ROWS], top = bar[BAR_TOP_ROW];
 
-    if (character >= 0 && character < 3 && list_rows(character) > WINDOW_ROWS) {
+    if (character >= 0 && character < 3 && list_rows(character) > WINDOW_ROWS && !command_view_shown(character)) {   /* (new commands, stage 8) a lent list's own bar */
         bar[BAR_TOTAL_ROWS] = (short)list_rows(character);
         bar[BAR_TOP_ROW] = (short)(window_base[character] + top);
     }
@@ -3167,7 +3220,7 @@ static void __cdecl materia_grid_input_hook(int *grid)
     int character = *(int *)ADDR_MATERIA_CHARACTER;
 
     ((void (__cdecl *)(int *))FN_GRID_INPUT)(grid);
-    if ((DWORD)grid == ADDR_MATERIA_MAGIC_GRID && character >= 0 && character < 3)
+    if ((DWORD)grid == ADDR_MATERIA_MAGIC_GRID && character >= 0 && character < 3 && !command_view_shown(character))   /* (new commands, stage 9a) no sliding under a list lent to the Check */
         slide_window(character, grid);
 }
 
@@ -3321,9 +3374,10 @@ static unsigned __cdecl menu_target_ok_hook(unsigned mask)
 /* FUN_00437679(actor, 1), as called when the battle Magic list is opened.
    Unless the game is keeping menu positions, its grid starts at the top,
    so the window does too. */
+static BOOL command_view_open(int actor);      /* ("New commands", stage 8) */
 static void __cdecl battle_magic_open_hook(int actor, int list)
 {
-    if (actor >= 0 && actor < 3 && *(int *)ADDR_CURSOR_MEMORY == 0 && window_base[actor] != 0) {
+    if (!command_view_open(actor) && actor >= 0 && actor < 3 && *(int *)ADDR_CURSOR_MEMORY == 0 && window_base[actor] != 0) {    /* (new commands, stage 8) a list command's own list shown, or Magic's put back */
         set_window_base(actor, 0);
         mark_slot_flags_stale(actor);
     }
@@ -4469,6 +4523,8 @@ static void __cdecl equip_list_hook(int kind)
 
 static unsigned __cdecl item_restrictions_hook(int id)
 {
+    if (command_teaches_item(id))
+        return ((unsigned (__cdecl *)(int))FN_ITEM_RESTRICTIONS)(ITEM_LIMIT_FIRST);     /* (new commands, stage 9b) a teaching item: a limit item's */
     if (id >= ITEM_COUNT_EXTENDED) {
         /* (wide items) a wide item's own record; any other number from 512 up: no use at all */
         const struct wide_item *w = wide_item(id);
@@ -4575,6 +4631,7 @@ static const BYTE *requote_spell_names(const BYTE *text)
                  an index a materia can have; a blank otherwise;
      others      the placeholder. */
 static const BYTE *__cdecl text_fetch_hook(int section, int index, int zero);
+static const BYTE *command_text_answer(int section, int index);    /* ("New commands", after the materia file code) */
 static const BYTE *wide_item_text(int index, BOOL description, int zero)
 {
     static const BYTE blank[1] = { 0xff };
@@ -4606,6 +4663,13 @@ static const BYTE *__cdecl text_fetch_hook(int section, int index, int zero)
 
         if (section == item || section == item + TEXT_NAME_OFFSET)
             return wide_item_text(index, section == item, zero);
+    }
+    {
+        /* (new commands) a defined free command's name or description (type 5, index 0x1c-0x1f); NULL otherwise */
+        const BYTE *text = command_text_answer(section, index);
+
+        if (text)
+            return text;
     }
     if (index >= 0 && index < WEAPON_COUNT_ORIGINAL) {
         /* (kernel overrides) a game piece whose section gives it a name or description: that text; the kernel's otherwise */
@@ -4723,7 +4787,10 @@ static void __cdecl battle_inventory_hook(void)
     for (i = 0; i < battle_rows(); i++, entry += 6) {
         int id = *(const WORD *)entry;
 
-        if (is_new_weapon_item(id)) {
+        if (command_teaches_item(id)) {
+            entry[3] = 0;           /* (new commands, stage 9b) a teaching item: a limit item's, never used in battle */
+            entry[4] = (BYTE)(((unsigned (__cdecl *)(int))FN_ITEM_RESTRICTIONS)(ITEM_LIMIT_FIRST) & 0x0b);
+        } else if (is_new_weapon_item(id)) {
             const BYTE *record = weapon_table + (id - ITEM_ID_WEAPON_BASE) * WEAPON_RECORD_SIZE;
 
             entry[3] = record[0];
@@ -7446,6 +7513,10 @@ static void gear_wide_gate(void);       /* (with the Equip menu's start-up line,
 static void gear_wide_loaded(void);
 static void gear_worn_after_load(void); /* (the three are with the companion's code) */
 static void forget_flags_poll(const char *moment);     /* (`forget_flag`) with the worn pieces' code */
+static void seat_when_poll(const char *moment);       /* (`seat_when`) after forget_flag's code */
+static void seat_when_after_load(void);
+static void seat_when_take_header(void);
+static void seat_when_forget(void);
 static int character_wide_defer;        /* (a sheet's wide piece) set by load_accepted_hook while it makes the characters: their wide pieces are put on after the save's WORN entries */
 static void character_wide_wear_pending(const char *moment);
 static void gear_worn_save_begin(void);
@@ -9602,6 +9673,7 @@ static void __cdecl load_accepted_hook(int argument)
     if (!box_live)                  /* (the box, A8 / C9) with the box at work the aids run AFTER the box of the load is decided: box_after_decide */
         load_aids();
     sxc2_load_decide();             /* what this load is read from: the SXC2 file of the slot's key, the old format, the fallback */
+    seat_when_take_header();        /* (`seat_when`) what the keys held, before the seats are set up: a keeper that gave its seat waits */
     fields_after_load();            /* (field capacity, stage 2) a save made in a registered field: its real place back into the block, by name, before the Load menu closes and mode 0x15 copies it */
     box_after_decide();             /* (the box) its self-test if armed, then the aids; nothing unless the box is at work */
     character_wide_defer = 1;       /* (a sheet's wide piece) a character made now gets its sheet's wide pieces after the save's WORN entries: character_wide_wear_pending */
@@ -9611,7 +9683,9 @@ static void __cdecl load_accepted_hook(int argument)
         gear_worn_after_load();     /* (the box, stage B5, A14) the wide pieces the save's characters wore: lent a slot and worn again, or boxed, or carried; before the game rebuilds the party's figures (007224ab, after the Load menu closes); never unless wide gear is at work */
     else
         character_wide_wear_pending("a load");     /* (a sheet's wide piece) wide gear is not at work: each wish's one line, the stand-in stays */
+    seat_when_after_load();         /* (`seat_when`) the look: a save made with the bit on comes back as it was */
     forget_flags_poll("the end of a load");       /* (`forget_flag`) a save made with the bit on: settled now, after the save's wide pieces are worn again */
+    command_learn_after_load();     /* (new commands, stage 9b) a field request and test_lesson, after the companion's learned entries were taken */
     wide_give_on_load();            /* (wide items) the testing aids for wide numbers, after the companion's item list was taken */
     wide_test_fill();               /* (stage 3) the testing aid test_fill_rows; nothing without the key */
     wide_sync("a load accepted (after the characters)");    /* (the switch) a limit item given at this load was put after the last look: the picture after it; nothing unless the switch is on */
@@ -11539,6 +11613,7 @@ static BOOL test_party_damage_value(char *value, char *stop, DWORD *out)
 }
 /* TEST PARTY DAMAGE PURE END */
 
+static void command_potency_hit(int *action, int target);  /* ("New commands", stage 5) */
 static int __cdecl fixed_damage_hook(int target)
 {
     int *action = *(int **)ADDR_ACTION_PTR;
@@ -11555,6 +11630,7 @@ static int __cdecl fixed_damage_hook(int target)
 
         action[0x85] = (int)(amount > limit ? limit : amount);
     }
+    command_potency_hit(action, target);    /* (new commands, stage 5) an item command's potency: before the testing aid */
     if (test_party_damage)
         action[0x85] = test_party_damage_amount(test_party_damage, enemy_hp_limit, action[ACT_ACTOR], target,
                                                 (DWORD)action[0x86], (DWORD)action[0x88], action[0x85]);
@@ -11580,6 +11656,7 @@ static void __cdecl hit_target_hook(int attacker, int target)
     }
     ((void (__cdecl *)(int, int))FN_HIT_TARGET)(attacker, target);
     action = *(const int **)ADDR_ACTION_PTR;
+    command_learn_hit(action);      /* (new commands, stage 9b) an enemy's attack that a list entry names: learned */
     if (counting)
         state_landed_after(before);
     /* the ACTING actor, not the hit's attacker: for a reflected hit that is the one it bounced off */
@@ -11983,6 +12060,8 @@ static void install_mp_cost_hooks(void)
     log_line("MP cost above 255: %d of 10 display hooks", done);
 }
 
+static void __cdecl materia_check_grid_hook(int *grid, int a, int b, int c, int d, int e, int f, int g, int h, int i, int j, int k,
+                                            int l, int m, int n);  /* ("New commands", stage 9a) */
 static void install_hooks(void)
 {
     int ok = 0, total = 31;
@@ -12027,7 +12106,7 @@ static void install_hooks(void)
         load_slot_live = 1, ok++;
     ach_view_install();         /* (says in the log what it did; not in the count below) */
     install_save_write_hook();      /* (says in the log what it did; not in the count below) */
-    ok += patch_call(SITE_MATERIA_GRID_SETUP, FN_GRID_SETUP, menu_grid_setup_hook);
+    ok += patch_call(SITE_MATERIA_GRID_SETUP, FN_GRID_SETUP, materia_check_grid_hook);   /* (new commands, stage 9a) the Check's own: menu_grid_setup_hook, then a list command's list */
     ok += patch_pointer(ADDR_ACTION_SETUP_ENTRY, FN_ACTION_SETUP, action_setup_hook);
     for (i = 0; i < sizeof slot_flag_sites / sizeof slot_flag_sites[0]; i++, total++)
         ok += patch_call(slot_flag_sites[i], FN_SLOT_FLAGS, slot_flags_hook);
@@ -12166,7 +12245,7 @@ static const struct flag_name special_flags[] = {
 
 /* What one [section] of the file has set so far. */
 /* `script_bytes` (see "A spell's caster script bytes", after "A spell's caster script"): the spells' bytes */
-#define SPELL_BYTES_MAX         128          /* bytes of a spell's script_bytes, as a limit's `script` */
+#define SPELL_BYTES_MAX         255          /* bytes of a spell's script_bytes (the lent buffer keeps one ee after them) */
 #define SPELL_BYTES_SPELLS      64           /* spells that may carry script_bytes */
 #define SPELL_BYTES_BUFFER      256          /* a lent copy: the interpreter's position is a byte, it cannot read past this */
 #define SPELL_BYTES_SLOT_MAGIC  0x1d         /* the command's own script lent: Magic (and `party_vanishes = no`) */
@@ -12174,7 +12253,7 @@ static const struct flag_name special_flags[] = {
 static struct spell_bytes_entry {
     WORD id;
     BYTE length;
-    signed char max_animation;          /* the highest animation byte the bytes play; -1 none */
+    short max_animation;                /* the highest animation the bytes play (a byte, or a7 / a9 / b6's operand); -1 none */
     char model[3];                      /* `script_bytes_model`: the caster's script file's two letters, upper case; "" = any */
     BYTE bytes[SPELL_BYTES_MAX];
 } spell_bytes[SPELL_BYTES_SPELLS];
@@ -15661,6 +15740,7 @@ static int effect_copy_base(DWORD number);   /* ("Effect copies", after the spel
 static const char *spell_script_value_problem(DWORD value);  /* ("A spell's caster script", after the actor's script table) */
 static void spell_script_forget(void);
 static const char *spell_bytes_problem(const BYTE *b, int length, int *max_animation);    /* ("A spell's caster script bytes") */
+static int spell_bytes_shows_results(const BYTE *b, int length);
 static void spell_bytes_forget_log(void);
 static const char *state_bytes(BYTE *out, BYTE *out_length, int most, char *value, char *stop);   /* (a state's scripts, after the forms) */
 
@@ -16032,7 +16112,7 @@ static void finish_spell(struct spell_draft *draft)
     } else if (draft->bytes_length) {
         /* (taken here, after the returns above: a skipped spell takes no entry) */
         struct spell_bytes_entry *e = &spell_bytes[spell_bytes_count];
-        int max_animation;
+        int max_animation, shows;
 
         if (spell->script) {
             log_line("spell file line %d: spell %d has script_bytes and script: script (0x%x) is not used",
@@ -16043,7 +16123,10 @@ static void finish_spell(struct spell_draft *draft)
         e->length = draft->bytes_length;
         copy_bytes(e->bytes, draft->bytes, draft->bytes_length);
         spell_bytes_problem(e->bytes, e->length, &max_animation);     /* (accepted when read: for its highest animation) */
-        e->max_animation = (signed char)max_animation;
+        e->max_animation = (short)max_animation;
+        if ((shows = spell_bytes_shows_results(e->bytes, e->length)) >= 0)
+            log_line("spell file line %d: spell %d: script_bytes: %02x shows the results itself; the spell's effect shows its hits too: each number may show twice (time the hit with the ec or d6 instead)",
+                     draft->line, draft->id, (unsigned)shows);
         e->model[0] = draft->bytes_model[0];
         e->model[1] = draft->bytes_model[1];
         e->model[2] = 0;
@@ -19850,6 +19933,204 @@ static void outfit_state_line(char *msg, int cap, int id, const char *bit, int s
 }
 /* ---- OUTFIT PURE end ---- */
 
+/* ---- SEAT WHEN PURE begin (no game memory, no Windows: its stage's test folder compiles this block, after the FORGET FLAG PURE and OUTFIT PURE ones, alone) ----
+
+   `seat_when = BANK:BYTE.BIT SEAT` (the character file): while that save bit is on, the character sits in seat SEAT
+   (13, 14 or 15); whoever sat there steps aside keeping its record, and has the seat back when the bit goes off. It is
+   the game's own way with a flashback character (one who borrows a record nobody uses at that time), done per seat, so
+   a field script that names the seat's ID gets the key's character while the bit is on.
+     - seat 12 is refused (its record is the one the save file itself holds), and so is a seat an earlier section's key
+       names already (the second key is off). A KEPT seat may be borrowed: while the bit is on its keeper (`keep_seat`)
+       steps aside like anyone else and does not take a seat back (not at a load, not by the keepers' seating, not from
+       the PHS); when the bit goes off it has its seat back;
+     - looked at where the seats are settled: every party-slot rebuild and the PHS (new_characters_joining), the end of
+       a load and the reading of a field; never in a battle, nor while a save or a load is putting pieces on;
+     - the seat's ID may be in the party: the character that answers to it changes and the party slot is rebuilt (a
+       flashback's PRTYE names the seat right after the bit goes on: waiting would never end). Only the way back waits
+       while the seat's ID is in the party and the one coming back has no record (it would be made too early) or
+       nobody comes back (a party slot must not name an empty seat);
+     - who stepped aside is kept in the save's companion file (header bytes 80-83), so a save made with the bit on
+       comes back right. */
+#define SEAT_WHEN_FIRST         13      /* the seats a key may name */
+#define SEAT_WHEN_LAST          15
+#define SEAT_WHEN_NOBODY        (-2)    /* gave: the seat was empty when the key's character took it */
+#define SEAT_WHEN_UNKNOWN       (-1)    /* gave: who sat there is not known (a save whose companion does not say) */
+
+/* The value, value..end: `none` (*flag = FORGET_FLAG_NONE, *seat = 0) or BANK:BYTE.BIT and a seat ID 12 to 15 (12 is
+   refused here). Returns NULL, or msg with what is wrong; *flag and *seat are then untouched. */
+static const char *seat_when_parse(const char *value, const char *end, int *flag, int *seat, char *msg, int cap)
+{
+    static const char key[] = "seat_when: ";
+    const char *p = value, *bit_end, *word, *problem;
+    int new_flag = FORGET_FLAG_NONE, n = 0, id = 0, digits = 0;
+
+    msg[0] = 0;
+    while (p < end && (*p == ' ' || *p == '\t'))
+        p++;
+    while (end > p && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\r'))
+        end--;
+    if (end - p == 4 && (p[0] | 0x20) == 'n' && (p[1] | 0x20) == 'o' && (p[2] | 0x20) == 'n' && (p[3] | 0x20) == 'e') {
+        *flag = FORGET_FLAG_NONE;
+        *seat = 0;
+        return NULL;
+    }
+    for (bit_end = p; bit_end < end && *bit_end != ' ' && *bit_end != '\t'; bit_end++)
+        ;
+    for (word = bit_end; word < end && (*word == ' ' || *word == '\t'); word++)
+        ;
+    if (bit_end == p || word == end) {
+        outfit_say(msg, cap, &n, key);
+        outfit_say(msg, cap, &n, "expected BANK:BYTE.BIT (such as 3:40.1) and then a seat, 13 to 15, or none");
+        return msg;
+    }
+    if ((problem = forget_flag_parse(p, bit_end, &new_flag)) != NULL) {
+        outfit_say(msg, cap, &n, key);
+        outfit_say(msg, cap, &n, "the bit: ");
+        outfit_say(msg, cap, &n, problem);
+        return msg;
+    }
+    if (new_flag == FORGET_FLAG_NONE) {
+        outfit_say(msg, cap, &n, key);
+        outfit_say(msg, cap, &n, "a bit is needed before the seat (to clear the key write none alone)");
+        return msg;
+    }
+    while (word < end && *word >= '0' && *word <= '9' && digits < 3)
+        id = id * 10 + (*word++ - '0'), digits++;
+    if (!digits || word != end || id < 12 || id > SEAT_WHEN_LAST) {
+        outfit_say(msg, cap, &n, key);
+        outfit_say(msg, cap, &n, "the seat must be 13, 14 or 15 (a seat's character ID)");
+        return msg;
+    }
+    if (id < SEAT_WHEN_FIRST) {
+        outfit_say(msg, cap, &n, key);
+        outfit_say(msg, cap, &n, "seat 12 cannot be named: its record is the one the save file itself holds (name 13, 14 or 15)");
+        return msg;
+    }
+    *flag = new_flag;
+    *seat = id;
+    return NULL;
+}
+
+/* After the file is read: which keys stand. seat[i] is the seat ID roster character i's key names (0: no key). In file
+   order a key is refused when an earlier key that stands names the same seat (SEAT_WHEN_KEY_SHARED; other[i] is then
+   that one's index). A refused key's seat[i] is set to 0. (A kept seat is NOT refused: a key may borrow it.) */
+#define SEAT_WHEN_KEY_OK        0
+#define SEAT_WHEN_KEY_SHARED    2
+
+static void seat_when_check(int count, int *seat, int *reason, int *other)
+{
+    int i, j;
+
+    for (i = 0; i < count; i++) {
+        reason[i] = SEAT_WHEN_KEY_OK;
+        other[i] = -1;
+        if (!seat[i])
+            continue;
+        for (j = 0; j < i && seat[j] != seat[i]; j++)
+            ;
+        if (j < i) {
+            reason[i] = SEAT_WHEN_KEY_SHARED;
+            other[i] = j;
+            seat[i] = 0;
+        }
+    }
+}
+
+/* What one key's seat is now, as seat_when_judge needs it (filled by the DLL from the game's memory, by the test from
+   its model). */
+struct seat_when_view {
+    int bit_on;                 /* the key's save bit */
+    int seat_exists;            /* the seat is one of this game's (seats = 2 leaves 14 and 15 out) */
+    int holder_here;            /* the key's character sits in the key's seat */
+    int holder_elsewhere_in_party;  /* it sits in ANOTHER seat, and that seat's ID is in the party (or the field's) */
+    int occupant;               /* who sits in the key's seat when it is not the key's character: a roster index, -1 nobody */
+    int active;                 /* the key put its character there (this run, or the save's companion says so) */
+    int gave;                   /* who stepped aside then: a roster index, SEAT_WHEN_NOBODY, SEAT_WHEN_UNKNOWN */
+    int gave_seated;            /* that one sits in a seat now (another: it cannot be in this one) */
+    int gave_has_record;
+    int in_party;               /* the key's seat's ID is in the party or the field's copy of it */
+    int busy;                   /* a battle, a save's stand-ins, a load's pieces still to put on: nothing moves now */
+};
+
+#define SEAT_WHEN_NOTHING       0   /* as it should be */
+#define SEAT_WHEN_TAKE          1   /* bit on: the key's character takes the seat; whoever is there steps aside with its record */
+#define SEAT_WHEN_ADOPT         2   /* bit on, it is there already (a save made with the bit on): the key holds the seat now */
+#define SEAT_WHEN_RETURN        3   /* bit off: it steps aside with its record; the one that gave the seat up comes back */
+#define SEAT_WHEN_RETURN_EMPTY  4   /* bit off: it steps aside; nobody to bring back (the seat was empty, the one who gave it sits elsewhere now, or not known): the seat's own character, if any */
+#define SEAT_WHEN_LET_GO        5   /* bit off, it is no longer in the seat (moved by a menu): the key lets go, nothing moves */
+#define SEAT_WHEN_WAIT_BUSY     6   /* a move is due but not now */
+#define SEAT_WHEN_WAIT_PARTY    7   /* bit off, but the seat's ID is in the party and nobody with a record would answer to it */
+#define SEAT_WHEN_WAIT_HOLDER   8   /* bit on, but the key's character sits in another seat whose ID is in the party */
+#define SEAT_WHEN_REFUSE_SEAT   9   /* bit on, the seat is not one of this game's */
+
+static int seat_when_judge(const struct seat_when_view *v)
+{
+    int verdict;
+
+    if (v->bit_on) {
+        if (v->holder_here)
+            verdict = v->active ? SEAT_WHEN_NOTHING : SEAT_WHEN_ADOPT;
+        else if (!v->seat_exists)
+            verdict = SEAT_WHEN_REFUSE_SEAT;
+        else if (v->holder_elsewhere_in_party)
+            verdict = SEAT_WHEN_WAIT_HOLDER;
+        else
+            verdict = SEAT_WHEN_TAKE;
+    } else if (!v->active) {
+        verdict = SEAT_WHEN_NOTHING;
+    } else if (!v->holder_here) {
+        verdict = SEAT_WHEN_LET_GO;
+    } else if (v->gave >= 0 && !v->gave_seated) {
+        verdict = v->in_party && !v->gave_has_record ? SEAT_WHEN_WAIT_PARTY : SEAT_WHEN_RETURN;
+    } else {
+        verdict = v->in_party ? SEAT_WHEN_WAIT_PARTY : SEAT_WHEN_RETURN_EMPTY;
+    }
+    if (v->busy && (verdict == SEAT_WHEN_TAKE || verdict == SEAT_WHEN_RETURN || verdict == SEAT_WHEN_RETURN_EMPTY))
+        verdict = SEAT_WHEN_WAIT_BUSY;
+    return verdict;
+}
+
+/* Who stepped aside, as the companion file's header keeps it for each seat (bytes 80-83): 0 the key holds no seat
+   there; 0xff it holds it and the seat was empty; 0xfe it holds it and who sat there is not known; else the file ID of
+   the one who stepped aside. And back: `byte` read from a file, `first_id` the first section's ID, `count` the roster's
+   size: *active, *gave. A byte that names no roster character reads as not known. */
+#define SEAT_WHEN_BYTE_NONE     0x00
+#define SEAT_WHEN_BYTE_EMPTY    0xff
+#define SEAT_WHEN_BYTE_UNKNOWN  0xfe
+
+static int seat_when_byte(int active, int gave, int first_id)
+{
+    if (!active)
+        return SEAT_WHEN_BYTE_NONE;
+    if (gave == SEAT_WHEN_NOBODY)
+        return SEAT_WHEN_BYTE_EMPTY;
+    if (gave < 0 || first_id + gave > 0xfd)
+        return SEAT_WHEN_BYTE_UNKNOWN;
+    return first_id + gave;
+}
+
+static void seat_when_unbyte(int byte, int first_id, int count, int *active, int *gave)
+{
+    *active = byte != SEAT_WHEN_BYTE_NONE;
+    *gave = byte == SEAT_WHEN_BYTE_EMPTY ? SEAT_WHEN_NOBODY
+          : byte >= first_id && byte < first_id + count && byte != SEAT_WHEN_BYTE_UNKNOWN ? byte - first_id : SEAT_WHEN_UNKNOWN;
+}
+/* seat_keepers' choice for an unseated keeper: SEAT_WHEN_KEEPER_WAIT it gave its seat to a key whose bit is on (it has
+   it back when the bit goes off), SEAT_WHEN_KEEPER_OWN it takes the seat of its own ID (`own_exists`: there is such a
+   seat; not when another keeper is there, nor when a key whose bit is on holds it), else SEAT_WHEN_KEEPER_ANY: any
+   seat seat_for finds (which skips a held seat). */
+#define SEAT_WHEN_KEEPER_WAIT   0
+#define SEAT_WHEN_KEEPER_OWN    1
+#define SEAT_WHEN_KEEPER_ANY    2
+
+static int seat_when_keeper(int waits, int own_exists, int own_kept_by_other, int own_held)
+{
+    if (waits)
+        return SEAT_WHEN_KEEPER_WAIT;
+    return own_exists && !own_kept_by_other && !own_held ? SEAT_WHEN_KEEPER_OWN : SEAT_WHEN_KEEPER_ANY;
+}
+/* ---- SEAT WHEN PURE end ---- */
+
 /* first weapon of each of the nine, for a sheet that names none (build_character_record; forget_sheet_byte) */
 static const BYTE sheet_first_weapon[9] = { 0, 32, 16, 62, 48, 87, 101, 114, 73 };
 
@@ -19967,6 +20248,10 @@ struct new_character {
     int battle_when_flag;               /* `battle_files_when = BANK:BYTE.BIT xx`: while the bit is on the battle files are xx..; FORGET_FLAG_NONE = no key */
     char battle_when_prefix[4];         /* xx, upper case */
     char battle_letters_now[4];         /* the two letters the last battle load of this character chose (battle_prefix or battle_when_prefix); "" = none yet */
+    /* `seat_when = BANK:BYTE.BIT SEAT` (SEAT WHEN PURE): while the bit is on the character sits in that seat. Last in the
+       struct, as the outfit keys. Not copied by copy_of. */
+    int seat_when_flag;                 /* the bit; FORGET_FLAG_NONE = no key */
+    int seat_when_seat;                 /* the seat's character ID, 13 to 15; 0 = no key (or refused after the file was read) */
 };
 
 /* ---- Seats and the roster ------------------------------------------------------
@@ -19998,6 +20283,12 @@ static LONG new_characters_live;
 static int seat_count = 2;                                      /* 4 once the table of record indices reaches ID 15 */
 static int seats_wanted = SEAT_MAX;                             /* `seats` in the game file: 2 leaves that table alone */
 static signed char seat_roster[SEAT_MAX] = { -1, -1, -1, -1 }; /* who sits in each seat: an index in new_characters, or -1 */
+/* (`seat_when`) For each seat: the key of the character in it put it there (1), and who stepped aside then (a roster
+   index, SEAT_WHEN_NOBODY or SEAT_WHEN_UNKNOWN). Forgotten with a game (sxc2_forget_loaded); a load takes them back from
+   the companion file's header (seat_when_take_header, before its seating); every save writes them there (sxc2_build). */
+static BYTE seat_when_active[SEAT_MAX];
+static signed char seat_when_gave[SEAT_MAX] = { SEAT_WHEN_UNKNOWN, SEAT_WHEN_UNKNOWN, SEAT_WHEN_UNKNOWN, SEAT_WHEN_UNKNOWN };
+static BYTE seat_when_said[ROSTER_MAX];         /* the last wait or refusal logged for each key: said once until it changes */
 
 /* The occupant of a seat, by the seat's character ID; NULL for any other ID and for an empty seat. */
 static struct new_character *new_character(int id)
@@ -20124,6 +20415,42 @@ static void outfit_check_keys(void)
             forget_flag_text(c->battle_when_flag, other);
             log_line("character %d: the field's and the battle's outfit keys name different bits (%s and %s): the field and the battle can then disagree",
                      character_file_id(c), bit, other);
+        }
+    }
+}
+
+/* (`seat_when`) After the character file is read: the keys that stand (SEAT WHEN PURE's seat_when_check), one line each.
+   A key's character that also has keep_seat loses the keep_seat (it would take a seat for good). */
+static void seat_when_check_keys(void)
+{
+    int seat[ROSTER_MAX], reason[ROSTER_MAX], other[ROSTER_MAX], i;
+    char bit[16];
+
+    for (i = 0; i < ROSTER_MAX; i++) {
+        struct new_character *c = &new_characters[i];
+
+        seat[i] = c->defined && c->seat_when_flag != FORGET_FLAG_NONE ? c->seat_when_seat : 0;
+    }
+    seat_when_check(ROSTER_MAX, seat, reason, other);
+    for (i = 0; i < ROSTER_MAX; i++) {
+        struct new_character *c = &new_characters[i];
+
+        if (!c->defined || c->seat_when_flag == FORGET_FLAG_NONE)
+            continue;
+        forget_flag_text(c->seat_when_flag, bit);
+        if (reason[i] == SEAT_WHEN_KEY_SHARED)
+            log_line("character %d: seat_when %s %d is REFUSED: character %d's seat_when names seat %d already (one key a seat); the key is off",
+                     character_file_id(c), bit, c->seat_when_seat, NEW_CHARACTER_FIRST_ID + other[i], c->seat_when_seat);
+        else
+            log_line("character %d: seat_when: while save bit %s is on it sits in seat %d; whoever sits there (a keeper too) steps aside with its record and has the seat back when the bit goes off",
+                     character_file_id(c), bit, c->seat_when_seat);
+        if (reason[i] != SEAT_WHEN_KEY_OK) {
+            c->seat_when_flag = FORGET_FLAG_NONE;
+            c->seat_when_seat = 0;
+        } else if (c->keep_seat > 0) {      /* only for a key that stands: a refused one leaves keep_seat as it is */
+            log_line("character %d: keep_seat is not used: it has a seat_when key (it sits in seat %d only while that key's bit is on)",
+                     character_file_id(c), c->seat_when_seat);
+            c->keep_seat = 0;
         }
     }
 }
@@ -20257,6 +20584,25 @@ static void seat_put(int seat, struct new_character *c)
 
 static int seat_for(struct new_character *c, int spare_slot);
 
+/* (`seat_when`) Seat `seat` (0-3) is held by the key of the character in it, whose bit is on: nobody else is given it. */
+static BOOL seat_when_holds(int seat)
+{
+    const struct new_character *there = new_character(NEW_CHARACTER_FIRST_ID + seat);
+
+    return there && there->seat_when_seat == NEW_CHARACTER_FIRST_ID + seat && outfit_bit_on(there->seat_when_flag);
+}
+
+/* (`seat_when`) `c` stepped aside for a key that still holds that seat: it waits for it and is given no other. */
+static BOOL seat_when_waits(const struct new_character *c)
+{
+    int seat;
+
+    for (seat = 0; seat < SEAT_MAX; seat++)
+        if (seat_when_active[seat] && seat_when_gave[seat] == (int)(c - new_characters))
+            return TRUE;
+    return FALSE;
+}
+
 /* `keep_seat = yes`: such a character is always seated. One that is not takes the seat of its own
    ID if that seat is not another keeper's, else any seat seat_for finds. */
 static void seat_keepers(void)
@@ -20265,15 +20611,19 @@ static void seat_keepers(void)
 
     for (n = 0; n < ROSTER_MAX; n++) {
         struct new_character *c = &new_characters[n], *there;
-        int own = n;        /* its own seat's number, if there is such a seat */
+        int own = n, way;   /* its own seat's number, if there is such a seat */
 
         if (!c->defined || c->keep_seat <= 0 || c->seated)
             continue;
         there = own < seat_count ? new_character(NEW_CHARACTER_FIRST_ID + own) : NULL;
-        if (own < seat_count && !(there && there->keep_seat > 0))
+        way = seat_when_keeper(seat_when_waits(c), own < seat_count, there && there->keep_seat > 0, own < seat_count && seat_when_holds(own));
+        if (way == SEAT_WHEN_KEEPER_WAIT)
+            continue;       /* (`seat_when`) it gave its seat to a key whose bit is on: it has it back when the bit goes off */
+        if (way == SEAT_WHEN_KEEPER_OWN)
             seat_put(own, c);
         else if (seat_for(c, -1) < 0)
-            log_line("character %d: keep_seat: no seat could be given (more keepers than seats, or all in the party)", character_file_id(c));
+            log_line("character %d: keep_seat: no seat could be given (more keepers than seats, or all in the party%s)", character_file_id(c),
+                     seat_when_holds(0) || seat_when_holds(1) || seat_when_holds(2) || seat_when_holds(3) ? "; or a seat_when key whose bit is on holds its seat: it is seated when that bit goes off" : "");
     }
 }
 
@@ -20306,6 +20656,8 @@ static int seat_for(struct new_character *c, int spare_slot)
 
     if (c->seated)
         return character_seat_id(c);
+    if (seat_when_waits(c))
+        return -1;                          /* (`seat_when`) it waits for the seat it gave up to a key */
     /* first without the party member who is about to leave (spare 0): that one keeps its seat, and
        stays in the PHS under its own ID, as long as any other seat will do */
     for (spare = 0; spare < (spare_slot >= 0 ? 2 : 1); spare++)
@@ -20319,6 +20671,8 @@ static int seat_for(struct new_character *c, int spare_slot)
                 continue;
             if (there && there->keep_seat > 0)
                 continue;                   /* `keep_seat`: that seat is nobody else's */
+            if (seat_when_holds(seat))
+                continue;                   /* (`seat_when`) a key whose bit is on holds it */
             for (slot = 0; slot < 3; slot++)
                 in_party |= !(spare && slot == spare_slot) && party[slot] == id;
             if (in_party)
@@ -22605,6 +22959,8 @@ static int load_characters(void)
                 current->party_slot = 0;
                 current->join_on_load = 0;
                 current->forget_flag = FORGET_FLAG_NONE;
+                current->seat_when_flag = FORGET_FLAG_NONE;        /* (`seat_when`) none until the section says */
+                current->seat_when_seat = 0;
                 current->portrait[0] = 0;
                 current->portrait_number = -1;
                 current->portrait_texture = 0;
@@ -22662,6 +23018,10 @@ static int load_characters(void)
                         problem = "expected yes or no";
                 } else if (word_is(start, key_end, "forget_flag")) {
                     problem = forget_flag_parse(value, stop, &current->forget_flag);
+                } else if (word_is(start, key_end, "seat_when")) {
+                    static char seat_when_msg[160];
+
+                    problem = seat_when_parse(value, stop, &current->seat_when_flag, &current->seat_when_seat, seat_when_msg, (int)sizeof seat_when_msg);
                 } else if (word_is(start, key_end, "copy_of")) {
                     /* everything an earlier section says, to be changed by the lines that follow (so it
                        belongs at the top of its section); not its party slot or how it joins */
@@ -22676,6 +23036,8 @@ static int load_characters(void)
                         current->copy_of = (int)n;
                         current->party_slot = current->join_on_load = current->keep_seat = 0;
                         current->forget_flag = FORGET_FLAG_NONE;       /* (a guest's one-shot request names that guest alone) */
+                        current->seat_when_flag = FORGET_FLAG_NONE;    /* (`seat_when`: two keys cannot name one seat) */
+                        current->seat_when_seat = 0;
                         current->portrait_texture = current->battle_avatar_texture = 0;
                         current->battle_avatar_tried = current->battle_avatar_queued = 0;
                         current->limit_block = current->seated = 0;
@@ -22769,6 +23131,7 @@ static int load_characters(void)
             portrait_source_line(c);
     }
     outfit_check_keys();            /* (the outfit keys) each _when key needs its plain key; a skeleton two characters share is refused */
+    seat_when_check_keys();         /* (`seat_when`) a seat an earlier key names is refused; a kept seat may be borrowed */
     return count;
 }
 
@@ -25658,7 +26021,10 @@ static int __cdecl field_read_hook(const char *name)
     if (!resumed)
         fields_after_read(name, result);            /* (field capacity) a registered field's line; nothing with the feature off */
     /* back from a battle or a menu nothing was read: the file is as it was left here, and nothing is done or said */
+    if (result && !resumed)
+        command_learn_poll("a field is read");      /* (new commands, stage 9b) a field request's two save bytes */
     if (result && !resumed && new_characters_live) {
+        seat_when_poll("a field is read");          /* (`seat_when`) before the bodies: the seat's field body is already its key's character's */
         field_swap_skeletons(name ? name : "?");     /* (the outfit swap) a second look for a character whose save bit is on; before the seats, so a merged body is named as the rest */
         if (field_entities_hooked && field_entities_mode)
             field_add_seats(name ? name : "?");
@@ -26636,6 +27002,7 @@ static void __cdecl new_game_hook(void)
             release_limit_block(&new_characters[n]);
         }
         clear_new_records();
+        seat_when_forget();         /* (`seat_when`) before the seating: no keeper of the last game waits for a seat */
         seat_defaults();
         log_line("new game: every seat back to its own character, without a record");
     }
@@ -29118,15 +29485,18 @@ static void menu_target_widen(void)
     }
 }
 
+static void command_w_menu(void);      /* ("New commands", stage 7) */
 static void __cdecl menu_target_hook_a(void)
 {
     menu_target_widen();
+    command_w_menu();           /* (new commands, stage 7) the W flag of a w_form command's row */
     ((void (__cdecl *)(void))menu_target_next[0])();
 }
 
 static void __cdecl menu_target_hook_b(void)
 {
     menu_target_widen();
+    command_w_menu();           /* (new commands, stage 7) the same for a cursor-7 row */
     ((void (__cdecl *)(void))menu_target_next[1])();
 }
 
@@ -29385,15 +29755,22 @@ static void state_turn_aim(int actor, int *action, int turn)
     note->record = (short)count;
 }
 
+static int command_weapon_before(BYTE *saved);              /* ("New commands", after the materia file code) */
+static void command_weapon_after(const BYTE *saved, int lent);
+
 /* Handler 0x0e of the command handler table (008fee80): the weapon set-up of Attack, Morph,
-   Deathblow, Mug, Slash-All, 2x-Cut, Flash and 4x-Cut. The game's routine first, unchanged. */
+   Deathblow, Mug, Slash-All, 2x-Cut, Flash and 4x-Cut. The game's routine first, unchanged (for a new
+   physical command, with the command's values lent to the weapon record around it: "New commands"). */
 static void __cdecl weapon_setup_hook(void)
 {
+    BYTE saved[0x18];           /* (new commands) the weapon record, COMMAND_WEAPON_RECORD bytes */
     int *action;
-    int actor;
+    int actor, lent;
 
     spell_bytes_put_back();     /* script_bytes: the last action's lent cast slots go back (its display is over) */
+    lent = command_weapon_before(saved);
     ((void (__cdecl *)(void))FN_WEAPON_SETUP)();
+    command_weapon_after(saved, lent);      /* (new commands) the record put back at once; a physical command's writes */
     action = current_action();
     actor = action[ACT_ACTOR];
     camera_clock_stop("the next action was set up");   /* (an action's clock, clock = action, ends with the last display) */
@@ -29427,6 +29804,15 @@ static void __cdecl weapon_setup_hook(void)
     /* hits = 1 changes no hits, but scripts of the state's own, its targets, element or range still apply */
     if (state_run[actor].on && (state_run[actor].state.hits > 1 || state_changes_attacks(&state_run[actor].state)))
         state_hits(actor, action);
+}
+
+/* The weapon set-up's entry, put in once for whoever needs it first: the new characters' states
+   (install_limit_hooks) or a new physical command (load_commands). */
+static BOOL weapon_setup_install(void)
+{
+    if (!weapon_hook_live)
+        weapon_hook_live = patch_pointer(ADDR_WEAPON_SETUP_ENTRY, FN_WEAPON_SETUP, weapon_setup_hook);
+    return weapon_hook_live && *(const DWORD *)ADDR_WEAPON_SETUP_ENTRY == (DWORD)weapon_setup_hook;
 }
 
 /* ---- A state's `physical_evade = 100` -------------------------------------------------------------
@@ -31245,11 +31631,20 @@ static void state_dex_end(int actor)
              now == state_run[actor].dex_written ? " (the value before the state)" : " (it had been changed since the raise: only the state's part comes off, at least 1 left)");
 }
 
+static void commands_battle_start(void);       /* ("New commands", after the materia file code) */
+
 static void __cdecl battle_start_party_hook(void)
 {
     const BYTE *party = (const BYTE *)ADDR_PARTY;
     int slot;
 
+    if (!battle_start_hooked) {
+        /* (new commands) the call is in for them alone (install_limit_hooks never ran: no new character): the
+           game's routine and their step, nothing else of this hook */
+        ((void (__cdecl *)(void))FN_BATTLE_START_PARTY)();
+        commands_battle_start();
+        return;
+    }
     if (limits_to_copy) {
         /* a new character joined while the battle was being set up: the limits in its party slot's
            data are those of nobody. The game's own copy routine, as it runs after a load. */
@@ -31258,6 +31653,7 @@ static void __cdecl battle_start_party_hook(void)
         log_line("battle start: the party's limits copied afresh (a new character had just joined)");
     }
     ((void (__cdecl *)(void))FN_BATTLE_START_PARTY)();
+    commands_battle_start();    /* new commands: their handler lists, now that FUN_00437db0 has rebuilt the offsets */
     forget_followup_scripts();
     spell_bytes_forget();       /* script_bytes: the models are loaded afresh, nothing to put back */
     atb_dex_battle_start();     /* atb_follows_dexterity: the dexterity the steps are about to be made from */
@@ -31677,17 +32073,31 @@ static void spell_script_apply(int *action, int spell)
    before the next is set up), only if the table is still the actor's own and the slot still holds the copy
    (the states' rule: nothing is written into a model loaded since, or a slot another hand wrote), never
    while the actor plays it; it is forgotten at a battle's start (the models are loaded afresh).
-   At reading (spell_bytes_problem): only the commands the game's own cast scripts use (slots 0x1d-0x1f of its
-   20 party files) plus the c9 .. ca hold, animations 00-2b, e8 first, one ec, ee last; a hold needs something
-   that ends the frame's pass between the first byte c9 and the first ca (ca jumps there while an effect loads,
-   00bf2a30: with the game's own loader a hold of nothing spins within one frame), no ec inside it; ed needs
-   an fa after it. At the cast (spell_bytes_apply): a party actor, a cast as magic, script 1d or 1f, its own
-   model drawn (not a frog), the model's animation count (record +8) above every animation the bytes play
-   and each one loaded (+0xc), the slot not lent by a state nor played now, the last lend back; with
-   `script_bytes_model = XY`, the caster's script file is XY.. (a form's model_script / model_files, a new
-   character's battle_files of this battle, else the battle archive's name for the slot's data file).
-   Otherwise the command's own script plays, with one log line per spell and model. */
+   At reading (spell_bytes_problem), walked command by command with form_operands: up to 255 bytes; any command
+   of the battle model scripts but those refused with their reason (spell_bytes_refused: they lock, end the
+   record early, reload, start a death, write past a table, or were not traced; bb c0 cd d2 d3 d9 ef are not
+   commands but animations, write a7 NN); animations 00-8d as a byte and any number as a7 / a9 / b6's operand,
+   but 2c-33 (a limit pack's); one e8 before one effect step (ec, or d6 NN: the step NN frames later, through
+   004277e5); the last command ee or ff, once; an fa after the last command that moves the caster (a8, ab too);
+   no 00 where the game divides by a frame count; d0's NN 00-07, b9's 00-66, ad's first byte 00-0f, d7's second
+   00-47, c6's NN 01-7f (a signed divisor of every fade) and the last c6 c6 0e (the battle's own: it outlives the
+   cast); what lasts with its undo after it (b6 .. aa, e7 00 / b8 .. e7 NN or e1, e2 .. e1, a0 / af .. ae, ab ..
+   a6, 8e .. 8f; e1 and e2 after a c6 NN); at most three 10-list tasks a frame's pass; a hold c9 .. ca with
+   something that ends the frame's pass between the first byte c9 and the first ca (ca jumps there while an
+   effect loads, 00bf2a30: with the game's own loader a hold of nothing spins within one frame), no effect step
+   inside it; a b3 with its b2 and nothing needed skipped (c6 included). f7 be c2 a1 (the results shown by the
+   script too) give a line at reading.
+   At the cast (spell_bytes_apply): a party actor, a cast as magic, script 1d or 1f, its own model drawn (not a
+   frog), the model's animation count (record +8) above every animation the bytes play and each one loaded
+   (+0xc); for bytes with an animation 34 up, a0 / af, d6, e2 or a move, the animations' records (+4 frames, +8
+   bones): a body's bones for 34 up (not a weapon track), a0 / af at a bone the model has, enough frames after
+   d6, every move over before the last fa, each e2's fade-out over before its e1 / e7 NN
+   (spell_bytes_cast_problem); the slot not lent by a state nor played now, the last lend back; with
+   `script_bytes_model = XY`, the caster's script file is XY.. (a form's
+   model_script / model_files, a new character's battle_files of this battle, else the battle archive's name
+   for the slot's data file). Otherwise the command's own script plays, with one log line per spell and model. */
 #define SPELL_BYTES_LOGS        64           /* "spell bytes:" lines, per run of the game */
+#define SPELL_BYTES_ANIMATIONS  256          /* the animation numbers a script may play (a byte, or a7 / a9 / b6's operand) */
 
 /* SPELL BYTES PURE BEGIN  (no Win32 call inside: tested natively, script_bytes stage B1's test) */
 static struct spell_bytes_lend {
@@ -31698,20 +32108,19 @@ static struct spell_bytes_lend {
     BYTE bytes[SPELL_BYTES_BUFFER];     /* the copy, the rest ee */
 } spell_bytes_lent[3];
 
-/* `text` with its first XX replaced by `value` in hexadecimal (a static buffer, for a problem line). */
+/* `text` with every XX replaced by `value` in hexadecimal (a static buffer, for a problem line). */
 static const char *spell_bytes_say(const char *text, int value)
 {
     static char out[256];
     static const char digits[] = "0123456789abcdef";
-    int i = 0, done = 0;
+    int i = 0;
 
     for (; *text && i < (int)sizeof out - 1; text++) {
-        if (!done && text[0] == 'X' && text[1] == 'X') {
+        if (text[0] == 'X' && text[1] == 'X') {
             out[i++] = digits[value >> 4 & 15];
             if (i < (int)sizeof out - 1)
                 out[i++] = digits[value & 15];
             text++;
-            done = 1;
         } else {
             out[i++] = *text;
         }
@@ -31720,68 +32129,166 @@ static const char *spell_bytes_say(const char *text, int value)
     return out;
 }
 
-/* The commands a spell's script_bytes may use: those of the game's own cast scripts, and the hold c9 / ca. */
-static BOOL spell_bytes_allowed(BYTE op)
+/* Whether `op` is one of the `n` bytes of `set`. */
+static BOOL spell_bytes_in(const BYTE *set, int n, BYTE op)
 {
-    static const BYTE list[] = { 0xe8, 0xec, 0xea, 0xfc, 0xed, 0xfa, 0xe5, 0xe6, 0xa4, 0xa5, 0xf4, 0xf3, 0xc9, 0xca, 0xee };
-    unsigned i;
+    int i;
 
-    for (i = 0; i < sizeof list; i++)
-        if (list[i] == op)
+    for (i = 0; i < n; i++)
+        if (set[i] == op)
             return TRUE;
     return FALSE;
 }
+#define SPELL_BYTES_IN(set, op) spell_bytes_in(set, (int)sizeof set, op)
 
-static const char *spell_bytes_refused_command(BYTE op)
+/* Bytes from 0x8e whose entry of the interpreter's jump table (004248c2, sub 0x8e, cmp 0x71) is the switch's
+   default 004246ee: not commands, they play as animation numbers. */
+static const BYTE spell_bytes_animation_bytes[] = { 0xbb, 0xc0, 0xcd, 0xd2, 0xd3, 0xd9, 0xef };
+/* The commands that move the caster: an fa after the last of them puts it home (FUN_00425119). a8 walks it home
+   over its frames, but not on a cast at itself (00426c9b: no step when 00bfb198 is the caster), so it is one more;
+   ab puts the caster at the target's home and turns it before it places the target (0042182e: 0042188c, 004218ae
+   write the caster's place from 00bfd0a0 + 00bfcb68 * 6), and its a6 puts back only the target. */
+static const BYTE spell_bytes_movers[] = { 0x99, 0x9a, 0xfb, 0xbd, 0xb0, 0xb1, 0xc4, 0xc8, 0xcc, 0xcf, 0xd0, 0xd1,
+                                           0xd4, 0xd5, 0xe4, 0xe9, 0xed, 0xfd, 0xa8, 0xab };
+/* The commands that start a task on the 10-list (005becf1: ten slots shared by every actor; with none free it
+   returns -1, and the movers write through it) */
+static const BYTE spell_bytes_ten_list[] = { 0x94, 0x99, 0xcc, 0xcf, 0xd0, 0xd1, 0xd5, 0xe9, 0xc4, 0xc8, 0xd4, 0xa8 };
+/* What a b3 .. b2 skip may not pass over: the preload, the effect step, the end, a hold, a way home, an undo, the
+   stored wait (c6: the fades and the cast check take the last one before them) */
+static const BYTE spell_bytes_no_skip[] = { 0xe8, 0xec, 0xd6, 0xee, 0xff, 0xc9, 0xca, 0xb3, 0xfa, 0xa8, 0xe1, 0xa6,
+                                            0xae, 0xaa, 0xe7, 0x8f, 0xc6 };
+
+/* Why the command `op` (0x8e-0xff, not one of the animation bytes) may not be in a spell's script_bytes, from its
+   case of FUN_0041fba4; NULL: allowed (some with a rule of spell_bytes_problem's). */
+static const char *spell_bytes_refused(BYTE op)
 {
-    if (op == 0xb6 || op == 0xaa)
-        return "b6 NN aa are an enemy's (a 60-list task and the camera's hold, no party script uses them): write NN as a plain animation byte and drop aa";
-    if (op == 0xa2 || op == 0xac)
-        return spell_bytes_say("XX reloads the model (a2 / ac)", op);
-    if (op == 0xc1 || op == 0xb3 || op == 0xce)
-        return spell_bytes_say("XX jumps (to a mark of the script)", op);
-    if (op == 0xfe || op == 0xff)
-        return spell_bytes_say("XX never finishes (fe c0 / ff): the battle would wait on it", op);
-    if (op == 0xf1)
-        return "f1 holds the script on its own byte after the action: the slot is put back under it";
-    if (op == 0x9e)
-        return "9e waits on the target and the effects: no game cast does, and a 9e end once locked a battle";
-    return spell_bytes_say("XX is not one of the commands the game's own cast scripts use (e8 ec ea fc ed fa e5 e6 a4 a5 f4 f3 c9 ca ee)", op);
+    switch (op) {
+    case 0x90: return "90 recolours a model part chosen only for actors 6-9: for a party actor the part is whatever the last command left";
+    case 0x92: return "92 stops the battle clock (00bfb2ec): only the battle's set-up and the summon and limit effects clear it";
+    case 0x93: return "93 starts a white-out that never ends (60-list task 005bcd42): a white screen for the rest of the battle";
+    case 0x97: return "97 runs the enemies' deaths";
+    case 0x98: return "98 is a second name banner with an argument: not traced";
+    case 0x9d: return "9d starts one of a limit's effects beside the spell's";
+    case 0x9e: return "9e waits on the target and the effects, then marks the caster finished: the record can end before the rest (a 9e end once locked a battle)";
+    case 0xa2:
+    case 0xac: return spell_bytes_say("XX reloads the model (a2 / ac)", op);
+    case 0xa3: return "a3 is a sound operation (0xa4): not traced";
+    case 0xb7: return "b7 starts the caster's own death";
+    case 0xbc: return "bc changes the battle's resting camera for the rest of the battle";
+    case 0xbf: return "bf writes the byte 00bfcdf0 + NN for any NN (past its table)";
+    case 0xc1: return "c1 always jumps back to just after the first c9: the script never ends";
+    case 0xc3: return "c3 marks the caster finished and starts its disintegration (an enemy's death)";
+    case 0xc7: return "c7 starts another actor's script";
+    case 0xce: return "ce is an enemy's skip to the next cd: for a party actor it does nothing and the cd plays as an animation";
+    case 0xda: return "da changes the effect the effect step plays, after e8 preloaded the spell's";
+    case 0xdc: return "dc writes a word of the caster's state for any NN (its script position, its finished flag)";
+    case 0xe3: return "e3 moves the caster's home for the rest of the battle";
+    case 0xeb: return "eb is the Item / Throw step: it frees the effect files e8 preloaded";
+    case 0xf1: return "f1 holds the script on its own byte after the action: the slot is put back under it";
+    case 0xf5: return "f5 is an enemy's: for a party actor it writes before its table";
+    case 0xf6: return "f6 is a reaction's: the caster's death when it is due";
+    case 0xf8: return "f8 starts a model effect program from the script file's header: party files have none";
+    case 0xfe: return "fe never finishes (fe c0 goes back to the idle): the battle would wait on it";
+    }
+    return NULL;
 }
 
-/* NULL if `length` bytes may be a spell's script_bytes, else why not; *max_animation is the highest animation
-   byte it plays (-1: none). Walked command by command with form_operands. */
+/* The bytes of the command `op`: an animation byte is one, a command one more than form_operands gives. */
+static int spell_bytes_size(BYTE op)
+{
+    return op < 0x8e ? 1 : 1 + form_operands[op - 0x8e];
+}
+
+/* Which operand (0: the first after the command) the game divides by for `op`: its frame count or interval
+   (0042519a's param_5 for 99 cc cf d1 d5 e9; 94 and d4 their NN; a8 its MM in 00426c9b; a1 its MM, 005beb68's %);
+   -1 none. */
+static int spell_bytes_divisor(BYTE op)
+{
+    switch (op) {
+    case 0x94: case 0xd1: return 4;     /* 94 W W NN, d1 W W FF */
+    case 0x99: return 5;                /* 99 NN W W FF */
+    case 0xcc: return 0;                /* cc NN */
+    case 0xcf: case 0xd5: return 7;     /* W W W NN FF */
+    case 0xd4: case 0xe9: return 2;     /* d4 W NN, e9 W FF */
+    case 0xa1: case 0xa8: return 1;     /* NN MM */
+    }
+    return -1;
+}
+
+/* The animation the command at b[i] plays: a byte below 0x8e, or the operand of a7 NN, a9 xx NN, b6 NN; -1 none.
+   (The caller has checked that the command's operands are inside the bytes.) */
+static int spell_bytes_animation_at(const BYTE *b, int i)
+{
+    if (b[i] < 0x8e)
+        return b[i];
+    if (b[i] == 0xa7 || b[i] == 0xb6)
+        return b[i + 1];
+    if (b[i] == 0xa9)
+        return b[i + 2];
+    return -1;
+}
+
+/* The frames the 10-list move of the caster at b[i] lasts, its delay included, or -1 if b[i] is not one. `delay`
+   is the delay a 99 before it may have left in 00be10b4, which every move FUN_0042519a starts takes (99 d1 cc cf d5
+   e9 d0); c4 c8 d4 start their own tasks, a8 has its own delay NN. */
+static int spell_bytes_move_frames(const BYTE *b, int i, int delay)
+{
+    switch (b[i]) {
+    case 0x99: return b[i + 1] + b[i + 6];
+    case 0xd1: return delay + b[i + 5];
+    case 0xcc: return delay + b[i + 1];
+    case 0xcf: case 0xd5: return delay + b[i + 8];
+    case 0xe9: return delay + b[i + 3];
+    case 0xd0: return delay + (b[i + 3] < 4 ? 5 : 8);
+    case 0xc4: case 0xd4: return b[i + 3];
+    case 0xc8: return b[i + 5];
+    case 0xa8: return b[i + 1] + b[i + 2];
+    }
+    return -1;
+}
+
+/* NULL if `length` bytes may be a spell's script_bytes, else why not; *max_animation is the highest animation it
+   plays (a byte below 0x8e, or the operand of a7 / a9 / b6; -1: none). Walked command by command with
+   form_operands (each of the interpreter's cases reads exactly that many bytes). */
 static const char *spell_bytes_problem(const BYTE *b, int length, int *max_animation)
 {
-    int at[SPELL_BYTES_MAX], count = 0, i, j, e8 = 0, ec = 0, c9 = 0, first_c9, first_ca = -1, last_ca = -1;
+    int at[SPELL_BYTES_MAX], count = 0, i, j, k, t, e8 = -1, e8s = 0, step = -1, steps = 0, c9 = 0, first_c9 = -1;
+    int first_ca = -1, last_ca = -1, last_move = -1, last_fa = -1, last_c6 = -1, starts;
     BOOL waits = FALSE, armed = FALSE, command;
 
     *max_animation = -1;
     if (length < 3)
         return "a cast is at least 3 bytes (e8, ec, ee)";
     if (length > SPELL_BYTES_MAX)
-        return "a spell's script_bytes may be up to 128 bytes";
-    if (b[0] != 0xe8)
-        return "a cast starts with e8, the preload of the spell's effect files";
+        return "a spell's script_bytes may be up to 255 bytes";
     for (i = 0; i < length; ) {
         BYTE op = b[i];
-        int n = 1;
+        int n = 1, a;
 
-        if (op < 0x8e) {
-            if (op >= 0x2c && op <= 0x33)
-                return spell_bytes_say("animation XX is a limit pack's (2c-33): a spell loads no pack", op);
-            if (op > 0x2b)
-                return spell_bytes_say("animation XX is past 2b: only the body animations that have a weapon track in the party layout, 00-2b", op);
-            if (op > *max_animation)
-                *max_animation = op;
-        } else {
-            if (!spell_bytes_allowed(op))
-                return spell_bytes_refused_command(op);
+        if (op >= 0x8e) {
+            const char *why;
+
+            if (SPELL_BYTES_IN(spell_bytes_animation_bytes, op))
+                return spell_bytes_say("XX is not a command: the game plays it as animation XX (write a7 XX)", op);
+            if ((why = spell_bytes_refused(op)) != NULL)
+                return why;
             n += form_operands[op - 0x8e];
             if (i + n > length)
                 return spell_bytes_say("the operands of XX run past the end", op);
-            e8 += op == 0xe8;
-            ec += op == 0xec;
+            if ((k = spell_bytes_divisor(op)) >= 0 && !b[i + 1 + k])
+                return spell_bytes_say("XX: its frame count (or interval) is 00: the game divides by it", op);
+            if (op == 0xd0 && b[i + 3] > 7)
+                return "d0: its NN is 00-07 (5 or 8 frames): above, the frame count is whatever the last move left";
+            if (op == 0xb9 && b[i + 1] > 0x66)
+                return "b9: the game's built-in cameras are 00-66";
+            if (op == 0xad && b[i + 1] > 0x0f)
+                return "ad: its first byte is 00-0f (the model's 16 aim bones)";
+            if (op == 0xd7 && b[i + 2] > 0x47)
+                return "d7: its second byte is 00-47 (the game's 72 hit marks, 007c3098): above, a pointer past that table is read";
+            if (op == 0xc6 && (!b[i + 1] || b[i + 1] > 0x7f))
+                return "c6: its NN is 01-7f: every fade (e1, e2, the game's own later in the battle) divides by it as a signed byte";
+            if ((op == 0xee || op == 0xff) && i != length - 1)
+                return spell_bytes_say("XX before the last byte: a cast ends with ee (or ff), once", op);
             c9 += op == 0xc9;
             if (op == 0xca) {
                 if (!c9)
@@ -31790,18 +32297,89 @@ static const char *spell_bytes_problem(const BYTE *b, int length, int *max_anima
                     first_ca = i;
                 last_ca = i;
             }
-            if (op == 0xee && i != length - 1)
-                return "ee before the last byte: a cast ends with ee, once";
         }
+        a = spell_bytes_animation_at(b, i);
+        if (a >= 0x2c && a <= 0x33)
+            return spell_bytes_say("animation XX is a limit pack's (2c-33): a spell loads no pack", a);
+        if (a > *max_animation)
+            *max_animation = a;
         at[count++] = i;
         i += n;
     }
-    if (b[at[count - 1]] != 0xee || at[count - 1] != length - 1)
-        return "the last command is not ee: a cast ends with ee, once";
-    if (e8 != 1)
-        return "e8 more than once: a cast has one preload";
-    if (ec != 1)
-        return ec ? "ec more than once: a cast has one effect step" : "no ec: a cast has one effect step";
+    if (b[at[count - 1]] != 0xee && b[at[count - 1]] != 0xff)
+        return "the last command is not ee (or ff): a cast ends with ee, once";
+    for (j = 0; j < count; j++) {
+        BYTE op = b[at[j]];
+
+        if (op == 0xe8 && !e8s++)
+            e8 = at[j];
+        if ((op == 0xec || op == 0xd6) && !steps++)
+            step = at[j];
+        if (op == 0xfa)
+            last_fa = j;
+        if (op == 0xc6)
+            last_c6 = j;
+        if (SPELL_BYTES_IN(spell_bytes_movers, op))
+            last_move = j;
+    }
+    if (e8s != 1)
+        return e8s ? "e8 more than once: a cast has one preload" : "no e8: a cast preloads the spell's effect files (e8) before its effect step";
+    if (steps != 1)
+        return steps ? "more than one effect step (ec, d6): a cast has one" : "no effect step: a cast has one, ec (or d6 NN, the effect step NN frames later)";
+    if (e8 > step)
+        return "e8 after the effect step: the preload comes before it";
+    if (last_move > last_fa)
+        return b[at[last_move]] == 0xa8 ? "a8 walks the caster home, but not on a cast at itself: an fa after it puts it home"
+             : spell_bytes_say("XX moves the caster: an fa after it puts it home (an a8 walk back goes before that fa)", b[at[last_move]]);
+    /* the stored wait outlives the cast (only the battle's set-up and a summon set it back, 0x0e): the last c6 puts that back */
+    if (last_c6 >= 0 && b[at[last_c6] + 1] != 0x0e)
+        return "c6: the last c6 is c6 0e (the battle's own stored wait): every later fade of the battle, the game's own too, takes the value left";
+    /* what lasts needs its undo after it; e1 / e2 divide by the stored wait */
+    for (j = 0; j < count; j++) {
+        BYTE op = b[at[j]], undo = 0;
+        const char *why = NULL;
+
+        switch (op) {
+        case 0xab: undo = 0xa6; why = "ab moves the target: an a6 after it puts it home"; break;
+        case 0xa0:
+        case 0xaf: undo = 0xae; why = "XX holds the target at a bone: an ae after it lets it go"; break;
+        case 0x8e: undo = 0x8f; why = "8e stops the battle's sprites being drawn: an 8f after it draws them again"; break;
+        case 0xb6: undo = 0xaa; why = "b6 holds the camera: an aa after it lets it run (else it stays held until the next record's camera)"; break;
+        case 0xe2: undo = 0xe1; why = "e2 fades the caster out: an e1 after it fades it in"; break;
+        }
+        if (undo) {
+            for (k = j + 1; k < count && b[at[k]] != undo; k++)
+                ;
+            if (k == count)
+                return spell_bytes_say(why, op);
+        }
+        if (op == 0xb8 || (op == 0xe7 && !b[at[j] + 1])) {
+            for (k = j + 1; k < count && b[at[k]] != 0xe1 && !(b[at[k]] == 0xe7 && b[at[k] + 1]); k++)
+                ;
+            if (k == count)
+                return spell_bytes_say("XX hides the caster: an e7 NN (not 00) or e1 after it shows it", op);
+        }
+        if (op == 0xe1 || op == 0xe2) {
+            for (k = 0; k < j && b[at[k]] != 0xc6; k++)
+                ;
+            if (k == j)
+                return spell_bytes_say("XX fades over the stored wait (it divides by it): a c6 NN (01-7f) before it", op);
+        }
+    }
+    /* at most three 10-list tasks between two commands that end a frame's pass (an animation, a7 a9 b6, f4 NN f3) */
+    for (starts = 0, j = 0; j < count; j++) {
+        BYTE op = b[at[j]];
+
+        if (spell_bytes_animation_at(b, at[j]) >= 0 || (op == 0xf3 && armed)) {
+            starts = 0;
+            armed = FALSE;
+            continue;
+        }
+        if (op == 0xf4)
+            armed = b[at[j] + 1] >= 1;
+        if (SPELL_BYTES_IN(spell_bytes_ten_list, op) && ++starts > 3)
+            return "more than three moves or turns start in one frame: the list of 10 is shared by every actor, and a full one is written at -1";
+    }
     if (first_ca >= 0) {
         /* ca (while an effect loads) searches the bytes from 0 for the first BYTE c9, operands included */
         for (first_c9 = 0; b[first_c9] != 0xc9; first_c9++)
@@ -31811,12 +32389,12 @@ static const char *spell_bytes_problem(const BYTE *b, int length, int *max_anima
                 command = TRUE;
         if (!command)
             return "a byte c9 inside a command's operand (f4 c9) comes before the hold's c9: ca would jump there";
-        for (j = 0; j < count; j++) {
+        for (armed = FALSE, j = 0; j < count; j++) {
             BYTE op = b[at[j]];
 
             if (at[j] <= first_c9 || at[j] >= first_ca)
                 continue;
-            if (op <= 0x2b)
+            if (spell_bytes_animation_at(b, at[j]) >= 0)
                 waits = TRUE;
             else if (op == 0xf4)
                 armed = b[at[j] + 1] >= 1;
@@ -31826,20 +32404,43 @@ static const char *spell_bytes_problem(const BYTE *b, int length, int *max_anima
         if (!waits)
             return "nothing between c9 and ca waits a frame: while the effect loads the hold would repeat for ever within one frame (the game's own: c9 f4 01 f3 ca, or c9 07 ca)";
         for (j = 0; j < count; j++)
-            if (b[at[j]] == 0xec && at[j] > first_c9 && at[j] < last_ca)
-                return "ec inside the hold: the effect step could run again";
+            if ((b[at[j]] == 0xec || b[at[j]] == 0xd6) && at[j] > first_c9 && at[j] < last_ca)
+                return spell_bytes_say("XX inside the hold: the effect step could run again", b[at[j]]);
     }
+    /* b3, while the caster is small (00bf23c0 bit 0x1000), searches on for the next BYTE b2 */
     for (j = 0; j < count; j++) {
-        int k;
-
-        if (b[at[j]] != 0xed)
+        if (b[at[j]] != 0xb3)
             continue;
-        for (k = j + 1; k < count && b[at[k]] != 0xfa; k++)
+        for (t = at[j] + 1; t < length && b[t] != 0xb2; t++)
             ;
-        if (k == count)
-            return "ed steps the caster forward, one step more each cast: only fa puts it home (an fa after it)";
+        if (t == length)
+            return "b3 skips to the next b2: there is none after it";
+        for (command = FALSE, k = j + 1; k < count && at[k] <= t; k++)
+            if (at[k] == t)
+                command = TRUE;
+        if (!command)
+            return "b3: a byte b2 inside an operand comes before its b2: the skip would land there";
+        for (k = j + 1; k < count && at[k] < t; k++)
+            if (SPELL_BYTES_IN(spell_bytes_no_skip, b[at[k]]))
+                return spell_bytes_say("b3 .. b2 may skip XX (the preload, the effect step, the end, a hold, a way home, an undo or the stored wait)", b[at[k]]);
+        if (first_ca >= 0 && !(t < first_c9 || at[j] > last_ca))
+            return "b3 .. b2 and a hold c9 .. ca overlap";
     }
     return NULL;
+}
+
+/* The first command of the bytes that shows the record's results itself (f7, be, c2, a1), -1 none: the spell's
+   effect shows its hits too, so each number may show twice (a line at reading). */
+static int spell_bytes_shows_results(const BYTE *b, int length)
+{
+    int i = 0;
+
+    while (i < length && i + spell_bytes_size(b[i]) <= length) {
+        if (b[i] == 0xf7 || b[i] == 0xbe || b[i] == 0xc2 || b[i] == 0xa1)
+            return b[i];
+        i += spell_bytes_size(b[i]);
+    }
+    return -1;
 }
 
 /* NULL if a spell with script_bytes may lend them for this actor, command type and script number. */
@@ -31854,24 +32455,171 @@ static const char *spell_bytes_rule(int actor, int command_type, int slot)
     return NULL;
 }
 
-/* The first animation the bytes play that a model with `count` animations (the record's +8) and the array
-   `animations` (its +0xc, readable up to the highest one played) does not have; -1 if it has them all. */
+/* The first animation the bytes play (a byte below 0x8e, or a7 / a9 / b6's) that a model with `count` animations
+   (the record's +8) and the array `animations` (its +0xc, readable up to the highest one played) does not have; -1
+   if it has them all. */
 static int spell_bytes_animation_missing(const BYTE *b, int length, int count, const DWORD *animations)
 {
-    int i = 0;
+    int i = 0, a;
 
-    while (i < length) {
-        BYTE op = b[i];
-
-        if (op < 0x8e) {
-            if (op >= count || !animations || !animations[op])
-                return op;
-            i++;
-        } else {
-            i += 1 + form_operands[op - 0x8e];
-        }
+    while (i < length && i + spell_bytes_size(b[i]) <= length) {
+        a = spell_bytes_animation_at(b, i);
+        if (a >= 0 && (a >= count || !animations || !animations[a]))
+            return a;
+        i += spell_bytes_size(b[i]);
     }
     return -1;
+}
+
+/* Whether the bytes need the cast check of the caster's animation records (spell_bytes_cast_problem): an animation
+   34 or above, a0 / af, d6, e2, or a move that lasts frames. The bytes the strict check of before accepted have none
+   of them, so they are judged at the cast exactly as then. With `bone_zero`, whether animation 00's bones are
+   needed (an animation 34 or above, a0 / af). */
+static BOOL spell_bytes_needs_records(const BYTE *b, int length, BOOL *bone_zero)
+{
+    int i = 0;
+    BOOL any = FALSE;
+
+    *bone_zero = FALSE;
+    while (i < length && i + spell_bytes_size(b[i]) <= length) {
+        if (spell_bytes_animation_at(b, i) >= 0x34 || b[i] == 0xa0 || b[i] == 0xaf)
+            any = *bone_zero = TRUE;
+        if (b[i] == 0xd6 || b[i] == 0xe2 || spell_bytes_move_frames(b, i, 0) >= 0)
+            any = TRUE;
+        i += spell_bytes_size(b[i]);
+    }
+    return any;
+}
+
+/* The frames that surely pass between the command at offset `from` and the one at `to` (`length`: the end), with
+   the frame counts `frames` of the model's animations (record +4; -1 not read): each plain animation its frames
+   less one (the interpreter reads on once it is at its last frame), an f3 the count of the f4 or c5 before it (c5:
+   the stored wait, the last c6's NN; none before it: 0), a7 / a9 / b6 none (the frame they start at is not known),
+   and nothing that a b3 .. b2 skip may pass over. */
+static int spell_bytes_frames_between(const BYTE *b, int length, int from, int to, const int *frames)
+{
+    int i = 0, got = 0, counter = 0, wait = 0;
+    BOOL skipping = FALSE;
+
+    while (i < length && i + spell_bytes_size(b[i]) <= length) {
+        BYTE op = b[i];
+        BOOL inside = i > from && i < to && !skipping;
+
+        if (op == 0xb3)
+            skipping = TRUE;
+        else if (op == 0xb2)
+            skipping = FALSE;
+        else if (op == 0xf4) {
+            if (!skipping || b[i + 1] < counter)        /* (a skipped f4: the smaller of the two counts) */
+                counter = b[i + 1];
+        } else if (op == 0xc6) {
+            wait = b[i + 1];
+        } else if (op == 0xc5) {
+            if (!skipping || wait < counter)            /* (as f4) */
+                counter = wait;
+        } else if (op == 0xf3) {
+            if (inside)
+                got += counter;
+            counter = 0;
+        } else if (op < 0x8e && inside && frames[op] > 1) {
+            got += frames[op] - 1;
+        }
+        i += spell_bytes_size(op);
+    }
+    return got;
+}
+
+#define SPELL_CAST_FINE         0            /* spell_bytes_cast_problem: nothing against the cast */
+#define SPELL_CAST_UNREAD       1            /* a record it needs was not read; v[0] the animation */
+#define SPELL_CAST_WEAPON       2            /* v[0] an animation 34 or above with v[1] bones, animation 00 has v[2] */
+#define SPELL_CAST_BONE         3            /* v[0] a0 / af holds at bone v[1]; the model has v[2] */
+#define SPELL_CAST_D6           4            /* v[0] d6's NN; v[1] frames surely after it, v[2] needed */
+#define SPELL_CAST_MOVING       5            /* v[0] a move needing v[1] frames before the last fa; v[2] surely there */
+#define SPELL_CAST_FADING       6            /* v[0] e2's stored wait; v[1] frames surely before its e1 / e7 NN, v[2] needed */
+
+/* The cast checks that need the caster's animation records: `frames` and `bones` (record +4 and +8, -1 where not
+   read) for every animation the bytes play and, when needed, animation 00. An animation 34 or above must have the
+   bones of animation 00, which is a body (a party model's 34-67 are weapon tracks of 0 bones); a0 / af hold at one
+   of the caster's bones; d6's task is on the 60-list, which the record does not wait on, so its effect must start
+   (NN + 1 ticks, 004277b1) a frame before the end; a 10-list move adds its step each frame after the fa put the
+   caster home (00426a26, 00426de3), so it must be over (delay + frames, then one more) before the last fa; e2's
+   fade-out (10-list task 0042c66d, started by 0042c31c the frame after e2) counts the stored wait down and, on the
+   tick after, sets "not drawn" (00be119d bit 4), which e1 clears a frame after it (0042c31c) and e7 NN at once: so
+   the fade-out must be over before them (the wait + 2 frames before an e1, + 3 before an e7 NN). The handler runs
+   before the actor's interpreter call each frame (0042e2b2 before 0042e327) and reads the wait then (0042c377), so
+   a c6 later in e2's own pass sets the fade-out's count: e2 is judged by the largest c6 NN from the last one before
+   it up to its e1 / e7 NN (a smaller later one only makes the check stricter). */
+static int spell_bytes_cast_problem(const BYTE *b, int length, const int *frames, const int *bones, int *v)
+{
+    int i = 0, last_fa = -1, delay = 0, wait = 0, a, f, got, k;
+
+    while (i < length && i + spell_bytes_size(b[i]) <= length) {
+        if (b[i] == 0xfa)
+            last_fa = i;
+        i += spell_bytes_size(b[i]);
+    }
+    for (i = 0; i < length && i + spell_bytes_size(b[i]) <= length; i += spell_bytes_size(b[i])) {
+        BYTE op = b[i];
+
+        v[0] = v[1] = v[2] = 0;
+        a = spell_bytes_animation_at(b, i);
+        if (a >= 0x34) {
+            v[0] = a;
+            if (bones[a] < 0 || bones[0] < 0)
+                return SPELL_CAST_UNREAD;
+            if (bones[a] != bones[0]) {
+                v[1] = bones[a];
+                v[2] = bones[0];
+                return SPELL_CAST_WEAPON;
+            }
+        }
+        if (op == 0xa0 || op == 0xaf) {
+            if (bones[0] < 0)
+                return SPELL_CAST_UNREAD;
+            if (b[i + 1] >= bones[0]) {
+                v[0] = op;
+                v[1] = b[i + 1];
+                v[2] = bones[0];
+                return SPELL_CAST_BONE;
+            }
+        }
+        if (op == 0xd6 && (got = spell_bytes_frames_between(b, length, i, length, frames)) < b[i + 1] + 2) {
+            v[0] = b[i + 1];
+            v[1] = got;
+            v[2] = b[i + 1] + 2;
+            return SPELL_CAST_D6;
+        }
+        if (op == 0xc6)
+            wait = b[i + 1];
+        if (op == 0xe2) {
+            int w = wait;               /* the handler reads 00bfd0f0 the frame after e2 (0042e2b2 before 0042e327;
+                                           0042c377): a c6 later in e2's pass sets the fade-out's count */
+
+            for (k = i + 1; k < length && k + spell_bytes_size(b[k]) <= length; k += spell_bytes_size(b[k])) {
+                if (b[k] == 0xe1 || (b[k] == 0xe7 && b[k + 1]))
+                    break;
+                if (b[k] == 0xc6 && b[k + 1] > w)
+                    w = b[k + 1];
+            }
+            if (k < length && k + spell_bytes_size(b[k]) <= length &&
+                (got = spell_bytes_frames_between(b, length, i, k, frames)) < w + (b[k] == 0xe7 ? 3 : 2)) {
+                v[0] = w;
+                v[1] = got;
+                v[2] = w + (b[k] == 0xe7 ? 3 : 2);
+                return SPELL_CAST_FADING;
+            }
+        }
+        if (op == 0x99 && b[i + 1] > delay)
+            delay = b[i + 1];
+        if ((f = spell_bytes_move_frames(b, i, delay)) >= 0 &&
+            (got = last_fa > i ? spell_bytes_frames_between(b, length, i, last_fa, frames) : 0) < f + 1) {
+            v[0] = op;
+            v[1] = f + 1;
+            v[2] = got;
+            return SPELL_CAST_MOVING;
+        }
+    }
+    return SPELL_CAST_FINE;
 }
 
 /* script_bytes_model: whether the two letters `have` (the caster's script file, "" = not known) are `want`. */
@@ -32062,17 +32810,51 @@ static void spell_bytes_log(int actor, int spell, int slot, const struct spell_b
              actor, spells[spell].id, name, (unsigned)e->length, slot, model, animations);
 }
 
+/* One animation's record (array entry `a` of the caster's model, `count` entries): its frames (+4) and bones (+8)
+   into frames[a] / bones[a]. FALSE if it cannot be read. */
+static BOOL spell_bytes_read_record(const DWORD *animations, int count, int a, int *frames, int *bones)
+{
+    const DWORD *r;
+
+    if (frames[a] >= 0)
+        return TRUE;
+    if (!animations || a >= count || IsBadReadPtr(animations + a, 4) || !(r = (const DWORD *)animations[a]) ||
+        IsBadReadPtr(r, 0xc) || (int)r[1] < 0 || (int)r[2] < 0)
+        return FALSE;
+    frames[a] = (int)r[1] > 0x7fff ? 0x7fff : (int)r[1];
+    bones[a] = (int)r[2] > 0x7fff ? 0x7fff : (int)r[2];
+    return TRUE;
+}
+
+/* For spell_bytes_cast_problem: the records of every animation the bytes play and, with `bone_zero`, of animation
+   00; -1 in the rest. Read only for the bytes that need them (spell_bytes_needs_records). FALSE if one cannot be. */
+static BOOL spell_bytes_read_records(const DWORD *animations, int count, const BYTE *b, int length, BOOL bone_zero,
+                                     int *frames, int *bones)
+{
+    int i, a;
+
+    for (i = 0; i < SPELL_BYTES_ANIMATIONS; i++)
+        frames[i] = bones[i] = -1;
+    if (bone_zero && !spell_bytes_read_record(animations, count, 0, frames, bones))
+        return FALSE;
+    for (i = 0; i < length && i + spell_bytes_size(b[i]) <= length; i += spell_bytes_size(b[i]))
+        if ((a = spell_bytes_animation_at(b, i)) >= 0 && !spell_bytes_read_record(animations, count, a, frames, bones))
+            return FALSE;
+    return TRUE;
+}
+
 /* `script_bytes` of an extended spell: the caster's own script, lent into the command's slot for this action.
    Called by action_setup_hook after spell_script_apply. Lends only when every check passes. */
 static void spell_bytes_apply(int *action, int spell)
 {
-    int actor = action[ACT_ACTOR], slot = action[ACT_SCRIPT], count = 0, missing, k;
+    int actor = action[ACT_ACTOR], slot = action[ACT_SCRIPT], count = 0, missing, k, v[3];
     const struct spell_bytes_entry *e;
     const DWORD *record = NULL;
     DWORD *table = NULL;
     const char *why;
-    static char text[160];
+    static char text[200];
     char two[3];
+    BOOL bone_zero;
 
     if (spell < 0 || !spells[spell].bytes_entry || slot < 0)   /* not given, or the game shows nothing (-1) */
         return;
@@ -32105,6 +32887,42 @@ static void spell_bytes_apply(int *action, int spell)
         } else if ((missing = spell_bytes_animation_missing(e->bytes, e->length, count, (const DWORD *)record[3])) >= 0) {
             wsprintfA(text, "animation %02x of the model is not loaded", (unsigned)missing);
             why = text;
+        }
+    }
+    if (!why && spell_bytes_needs_records(e->bytes, e->length, &bone_zero)) {
+        /* (only bytes the strict check of before refused get here: an animation 34 up, a0 / af, d6, e2, a move) */
+        int frames[SPELL_BYTES_ANIMATIONS], bones[SPELL_BYTES_ANIMATIONS];
+
+        if (!spell_bytes_read_records((const DWORD *)record[3], count, e->bytes, e->length, bone_zero, frames, bones))
+            why = "the model's animation records cannot be read";
+        else switch (spell_bytes_cast_problem(e->bytes, e->length, frames, bones, v)) {
+        case SPELL_CAST_UNREAD:
+            why = "the model's animation records cannot be read";
+            break;
+        case SPELL_CAST_WEAPON:
+            wsprintfA(text, "animation %02x of the model is a weapon track (%d bones; animation 00 has %d), not a body animation",
+                      (unsigned)v[0], v[1], v[2]);
+            why = text;
+            break;
+        case SPELL_CAST_BONE:
+            wsprintfA(text, "%02x holds the target at bone %d: the model has %d", (unsigned)v[0], v[1], v[2]);
+            why = text;
+            break;
+        case SPELL_CAST_D6:
+            wsprintfA(text, "d6 %02x: the animations and waits after it last %d frames; it needs %d (its effect would start after the cast)",
+                      (unsigned)v[0], v[1], v[2]);
+            why = text;
+            break;
+        case SPELL_CAST_MOVING:
+            wsprintfA(text, "%02x moves the caster for %d frames: what plays between it and the last fa lasts %d, it needs %d (else it ends away from home)",
+                      (unsigned)v[0], v[1] - 1, v[2], v[1]);
+            why = text;
+            break;
+        case SPELL_CAST_FADING:
+            wsprintfA(text, "e2 fades the caster out over %d frames: what plays before its e1 (or e7) lasts %d, it needs %d (else it stays hidden for the battle)",
+                      v[0], v[1], v[2]);
+            why = text;
+            break;
         }
     }
     if (!why)
@@ -32747,7 +33565,7 @@ static const char *state_bytes(BYTE *out, BYTE *out_length, int most, char *valu
             v = v * 16 + d;
         }
         if (length == most)
-            return most == SPELL_BYTES_MAX ? "a spell's script_bytes may be up to 128 bytes"
+            return most == SPELL_BYTES_MAX ? "a spell's script_bytes may be up to 255 bytes"
                  : most == STATE_SCRIPT_MAX ? "a state's attack script may be up to 48 bytes"
                  : most == STATE_LEND_MAX ? "a state's script_NN may be up to 32 bytes" : "a state's idle script may be up to 16 bytes";
         out[length++] = (BYTE)v;
@@ -34309,18 +35127,19 @@ static void load_limits(void)
         move_limit_tables();
 }
 
+static BOOL battle_start_install(void);        /* ("New commands": the battle-start call, put in once for whoever needs it) */
+
 static int install_limit_hooks(void)
 {
     int ok = 0, i;
 
     for (i = 0; i < (int)(sizeof limit_command_sites / sizeof limit_command_sites[0]); i++)
         ok += patch_call(limit_command_sites[i], FN_LIMIT_COMMAND, limit_command_hook);
-    ok += (battle_start_hooked = patch_call(SITE_BATTLE_START_PARTY, FN_BATTLE_START_PARTY, battle_start_party_hook));
+    ok += (battle_start_hooked = battle_start_install());
     ok += patch_call(SITE_LIMIT_LEARNING, FN_LIMIT_LEARNING, limit_learning_hook);
     /* a limit's `state`: the weapon set-up, handler 0x0e, as action_setup_hook has handler 0x0c. Not counted
        with the hooks above: without it everything else works, and states change no hits */
-    if (!weapon_hook_live)
-        weapon_hook_live = patch_pointer(ADDR_WEAPON_SETUP_ENTRY, FN_WEAPON_SETUP, weapon_setup_hook);
+    weapon_setup_install();
     log_line("limit states: the weapon set-up (handler 0x0e, table entry %08lx -> %08lx) is %s", ADDR_WEAPON_SETUP_ENTRY,
              FN_WEAPON_SETUP, weapon_hook_live ? "followed: a state's attacks are noted"
                                                : "NOT followed (the entry is not the game's): states are entered but change nothing");
@@ -34923,6 +35742,7 @@ static void ach_view_install(void)
 #define ADDR_SAVE_PATH_TEXT     0x00dd74e8u /* where the game's writer builds "%ssave/save%02d.ff7" (006fec2e: push 00dd74e8) */
 
 #define SXC2_HEADER_SIZE        0x60        /* what this build writes and knows */
+#define SXC2_SEAT_WHEN          80          /* (`seat_when`) header bytes 80-83: for each seat 12..15, who stepped aside for a key (seat_when_byte) */
 #define SXC2_HEADER_MAX         0x100       /* the longest header any build may write */
 #define SXC2_ENTRY_SIZE         (4 + SAVE_RECORD_SIZE)
 #define SXC2_ENTRIES_MAX        255
@@ -35180,6 +36000,7 @@ static void sxc2_part_sums(const BYTE *slot, BYTE *out)
 #define SXC3_ITEM_ROWS_ROOM     ((SXC3_SECTIONS_ROOM - SXC3_SECTION_HEAD - 8) / 4) /* (stage 4) the most rows a version-3 list can have in any file (its readers' arrays) */
 #define SXC3_KEPT_ROOM          (SXC3_SECTIONS_ROOM - SXC3_SECTION_HEAD - SXC3_ITEM_BYTES_MAX)  /* a list of this build's own always fits beside what is carried (stage 4: its longest) */
 #define SXC3_WORN_ROOM          (SXC3_SECTION_HEAD + 4 + 125 * 8)                   /* (stage 4b, fix pass) the longest WORN section (GEAR_WORN_MAX entries: checked where that is defined) */
+#define SXC3_CMDL_ROOM          (SXC3_SECTION_HEAD + 4 + 512 * 4)                   /* (new commands, stage 9b) the longest CMDL section, the learned list entries (COMMAND_LEARNED_MOST: checked where that is defined) */
 #define SXC3_KEPT_ROOM_WHOLE    (SXC3_SECTIONS_ROOM - SXC3_WORN_ROOM - FLDX_SECTION) /* (stage 4b, fix pass) the same when the loaded file's item list is CARRIED WHOLE: no list of this build's own is written beside it, so its room is free; the longest WORN and FLDX sections this build may write still fit (the box's own room is its cap's: box_kinds_allowed) */
 #define SXC3_DIFFERENCES_LOGGED 12
 static BYTE sxc3_kept[SXC3_SECTIONS_ROOM];          /* sections of the loaded save's file that the files of this game carry forward, head and contents, one after another */
@@ -35404,8 +36225,9 @@ static BOOL sxc3_keep_section(const BYTE *head)
 
     /* (the box) with the box at work one place more, and the bytes of an empty box section, stay free for the box of this build's own.
        (Stage 4b, fix pass) when the file's item list is carried whole (sxc3_list_whole), the room of this build's own list is free too:
-       without it a box kept beside a long list (rows + box kinds above about 13,000) would not be carried by a run that cannot read the list */
-    if (sxc3_kept_size + bytes > (DWORD)((sxc3_list_whole ? SXC3_KEPT_ROOM_WHOLE : SXC3_KEPT_ROOM) - (box_live ? BOX_SECTION_FIXED : 0)) || sxc3_kept_count >= SXC3_SECTIONS_MAX - 1 - (box_live != 0) - (gear_wide_live != 0)) {       /* (stage B5: and one for the WORN section, whose bytes are in the box's reserve) */     /* (one place of the SXC3_SECTIONS_MAX always stays free for this build's own list) */
+       without it a box kept beside a long list (rows + box kinds above about 13,000) would not be carried by a run that cannot read the list.
+       (New commands, stage 9b, review 1) there the longest CMDL section's room stays free too, only while the learned set is wanted */
+    if (sxc3_kept_size + bytes > (DWORD)((sxc3_list_whole ? SXC3_KEPT_ROOM_WHOLE - (command_learn_wanted() ? SXC3_CMDL_ROOM : 0) : SXC3_KEPT_ROOM) - (box_live ? BOX_SECTION_FIXED : 0)) || sxc3_kept_count >= SXC3_SECTIONS_MAX - 1 - (box_live != 0) - (gear_wide_live != 0) - (command_learn_wanted() != 0)) {       /* (new commands, stage 9b: and one for the CMDL section) */       /* (stage B5: and one for the WORN section, whose bytes are in the box's reserve) */     /* (one place of the SXC3_SECTIONS_MAX always stays free for this build's own list) */
         log_line("SXC3: *** no room to carry section '%s' (%lu bytes) forward: it is NOT in the files this game writes; it stays in %s ***",
                  sxc3_tag_text(head), bytes, sxc2_load_name[0] ? sxc2_load_name : "the loaded file");
         return FALSE;
@@ -35757,6 +36579,9 @@ typedef char box_check_room[BOX_FILE_ROOM == SXC3_SECTIONS_ROOM && BOX_ITEM_SECT
    homes fit the DLL's types (a home is a WORD with a 0x8000 mark; the Box screen's view holds BOX_VIEW_ROOM rows) */
 typedef char box_check_max[!(WIDE_ROWS_MAX & 1) && WIDE_ROWS_MAX >= WIDE_V2_ROWS + 2 && ((long)BOX_FILE_ROOM - BOX_ITEM_SECTION - BOX_SECTION_FIXED - BOX_RESERVE) / 4 >= BOX_KINDS_MAX &&
                            WIDE_ROWS_MAX + WIDE_GUARD_ROWS < 0x8000 && WIDE_ROWS_MAX <= BOX_VIEW_ROOM ? 1 : -1];
+/* (new commands, stage 9b) the box's reserve holds the longest WORN, FLDX and CMDL sections beside the BOX_RETURN_OVER kinds the box may pass its cap by
+   (1,016 + 68 + 2,064 + 256 = 3,404 of 4,096): the box at its cap beside the longest list still leaves room for all three */
+typedef char box_check_reserve[SXC3_WORN_ROOM + FLDX_SECTION + SXC3_CMDL_ROOM + BOX_RETURN_OVER * 4 <= BOX_RESERVE ? 1 : -1];
 #define SXC2_FLAG_HAS_BOX       0x0001u
 #define SXC2_FLAG_BOX_NEW       0x0002u     /* (box = auto) the box of this save WOKE and its Box screen has not been opened since: the Box row reads "Box new" */
 #define BOX_VERSION             1
@@ -37181,6 +38006,243 @@ static void forget_flags_poll(const char *moment)
 }
 /* ==== `forget_flag`: end ==== */
 
+/* ==== `seat_when` (the character file): a character sits in a seat while a save bit is on: begin ====
+
+   The rules are SEAT WHEN PURE's (seat_when_judge); here the game's memory is read for them and the seats move, by
+   seat_put as a menu moves them (the record goes along with its character). Looked at the start of
+   new_characters_joining (every party-slot rebuild, the PHS), at the end of a load and as a field is read. */
+#define ADDR_SEAT_WHEN_MODE     0x00cbf9dcu     /* (= ADDR_GAME_MODE, defined with the battle menu) WORD: the main loop's mode, 2 a battle */
+#define SEAT_WHEN_MODE_BATTLE   2
+static const char *seat_when_moment = "";
+
+/* Puts `c` (NULL: nobody) in seat `seat` for a key and puts right what seat_put leaves: the seat's "shown" bit of the
+   PHS becomes the newcomer's own (one without a record is shown by nobody: it is made when the party names the seat),
+   and each party slot that names the seat answers with the newcomer: made now if it has no record, its weapon's data
+   copied, the party marked to be rebuilt (the menu and the world map rebuild it; a battle copies its limits). */
+static void seat_when_move(int seat, struct new_character *c)
+{
+    const BYTE *party = (const BYTE *)ADDR_PARTY, *field_party = (const BYTE *)ADDR_FIELD_PARTY;
+    WORD *phs = (WORD *)ADDR_PHS_MASKS;
+    int id = NEW_CHARACTER_FIRST_ID + seat, slot, in_party = 0;
+    BOOL hidden = c && c->hidden;
+
+    seat_put(seat, c);
+    if (!c)
+        return;
+    if (*new_character_record(id) == (BYTE)id && !hidden)
+        phs[1] |= (WORD)(1 << id);
+    else
+        phs[1] &= (WORD)~(1 << id);
+    for (slot = 0; slot < 3; slot++)
+        in_party |= party[slot] == id || field_party[slot] == id;
+    if (!in_party)
+        return;
+    if (*new_character_record(id) != (BYTE)id)
+        create_new_character(id, "joined: seat_when, its seat is in the party");
+    for (slot = 0; slot < 3; slot++)
+        if (party[slot] == id)
+            ((void (__cdecl *)(int))FN_COPY_WEAPON)(slot);
+    *(DWORD *)0x00dc1124u = 1;          /* (as new_characters_joining) the main menu copies the slots' limits */
+    *(BYTE *)0x00cc0888u = 1;           /* the party changed: rebuilt at the next menu or world map */
+    limits_to_copy = TRUE;              /* and a battle that starts first: battle_start_party_hook */
+}
+
+/* A roster index as a line names it: "character 26", "nobody", "not known". */
+static void seat_when_who(int gave, char *out)
+{
+    if (gave >= 0)
+        wsprintfA(out, "character %d", NEW_CHARACTER_FIRST_ID + gave);
+    else
+        lstrcpyA(out, gave == SEAT_WHEN_NOBODY ? "nobody (the seat was empty)" : "not known (the save's companion file does not say)");
+}
+
+static void seat_when_poll(const char *moment)
+{
+    const BYTE *party = (const BYTE *)ADDR_PARTY, *field_party = (const BYTE *)ADDR_FIELD_PARTY;
+    int n;
+
+    if (!new_characters_live)
+        return;
+    seat_when_moment = moment;
+    for (n = 0; n < SEAT_MAX; n++) {        /* a seat held for a key that is gone (a Re-init of the files): let go, or its old character would wait for ever */
+        int k;
+
+        for (k = 0; k < ROSTER_MAX && !(new_characters[k].defined && new_characters[k].seat_when_flag != FORGET_FLAG_NONE &&
+                                        new_characters[k].seat_when_seat == NEW_CHARACTER_FIRST_ID + n); k++)
+            ;
+        if (seat_when_active[n] && k == ROSTER_MAX) {
+            char who[80];
+
+            seat_when_who(seat_when_gave[n], who);
+            log_line("seat_when: no key names seat %d any more (the character file changed): nothing moves; %s no longer waits for the seat",
+                     NEW_CHARACTER_FIRST_ID + n, who);
+            seat_when_active[n] = 0;
+            seat_when_gave[n] = SEAT_WHEN_UNKNOWN;
+        }
+    }
+    for (n = 0; n < ROSTER_MAX; n++) {
+        struct new_character *c = &new_characters[n], *there, *back;
+        struct seat_when_view v;
+        int id = c->seat_when_seat, seat = id - NEW_CHARACTER_FIRST_ID, slot, verdict, at;
+        char bit[16], who[80];
+
+        if (!c->defined || c->seat_when_flag == FORGET_FLAG_NONE || id < SEAT_WHEN_FIRST || id > SEAT_WHEN_LAST)
+            continue;
+        v.bit_on = outfit_bit_on(c->seat_when_flag);
+        v.seat_exists = seat < seat_count;
+        there = v.seat_exists ? new_character(id) : NULL;
+        v.holder_here = there == c;
+        v.occupant = there && there != c ? (int)(there - new_characters) : -1;
+        v.holder_elsewhere_in_party = 0;
+        at = character_seat_id(c);
+        if (c->seated && !v.holder_here)
+            for (slot = 0; slot < 3; slot++)
+                v.holder_elsewhere_in_party |= party[slot] == (BYTE)at || field_party[slot] == (BYTE)at;
+        v.active = seat_when_active[seat];
+        v.gave = seat_when_gave[seat];
+        if (v.gave >= 0 && (v.gave >= ROSTER_MAX || !new_characters[v.gave].defined || v.gave == n))
+            v.gave = seat_when_gave[seat] = SEAT_WHEN_UNKNOWN;     /* (a Re-init took its section away) */
+        v.gave_seated = v.gave >= 0 && new_characters[v.gave].seated;
+        v.gave_has_record = v.gave >= 0 && new_characters[v.gave].has_record;
+        v.in_party = 0;
+        for (slot = 0; slot < 3; slot++)
+            v.in_party |= party[slot] == (BYTE)id || field_party[slot] == (BYTE)id;
+        v.busy = gear_standins_on || character_wide_defer || *(const WORD *)ADDR_SEAT_WHEN_MODE == SEAT_WHEN_MODE_BATTLE;
+        verdict = seat_when_judge(&v);
+        forget_flag_text(c->seat_when_flag, bit);
+        switch (verdict) {
+        case SEAT_WHEN_NOTHING:
+            break;
+        case SEAT_WHEN_TAKE: {
+            BOOL kept = v.occupant >= 0 && *new_character_record(id) == (BYTE)id;
+            BOOL brings = c->seated ? *new_character_record(at) == (BYTE)at : c->has_record;
+
+            if (v.occupant >= 0 || !v.active)
+                seat_when_gave[seat] = (signed char)(v.occupant >= 0 ? v.occupant : SEAT_WHEN_NOBODY);
+            seat_when_active[seat] = 1;
+            seat_when_who(v.occupant >= 0 ? v.occupant : SEAT_WHEN_NOBODY, who);
+            seat_when_move(seat, c);
+            log_line("seat_when %s is on (%s): character %d takes seat %d%s; %s steps aside%s%s",
+                     bit, moment, character_file_id(c), id,
+                     brings ? " with its record" : *new_character_record(id) == (BYTE)id ? " (made now: the seat is in the party)"
+                                                 : " (no record yet: made when a field script puts the seat in the party)",
+                     who, v.occupant < 0 ? "" : kept ? " and keeps its record" : " (it had no record yet)",
+                     v.in_party ? "; the seat's ID is in the party: that slot answers with the newcomer" : "");
+            break;
+        }
+        case SEAT_WHEN_ADOPT:
+            seat_when_active[seat] = 1;
+            seat_when_who(v.gave, who);
+            log_line("seat_when %s is on (%s): character %d is in seat %d already (a save made with the bit on): the key holds it; who gave it up: %s",
+                     bit, moment, character_file_id(c), id, who);
+            break;
+        case SEAT_WHEN_RETURN:
+        case SEAT_WHEN_RETURN_EMPTY:
+            back = verdict == SEAT_WHEN_RETURN ? &new_characters[v.gave] : NULL;
+            seat_when_who(back ? v.gave : v.gave == SEAT_WHEN_UNKNOWN ? SEAT_WHEN_UNKNOWN : SEAT_WHEN_NOBODY, who);
+            seat_when_active[seat] = 0;
+            seat_when_gave[seat] = SEAT_WHEN_UNKNOWN;
+            seat_when_move(seat, back);
+            if (c->has_record)
+                c->hidden = 1;          /* while its bit is off the PHS never shows it (not as a stand-in either) */
+            if (!back)
+                seat_defaults();        /* the seat's own character, if it has a section and is free */
+            log_line("seat_when %s is off (%s): character %d steps aside from seat %d%s; %s%s",
+                     bit, moment, character_file_id(c), id, c->has_record ? " and keeps its record (hidden from the PHS)" : " (it had no record yet)",
+                     back ? who : "", back ? (back->seated && *new_character_record(id) == (BYTE)id ? " comes back with its record" : " comes back (no record yet)")
+                                       : v.gave_seated ? "the one that gave it up sits in another seat now: the seat goes to its own character, if any"
+                                       : "nobody to bring back: the seat goes to its own character, if any");
+            if (!back && v.gave != SEAT_WHEN_NOBODY && !v.gave_seated) {
+                char was[80];
+
+                seat_when_who(v.gave, was);
+                log_line("seat_when: who sat in seat %d before is %s", id, was);
+            }
+            break;
+        case SEAT_WHEN_LET_GO:
+            seat_when_active[seat] = 0;
+            seat_when_who(v.gave, who);
+            seat_when_gave[seat] = SEAT_WHEN_UNKNOWN;
+            log_line("seat_when %s is off (%s): character %d is no longer in seat %d (a menu moved it): nothing moves; %s no longer waits for the seat",
+                     bit, moment, character_file_id(c), id, who);
+            break;
+        default:
+            if (seat_when_said[n] == verdict)
+                break;
+            seat_when_who(v.gave, who);
+            if (verdict == SEAT_WHEN_WAIT_BUSY)
+                log_line("seat_when %s is %s (%s): character %d's seat %d is not changed now (%s): the next look does it",
+                         bit, v.bit_on ? "on" : "off", moment, character_file_id(c), id,
+                         *(const WORD *)ADDR_SEAT_WHEN_MODE == SEAT_WHEN_MODE_BATTLE ? "a battle" : "a save or a load is putting pieces on");
+            else if (verdict == SEAT_WHEN_WAIT_PARTY)
+                log_line("seat_when %s is off (%s): character %d STAYS in seat %d for now: the seat's ID is in the party and %s would answer to it (%s); it steps aside once a field script takes %d out of the party",
+                         bit, moment, character_file_id(c), id, v.gave >= 0 && !v.gave_seated ? "a character without a record" : "nobody", who, id);
+            else if (verdict == SEAT_WHEN_WAIT_HOLDER)
+                log_line("seat_when %s is on (%s): character %d does NOT take seat %d yet: it sits in seat %d, which is in the party; it moves once %d is out of the party",
+                         bit, moment, character_file_id(c), id, at, at);
+            else if (verdict == SEAT_WHEN_REFUSE_SEAT)
+                log_line("seat_when %s is on (%s): character %d is NOT seated: this game has %d seats (12 to %d; seats in the game file, or another mod), so seat %d is not there",
+                         bit, moment, character_file_id(c), seat_count, NEW_CHARACTER_FIRST_ID + seat_count - 1, id);
+            seat_when_said[n] = (BYTE)verdict;
+            continue;
+        }
+        seat_when_said[n] = 0;
+    }
+}
+
+/* Forgets what the keys held (another game: sxc2_forget_loaded). */
+static void seat_when_forget(void)
+{
+    int i;
+
+    for (i = 0; i < SEAT_MAX; i++) {
+        seat_when_active[i] = 0;
+        seat_when_gave[i] = SEAT_WHEN_UNKNOWN;
+    }
+    for (i = 0; i < ROSTER_MAX; i++)
+        seat_when_said[i] = 0;
+}
+
+/* In a load, after sxc2_load_decide and BEFORE the seats are set up: what the save's companion file says the keys held
+   (SXC2 header bytes 80-83), taken only for a seat whose saved character (header bytes 24-27) is one whose key names
+   that seat. Before the seating, so a keeper that gave its seat to a key waits (seat_keepers) and does not take it
+   back at the load. */
+static void seat_when_take_header(void)
+{
+    int seat, active, gave;
+    char who[80];
+
+    seat_when_forget();
+    if (!new_characters_live || !sxc2_load_source || sxc2_kept_header_size < SXC2_HEADER_SIZE)
+        return;
+    for (seat = 0; seat < seat_count; seat++) {
+        int saved = sxc2_kept_header[24 + seat];
+        const struct new_character *c = saved != 0xff ? roster_character(saved) : NULL;
+
+        seat_when_unbyte(sxc2_kept_header[SXC2_SEAT_WHEN + seat], NEW_CHARACTER_FIRST_ID, ROSTER_MAX, &active, &gave);
+        if (!active)
+            continue;
+        if (!c || c->seat_when_flag == FORGET_FLAG_NONE || c->seat_when_seat != NEW_CHARACTER_FIRST_ID + seat) {
+            log_line("seat_when: the save's companion file says a key held seat %d, but the character saved there (%d) has no seat_when for it now: not taken",
+                     NEW_CHARACTER_FIRST_ID + seat, saved);
+            continue;
+        }
+        seat_when_active[seat] = 1;
+        seat_when_gave[seat] = (signed char)gave;
+        seat_when_who(gave, who);
+        log_line("seat_when: the save's companion file: character %d's key holds seat %d; who gave it up: %s",
+                 saved, NEW_CHARACTER_FIRST_ID + seat, who);
+    }
+}
+
+/* At the end of a load: the look (a save made with the bit on comes back as it was; one made without the companion's
+   bytes is adopted). */
+static void seat_when_after_load(void)
+{
+    seat_when_poll("the end of a load");
+}
+/* ==== `seat_when`: end ==== */
+
 /* ==== THE BOX (stage B6), the window: begin ====
 
    THE EQUIP MENU'S LIST WHEN A CHARACTER CAN WEAR MORE WIDE PIECES THAN THERE ARE FREE LENT SLOTS
@@ -37929,6 +38991,8 @@ static void sxc3_take_sections(const BYTE *file, DWORD size, const BYTE *words, 
         const BYTE *head = heads[n];
 
         if (!sxc3_tag_is(head, (const char *)item_tag)) {
+            if (command_cmdl_met(head, fallback))   /* (new commands, stage 9b) the learned list entries: read, or carried as they are */
+                continue;
             if (fields_fldx_met(head, !fallback))   /* (field capacity, stage 2) the save's real place: taken, never carried forward */
                 continue;
             if (box_section_met(head, boxes))       /* (the box) a box section with the box at work: read, or REFUSED and kept; with the box off: only noted */
@@ -37995,16 +39059,25 @@ static void sxc3_take_sections(const BYTE *file, DWORD size, const BYTE *words, 
         log_line("wide list shadow: %s has no item list section: nothing to compare", sxc2_load_name);
 }
 
-/* (field capacity, stage 2) Is there room in the companion file being built for one more section of `bytes` (head
-   included), beside what sxc3_add_sections writes now (the same tests it makes) and every section carried? */
-static BOOL sxc3_room_for(DWORD bytes)
+/* (new commands, stage 9b, review 1) Is there room in the companion file being built for a CMDL section of `cmdl` bytes
+   and an FLDX section of `fldx` bytes (heads included; each 0: none, and no section), beside what else
+   sxc3_add_sections writes now (the same tests it makes) and every section carried? */
+static BOOL sxc3_room_with(DWORD cmdl, DWORD fldx)
 {
     BOOL item = (wide_shadow_on() || wide_carried_count) && !sxc3_item_carried;
     BOOL box = box_writes_own(), worn = gear_worn_writes();
-    DWORD sum = (item ? SXC3_SECTION_HEAD + SXC3_ITEM_BYTES_MAX : 0) + (box ? box_section_size() : 0) + (worn ? gear_worn_section_size() : 0) + sxc3_kept_size + bytes;     /* (stage 4: the longest item list this build writes) */
-    int sections = (item != 0) + (box != 0) + (worn != 0) + sxc3_kept_count + 1;
+    DWORD sum = (item ? SXC3_SECTION_HEAD + SXC3_ITEM_BYTES_MAX : 0) + (box ? box_section_size() : 0) + (worn ? gear_worn_section_size() : 0) + sxc3_kept_size + cmdl + fldx;     /* (stage 4: the longest item list this build writes) */
+    int sections = (item != 0) + (box != 0) + (worn != 0) + (cmdl != 0) + sxc3_kept_count + (fldx != 0);
 
     return sum <= SXC3_SECTIONS_ROOM && sections <= SXC3_SECTIONS_MAX;
+}
+
+/* (field capacity, stage 2) Is there room in the companion file being built for one more section of `bytes` (head
+   included; never 0), beside what sxc3_add_sections writes now and every section carried? (Stage 9b: the CMDL
+   section the set would write counted too.) */
+static BOOL sxc3_room_for(DWORD bytes)
+{
+    return sxc3_room_with(command_cmdl_bytes(), bytes);
 }
 
 /* For sxc2_build: the sections of the file being built, after its characters' part (`size`
@@ -38027,6 +39100,7 @@ static DWORD sxc3_add_sections(BYTE *data, DWORD size, const BYTE *slot)
     BOOL box = box_writes_own();    /* (the box) FALSE with the box off, LOCKED, or never used */
     BOOL worn = gear_worn_writes(); /* (the box, stage B5) FALSE unless wide gear is at work and a piece is worn or kept */
     DWORD fldx = fields_fldx_bytes();   /* (field capacity, stage 2) the real place of a save made in a registered field; 0 none */
+    DWORD cmdl = command_cmdl_bytes();  /* (new commands, stage 9b) the learned list entries; 0 none */
     DWORD item_bytes = SXC3_ITEM_BYTES; /* (stage 4) the item list's contents: 2044 bytes (versions 1 and 2), 8 + 4 x count (version 3) */
     int item_rows = WIDE_V2_ROWS;
     BYTE compact = 0;
@@ -38048,7 +39122,13 @@ static DWORD sxc3_add_sections(BYTE *data, DWORD size, const BYTE *slot)
         if (lost)
             log_line("save: *** wide items: %d row(s) of this game that the save's 320 words do not hold are NOT written: the loaded companion's item list is of a version this build does not know and is carried in the list's place. Use a build that knows it ***", lost);
     }
-    if (fldx && !sxc3_room_for(fldx)) {
+    if (cmdl && !sxc3_room_with(cmdl, fldx)) {
+        /* (new commands, stage 9b) cannot be: the box's reserve holds it (box_check_reserve); the set is left out, the file is written.
+           (Review 1) the CMDL and this FLDX (0: none) beside the rest, each counted once */
+        log_line("save: *** the companion file has no room for the CMDL section (%lu bytes: the learned list entries): left out of this save ***", cmdl);
+        cmdl = 0;
+    }
+    if (fldx && !sxc3_room_with(cmdl, fldx)) {     /* (stage 9b, review 1) with the CMDL as it now is: 0 if it was left out */
         /* (field capacity, stage 2) cannot be: fields_save_guard_begin asked the same a moment ago; the save then holds the fallback alone */
         log_line("save: *** the companion file has no room for the FLDX section (the real place of a save made in a registered field): left out; this save loads at fields_fallback ***");
         fldx = 0;
@@ -38080,8 +39160,8 @@ static DWORD sxc3_add_sections(BYTE *data, DWORD size, const BYTE *slot)
     {
         /* (the box, C8) the file's room, asserted: with the cap at arrival this cannot fail; if it does NO file is written.
            (Stage 4) at every save, box or not, with the item list's own length */
-        DWORD sum = (item ? SXC3_SECTION_HEAD + item_bytes : 0) + (box ? box_section_size() : 0) + (worn ? gear_worn_section_size() : 0) + sxc3_kept_size + fldx;
-        int sections = (item != 0) + (box != 0) + (worn != 0) + sxc3_kept_count + (fldx != 0);
+        DWORD sum = (item ? SXC3_SECTION_HEAD + item_bytes : 0) + (box ? box_section_size() : 0) + (worn ? gear_worn_section_size() : 0) + sxc3_kept_size + fldx + cmdl;   /* (stage 9b: cmdl) */
+        int sections = (item != 0) + (box != 0) + (worn != 0) + sxc3_kept_count + (fldx != 0) + (cmdl != 0);
 
         if (sum > SXC3_SECTIONS_ROOM || sections > SXC3_SECTIONS_MAX) {
             log_line("save: *** the companion file's sections do NOT FIT: %lu bytes in %d sections (the item list %d, the box %lu with %d kinds, carried %lu); a file holds %d bytes in %d sections. NO companion file is built ***",
@@ -38091,7 +39171,7 @@ static DWORD sxc3_add_sections(BYTE *data, DWORD size, const BYTE *slot)
             return 0;
         }
     }
-    if (!item && !sxc3_kept_size && !box && !worn && !fldx)
+    if (!item && !sxc3_kept_size && !box && !worn && !fldx && !cmdl)     /* (stage 9b: cmdl) */
         return size;
     data[3] = '3';
     put32(data + size, crc32_of(data, size, 0));
@@ -38122,6 +39202,8 @@ static DWORD sxc3_add_sections(BYTE *data, DWORD size, const BYTE *slot)
         p = gear_worn_section_write(p);     /* (the box, stage B5, A11) after the box, before everything carried: from the LEDGER (A13), never from the records, which hold stand-ins now */
     if (fldx)
         p = fields_fldx_write(p);           /* (field capacity, stage 2) after the worn pieces, before everything carried */
+    if (cmdl)
+        p = command_cmdl_write(p);          /* (new commands, stage 9b) after FLDX, before everything carried */
     copy_bytes(p, sxc3_kept, (int)sxc3_kept_size);
     p += sxc3_kept_size;
     return (DWORD)(p - data);
@@ -38360,8 +39442,10 @@ static void sxc2_forget_loaded(void)
     sxc3_kept_size = 0;             /* (the format step) the loaded file's sections are forgotten with it */
     sxc3_kept_count = sxc3_item_carried = sxc3_list_whole = 0;
     fields_fldx_forget();           /* (field capacity, stage 2) the loaded save's FLDX section went with it */
+    command_learned_forget();       /* (new commands, stage 9b) and the learned list entries of that game */
     sxc2_kept_said = sxc2_kept_no_room = 0;
     sxc2_refused_argument = 0;
+    seat_when_forget();             /* (`seat_when`) what the keys held belonged to that game */
     sxc2_displaced = 0;
     sxc2_pending.argument = 0;
     sxc2_load_name[0] = 0;
@@ -38490,6 +39574,8 @@ static DWORD sxc2_build(BYTE *data, const BYTE *slot, int *carried)
             !roster_character(sxc2_seats_were[seat]))
             data[24 + seat] = sxc2_seats_were[seat];
     }
+    for (seat = 0; seat < SEAT_MAX; seat++)      /* (`seat_when`) what each seat's key holds: a load takes it back */
+        data[SXC2_SEAT_WHEN + seat] = (BYTE)seat_when_byte(seat < seat_count && seat_when_active[seat], seat_when_gave[seat], NEW_CHARACTER_FIRST_ID);
     sxc2_part_sums(slot, data + 64);
     *carried = 0;
     sxc2_displaced = 0;
@@ -42183,7 +43269,7 @@ static struct {
 static BOOL save_work_on(void)
 {
     static int said;
-    BOOL wanted = new_characters_live || wide_live || fields_save_wanted();     /* (field capacity, stage 2) the save guard keeps the real place in the companion file */
+    BOOL wanted = new_characters_live || wide_live || fields_save_wanted() || command_learn_wanted();     /* (field capacity, stage 2) the save guard keeps the real place in the companion file; (new commands, stage 9b) the learned list entries */
     BOOL on = wanted && save_prepare_live && load_slot_live && load_accepted_live && save_write_live;
 
     if (!on && new_characters_live && !said++)
@@ -42847,6 +43933,7 @@ static unsigned __cdecl save_write_hook(DWORD argument)
 {
     unsigned result;
 
+    command_learn_poll("a save");   /* (new commands, stage 9b) first: a pending field request is in this save's companion, its bytes cleared in the block */
     box_selftest_off();             /* (the box, C10) the self-test's folders are never in force during a save */
     save_write_slot = (int)(argument & 0x0f);
     sxc2_save.mode = 0;
@@ -43033,6 +44120,7 @@ static void new_characters_joining(void)
 
     if (!new_characters_live)
         return;
+    seat_when_poll("a party slot rebuilt, or the PHS");          /* (`seat_when`) first: a seat a key takes or gives back now is filled below */
     forget_flags_poll("a party slot rebuilt, or the PHS");       /* (`forget_flag`) first: a guest forgotten now is made again below only if it is wanted */
     for (id = NEW_CHARACTER_FIRST_ID; id < NEW_CHARACTER_FIRST_ID + seat_count; id++) {
         BOOL wanted = (((const WORD *)ADDR_PHS_MASKS)[1] >> id) & 1;
@@ -43162,6 +44250,10 @@ void __cdecl limit_item_use(int item, int who)
     WORD all = 0;
     int i;
 
+    if (command_teaches_item(item)) {
+        command_item_use(item, who);    /* (new commands, stage 9b) a teaching item: a list command's entries learned */
+        return;
+    }
     if (item >= ITEM_COUNT_EXTENDED && !wide) {
         sound(3);       /* (wide items) a number nothing defines: no use (the menu does not offer it: its restrictions say so) */
         return;
@@ -45367,6 +46459,5380 @@ static void load_materia(void)
              test_materia_count, errors);
 }
 
+/* ==== NEW COMMANDS (stage 1: one fixed command, one button that casts one spell) BEGIN ====
+   FF7_SpellExt_Commands.ini (optional) defines the free command numbers 0x1c-0x1f: empty in every per-command
+   table of the game (the setup row 007b7510 is 00 00 0000, the handler list a lone 1f, the kernel record ff x8,
+   no name or description; vanilla and New Threat alike: tools/work/new_command_materia/RESEARCH.md 2.0). A materia
+   of the materia file gives one (`kind = command`, `attributes = 0x1c`). What the DLL does for a defined number:
+     1. its 8-byte kernel record 00db9590 + n*8 (byte 0 what OK does, byte 1 the target flags, cameras ffff) is
+        written, ONLY if the loaded kernel still has ff x8 there (another mod's kernel, or an FFNx
+        kernel.bin.chunk.1, which FFNx reads inside kernel_init, before kernel_loader_hook goes on, would have
+        put its own record there). Again in reload_config after restore_kernel_tables (which puts ff x8 back).
+        The target byte is never left ff: with ff the menu would aim with the weapon's flags while the action
+        keeps ff and its aim hits every living actor (FUN_00435d81 copies the menu's byte only for commands
+        5, 6, 9, 0x0a, 0x0b, 0x11; FUN_005dc390).
+     2. its name and description: the type-5 texts (sections 0 and 8 of kernel2) of index n, in text_fetch_hook.
+     3. at each battle start (battle_start_party_hook, after FUN_00437db0 has rebuilt the list offsets at
+        00437e2c): 009ae9c8[n] = 009ae9c8[2], Magic's handler list `00 0c 09` (handler 0: attack ID = queued ID;
+        0x0c: the attack record, action_setup_hook; 09: the hit loop). FUN_00435d81 reads it at 0043655b as a
+        plain offset into 007b75a8.
+     4. action_setup_hook's first step (command_action_setup): a party member's action of the command becomes
+        its spell's cast as the Magic command makes it: attack ID, queued ID and banner ID = the spell (spell_all
+        with more than one target), command TYPE 2 (what the hit loop, display, effect, Silence/Frog tests and
+        banner read), caster script 0x1d (Magic's). The command NUMBER stays: the enemies' AI sees command
+        0x1c, not Magic (009ab0a0 byte 0), so a rule that answers Magic does not answer it. An enemy's action
+        of the command (an AI's opcode 0x92: none queues these numbers today) gets script -1, which the hit
+        loop takes as "nothing to do" (FUN_005d9940's first test, as the game's handlers 0x13 and 0x15 leave
+        a refused action), and the game's set-up is not run for it.
+   MP is the spell's own cost: the slot match FUN_005caa86 finds no slot for a command that is not 2, 3 or
+   0x0d, so handler 0x0c takes the record's MP word (no All/Quadra count, no MP Turbo, no slot-cost
+   override); FUN_005dbe6f charges it at the hit loop's start or ends the cast with the game's "not enough
+   MP" message. Free under Mime (action flag 0x400000), as Magic.
+   Stage 2 (tools/work/new_command_materia/stage2/DESIGN.md):
+     5. `kind = physical`: a WEAPON attack made `like` one of the game's eight weapon commands (the commands whose
+        handler list has the weapon set-up 0x0e: Attack, Morph, Deathblow, Mug, Slash-All, 2x-Cut, Flash, 4x-Cut).
+        At each battle start its handler list is the like's (009ae9c8[n] = 009ae9c8[like]: the like's own steps run,
+        in its order). In weapon_setup_hook (handler 0x0e) the command's values are LENT to the actor's weapon
+        battle record (009a8e54 + actor*0x18: formula, accuracy, impact effect, hit sound, element, special flags)
+        for the one call of the game's FUN_005c9c64, so its own rules apply to them as to the weapon's (Darkness
+        halves the accuracy, a frog's sounds, the Elemental materia's element, the 0x1e61 rule), and the record is
+        put back right after the call. Then what the routine does not take from the weapon is written: script,
+        flags (ORed: the builder's 0x200 / 0x400000 are kept), command type = the like's, queued and banner ID 0,
+        power, turns, status (FUN_005ca766, the game's own). The kernel record's cursor, target flags (ff = the
+        weapon's, as Attack: FUN_005ca703 inside FUN_005c9c64 and FUN_005cfe67 at battle start take ff to the
+        weapon's) and cameras default to the like's record as loaded. Party only, as a spell command.
+     6. The build-list guard: the 17 calls of FUN_005cece9 (and the DLL's own two adds) go to command_add_guard.
+        FUN_005cece9 appends to the 16-entry list 00c06920 with no bound; the guard keeps the list at 16: when it
+        is full the game's commands come first (one takes Steal's entry when Mug is listed, as the game drops
+        Steal then anyway, FUN_005cee69; else the last new command's), and a new command that finds no room is not
+        added (one line). Without the guard at most one new command is made live.
+   Stage 3 (tools/work/new_command_materia/stage3/STAGE_3.md):
+     7. A frog: Toad can land between the choice and the swing (the row is greyed, but a chosen action is built when
+        it runs). For a frog actor (status 0x800 at the set-up, as FUN_005c9c64 reads it) the script is the like's
+        own row script, as the game plays its own command for a frog; script and script_all are not used. Nothing
+        else changes: the game's own frog rules apply as for its commands (FUN_005c9c64: the frog's sounds, impact
+        0; FUN_005dbe6f: for a frog only type 1, Attack's, is played, so a command made like any other weapon
+        command ends there with the two bare steps, as the game's Deathblow or Mug on a frog).
+     8. The 2x-Cut / 4x-Cut chain scripts: in every party model 0x16, 0x18, 0x19 and 0x1a end with no step home,
+        relying on the next turn's script (the hit loop steps 0x16 -> 0x17, 0x18 -> 0x19 -> 0x1a -> 0x1b); a script
+        or script_all that would leave the actor away from home is refused at reading (command_chain_problem).
+   Stage 4 (tools/work/new_command_materia/stage4/DESIGN.md, build/STAGE_4.md): 26 more numbers, 0x26-0x3f.
+     9. The move. Only when the commands file has a usable section from 0x26 up at the FIRST reading (the first
+        kernel load), and decided once for the run: the game's three per-command tables are moved into this DLL, as
+        the gear and item tables are: the kernel command records (00db9590: 9 operands and the loader's pointer
+        007ba070[0]) to command_records (256 records: any byte FUN_005cf002 / FUN_005cfe67 index has one), the
+        set-up rows (007b7510: 3 operands) to command_rows (64: the builder masks the number & 0x3f), the list
+        offsets (009ae9c8: 2 operands) to command_offsets. All 15 places are checked first (instruction bytes and
+        stock value), with the guard (6), the slot-match call, the text fetch call and the battle-start call
+        being this DLL's: all or nothing (a write that fails part-way puts the written operands back). Not moved:
+        the handler lists 007b75a8 and their bound 0x6d, and the three `< 0x20` gates of FUN_00435d81 (004361e1,
+        00436481, 00436616), which are never raised. The old tables are kept true for the game's numbers: the
+        records mirrored back to 00db9590 after every reading, the 38 offsets (exactly 0x98 bytes: 009aea60 is the
+        builder's stop flag) to 009ae9c8 at every battle start; the old rows (.rdata) are never written.
+        With no section from 0x26 up nothing moves and no further site is patched: 0x1c-0x1f run as in stage 3.
+    10. Fail closed: the guard (6) adds no number from 0x20 that is not a live new command (0x20-0x25, 0x40 and up,
+        a 0x26-0x3f without the move or not live), so a materia naming one gives no row; the guard goes in also
+        when only a materia names such a number. A replace-Attack materia (type 0x12, FUN_005cd5a2 writes build
+        entry 0 directly) naming 0x20 and up is read as 01 (Attack). Every type-5 text from 0x20 to 0xff is
+        answered (a blank when not a live command): FFNx's kernel2_get_text has no bound.
+    11. The gate fields: the builder takes [0x14], [0x18], [0x19] from the record only below 0x20; for 0x26-0x3f
+        slot_match_hook (00436266, every party action, before the list is read) writes them from command_records.
+    12. Mime: the game stores an action for Mime only below 0x20 (00436616); a call hook at 004365ef (the call of
+        00436cf2 right before the store) stores a 0x26-0x3f action as the game's store does (command_mime_store).
+   Stage 5 (tools/work/new_command_materia/stage5/DESIGN.md, build/STAGE_5.md): `kind = item`.
+    13. The record is Item's own, 03 ff x7 (OK opens the battle's Item list, window 5; the target flags and cameras
+        are the chosen item's), and at each battle start the handler list is Item's, `02 0d 09`. Everything the menu
+        does keys on the cursor action 3, not on the number (the list, the target cursor, one item taken out at the
+        target confirm). Three steps of the game key on the NUMBER and are supplied here: the action's type (item_
+        setup_hook, handler 0x02's entry 008fee50: type 4 before the game's 005c8fdf, so the effect, the banner, the
+        Silence rule and fixed_damage_hook's item guard treat it as Item's), the reservation of the item (the game's
+        00432aa2 reserves for 4, 8 and 0x17 only: command_item_reserve in enqueue_hook, when the menu's issue reaches
+        the queue, so an item never used is given back), and the hit-time rule of FUN_00433887 (its only call,
+        005da663: `[3] != 4` lets the target's Resist, Death Force and Shield apply, as for W-Item; the hook shows it
+        4 for the call). Party only; an item not of the command's set, or an enemy's action, gets script -1.
+    14. `items`: the numbers the command allows. The other rows are DIMMED, not hidden: the Item list draws a row
+        dim and buzzes on OK when its use bit 0x02 ("not in battle") is set, and that bit of the battle's list is
+        read by the Item list alone (window 5 at cursor 3 or 0x0a; every other reader tests 0x01 or 0x08). Window
+        5's set-up (0091e64c) and input (0091e6cc, every frame it is open) entries call command_filter_sync first:
+        while the menu's command is such a command at cursor 3 the bit is set on the rows outside its set (noted),
+        and the notes are undone when anyone else opens the list (or at a Re-init's next opening).
+    15. `potency`: each amount of the command's item actions x potency / 100 (fixed_damage_hook, after the game's
+        clamp: the same limit, never below 1).
+    16. Fail closed: no record unless 008fee50 holds item_setup_hook, 004330c0 is the game's reservation and the
+        queue's call 00432878 is enqueue_hook; with `items` also the two window entries; with `potency` also the
+        hit's call 005daae5.
+   Stage 6 (tools/work/new_command_materia/stage6/DESIGN.md, build/STAGE_6.md): support materia on the new commands.
+    17. The game's support routines serve a command partner only for the commands of their own lists, or a magic
+        partner only. The two calls of FUN_005cba3f (005cba19, 005cba33: every linked pair, the DLL's chains too) go
+        to support_link_hook: the game's routine, then what it would have written for one of its own commands, for a
+        live new command the character has: Counter / Sneak Attack / Final Attack (spell and physical kinds) a counter
+        entry (8 / 5 / 2, the command, the support's value: the battle side takes any command byte, ID ffff, which
+        the set-ups never read); All (spell) uses in build-list byte +1 -> the row's byte 4; Quadra Magic (spell) a
+        count and uses per party slot (command_quadra); MP Turbo (spell) in build-list byte +2's top 3 bits -> the
+        row's byte 5 -> [0x3c] (the damage percent: the game's, for any command). Mega All (mega_all_hook) adds its
+        level to the rows of live spell and physical commands too (entries 1-15; entry 0 is replace-Attack's).
+        Refused with a line: anything on an item command, All / Quadra / Turbo on a physical one; Magic Counter
+        (a magic partner's) does nothing, with a line.
+    18. In battle: the row offers "all" while its count is above 0 (FUN_004379be, for any command); slot_match_hook
+        spends a use at several targets (command_all_use: as FUN_00435d81 does for Steal, with Magic's rule for no use
+        left: one random target only if the record's target byte has toggle); at battle start a row whose target byte
+        has no toggle keeps no use (battle_slots_hook); Quadra Magic is taken in command_action_setup (FUN_005ca811,
+        the game's, so New Threat's Octa follows); the MP Turbo cost in action_setup_hook (the game's formula and cap).
+    19. `support = ...`: what of this applies to the command (default: all that apply to its kind).
+    20. Fail closed: no pairing hook unless both calls are e8 to 005cba3f; no All / Mega All unless the slot match and
+        both battle-start calls are this DLL's and 00435139 is the game's; no Quadra unless 005ca811 and 00435139 are
+        the game's and handler 0x0c is this DLL's. One line each.
+   Stage 7 (tools/work/new_command_materia/stage7/DESIGN.md, build/STAGE_7.md): the Attack row and the W- form.
+    21. The Attack row: a replace-Attack materia (type 0x12) naming a live spell or physical command keeps it
+        (command_attack_rule; an item command, a number not live, 0x20 and up: read as 01 with one line, the materia
+        file untouched). FUN_005cd5a2 writes it into build entry 0; the finish's one placement call (005cee10 ->
+        FUN_005ceef0, which answers 0 only for 1 and 0x18-0x1b) goes to placement_hook, which answers 0 (menu entry 0)
+        for such a command at build entry 0 while entry 0 is still empty, else calls the game's routine. At battle
+        start (battle_slots_hook, before 00437370 copies entry 0 to 009aead0) its byte 4 = ff, as 005cfe67 makes it for
+        0x18-0x1b (FUN_004379be keeps entry 0 only while byte 4 is not 0), and its target byte the record's (ff: the
+        weapon's) without multiple and toggle when it has toggle (no All use). Berserk, Confuse and FFNx's
+        auto-attack then use it as they use Slash-All; Frog, Limit and Mega All are the game's. An automatic turn at
+        several targets (targets 0) with a toggle record byte: one random target (slot_match_hook, Magic's rule).
+        Item commands are refused there: FFNx's auto-attack issues the row with a stale item and no take-one.
+    22. `w_form = yes`: the command twice in one turn, two picks (as W-Magic, W-Summon, W-Item). An item command's
+        record is W-Item's, 0a ff x7 (the game's W-Item list, take-one and give-back, all keyed on cursor 0x0a). A spell
+        or physical command: the target set-up calls 006d95ba / 006d95fe (menu_target_hook_a / _b, after the game wrote
+        W 00dc3c88 = 0 and the return state 1) set W = 1 and a mark in 00dc3c54 for the first pick (the confirm stores
+        it in 00dc3638 and goes back to the command list), W = 2 when this actor's first pick of this command is
+        stored (00dc3638 holds the mark: the confirm's FUN_006d8963 issues both). Disarmed by any issue of that actor
+        (enqueue_hook) and at battle start.
+    23. Fail closed: the placement call refused unless its bytes are the game's and the battle-start and slot-match
+        calls are this DLL's (then the rule reads such a materia as 01); a spell or physical w_form command is not
+        used unless the target set-up hook and the queue's call are this DLL's.
+    24. Stage 6's carry-overs: Quadra Magic needs rebuild_start_hook too; a rebuild line's said-once bit is set only
+        when the line is written.
+   Stage 8 (tools/work/new_command_materia/stage8/DESIGN.md, build/STAGE_8.md): `kind = list`, the command's own list.
+    25. The record is Magic's, 01 03 ff x6 (w_form: W-Magic's 08): OK opens the battle's Magic list, window 6, whose
+        set-up, input, draw, panel and help read only the actor's 56 magic slots (00dba5a0 + slot * 0x440) and its grid
+        (00dc2110 + slot * 0x700), never the command; its OK issues the row's command with the slot's byte as the ID.
+        The handler list is Magic's, 00 0c 09 (as a spell command's).
+    26. The view: while the actor's window 6 is open for a live list command, its slots hold that list (a kernel magic
+        ID raw, a spell of the spell file as its handle, pinned: release_unused_handles keeps it), filled from the list
+        after window_store put Magic's window back into spell_list; the game's refresh (00437679 / 00437814 and
+        slot_flags_hook) greys them as Magic's. Put back (window_load: the handles re-derived from the IDs, the stale
+        bits 0x03 set: the command list's refresh 004379be recomputes Magic's row) by: the window opening for another
+        command (battle_magic_open_hook, 006d9b8c); the command list's input entry 0091e6bc (the only new site: every
+        frame window 1 is open, before window 6's input in the same frame) when window 6 is not open for that actor and
+        command; the queue's call (an issue by the actor); a Magic / W-Magic action of the actor (slot_match_hook:
+        content only, shown again the next frame); the battle-start fix-up (battle_slots_hook); Magic's window moving
+        (set_window_base: the field menus' set-up too); Re-init. A rebuild forgets it (the game rewrites the slots).
+        The grid's four words (column, row, +0x10, top row) are kept per list and for Magic (with cursor memory).
+    27. The cast: the queue turns the handle back into the ID (enqueue_hook's rule for 2 and 3, now for a list command
+        too); handler 0x0c's first step casts that spell when it is one of the list's (as stage 1: type 2, script 0x1d,
+        the spell's MP and caster script) and writes the spell's own target byte into [0x14] (the builder took the
+        record's 03); a spell not in the list: script -1.
+    28. Support: All / Mega All (the row's count in the toggle spells' slot byte 2; a use spent at several targets only
+        for a toggle spell), Quadra Magic and MP Turbo (kernel: the slot's byte raised, capped 0xff; extended: the
+        record's, capped 999) as on a spell command; Counter, Sneak Attack and Final Attack refused (no entry to
+        choose). Refused in the Attack row (an automatic turn chooses no entry).
+    29. Fail closed: a list command is used only when every hook of 26-27 is this DLL's (checked at reading) and the
+        command list's input entry 0091e6bc held the game's 006d91fa and now holds the follow.
+    30. Stage 7's carry-over: the Attack row's several-target turn also when entry 0 shows Limit (the command kept in
+        009aead0, FUN_00437370).
+   Stage 9a (tools/work/new_command_materia/stage9/DESIGN.md, build_a/STAGE_9A.md): list entries offered by a condition.
+    31. A `spells` word may carry one condition, `ID:N` / `ID:materia:N` (a materia giving the command, at level N or
+        more, is on the character) or `ID:level:N` (the character's level is N or more). An entry whose condition is not
+        met is an empty place (ff, 0 x7) in its slot: window 6 draws it blank and buzzes on OK, the Check draws it blank;
+        the others keep their places. `enemy:`, `item:` and `event:` (learned entries, kept per character in the
+        companion file: a later stage) are read and left out, one line each.
+    32. The answers come from a snapshot of each party slot taken in rebuild_start_hook (005cb31a) from the record the
+        rebuild reads right after it (00dc0230[slot], 00919928[id], 00dbfd8c + index * 0x84): its level (byte 1) and 16
+        materia. A materia gives command n at its level as FUN_005cebe5's walk does (the level, 5 at most, then the
+        attribute bytes back past ff); the level compared is the materia's real one (1-20).
+    33. The Materia screen's Check: 0070ddf1 (the grid set-up of the Check's Magic view, cursor 1 or 8) goes to
+        materia_check_grid_hook: what menu_grid_setup_hook does (every Magic window put back, at the top), the game's
+        006f4d30, then the row's list lent to the shown member's slots (content only) when the row is a live list
+        command and 00dca7f8 is that member's command entries (else Magic's list, one line). Put back by the next
+        reader (Check on another row, the field Magic menu, a rebuild, the battle start, Re-init); the Check's grid
+        input slides no window under it.
+    34. The reader warns (not refused) when `:N` is above every level a materia giving the command has.
+   Stage 9b (stage9/DESIGN.md 4.6-4.10, build_b/STAGE_9B.md): entries learned, kept per character in the companion file.
+    35. `ID:enemy:ATTACK` (way 3): learned when an enemy's attack ATTACK is aimed at the character (after Cover and
+        Reflect, hit or missed, not while 009a88a6 bit 0x40 is set: the game's own test of FUN_005da5da, without its
+        Enemy Skill parts) while a materia giving the command is on it; hit_target_hook, after the game's 005da5da. The
+        battle's top line says so: battle text 0x80 + n - 0x1c (section 0x10, past the game's 128), answered by
+        text_fetch_hook with the command's `learned_text`, raised through the game's text event FUN_005c7d59 with the
+        spell's ID as the composer's argument of its `ee ff ff` (the attack name, section 9: an ID from 3000 the spell
+        file's name, answered here too). One message per target per hit, as the game's.
+    36. `ID:item:ITEM` (way 4a): learned when ITEM (a new item of the items file that is no limit item and restores
+        nothing in the menu) is used on the character in the Item menu (limit_item_use, the limit manuals' path: the
+        manual's sound, the item used up, the help line; "Already learned." and the buzzer when nothing is left). The item
+        has a limit item's restrictions (item_restrictions_hook, the battle inventory: the menu only, never in battle).
+    37. `ID:event:LESSON` (way 4b): learned when a field request names the lesson and the character: two save bytes
+        named by [learning] request = BANK:BYTE (the lesson, then the character: 0-15 the game's ID, 255 the party),
+        taken and cleared at a field read (where that hook is in), a party slot's rebuild, the end of a load and the
+        start of a save; `test_lesson = LESSON:CHARACTER` (a testing aid) at the end of every load.
+    38. The learned set: up to 512 entries (character, command, spell), saved in the companion file's section CMDL
+        (version 1), read at a load (own file, carried, or the fallback search's), cleared at every load and New Game
+        (new_game_hook, put in for it when it is not in); a section this build cannot read is carried as it is and the
+        set is frozen for that game. Ways 3 and 4 are on only with the four save and load hooks and New Game's hook in.
+    39. The checks after both files (a kernel load, a Re-init): an item entry naming no usable teaching item, and every
+        learned entry while a way's hooks are not in, is turned off (a blank place, never offered), one line each.
+   Not here (a later stage): a level-up second command, enemies seeing it as Magic, Berserk falling back to Attack. */
+#define COMMAND_FILE_NAME       "FF7_SpellExt_Commands.ini"
+#define ADDR_COMMAND_RECORDS    0x00db9590u  /* kernel section 0: 32 command records of 8 bytes */
+#define ADDR_COMMAND_SECTION_AT 0x007ba070u  /* the kernel's pointer to section 0 (ADDR_KERNEL_POINTERS[0]): 00db9590 */
+#define ADDR_COMMAND_LIST_AT    0x009ae9c8u  /* 38 dwords: each command's offset into 007b75a8, rebuilt per battle by FUN_00436b1b */
+#define ADDR_COMMAND_LISTS      0x007b75a8u  /* the handler lists, 0x6d bytes, each ended by 1f */
+#define COMMAND_LISTS_SIZE      0x6d
+#define COMMAND_MAGIC           2
+#define SITE_COMMAND_LIST_READ  0x0043655bu  /* in FUN_00435d81: mov edx, [ecx*4 + 009ae9c8] */
+#define SITE_COMMAND_LIST_BYTE  0x0043656au  /* then: mov cl, [eax + 007b75a8] */
+#define COMMAND_LINES_MAX       32           /* action and materia lines of one reading */
+#define TEXT_TYPE_COMMAND       0x05         /* FUN_0041963c's type 5: command descriptions (007b74a8[5] = section 0), names 8 on */
+#define ADDR_COMMAND_ROWS       0x007b7510u  /* the setup rows, 4 bytes a command: script, formula, flags word (FUN_00435d81) */
+#define ADDR_FORMULA_CLASSES    0x008ff068u  /* 16 bytes: a formula class's flags (FUN_005d17c7) */
+#define ADDR_FORMULA_ROUTINES   0x008ff1f8u  /* 32 dwords: the damage formula routines (FUN_005d173f; 0 = none run) */
+#define ADDR_WEAPON_RECORDS     0x009a8e54u  /* 0x18 bytes per party actor: the weapon battle record FUN_005c9c64 reads */
+#define ADDR_SEVENS_RULE        0x009a8b4cu  /* short per actor (0x44 apart): 0x1e61 makes FUN_005c9c64 clear element and status */
+#define FN_SET_STATUS_FIELDS    0x005ca766u  /* FUN_005ca766(mode << 6 | chance, mask), cdecl: action[0x20..0x23] */
+#define ADDR_COMMAND_BUILD      0x00c06920u  /* the command list being built: 16 entries of 3 bytes (command, A, B) */
+#define ADDR_COMMAND_BUILD_COUNT 0x00c06974u /* signed byte: its entries (FUN_005cece9 appends here, with no bound) */
+#define COMMAND_ADD_SITES       17
+/* (stage 4) */
+#define SITE_MIME_STORE_CALL    0x004365efu  /* in FUN_00435d81: e8 fe 06 00 00, call 00436cf2, right before the Mime store */
+#define FN_MIME_STORE_BEFORE    0x00436cf2u  /* (its only caller) */
+#define ADDR_COMMAND_BUILD_ACTOR 0x009aea64u /* int: the actor of the action FUN_00435d81 builds (009ae9c8 + 0x9c) */
+#define ADDR_COMMAND_QUEUE_ENTRY 0x009a9884u /* the queue entry being built: byte 0 its priority (00435c89 pushes it) */
+#define ADDR_COMMAND_ACTOR_TURNS 0x009a8b3au /* byte per actor, 0x44 apart: the actor's turn count (the Mime store reads it) */
+#define ADDR_COMMAND_MIME_ENTRIES 0x009a9addu /* 2 x 8 bytes: turn, actor, command, word [4], word [0x25] (FUN_005ca465 replays) */
+#define ADDR_COMMAND_MIME_VALUES 0x009aad32u /* 2 words: [0x3c] | [0x3e] << 8 */
+/* (stage 5) */
+#define ADDR_ITEM_SETUP_ENTRY   0x008fee50u  /* handler table 008fee48, entry 0x02: 005c8fdf (Item's first step) */
+#define FN_ITEM_SETUP           0x005c8fdfu  /* [0xb] = [9] = [4], drops the reservation (0043305c), script 0x20 / 0x21 */
+#define ADDR_ITEM_LIST_SETUP_ENTRY 0x0091e64cu  /* window set-up table 0091e638, entry 5 (the Item list): 006d982c */
+#define FN_ITEM_LIST_SETUP      0x006d982cu
+#define ADDR_ITEM_LIST_INPUT_ENTRY 0x0091e6ccu  /* window input table 0091e6b8, entry 5: 006d98e3 (every frame it is open) */
+#define FN_ITEM_LIST_INPUT      0x006d98e3u
+#define ADDR_MENU_CURSOR_ACTION 0x00dc3c74u  /* byte: the chosen command's record byte 0 (FUN_006d91fa) */
+#define FN_ITEM_RESERVE         0x004330c0u  /* (actor, item): the reservation 00432aa2 makes for 4, 8, 0x17 (00432b30) */
+#define SITE_HIT_STATUS_RULE    0x005da663u  /* in FUN_005da5da: e8 1f 92 e5 ff, call 00433887 (its only call) */
+#define FN_HIT_STATUS_RULE      0x00433887u  /* reads [3] once (004338dc: [3] != 4) */
+#define ADDR_PARTY_HP_LIMIT     0x009a8dceu  /* word + target * 0x34: the clamp of FUN_005da5da (005daa74) */
+#define ADDR_PARTY_MP_LIMIT     0x009a8dccu
+#define SITE_ENEMY_HP_LIMIT     0x005daa92u  /* c7 45 fc <dword> (ADDR_ENEMY_HP_LIMIT below: the DLL's damage limit) */
+#define SITE_ENEMY_MP_LIMIT     0x005daa99u  /* c7 45 f0 <dword> */
+/* (stage 6) */
+#define SITE_SUPPORT_PAIR_A     0x005cba19u  /* in FUN_005cb94a: e8 21 00 00 00, call 005cba3f (the support is A) */
+#define SITE_SUPPORT_PAIR_B     0x005cba33u  /* e8 07 00 00 00, call 005cba3f (the support is B): the only two calls */
+#define FN_SUPPORT_APPLY        0x005cba3fu  /* FUN_005cba3f(support, partner, x, armour), cdecl: the support dispatcher */
+#define FN_QUADRA_REPEAT        0x005ca811u  /* FUN_005ca811(count), cdecl: [0x3e] = count, [0x2b] = count + 3, at most 8 */
+#define FN_COMMAND_POST         0x00435139u  /* FUN_00435139(queue, actor, kind, value), cdecl: (2, actor, 0x15, k) -> 009a8b1e |= k */
+#define ADDR_MENU_ENTRIES       0x00dba4e4u  /* + party slot * 0x440: 16 battle-menu entries of 6 bytes (battle record +0x4c) */
+#define COMMAND_REC_MENU        0x4c         /* the menu entries in the battle record FUN_005cb2cc rebuilds (00c068b0) */
+/* (stage 7) */
+#define SITE_PLACEMENT          0x005cee10u  /* in FUN_005ced53: 50 / e8 db 00 00 00 / 83 c4 04 89 45 fc (its only call) */
+#define FN_PLACEMENT            0x005ceef0u  /* FUN_005ceef0(command), cdecl: the menu entry; 55 8b ec 51 */
+#define ADDR_MENU_W             0x00dc3c88u  /* byte: the W- flag (0 one pick, 1 first of two, 2 second: FUN_006db0ee) */
+#define ADDR_MENU_SLOT          0x00dc3c54u  /* word: the pick's list row; a W 1 confirm copies it to 00dc3638 */
+#define ADDR_MENU_STORED_SLOT   0x00dc3638u  /* word: the stored first pick's row (006db503; 006dc752 sets it 0) */
+/* (stage 8) */
+#define ADDR_COMMAND_LIST_INPUT_ENTRY 0x0091e6bcu   /* window input table 0091e6b8, entry 1 (the command list): 006d91fa */
+#define FN_COMMAND_LIST_INPUT   0x006d91fau  /* 55 8b ec 83 ec 20; no argument (006db2b8: call [eax*4 + 0091e6b8], nothing pushed) */
+#define SITE_MENU_WINDOW_INPUT  0x006db2b8u  /* in FUN_006db0ee: ff 14 85 b8 e6 91 00 (the call of every open window's input) */
+#define ADDR_MENU_WINDOW_STATES 0x00dc2068u  /* byte per battle menu window: 0 closed, 1 opening, 2 open (input), 3 closing */
+#define COMMAND_MAGIC_WINDOW    6            /* the Magic list (set-up 006d9ad5, input 006d9b98, draw 006df9ba) */
+#define ADDR_ENTRY0_KEPT        0x009aead0u  /* + party slot * 6: menu entry 0 as FUN_00437370 kept it at battle start */
+#define COMMAND_ENTRY0_KEPT_STRIDE 6
+
+/* ---- NEW COMMANDS PURE begin (no game memory, no Windows: tools/work/new_command_materia/stage1/test compiles this
+   block with the file's parse helpers) ---- */
+#define COMMAND_FIRST           0x1c         /* the free command numbers (RESEARCH.md 2.0) */
+#define COMMAND_IN_PLACE_LAST   0x1f         /* (stage 4) 0x1c-0x1f: in the game's tables, always */
+#define COMMAND_MOVED_FIRST     0x26         /* (stage 4) 0x26-0x3f: only with the tables moved (0x20-0x25 are the game's) */
+#define COMMAND_LAST            0x3f         /* (stage 4) the builder keeps a command in 6 bits (FUN_00435d81, & 0x3f) */
+#define COMMAND_COUNT           (COMMAND_LAST - COMMAND_FIRST + 1)  /* commands[n - COMMAND_FIRST]; 0x20-0x25 never defined */
+#define COMMAND_RECORD_SIZE     8
+#define COMMAND_GAME_NUMBERS    0x26         /* (stage 4) 0x00-0x25: the game's rows and list offsets (38 lists) */
+#define COMMAND_KERNEL_RECORDS  0x20         /* (stage 4) kernel section 0: 32 records, 0x100 bytes */
+#define COMMAND_RECORDS_MOVED   0x100        /* (stage 4) records in the moved table: one for any byte */
+#define COMMAND_ROWS_MOVED      0x40
+#define COMMAND_OFFSETS_MOVED   0x70         /* FUN_00436b1b writes one per list start of the 0x6d bytes: 0x6d at most */
+#define COMMAND_MOVE_SITES      15           /* 14 operands and the loader's pointer */
+#define COMMAND_ACT_MIME_WORD   0x25         /* action fields the Mime store copies (00436694-0043673f) */
+#define COMMAND_ACT_SLOT_VALUE  0x3c
+#define COMMAND_ACT_SLOT_HIGH   0x3e
+#define COMMAND_CURSOR_TARGET   0x00         /* record byte 0: OK opens the target cursor (FUN_006d91fa, case 0) */
+#define COMMAND_CURSOR_UNCOVERED 0x07        /* Attack's: the target cursor over the uncovered pool (case 7) */
+#define COMMAND_KERNEL_SPELL_LAST 0x35       /* a kernel spell a command casts: 0x00-0x35, the 54 of the Magic list */
+#define COMMAND_SPELL_NONE      (-1)         /* spell_target's answers: not a spell a command can cast */
+#define COMMAND_SPELL_SUMMON    (-2)         /* an extended summon (`list = summon`): it is not cast as magic */
+#define COMMAND_KIND_SPELL      0            /* stage 1: the row casts one spell as Magic does */
+#define COMMAND_KIND_PHYSICAL   1            /* stage 2: a weapon attack made like one of the game's weapon commands */
+#define COMMAND_KIND_ITEM       2            /* (stage 5) the battle's Item list under the command's name: Item's handlers */
+#define COMMAND_ITEM            0x04         /* (stage 5) the game's Item: its handler list 02 0d 09 and its command type */
+#define COMMAND_CURSOR_ITEM     0x03         /* (stage 5) record byte 0: OK opens the Item list (FUN_006d91fa, case 3) */
+#define COMMAND_ITEM_NUMBERS    10000        /* (stage 5) `items` names 0-9999: items 0-127, 448-511, wide items 1024-9999 */
+#define COMMAND_POTENCY_DEFAULT 100          /* (stage 5) per cent */
+#define COMMAND_POTENCY_MOST    1000
+#define COMMAND_ITEM_ROW_SIZE   6            /* (stage 5) a row of the battle's item list: number word, quantity, target, use bits, spare */
+#define COMMAND_ITEM_ROW_USE    4
+#define COMMAND_ITEM_ROW_EMPTY  0xffff
+#define COMMAND_ITEM_NOT_IN_BATTLE 0x02      /* (stage 5) the use bit the Item list (and only it) dims a row by, at cursor 3 or 0x0a */
+#define COMMAND_ACT_HIT_AMOUNT  0x85         /* (stage 5) a hit's amount (FUN_005da5da) */
+#define COMMAND_ACT_HIT_MISS    0x86         /* bit 0: the hit missed */
+#define COMMAND_ACT_HIT_RESULT  0x88         /* bit 2: the amount is MP */
+#define COMMAND_LIKE_DEFAULT    0x01         /* Attack */
+#define COMMAND_WEAPON_RECORD   0x18         /* bytes of a weapon battle record (009a8e54 + actor * 0x18) */
+#define COMMAND_FLAG_KEEP_CAMERA 0x1000      /* action[0x24]: the running camera is kept across turns (2x-Cut, 4x-Cut) */
+#define COMMAND_BUILD_ENTRIES   16           /* the command build list 00c06920: 16 entries of 3 bytes */
+#define COMMAND_STEAL           0x05
+#define COMMAND_MUG             0x11         /* listed: FUN_005cee69 blanks every Steal entry at the finish */
+#define COMMAND_SUPPORT_LEVELS  5            /* (stage 6) a support record's values, one a level (00c068bf[1..5]) */
+#define COMMAND_CODE_ALL        0x51         /* (stage 6) a support materia's code: record byte 0x0e (005cba3f: - 0x51) */
+#define COMMAND_CODE_COUNTER    0x54
+#define COMMAND_CODE_MAGIC_COUNTER 0x55
+#define COMMAND_CODE_SNEAK      0x56
+#define COMMAND_CODE_FINAL      0x57
+#define COMMAND_CODE_TURBO      0x58
+#define COMMAND_CODE_QUADRA     0x63
+#define COMMAND_SUP_COUNTER     0x01         /* (stage 6) the `support` words, a bit each (support_named, support_off) */
+#define COMMAND_SUP_SNEAK       0x02
+#define COMMAND_SUP_FINAL       0x04
+#define COMMAND_SUP_ALL         0x08
+#define COMMAND_SUP_QUADRA      0x10
+#define COMMAND_SUP_MEGA_ALL    0x20
+#define COMMAND_SUP_TURBO       0x40
+#define COMMAND_SUP_MAGIC_COUNTER 0x80       /* (never taken: its "does nothing" line is said once, by this bit) */
+#define COMMAND_SUP_SPELL       0x7f         /* what applies to a spell command: the seven */
+#define COMMAND_SUP_PHYSICAL    (COMMAND_SUP_COUNTER | COMMAND_SUP_SNEAK | COMMAND_SUP_FINAL | COMMAND_SUP_MEGA_ALL)
+#define COMMAND_COUNTERS        8            /* (stage 6) the counter list: 8 entries of 3 bytes at battle record +0x24 */
+#define COMMAND_MENU_ENTRIES    16           /* (stage 6) a party slot's battle-menu entries (battle record +0x4c) */
+#define COMMAND_MENU_ENTRY_SIZE 6            /* command, cursor, target flags, availability, count, flags */
+#define COMMAND_ENTRY_TARGET    2
+#define COMMAND_ENTRY_COUNT     4            /* (stage 6) the All uses (build-list byte +1, FUN_005cf002); W-: the W level */
+#define COMMAND_ENTRY_FLAGS     5            /* (stage 6) build-list byte +2: absorb / steal / cut bits, MP Turbo in 0xe0 */
+#define COMMAND_COUNT_MOST      0xfe         /* (stage 6) a count never made ff (the game's "unlimited", 0x18-0x1b) */
+#define COMMAND_TURBO_MOST      5            /* (stage 6) as FUN_005cc6b5 */
+#define COMMAND_TOGGLE          0x08         /* (stage 6) target flags: toggle (one target / all) */
+#define COMMAND_FLAG_SEVERAL    0x200        /* (stage 6) action[0x24]: several targets asked (FUN_00435d81) */
+#define COMMAND_FLAG_ONE_RANDOM 0x100000     /* with 0x200: FUN_005dc390 aims at one random target */
+#define COMMAND_FLAG_REPEAT     0x400000     /* a Mime / W- repeat: no use is spent (FUN_00435d81, FUN_005c94d3) */
+#define COMMAND_ACT_MP_COST     0x0e         /* (stage 6) action[0xe]: the MP the hit loop charges (FUN_005dbe6f) */
+#define COMMAND_MP_MOST         999          /* (stage 6) as mp_cost_of's MP_COST_MAX */
+#define COMMAND_CURSOR_W_ITEM   0x0a         /* (stage 7) record byte 0: W-Item's (FUN_006d91fa case 10: W = 1, then the Item list) */
+#define COMMAND_REPLACE_ATTACK  0x12         /* (stage 7) the materia type byte FUN_005cd567 sends to FUN_005cd5a2 */
+#define COMMAND_ATTACK          0x01
+#define COMMAND_ONE_TARGET      0xf3         /* (stage 7) target flags without multiple (4) and toggle (8): FUN_004379be's rule */
+#define COMMAND_W_MARK          0xf000       /* (stage 7) the marks written to 00dc3c54: never a list row (below 3,366) */
+#define COMMAND_KIND_LIST       3            /* (stage 8) its own list of spells, in the Magic list's window (window 6) */
+#define COMMAND_LIST_MOST       54           /* (stage 8) one Magic window: 18 rows of 3 (the set-up's 0x12 rows) */
+#define COMMAND_MAGIC_SLOTS     56           /* (stage 8) the actor's magic slots, 8 bytes each (00437814's count 0x38) */
+#define COMMAND_SLOT_SIZE       8            /* id, MP, All uses, Quadra count, Quadra uses, target, state, MP Turbo */
+#define COMMAND_CURSOR_MAGIC    0x01         /* (stage 8) record byte 0: OK opens the Magic list (FUN_006d91fa case 1) */
+#define COMMAND_CURSOR_W_MAGIC  0x08         /* W-Magic's: case 8 writes W = 1 and falls into case 1 */
+#define COMMAND_LIST_TARGET     0x03         /* (stage 8) the record's target byte: never the aim (the chosen spell's) */
+#define COMMAND_W_MAGIC         0x15
+#define COMMAND_SUP_LIST        (COMMAND_SUP_ALL | COMMAND_SUP_QUADRA | COMMAND_SUP_MEGA_ALL | COMMAND_SUP_TURBO)
+#define COMMAND_GRID_WORDS      4            /* (stage 8) the grid's ints 0, 1, 4 and 5: column, row, +0x10, top row */
+#define COMMAND_COND_NONE       0            /* (stage 9a) a list entry's condition: none, always offered (stage 8) */
+#define COMMAND_COND_MATERIA    1            /* `ID:N`, `ID:materia:N`: a materia giving the command is on, at level N or more */
+#define COMMAND_COND_LEVEL      2            /* `ID:level:N`: the character's level is N or more */
+#define COMMAND_COND_ENEMY      3            /* `ID:enemy:ID`, `ID:item:ID`, `ID:event:N`: learned (stage 9b: the learned set) */
+#define COMMAND_COND_ITEM       4
+#define COMMAND_COND_EVENT      5
+#define COMMAND_MATERIA_LEVELS_MOST 20       /* (stage 9a) the materia file's levels (MATERIA_MAX_LEVELS) */
+#define COMMAND_CHARACTER_LEVEL_MOST 99
+#define COMMAND_CONDITION_DIGITS 7           /* (stage 9a) the longest number of a condition ("0x12345" / "65535") */
+#define COMMAND_MATERIA_SIZE    20           /* (stage 9a) a materia record: the type byte at 0x0d, the attribute bytes from 0x0e */
+#define COMMAND_MATERIA_TYPE    0x0d
+#define COMMAND_MATERIA_ATTRIBUTES 0x0e
+#define COMMAND_MATERIA_COMMAND 6            /* the type's low digit of a command materia (FUN_005cd078, case 6: FUN_005cebe5) */
+#define COMMAND_MATERIA_WALK_MOST 5          /* the level FUN_005cebe5 is told: 5 at most (005ce2c5 / materia_level_hook) */
+#define COMMAND_MATERIA_SLOTS   16           /* (stage 9a) a save record's materia: 16 dwords at +0x40, ID low byte (ff none), AP above */
+#define COMMAND_CHECK_GRID      4            /* (stage 9a) the Check's command grid: entry row + column * 4, 4 x 4 (0070dd90) */
+#define COMMAND_COND_OFF        6            /* (stage 9b) an entry turned off by the checks after both files: never offered */
+#define COMMAND_LEARNED_MOST    512          /* (stage 9b) the learned set's entries (the CMDL section's most) */
+#define COMMAND_CMDL_HEAD       12           /* (stage 9b) an SXC3 section's head: tag 4, flags 2, version 2, length 4 */
+#define COMMAND_CMDL_VERSION    1
+#define COMMAND_CMDL_ENTRY      4            /* character, command, spell ID (2 bytes, low first) */
+#define COMMAND_CMDL_MOST       (COMMAND_CMDL_HEAD + 4 + COMMAND_LEARNED_MOST * COMMAND_CMDL_ENTRY)    /* 2,064 bytes */
+#define COMMAND_LEARNED_TEXT_MOST 60         /* (stage 9b) `learned_text`: characters as written */
+#define COMMAND_MESSAGE_SIZE    96           /* (stage 9b) an encoded learned message, ended by ff */
+#define COMMAND_TEXT_ATTACK_NAME 0xee        /* (stage 9b) the composer's attack-name code (FUN_0041d090: ee ff ff takes the next argument word) */
+#define COMMAND_BATTLE_TEXTS    0x10         /* (stage 9b) battle texts: kernel2 section 0x10 (FUN_00419442), 128 of the game's */
+#define COMMAND_LEARNED_TEXT_FIRST 0x80      /* (stage 9b) battle text 0x80 + n - 0x1c: command n's learned message */
+#define COMMAND_REQUEST_PARTY   0xff         /* (stage 9b) a field request's character byte: the three in the party */
+#define COMMAND_REQUEST_IDS     16           /* the game's IDs a field request may name: 0-15 */
+#define COMMAND_LEARN_ENEMY_FLAG 0x40        /* (stage 9b) 009a88a6: no Enemy Skill is learned while this bit is set (005db812) */
+enum {  /* (stage 7) why command_attack_rule reads an attribute as Attack (0: kept) */
+    COMMAND_ATTACK_KEPT, COMMAND_ATTACK_NOT_COMMAND, COMMAND_ATTACK_NOT_LIVE, COMMAND_ATTACK_ITEM, COMMAND_ATTACK_NO_HOOKS,
+    COMMAND_ATTACK_LIST             /* (stage 8) */
+};
+enum { COMMAND_VIEW_KEEP, COMMAND_VIEW_SHOW, COMMAND_VIEW_RESTORE };  /* (stage 8) command_view_decide's answers */
+enum {  /* (stage 6) command_support_decide's answers */
+    COMMAND_PAIR_NONE, COMMAND_PAIR_COUNTER, COMMAND_PAIR_ALL, COMMAND_PAIR_QUADRA, COMMAND_PAIR_TURBO,
+    COMMAND_PAIR_ITEM, COMMAND_PAIR_KIND, COMMAND_PAIR_MAGIC_COUNTER, COMMAND_PAIR_OFF
+};
+enum { ACT_ACCURACY = 0x0f, ACT_FORMULA = 0x10, ACT_ELEMENT = 0x11, ACT_POWER = 0x12 };   /* (weapon set-up fields) */
+/* the keys a section was given, by the line they are on (key_line[k], 0 = not given) */
+enum {
+    COMMAND_KEY_KIND, COMMAND_KEY_SPELL, COMMAND_KEY_TARGET,    /* (spell: the first spell or spell_all line) */
+    COMMAND_KEY_LIKE, COMMAND_KEY_SCRIPT, COMMAND_KEY_SCRIPT_ALL, COMMAND_KEY_TURNS, COMMAND_KEY_POWER,
+    COMMAND_KEY_FORMULA, COMMAND_KEY_ACCURACY, COMMAND_KEY_ELEMENT, COMMAND_KEY_STATUS, COMMAND_KEY_STATUS_MODE,
+    COMMAND_KEY_STATUS_CHANCE, COMMAND_KEY_SPECIAL, COMMAND_KEY_FLAGS, COMMAND_KEY_IMPACT, COMMAND_KEY_SOUND,
+    COMMAND_KEY_CAMERA_SINGLE, COMMAND_KEY_CAMERA_MULTI,
+    COMMAND_KEYS
+};
+#define COMMAND_KEY_PHYSICAL_FIRST COMMAND_KEY_LIKE     /* LIKE .. CAMERA_MULTI: physical keys only */
+
+struct new_command {
+    BYTE defined;                       /* a section of this reading */
+    BYTE usable;                        /* no problem in its section, its spells exist, a target byte */
+    BYTE live;                          /* its kernel record is written: menu, texts and battle take it */
+    BYTE cursor;                        /* record byte 0 */
+    BYTE target;                        /* record byte 1 (never ff once usable, for a spell command) */
+    BYTE target_given, has_all, has_name, has_description, menu_given, spell_given;
+    WORD spell, spell_all;
+    int line;
+    char label[32];                     /* the name as written, for the log */
+    BYTE name[32];                      /* FF7 text */
+    BYTE description[96];
+    /* stage 2 */
+    BYTE kind;                          /* COMMAND_KIND_SPELL (default) or COMMAND_KIND_PHYSICAL */
+    BYTE like;                          /* physical: the weapon command it is made like (01 09 0a 11 18 19 1a 1b) */
+    BYTE like_list;                     /* that command's handler list: its offset in 007b75a8 (found at resolve) */
+    BYTE script, script_all;            /* model scripts: the like's row script unless given */
+    BYTE like_script;                   /* (stage 3) the like's row script as loaded: a frog's (command_weapon_setup) */
+    BYTE turns, power, formula, accuracy, impact;
+    BYTE status_mode, status_chance;    /* 0 inflict 1 cure 2 toggle; 0-63 (63 always) */
+    BYTE status_byte;                   /* status_mode << 6 | status_chance: FUN_005ca766's first argument */
+    WORD sound, element, special;       /* special as the record stores it (inverted: a clear bit is on) */
+    WORD flags;                         /* ORed into action[0x24]: the like's row flags unless given */
+    WORD camera_single, camera_multi;
+    DWORD status;
+    short key_line[COMMAND_KEYS];
+    /* stage 5 (kind = item): after key_line, so that stages 1-4's fields keep their places */
+    short items_line, potency_line;     /* the first `items` line, the `potency` line (0 = not given) */
+    WORD potency;                       /* per cent of each amount of the command's items (taken only with potency_line) */
+    WORD items_count;                   /* numbers in the set */
+    BYTE items[COMMAND_ITEM_NUMBERS / 8];   /* with an items line: bit n = item n may be used; without one any item may */
+    /* stage 6 (support materia): after stage 5's, so that stages 1-5's fields keep their places; all 0 with no line */
+    short support_line;                 /* the first `support` line (0 = not given) */
+    BYTE support_named;                 /* the words its support lines name (COMMAND_SUP_*) */
+    BYTE support_off;                   /* at resolve: what applies to the kind and the lines leave out */
+    /* stage 7 (the W- form): after stage 6's, so that stages 1-6's fields keep their places; 0 with no line */
+    short w_form_line;                  /* the `w_form` line (0 = not given) */
+    BYTE w_form;                        /* yes: the command twice in one turn, two picks */
+    /* stage 8 (kind = list): after stage 7's, so that stages 1-7's fields keep their places; 0 with no spells line */
+    BYTE list_count;                    /* the list's spells, in the order shown (at most COMMAND_LIST_MOST) */
+    BYTE list_over;                     /* the "more than 54" line was said */
+    short list_line;                    /* the first `spells` line (0 = not given) */
+    WORD list_ids[COMMAND_LIST_MOST];   /* a kernel magic ID 0x00-0x35, or a spell of the spell file (3000 and up) */
+    short list_lines[COMMAND_LIST_MOST];    /* the line each was given on */
+    BYTE list_target[COMMAND_LIST_MOST];    /* at resolve: each spell's record target byte */
+    /* stage 9a (conditions): after stage 8's, so that stages 1-8's fields keep their places; 0 for an entry without one */
+    BYTE list_cond[COMMAND_LIST_MOST];      /* COMMAND_COND_MATERIA or _LEVEL (_NONE: always offered); (stage 9b) _ENEMY, _ITEM, _EVENT, _OFF */
+    WORD list_value[COMMAND_LIST_MOST];     /* its N: a materia level 1-20, a character level 1-99; (stage 9b) an attack ID, an item, a lesson */
+    /* stage 9b (learned entries): after stage 9a's, so that stages 1-9a's fields keep their places; 0 with no line */
+    short learned_text_line;            /* the `learned_text` line (0 = not given: the default) */
+    char learned_text[COMMAND_LEARNED_TEXT_MOST + 1];   /* as written */
+};
+/* (stage 9b) The [learning] section of the commands file (command_file_read). */
+struct command_learning {
+    short line;                         /* the section's line, 0 = none */
+    short request_line, test_line;
+    int request;                        /* the lesson byte's offset in the save's banks (00dc08dc), the character's the next; -1 none */
+    BYTE test_lesson, test_who;         /* test_lesson = LESSON:CHARACTER (a testing aid); lesson 0 = none */
+};
+/* What the physical kind reads from the loaded exe at resolve (the glue points at the game's tables) */
+struct command_game {
+    const BYTE *rows;                   /* 007b7510: 4 bytes a command (script, formula, flags word) */
+    const BYTE *lists;                  /* 007b75a8: the handler lists, each ended by 1f */
+    int lists_size;
+    const BYTE *classes;                /* 008ff068: 16 class flag bytes */
+    const DWORD *formulas;              /* 008ff1f8: 32 routines, 0 = none */
+};
+typedef void (*command_problem_fn)(int line, const char *what);
+typedef int (*command_spell_fn)(int id);    /* the spell's record target byte, or COMMAND_SPELL_NONE / _SUMMON */
+typedef void (*command_status_fn)(DWORD mode_chance, DWORD mask);   /* FUN_005ca766 on the current action */
+
+/* (stage 4) A number a new command can have: 0x1c-0x1f, or 0x26-0x3f (live only with the tables moved). */
+static BOOL command_number_new(int n)
+{
+    return (n >= COMMAND_FIRST && n <= COMMAND_IN_PLACE_LAST) || (n >= COMMAND_MOVED_FIRST && n <= COMMAND_LAST);
+}
+
+/* (stage 4) The section of number n (commands[n - COMMAND_FIRST]), or NULL if n cannot be a new command's. */
+static const struct new_command *command_of(const struct new_command *commands, int n)
+{
+    return command_number_new(n) ? &commands[n - COMMAND_FIRST] : NULL;
+}
+
+/* The flag bits a physical command may OR into action[0x24] (each hit's [0x86], FUN_005db960) */
+static const struct flag_name command_flag_names[] = {
+    { "no_number", 0x0002 }, { "steal", 0x0004 }, { "no_reach", 0x0010 }, { "keep_camera", 0x1000 },
+    { "morph", 0x2000 }, { NULL, 0 },
+};
+
+/* A `like` word: a name of state_command_names, '-' taken as '_' (2x-cut = 2x_cut). The command's number, or 0. */
+static int command_like_number(const char *start, const char *end)
+{
+    int i, k;
+
+    for (i = 0; i < STATE_COMMANDS; i++) {
+        const char *name = state_command_names[i].name;
+
+        for (k = 0; start + k < end && name[k]; k++) {
+            char a = start[k] == '-' ? '_' : start[k];
+
+            if (a >= 'A' && a <= 'Z')
+                a = (char)(a - 'A' + 'a');
+            if (a != name[k])
+                break;
+        }
+        if (start + k == end && !name[k])
+            return state_command_names[i].number;
+    }
+    return 0;
+}
+
+/* A model script a physical command may play: the weapon and Steal-family scripts every party model has
+   (0x14-0x1c, 0x22-0x2d). For script_all not the seven that FUN_005da0e7 maps for several targets. */
+static BOOL command_script_ok(DWORD n, BOOL all)
+{
+    if (!((n >= 0x14 && n <= 0x1c) || (n >= 0x22 && n <= 0x2d)))
+        return FALSE;
+    return !all || !(n == 0x14 || (n >= 0x22 && n <= 0x2c && !(n & 1)));
+}
+
+/* Where FUN_00436b1b puts command k's list: the k-th list of the `size` bytes (a list starts at 0 and after each
+   1f). -1 if there is none. */
+static int command_list_offset(const BYTE *lists, int size, int k)
+{
+    int i, start = 0;
+
+    for (i = 0; i < size && k > 0; i++)
+        if (lists[i] == 0x1f) {
+            start = i + 1;
+            k--;
+        }
+    return k == 0 && start < size ? start : -1;
+}
+
+/* Is the list at `offset` a weapon command's: 0x0e before 0x09, no attack record (0x0c, 0x0d), and 09 1f at
+   its end? */
+static BOOL command_list_is_weapon(const BYTE *lists, int size, int offset)
+{
+    int i, weapon = 0, last = -1;
+
+    if (offset < 0)
+        return FALSE;
+    for (i = offset; i < size && lists[i] != 0x1f; i++) {
+        if (lists[i] == 0x0c || lists[i] == 0x0d || (lists[i] == 0x09 && !weapon))
+            return FALSE;
+        weapon |= lists[i] == 0x0e;
+        last = lists[i];
+    }
+    return i < size && weapon && last == 0x09;
+}
+
+/* (stage 3) The turns the list at `offset` gives the hit loop: handler 0x12 sets 2 (FUN_005c9fac, 2x-Cut's), 0x10
+   sets 4 (FUN_005c9f46, 4x-Cut's), the last of them counting; else the builder's 1 (FUN_00435d81). Both run before
+   0x0e in the game's lists; no other handler of a weapon list writes the turns. */
+static int command_list_turns(const BYTE *lists, int size, int offset)
+{
+    int i, turns = 1;
+
+    for (i = offset; i >= 0 && i < size && lists[i] != 0x1f; i++) {
+        if (lists[i] == 0x12)
+            turns = 2;
+        else if (lists[i] == 0x10)
+            turns = 4;
+    }
+    return turns;
+}
+
+/* (stage 3) NULL, or why model script `n` cannot be a physical command's with `turns` turns. In every party model
+   of the game's battle.lgp (the 16 'ab' files, rsab the frog's aside) scripts 0x16, 0x18, 0x19 and 0x1a end on 9e
+   with no fa (no step home): each is a part of a chain the hit loop steps on after every turn (005d9940: 0x16 ->
+   0x17, 0x18 -> 0x19 -> 0x1a -> 0x1b; 0x17 and 0x1b end with fa). No command starts a chain at 0x19 or 0x1a (rows
+   007b7510: 2x-Cut 0x16, 4x-Cut 0x18): they go on from 0x18's run to the target. So 0x19 and 0x1a never, 0x16 with
+   2 turns or more, 0x18 with 4. */
+static const char *command_chain_problem(DWORD n, int turns)
+{
+    if (n == 0x19 || n == 0x1a)
+        return "script / script_all 0x19 or 0x1a is the middle of 4x-Cut's chain (0x18 0x19 0x1a 0x1b): no command starts there and it does not bring the actor home (only 0x17 and 0x1b do): the command is not used";
+    if (n == 0x16 && turns < 2)
+        return "script / script_all 0x16 is 2x-Cut's first part (then 0x17, which brings the actor home): it needs 2 turns or more (turns, or the like's own): the command is not used";
+    if (n == 0x18 && turns < 4)
+        return "script / script_all 0x18 is 4x-Cut's first part (then 0x19, 0x1a and 0x1b, which brings the actor home): it needs 4 turns (turns, or the like's own): the command is not used";
+    return NULL;
+}
+
+/* A damage formula byte for a physical command: NULL, or why not. Class = high digit, its flags 008ff068[class];
+   class flag 4 (class 0xA) makes the low digit an additional effect (FUN_005d17c7), which a weapon command
+   never has; the routine 008ff1f8[low digit, +0x10 with class flag 2] must be there: with none (0) the game
+   runs no formula at all (FUN_005d173f), so the hit does no damage. */
+static const char *command_formula_problem(DWORD formula, const struct command_game *game)
+{
+    BYTE flags = game->classes[(formula >> 4) & 0x0f];
+
+    if (flags & 4)
+        return "damage_formula: class 0xA (and any class whose low digit is an additional effect) is not a weapon attack's: the command is not used";
+    if (!game->formulas[(formula & 0x0f) | (flags & 2 ? 0x10 : 0)])
+        return "damage_formula: the loaded game has no formula routine for this byte (the hit would do no damage; power = 0 makes a hit with no damage): the command is not used";
+    return NULL;
+}
+
+/* The stage 2 keys: `kind` and the physical kind's. 0: not one of them. 1: taken, or refused with a line (the
+   section is then not usable). Whether a key fits the section's kind is decided at resolve (kind may come last). */
+static int command_physical_key(struct new_command *c, char *key, char *key_end, char *value, char *stop, int line,
+                                command_problem_fn problem)
+{
+    static const struct { const char *name; BYTE key; DWORD most; const char *what; } numbers[] = {
+        { "turns", COMMAND_KEY_TURNS, 4, "turns is 1 to 4 (the hit loop's turns: 2x-Cut has 2, 4x-Cut 4)" },
+        { "power", COMMAND_KEY_POWER, 0xff, "power is 0 to 255 (16 = Attack's; 0 = a hit with no damage)" },
+        { "damage_formula", COMMAND_KEY_FORMULA, 0xff, "damage_formula is one byte, as in the spell file (0x11 = the physical formula)" },
+        { "accuracy", COMMAND_KEY_ACCURACY, 0xff, "accuracy is 0 to 255" },
+        { "impact_effect", COMMAND_KEY_IMPACT, 0xff, "impact_effect is 0 to 255" },
+        { "impact_sound", COMMAND_KEY_SOUND, 0x1ff, "impact_sound is 0 to 0x1ff (the hit sound)" },
+        { "camera_single", COMMAND_KEY_CAMERA_SINGLE, 0xffff, "camera_single is 0 to 0xffff (0xffff = the weapon's camera)" },
+        { "camera_multi", COMMAND_KEY_CAMERA_MULTI, 0xffff, "camera_multi is 0 to 0xffff (0xffff = the weapon's camera)" },
+        { "script", COMMAND_KEY_SCRIPT, 0xff, "script is a weapon or Steal-family model script, 0x14-0x1c or 0x22-0x2d (cast, summon and item scripts key on other commands)" },
+        { "script_all", COMMAND_KEY_SCRIPT_ALL, 0xff, "script_all is a model script 0x14-0x1c or 0x22-0x2d, but not 0x14, 0x22, 0x24, 0x26, 0x28, 0x2a or 0x2c (the game turns those into their several-target script itself)" },
+    };
+    const char *bad = NULL;
+    char *p = value;
+    DWORD n = 0, mask = 0;
+    unsigned i;
+    int k = -1;
+
+    for (i = 0; i < sizeof numbers / sizeof numbers[0]; i++)
+        if (word_is(key, key_end, numbers[i].name)) {
+            k = numbers[i].key;
+            if (!parse_number(&p, stop, &n) || p != stop || n > numbers[i].most ||
+                (k == COMMAND_KEY_TURNS && n < 1) ||
+                ((k == COMMAND_KEY_SCRIPT || k == COMMAND_KEY_SCRIPT_ALL) && !command_script_ok(n, k == COMMAND_KEY_SCRIPT_ALL)))
+                bad = numbers[i].what;
+            break;
+        }
+    if (k == COMMAND_KEY_TURNS)
+        c->turns = (BYTE)n;
+    else if (k == COMMAND_KEY_POWER)
+        c->power = (BYTE)n;
+    else if (k == COMMAND_KEY_FORMULA)
+        c->formula = (BYTE)n;
+    else if (k == COMMAND_KEY_ACCURACY)
+        c->accuracy = (BYTE)n;
+    else if (k == COMMAND_KEY_IMPACT)
+        c->impact = (BYTE)n;
+    else if (k == COMMAND_KEY_SOUND)
+        c->sound = (WORD)n;
+    else if (k == COMMAND_KEY_CAMERA_SINGLE)
+        c->camera_single = (WORD)n;
+    else if (k == COMMAND_KEY_CAMERA_MULTI)
+        c->camera_multi = (WORD)n;
+    else if (k == COMMAND_KEY_SCRIPT)
+        c->script = (BYTE)n;
+    else if (k == COMMAND_KEY_SCRIPT_ALL)
+        c->script_all = (BYTE)n;
+    else if (word_is(key, key_end, "kind")) {
+        k = COMMAND_KEY_KIND;
+        if (word_is(value, stop, "spell"))
+            c->kind = COMMAND_KIND_SPELL;
+        else if (word_is(value, stop, "physical"))
+            c->kind = COMMAND_KIND_PHYSICAL;
+        else if (word_is(value, stop, "item"))
+            c->kind = COMMAND_KIND_ITEM;    /* (stage 5) */
+        else if (word_is(value, stop, "list"))
+            c->kind = COMMAND_KIND_LIST;    /* (stage 8) */
+        else
+            bad = "kind is spell (the row casts a spell, the default), physical (a weapon attack made like one of the game's weapon commands), item (the battle's Item list under the command's own name) or list (its own list of spells, in the Magic list's window)";
+    } else if (word_is(key, key_end, "like")) {
+        k = COMMAND_KEY_LIKE;
+        c->like = (BYTE)command_like_number(value, stop);
+        if (!c->like)
+            bad = "like is attack, mug, deathblow, morph, slash_all, 2x_cut, flash or 4x_cut (a physical command is made like a command whose handler list has the weapon set-up 0x0e)";
+    } else if (word_is(key, key_end, "element")) {
+        k = COMMAND_KEY_ELEMENT;
+        if (!parse_flags(value, stop, element_flags, 0xffff, &mask))
+            bad = "element is the spell file's element names (fire ice lightning earth poison gravity water wind holy restorative cut hit punch shoot shout hidden), a number or none";
+        c->element = (WORD)mask;
+    } else if (word_is(key, key_end, "status")) {
+        k = COMMAND_KEY_STATUS;
+        if (!parse_flags(value, stop, status_flags, 0xffffffffu, &mask))
+            bad = "status is the spell file's status names, a number or none";
+        else if (mask & 0x80000000u)
+            bad = "status: imprisoned (bit 31) takes another path in the game's status set-up (FUN_005ca766): not for a command";
+        c->status = mask;
+    } else if (word_is(key, key_end, "status_mode")) {
+        static const char *const modes[] = { "inflict", "cure", "toggle" };
+
+        k = COMMAND_KEY_STATUS_MODE;
+        for (i = 0; i < 3 && !word_is(value, stop, modes[i]); i++)
+            ;
+        if (i == 3)
+            bad = "status_mode must be inflict, cure or toggle";
+        c->status_mode = (BYTE)(i & 3);
+    } else if (word_is(key, key_end, "status_chance")) {
+        k = COMMAND_KEY_STATUS_CHANCE;
+        if (word_is(value, stop, "always"))
+            c->status_chance = 63;
+        else if (!parse_number(&p, stop, &n) || p != stop || n > 100)
+            bad = "status_chance must be always or a percentage from 0 to 100";
+        else
+            c->status_chance = (BYTE)((n + 2) / 4);     /* (the spell file's conversion) */
+    } else if (word_is(key, key_end, "special")) {
+        k = COMMAND_KEY_SPECIAL;
+        if (!parse_flags(value, stop, special_flags, 0xffff, &mask))
+            bad = "special is the spell file's special names, a number or none";
+        c->special = (WORD)(~mask & 0xffff);            /* stored inverted, as the record has it */
+    } else if (word_is(key, key_end, "flags")) {
+        k = COMMAND_KEY_FLAGS;
+        if (!parse_flags(value, stop, command_flag_names, 0, &mask))
+            bad = "flags is steal, no_number, morph, no_reach, keep_camera or none (the whole set)";
+        c->flags = (WORD)mask;
+    }
+    if (k < 0)
+        return 0;
+    if (bad) {
+        problem(line, bad);
+        c->usable = 0;
+    } else {
+        c->key_line[k] = (short)line;
+    }
+    return 1;
+}
+
+/* (stage 5) Which run of item numbers n is in: 1 the items 0-127, 2 SpellExt's items 448-511, 3 the wide items
+   1024-9999; 0 none an `items` line may name: 128-447 are gear (weapons 128-255 and 320-383, armour 256-287 and
+   384-415, accessories 288-319 and 416-447: in the battle's list only to be thrown), 512-1023 and 10000 up no item. */
+static int command_item_run(DWORD n)
+{
+    return n < 128 ? 1 : n >= 448 && n < 512 ? 2 : n >= 1024 && n < COMMAND_ITEM_NUMBERS ? 3 : 0;
+}
+
+/* (stage 5) An `items` line: item numbers and ranges a-b (no space inside a range), decimal or 0x hex, at most six
+   characters a number, separated by commas or spaces, added to the section's set (several lines add up; a number
+   given twice counts once). A word that is not one, or that names gear or no item (a range must lie in one run of
+   command_item_run), is left out with one line; the rest is kept. An empty set is refused at resolve. */
+static void command_items_key(struct new_command *c, char *value, char *stop, int line, command_problem_fn problem)
+{
+    char *p = value;
+
+    if (!c->items_line)
+        c->items_line = (short)line;
+    while (p < stop) {
+        char *word, *end, *q, *second;
+        DWORD a = 0, b = 0;
+        int ok;
+
+        while (p < stop && (*p == ',' || is_space(*p)))
+            p++;
+        if (p == stop)
+            break;
+        for (word = p; p < stop && *p != ',' && !is_space(*p); p++)
+            ;
+        end = p;
+        q = word;
+        ok = parse_number(&q, end, &a) && q - word <= 6;
+        b = a;
+        if (ok && q < end) {
+            ok = *q == '-';
+            second = ++q;
+            ok = ok && parse_number(&q, end, &b) && q == end && q - second <= 6;
+        }
+        if (!ok) {
+            problem(line, "items: a word that is not an item number or a range of them (0x00-0x02: no space inside; at most six characters a number): that word is left out, the rest is kept");
+            continue;
+        }
+        if (a > b || !command_item_run(a) || command_item_run(a) != command_item_run(b)) {
+            problem(line, "items: a weapon, armour or accessory number (128-447), a number that is no item (512-1023, 10000 and up), a range reaching one, or a range backwards: only items 0-127, 448-511 and 1024-9999 are listed: that word is left out, the rest is kept");
+            continue;
+        }
+        for (; a <= b; a++)
+            if (!(c->items[a >> 3] & (1u << (a & 7)))) {
+                c->items[a >> 3] |= (BYTE)(1u << (a & 7));
+                c->items_count++;
+            }
+    }
+}
+
+/* (stage 6) The `support` words: the support materia this stage gives a new command (stage6/DESIGN.md 6.1). */
+static const struct flag_name command_support_names[] = {
+    { "counter", COMMAND_SUP_COUNTER }, { "sneak_attack", COMMAND_SUP_SNEAK }, { "final_attack", COMMAND_SUP_FINAL },
+    { "all", COMMAND_SUP_ALL }, { "quadra", COMMAND_SUP_QUADRA }, { "mega_all", COMMAND_SUP_MEGA_ALL },
+    { "mp_turbo", COMMAND_SUP_TURBO }, { "none", 0 }, { NULL, 0 },
+};
+
+/* (stage 6) A `support` line: words of command_support_names separated by commas or spaces, added to the section's
+   named set (several lines add up; `none` names nothing, so `support = none` alone turns every one off). A word that
+   is not one is left out with one line, the rest is kept; an empty line is one line and counts as no line. What
+   applies to the kind is settled at resolve (command_resolve_support). */
+static void command_support_key(struct new_command *c, char *value, char *stop, int line, command_problem_fn problem)
+{
+    char *p = value;
+
+    if (value == stop) {
+        problem(line, "support: an empty line (give the words: counter sneak_attack final_attack all quadra mega_all mp_turbo, or none): the line is ignored");
+        return;
+    }
+    if (!c->support_line)
+        c->support_line = (short)line;
+    while (p < stop) {
+        char *word;
+        int k;
+
+        while (p < stop && (*p == ',' || is_space(*p)))
+            p++;
+        if (p == stop)
+            break;
+        for (word = p; p < stop && *p != ',' && !is_space(*p); p++)
+            ;
+        for (k = 0; command_support_names[k].name && !word_is(word, p, command_support_names[k].name); k++)
+            ;
+        if (command_support_names[k].name)
+            c->support_named |= (BYTE)command_support_names[k].value;
+        else
+            problem(line, "support: a word that is not counter, sneak_attack, final_attack, all, quadra, mega_all, mp_turbo or none: that word is left out, the rest is kept");
+    }
+}
+
+/* (stage 9a) The condition of a `spells` word, [start, end) after its ID's ':': `N` or `materia:N` (a materia giving the
+   command at level N or more is on the character, 1-20), `level:N` (the character's level, 1-99); and `enemy:ID`
+   (0-0xffff), `item:ID` (105-127, 448-511, 1024-9999), `event:N` (1-255), each with its own range line (stage 9b: kept,
+   learned). The words in any case, the numbers decimal or 0x hex. Returns the COMMAND_COND_* with its *value, or -1 with
+   *why the problem's words. */
+static int command_list_condition(char *start, char *end, DWORD *value, const char **why)
+{
+    static const char *const words[] = { "materia", "level", "enemy", "item", "event" };
+    static const char *const ranges[] = {
+        "spells: a materia level is 1 to 20 (ID:N or ID:materia:N): that entry is left out, the rest is kept",
+        "spells: a character level is 1 to 99 (ID:level:N): that entry is left out, the rest is kept",
+        "spells: enemy:ID names an attack ID, 0 to 0xffff: that entry is left out, the rest is kept",
+        "spells: item:ID names a new item of the items file (105-127, 448-511 or 1024-9999): that entry is left out, the rest is kept",
+        "spells: event:N names a lesson, 1 to 255: that entry is left out, the rest is kept",
+    };
+    char *colon, *number = start, *q;
+    int cond = COMMAND_COND_MATERIA, k;
+    DWORD n = 0;
+
+    for (colon = start; colon < end && *colon != ':'; colon++)
+        ;
+    if (colon < end) {
+        for (k = 0; k < (int)(sizeof words / sizeof words[0]) && !word_is(start, colon, words[k]); k++)
+            ;
+        q = start;
+        if (k == (int)(sizeof words / sizeof words[0])) {
+            *why = parse_number(&q, colon, &n) && q == colon
+                       ? "spells: one condition per entry (as 0x22:2 or 0x22:level:20, not 0x22:2:3): that entry is left out, the rest is kept"
+                       : "spells: a condition that is not N, materia:N, level:N, enemy:ID, item:ID or event:N (as 0x22:2 or 0x22:level:20): that entry is left out, the rest is kept";
+            return -1;
+        }
+        cond = k + COMMAND_COND_MATERIA;
+        number = colon + 1;
+        for (q = number; q < end; q++)
+            if (*q == ':') {
+                *why = "spells: one condition per entry (as 0x22:2 or 0x22:level:20, not 0x22:2:3): that entry is left out, the rest is kept";
+                return -1;
+            }
+    }
+    q = number;
+    if (end - number > COMMAND_CONDITION_DIGITS || !parse_number(&q, end, &n) || q != end) {
+        *why = "spells: a condition that is not N, materia:N, level:N, enemy:ID, item:ID or event:N (as 0x22:2 or 0x22:level:20): that entry is left out, the rest is kept";
+        return -1;
+    }
+    if ((cond == COMMAND_COND_MATERIA && (n < 1 || n > COMMAND_MATERIA_LEVELS_MOST)) ||
+        (cond == COMMAND_COND_LEVEL && (n < 1 || n > COMMAND_CHARACTER_LEVEL_MOST)) || (cond == COMMAND_COND_ENEMY && n > 0xffff) ||
+        (cond == COMMAND_COND_ITEM && !((n >= 105 && n <= 127) || (n >= 448 && n <= 511) || (n >= 1024 && n <= 9999))) ||
+        (cond == COMMAND_COND_EVENT && (n < 1 || n > 255))) {
+        *why = ranges[cond - COMMAND_COND_MATERIA];
+        return -1;
+    }
+    *value = n;
+    return cond;
+}
+
+/* (stage 8) A `spells` line: spell IDs, decimal or 0x hex, separated by commas or spaces, appended to the section's list
+   in the order given (several lines add up). A word that is not an ID (0 to 0xffff), an ID listed twice, and every ID
+   past COMMAND_LIST_MOST are left out, one line each (the last once a section); the rest is kept. Whether each is a
+   spell a list can hold is settled at resolve (command_resolve_list). (stage 9a) A word may be ID:CONDITION
+   (command_list_condition, no space around the ':'): a bad condition leaves that entry out, one line each. (stage 9b)
+   enemy: / item: / event: are kept: entries learned per character (the learned set). */
+static void command_list_key(struct new_command *c, char *value, char *stop, int line, command_problem_fn problem)
+{
+    char *p = value;
+
+    if (!c->list_line)
+        c->list_line = (short)line;
+    while (p < stop) {
+        char *word, *end, *q, *id_end;
+        const char *why = NULL;
+        DWORD n = 0, condition = 0;
+        int j, cond = COMMAND_COND_NONE;
+
+        while (p < stop && (*p == ',' || is_space(*p)))
+            p++;
+        if (p == stop)
+            break;
+        for (word = p; p < stop && *p != ',' && !is_space(*p); p++)
+            ;
+        end = p;
+        for (id_end = word; id_end < end && *id_end != ':'; id_end++)
+            ;
+        q = word;
+        if (id_end - word > 7 || !parse_number(&q, id_end, &n) || q != id_end || n > 0xffff) {
+            problem(line, "spells: a word that is not a spell ID (a kernel magic ID 0x00-0x35 or a spell of the spell file, 3000 and up; decimal or 0x hex): that word is left out, the rest is kept");
+            continue;
+        }
+        if (id_end < end && (cond = command_list_condition(id_end + 1, end, &condition, &why)) < 0) {
+            problem(line, why);
+            continue;
+        }
+        for (j = 0; j < c->list_count && c->list_ids[j] != n; j++)
+            ;
+        if (j < c->list_count) {
+            problem(line, "spells: a spell listed twice: the second is left out, the rest is kept");
+            continue;
+        }
+        if (c->list_count >= COMMAND_LIST_MOST) {
+            if (!c->list_over)
+                problem(line, "spells: more than 54 spells (one Magic window: 18 rows of 3): the rest is left out");
+            c->list_over = 1;
+            continue;
+        }
+        c->list_ids[c->list_count] = (WORD)n;
+        c->list_lines[c->list_count] = (short)line;
+        c->list_cond[c->list_count] = (BYTE)cond;          /* (stage 9a) */
+        c->list_value[c->list_count] = (WORD)condition;
+        c->list_count++;
+    }
+}
+
+/* Reads the commands file into commands[COMMAND_COUNT] (cleared first): sections [0x1c] .. [0x1f] and (stage 4)
+   [0x26] .. [0x3f] with name, description, menu, spell, spell_all and target, and the stage 2 keys
+   (command_physical_key). A section with any problem is not usable (all or nothing); every problem goes to
+   `problem` with its line. Returns how many sections were read. (Whether 0x26-0x3f can be used in this run is
+   the glue's: load_commands.) */
+/* (stage 9b) A decimal number of at most `most` digits at *p, [*p, end): the number, or -1 (no digit). */
+static long command_decimal(const char **p, const char *end, int most)
+{
+    long n = 0;
+    int digits = 0;
+
+    while (*p < end && **p >= '0' && **p <= '9' && digits < most)
+        n = n * 10 + (*(*p)++ - '0'), digits++;
+    return digits ? n : -1;
+}
+
+/* (stage 9b) [learning] request = BANK:BYTE, or none: the two save bytes of a field request, BYTE (the lesson) and BYTE + 1
+   (the character), found as forget_flag finds a bank's byte (FUN_0060f750: bank 1 at 00dc08dc + BYTE, 3 + 0x100, 11 (B)
+   + 0x200, 13 (D) + 0x300, 15 (F) + 0x400); BYTE 0-254; neither byte a place forget_flag refuses (bank 11 bytes 192-255,
+   a character's record; bank 3 bytes 9-11, the field's copy of the party). The lesson byte's offset, -1 for none, or -2
+   with *why. */
+static int command_request_parse(const char *p, const char *end, const char **why)
+{
+    long bank, byte;
+    int base;
+
+    if (word_is(p, end, "none"))
+        return -1;
+    *why = "[learning] request is BANK:BYTE (the lesson's save byte; the character's is BYTE + 1) or none";
+    if (p < end && (*p | 0x20) >= 'b' && (*p | 0x20) <= 'f' && p + 1 < end && p[1] == ':')
+        bank = 11 + ((*p++ | 0x20) - 'b');
+    else
+        bank = command_decimal(&p, end, 3);
+    if (bank < 0 || p >= end || *p++ != ':')
+        return -2;
+    base = bank == 1 ? 0 : bank == 3 ? 0x100 : bank == 11 ? 0x200 : bank == 13 ? 0x300 : bank == 15 ? 0x400 : -1;
+    if (base < 0) {
+        *why = "[learning] request: the bank is 1, 3, 11 (B), 13 (D) or 15 (F), the save's banks as a field script names them";
+        return -2;
+    }
+    byte = command_decimal(&p, end, 4);
+    if (byte < 0 || p != end)
+        return -2;
+    if (byte > 254) {
+        *why = "[learning] request: the byte is 0 to 254 (the request takes it and the next one)";
+        return -2;
+    }
+    if (base == 0x200 && byte + 1 >= 192) {
+        *why = "[learning] request: bytes 192-255 of bank 11 hold a character's record (the DLL's own place)";
+        return -2;
+    }
+    if (base == 0x100 && byte + 1 >= 9 && byte <= 11) {
+        *why = "[learning] request: bytes 9-11 of bank 3 are the field's copy of the party";
+        return -2;
+    }
+    return base + (int)byte;
+}
+
+/* (stage 9b) A line of the [learning] section. */
+static void command_learning_key(struct command_learning *l, const char *key, const char *key_end, const char *value,
+                                 const char *stop, int line, command_problem_fn problem)
+{
+    const char *why = NULL, *p = value;
+    long lesson, who;
+    int at;
+
+    if (word_is(key, key_end, "request")) {
+        at = command_request_parse(value, stop, &why);
+        if (at < -1) {
+            problem(line, why);
+            return;
+        }
+        l->request = at;
+        l->request_line = (short)line;
+    } else if (word_is(key, key_end, "test_lesson")) {
+        if (word_is(value, stop, "none")) {
+            l->test_lesson = 0;
+            l->test_line = (short)line;
+            return;
+        }
+        lesson = command_decimal(&p, stop, 3);
+        if (lesson >= 0 && p < stop && *p == ':') {
+            p++;
+            who = command_decimal(&p, stop, 3);
+        } else
+            who = -1;
+        if (lesson < 1 || lesson > 255 || who < 0 || p != stop || (who >= COMMAND_REQUEST_IDS && who != COMMAND_REQUEST_PARTY)) {
+            problem(line, "[learning] test_lesson is LESSON:CHARACTER (a lesson 1 to 255; the game's character ID 0 to 15, or 255 for the three in the party) or none: not used");
+            return;
+        }
+        l->test_lesson = (BYTE)lesson;
+        l->test_who = (BYTE)who;
+        l->test_line = (short)line;
+    } else
+        problem(line, "unknown key in [learning] (it takes request and test_lesson)");
+}
+
+/* (stage 9a and before) The commands file without a [learning] section of its own (stages 1-9a's reader, kept for their
+   tests; the DLL reads with command_file_read): a [learning] line is refused as any section that is not a number. */
+static int command_file_read(char *text, DWORD size, struct new_command *commands, struct command_learning *learning,
+                             command_problem_fn problem);
+static __attribute__((unused)) int command_file_parse(char *text, DWORD size, struct new_command *commands, command_problem_fn problem)
+{
+    return command_file_read(text, size, commands, NULL, problem);
+}
+
+/* The commands file. (stage 9b) With `learning`, its [learning] section is read into it (request none, no test_lesson
+   when the file has none). */
+static int command_file_read(char *text, DWORD size, struct new_command *commands, struct command_learning *learning,
+                             command_problem_fn problem)
+{
+    char *line, *end, *file_end = text + size;
+    int line_number = 0, count = 0, i, skipping = 0, in_learning = 0;
+    struct new_command *c = NULL;
+
+    if (learning) {
+        learning->line = learning->request_line = learning->test_line = 0;
+        learning->request = -1;
+        learning->test_lesson = learning->test_who = 0;
+    }
+
+    for (i = 0; i < COMMAND_COUNT; i++) {
+        BYTE *b = (BYTE *)&commands[i];
+        unsigned k;
+
+        for (k = 0; k < sizeof commands[i]; k++)
+            b[k] = 0;
+        commands[i].name[0] = commands[i].description[0] = 0xff;
+    }
+    for (line = text; line < file_end; line = end + 1) {
+        char *start = line, *stop, *equals, *key_end, *value, *p;
+        DWORD n = 0;
+
+        for (end = line; end < file_end && *end != '\n'; end++)
+            ;
+        line_number++;
+        for (stop = start; stop < end; stop++)
+            if ((*stop == ';' || *stop == '#') && (stop == start || is_space(stop[-1])))
+                break;
+        trim(&start, &stop);
+        if (start == stop)
+            continue;
+        if (*start == '[') {
+            c = NULL;
+            skipping = 1;               /* the lines of a refused section are passed over without a word each */
+            in_learning = 0;
+            p = start + 1;
+            if (learning && stop - start > 2 && stop[-1] == ']' && word_is(start + 1, stop - 1, "learning")) {
+                /* (stage 9b) */
+                if (learning->line) {
+                    problem(line_number, "a second [learning] section: it is skipped");
+                    continue;
+                }
+                learning->line = (short)line_number;
+                in_learning = 1;
+                skipping = 0;
+                continue;
+            }
+            if (stop[-1] != ']' || !parse_number(&p, stop - 1, &n) || p != stop - 1) {
+                problem(line_number, "a section is [NUMBER], a free command number from 0x1c to 0x1f or 0x26 to 0x3f: the section is skipped");
+                continue;
+            }
+            if (n > 0xff || !command_number_new((int)n)) {
+                problem(line_number, "only the free command numbers 0x1c to 0x1f and 0x26 to 0x3f can be defined (0x00-0x1b are the game's commands, 0x20-0x25 its own internal ones, 0x40 and up past what an action holds): the section is skipped");
+                continue;
+            }
+            c = &commands[n - COMMAND_FIRST];
+            if (c->defined) {
+                /* a number is unique: neither section is used (the first is not quietly kept) */
+                problem(line_number, "this command number is already defined above: neither section is used");
+                c->usable = 0;
+                c = NULL;
+                continue;
+            }
+            count++;
+            skipping = 0;
+            c->defined = c->usable = 1;
+            c->line = line_number;
+            c->cursor = COMMAND_CURSOR_TARGET;
+            continue;
+        }
+        if (in_learning) {
+            /* (stage 9b) */
+            for (equals = start; equals < stop && *equals != '='; equals++)
+                ;
+            key_end = equals;
+            value = equals < stop ? equals + 1 : stop;
+            trim(&start, &key_end);
+            trim(&value, &stop);
+            if (equals == stop)
+                problem(line_number, "expected key = value");
+            else
+                command_learning_key(learning, start, key_end, value, stop, line_number, problem);
+            continue;
+        }
+        if (!c) {
+            if (!skipping)
+                problem(line_number, "this line is not inside a [0x1c] .. [0x1f] or [0x26] .. [0x3f] section");
+            continue;
+        }
+        for (equals = start; equals < stop && *equals != '='; equals++)
+            ;
+        key_end = equals;
+        value = equals < stop ? equals + 1 : stop;
+        trim(&start, &key_end);
+        trim(&value, &stop);
+        if (equals == stop) {
+            problem(line_number, "expected key = value");
+            c->usable = 0;
+        } else if (word_is(start, key_end, "name")) {
+            int k;
+
+            encode_text_range(c->name, sizeof c->name, value, stop);
+            for (k = 0; k < (int)sizeof c->label - 1 && value + k < stop; k++)
+                c->label[k] = value[k] >= 0x20 && value[k] < 0x7f ? value[k] : '?';
+            c->label[k] = 0;
+            c->has_name = value < stop;
+        } else if (word_is(start, key_end, "description")) {
+            encode_text_range(c->description, sizeof c->description, value, stop);
+            c->has_description = 1;
+        } else if (word_is(start, key_end, "menu")) {
+            if (word_is(value, stop, "target"))
+                c->cursor = COMMAND_CURSOR_TARGET;
+            else if (word_is(value, stop, "target_uncovered"))
+                c->cursor = COMMAND_CURSOR_UNCOVERED;
+            else {
+                problem(line_number, "menu is target (OK opens the target cursor) or target_uncovered (Attack's cursor); an item command (kind = item) takes no menu line: its OK opens the Item list");
+                c->usable = 0;
+            }
+            c->menu_given = 1;
+        } else if (word_is(start, key_end, "spell") || word_is(start, key_end, "spell_all")) {
+            BOOL all = word_is(start, key_end, "spell_all");
+
+            p = value;
+            if (!parse_number(&p, stop, &n) || p != stop || n > 0xffff) {
+                problem(line_number, "spell and spell_all are a spell's ID: an extended spell of the spell file (3000 and up) or a kernel magic ID 0x00-0x35");
+                c->usable = 0;
+            } else if (all) {
+                c->spell_all = (WORD)n;
+                c->has_all = 1;
+            } else {
+                c->spell = (WORD)n;
+                c->spell_given = 1;
+            }
+            if (!c->key_line[COMMAND_KEY_SPELL])
+                c->key_line[COMMAND_KEY_SPELL] = (short)line_number;
+        } else if (word_is(start, key_end, "target")) {
+            DWORD mask;
+
+            /* (0xff, `weapon`, is a physical command's only: a spell command's is refused at resolve) */
+            if (word_is(value, stop, "weapon"))
+                mask = 0xff;
+            else if (!parse_flags(value, stop, target_flags, 0xff, &mask))
+                mask = 0x100;
+            if (mask > 0xff) {
+                problem(line_number, "target is the spell file's target names (selectable enemy multiple toggle one_row short_range all_rows random) or a number 0 to 0xfe (0xff would aim at every living actor); a physical command also takes weapon (0xff: the weapon's own, as Attack)");
+                c->usable = 0;
+            } else {
+                c->target = (BYTE)mask;
+                c->target_given = 1;
+                c->key_line[COMMAND_KEY_TARGET] = (short)line_number;
+            }
+        } else if (word_is(start, key_end, "items")) {
+            command_items_key(c, value, stop, line_number, problem);    /* (stage 5) */
+        } else if (word_is(start, key_end, "support")) {
+            command_support_key(c, value, stop, line_number, problem);  /* (stage 6) */
+        } else if (word_is(start, key_end, "w_form")) {
+            /* (stage 7) any kind: an item command's record becomes W-Item's (resolve), a spell or physical one's
+               row gets the W flag in the target set-up (the glue) */
+            if (word_is(value, stop, "yes"))
+                c->w_form = 1;
+            else if (word_is(value, stop, "no"))
+                c->w_form = 0;
+            else {
+                problem(line_number, "w_form is yes (the command twice in one turn, two picks, as W-Magic and W-Item) or no: the command is not used");
+                c->usable = 0;
+            }
+            c->w_form_line = (short)line_number;
+        } else if (word_is(start, key_end, "potency")) {
+            p = value;
+            if (stop - value > 9 || !parse_number(&p, stop, &n) || p != stop || n < 1 || n > COMMAND_POTENCY_MOST) {
+                problem(line_number, "potency is 1 to 1000 (per cent of what each of the command's items does: 200 = twice as much): the command is not used");
+                c->usable = 0;
+            } else {
+                c->potency = (WORD)n;
+                c->potency_line = (short)line_number;
+            }
+        } else if (word_is(start, key_end, "spells")) {
+            command_list_key(c, value, stop, line_number, problem);     /* (stage 8) */
+        } else if (word_is(start, key_end, "learned_text")) {
+            /* (stage 9b) the message of a learned entry; any kind takes it, a list uses it */
+            if (stop - value > COMMAND_LEARNED_TEXT_MOST)
+                problem(line_number, "learned_text is at most 60 characters: the default (Learned {command} \"{spell}\".) is used");
+            else {
+                for (i = 0; value + i < stop; i++)
+                    c->learned_text[i] = value[i];
+                c->learned_text[i] = 0;
+                c->learned_text_line = (short)line_number;
+            }
+        } else if (!command_physical_key(c, start, key_end, value, stop, line_number, problem)) {
+            problem(line_number, "unknown key (a command takes name, description, menu, spell, spell_all, target and support; any kind also w_form; with kind = physical: like, script, script_all, turns, power, damage_formula, accuracy, element, status, status_mode, status_chance, special, flags, impact_effect, impact_sound, camera_single, camera_multi; with kind = item: items, potency; with kind = list: spells)");
+            c->usable = 0;
+        }
+    }
+    return count;
+}
+
+/* A physical section after the file is read: no spell keys; its like's handler list (in the loaded exe) is a
+   weapon command's; its script, flags and status byte made; the keys the like's own later step would undo
+   refused (Morph's 0x1c sets the power, Flash's 0x18 the formula, Death and its chance); (stage 3) a script or
+   script_all that would end its turns away from home refused (command_chain_problem, with the turns given or the
+   like's list's). TRUE if usable. */
+static BOOL command_resolve_physical(struct new_command *c, const struct command_game *game, command_problem_fn problem)
+{
+    const BYTE *row;
+    const char *why;
+    int offset, turns;
+
+    if (c->key_line[COMMAND_KEY_SPELL]) {
+        problem(c->key_line[COMMAND_KEY_SPELL], "a physical command casts no spell (spell and spell_all are a spell command's): the command is not used");
+        return FALSE;
+    }
+    if (!c->like)
+        c->like = COMMAND_LIKE_DEFAULT;
+    row = game->rows + c->like * 4;
+    offset = command_list_offset(game->lists, game->lists_size, c->like);
+    if (!command_list_is_weapon(game->lists, game->lists_size, offset)) {
+        problem(c->line, "the like's handler list in the loaded game is not a weapon command's (the weapon set-up 0x0e, then the hit loop 09): the command is not used");
+        return FALSE;
+    }
+    c->like_list = (BYTE)offset;
+    c->like_script = row[0];
+    if (!c->key_line[COMMAND_KEY_SCRIPT])
+        c->script = row[0];
+    if (!command_script_ok(c->script, FALSE)) {
+        problem(c->line, "the like's own model script in the loaded game is not a weapon script (0x14-0x1c, 0x22-0x2d): give script = ...: the command is not used");
+        return FALSE;
+    }
+    turns = c->key_line[COMMAND_KEY_TURNS] ? c->turns : command_list_turns(game->lists, game->lists_size, offset);
+    if ((why = command_chain_problem(c->script, turns)) != NULL) {
+        problem(c->key_line[COMMAND_KEY_SCRIPT] ? c->key_line[COMMAND_KEY_SCRIPT] : c->key_line[COMMAND_KEY_TURNS] ? c->key_line[COMMAND_KEY_TURNS] : c->line, why);
+        return FALSE;
+    }
+    if (c->key_line[COMMAND_KEY_SCRIPT_ALL] && (why = command_chain_problem(c->script_all, turns)) != NULL) {
+        problem(c->key_line[COMMAND_KEY_SCRIPT_ALL], why);
+        return FALSE;
+    }
+    if (!c->key_line[COMMAND_KEY_FLAGS])
+        c->flags = (WORD)(row[2] | row[3] << 8);
+    if (c->like == 0x09 && c->key_line[COMMAND_KEY_POWER]) {
+        problem(c->key_line[COMMAND_KEY_POWER], "power: a command made like morph has Morph's own power (its step after the weapon set-up writes it): the command is not used");
+        return FALSE;
+    }
+    if (c->like == 0x1a && (c->key_line[COMMAND_KEY_FORMULA] || c->key_line[COMMAND_KEY_STATUS] || c->key_line[COMMAND_KEY_STATUS_CHANCE])) {
+        problem(c->key_line[COMMAND_KEY_FORMULA] ? c->key_line[COMMAND_KEY_FORMULA] : c->key_line[COMMAND_KEY_STATUS] ? c->key_line[COMMAND_KEY_STATUS] : c->key_line[COMMAND_KEY_STATUS_CHANCE],
+                "damage_formula, status, status_chance: a command made like flash has Flash's own (its step after the weapon set-up writes formula 0xb0, Death and its chance): the command is not used");
+        return FALSE;
+    }
+    if (c->key_line[COMMAND_KEY_FORMULA] && (why = command_formula_problem(c->formula, game)) != NULL) {
+        problem(c->key_line[COMMAND_KEY_FORMULA], why);
+        return FALSE;
+    }
+    if (!c->key_line[COMMAND_KEY_STATUS] && (c->key_line[COMMAND_KEY_STATUS_MODE] || c->key_line[COMMAND_KEY_STATUS_CHANCE])) {
+        problem(c->key_line[COMMAND_KEY_STATUS_MODE] ? c->key_line[COMMAND_KEY_STATUS_MODE] : c->key_line[COMMAND_KEY_STATUS_CHANCE],
+                "status_mode and status_chance go with a status line: the command is not used");
+        return FALSE;
+    }
+    if (!c->key_line[COMMAND_KEY_STATUS_CHANCE])
+        c->status_chance = 63;          /* always */
+    c->status_byte = (BYTE)(c->status_mode << 6 | c->status_chance);
+    return TRUE;
+}
+
+/* (stage 5) An item section after the file is read: none of the spell keys, `target` or `menu` (OK opens the Item
+   list, and the chosen item aims: Item's own record, 03 ff x7), no physical key, and with an items line a set
+   that is not empty. TRUE if usable: cursor 3, target ff; (stage 7) with `w_form = yes` cursor 0x0a, W-Item's own
+   (OK sets the W flag and opens the Item list: two picks, both items taken, the first given back on a cancel). */
+static BOOL command_resolve_item(struct new_command *c, command_problem_fn problem)
+{
+    int k;
+
+    if (c->key_line[COMMAND_KEY_SPELL]) {
+        problem(c->key_line[COMMAND_KEY_SPELL], "an item command uses the item chosen in the Item list: spell and spell_all are a spell command's: the command is not used");
+        return FALSE;
+    }
+    if (c->target_given) {
+        problem(c->key_line[COMMAND_KEY_TARGET], "an item command aims as the chosen item does (as Item): target is not an item command's key: the command is not used");
+        return FALSE;
+    }
+    if (c->menu_given) {
+        problem(c->line, "an item command's OK opens the Item list: menu is not an item command's key: the command is not used");
+        return FALSE;
+    }
+    for (k = COMMAND_KEY_PHYSICAL_FIRST; k < COMMAND_KEYS && !c->key_line[k]; k++)
+        ;
+    if (k < COMMAND_KEYS) {
+        problem(c->key_line[k], "this key is a physical command's (kind = physical): the command is not used");
+        return FALSE;
+    }
+    if (c->items_line && !c->items_count) {
+        problem(c->items_line, "items: no item number is left (the line is empty, or every word was left out): the command is not used");
+        return FALSE;
+    }
+    c->cursor = c->w_form ? COMMAND_CURSOR_W_ITEM : COMMAND_CURSOR_ITEM;
+    c->target = 0xff;
+    return TRUE;
+}
+
+/* (stage 8) A list section after the file is read: none of the spell keys, `target` or `menu` (OK opens the Magic list,
+   and the chosen spell aims), no physical key; each listed spell a kernel magic ID 0x00-0x35 or a spell of the spell
+   file that is not a summon, with a target byte that is not ff (the others left out, one line each: the list keeps
+   its order); at least one left. TRUE if usable: cursor 1 (w_form: W-Magic's 8), target 03, each spell's record target
+   byte noted. */
+static BOOL command_resolve_list(struct new_command *c, command_spell_fn spell_target, command_problem_fn problem)
+{
+    int j, k, kept = 0, target;
+
+    if (c->key_line[COMMAND_KEY_SPELL]) {
+        problem(c->key_line[COMMAND_KEY_SPELL], "a list command casts the spell chosen in its list (spells = ...): spell and spell_all are a spell command's: the command is not used");
+        return FALSE;
+    }
+    if (c->target_given) {
+        problem(c->key_line[COMMAND_KEY_TARGET], "a list command aims as the chosen spell does (as Magic): target is not a list command's key: the command is not used");
+        return FALSE;
+    }
+    if (c->menu_given) {
+        problem(c->line, "a list command's OK opens its list in the Magic list's window: menu is not a list command's key: the command is not used");
+        return FALSE;
+    }
+    for (k = COMMAND_KEY_PHYSICAL_FIRST; k < COMMAND_KEYS && !c->key_line[k]; k++)
+        ;
+    if (k < COMMAND_KEYS) {
+        problem(c->key_line[k], "this key is a physical command's (kind = physical): the command is not used");
+        return FALSE;
+    }
+    for (j = 0; j < c->list_count; j++) {
+        target = spell_target(c->list_ids[j]);
+        if (target == COMMAND_SPELL_SUMMON) {
+            problem(c->list_lines[j], "spells: an extended summon (list = summon) is not cast as magic: that spell is left out, the rest is kept");
+            continue;
+        }
+        if (target < 0) {
+            problem(c->list_lines[j], "spells: a spell that is neither a kernel magic ID 0x00-0x35 nor a spell of the spell file (3000 and up; an enemy skill is listed as a spell of the spell file with its base and animation): that spell is left out, the rest is kept");
+            continue;
+        }
+        if (target == 0xff) {
+            problem(c->list_lines[j], "spells: a spell whose target byte is 0xff (it would aim at every living actor): that spell is left out, the rest is kept");
+            continue;
+        }
+        c->list_ids[kept] = c->list_ids[j];
+        c->list_lines[kept] = c->list_lines[j];
+        c->list_target[kept] = (BYTE)target;
+        c->list_cond[kept] = c->list_cond[j];      /* (stage 9a) an entry's condition goes with it */
+        c->list_value[kept] = c->list_value[j];
+        kept++;
+    }
+    for (j = kept; j < c->list_count; j++) {
+        c->list_ids[j] = 0;
+        c->list_lines[j] = 0;
+        c->list_cond[j] = 0;                        /* (stage 9a) */
+        c->list_value[j] = 0;
+    }
+    c->list_count = (BYTE)kept;
+    if (!kept) {
+        problem(c->list_line ? c->list_line : c->line, "a list command needs spells (a spells line with at least one spell a list can hold): the command is not used");
+        return FALSE;
+    }
+    c->cursor = c->w_form ? COMMAND_CURSOR_W_MAGIC : COMMAND_CURSOR_MAGIC;
+    c->target = COMMAND_LIST_TARGET;
+    return TRUE;
+}
+
+/* (stage 6) What the support materia of this stage can give a command of `kind`. (stage 8) A list command: All, Quadra
+   Magic, Mega All and MP Turbo (a counter has no entry to choose). */
+static BYTE command_support_applies(int kind)
+{
+    return (BYTE)(kind == COMMAND_KIND_SPELL ? COMMAND_SUP_SPELL : kind == COMMAND_KIND_PHYSICAL ? COMMAND_SUP_PHYSICAL
+                  : kind == COMMAND_KIND_LIST ? COMMAND_SUP_LIST : 0);
+}
+
+/* (stage 6) A section's support_off at resolve: what applies to its kind and its support lines leave out (0 with no
+   line: everything that applies is on). Words that do not apply to the kind: one line, ignored. */
+static void command_resolve_support(struct new_command *c, command_problem_fn problem)
+{
+    BYTE applies = command_support_applies(c->kind);
+
+    c->support_off = 0;
+    if (!c->support_line)
+        return;
+    if (c->support_named & ~applies)
+        problem(c->support_line, c->kind == COMMAND_KIND_ITEM
+                ? "support: none of these applies to an item command (Counter, Sneak Attack and Final Attack would need an item to pick; All, Quadra Magic, MP Turbo and Mega All have no meaning for an item): the line is ignored"
+                : c->kind == COMMAND_KIND_LIST    /* (stage 8) */
+                ? "support: counter, sneak_attack and final_attack do not apply to a list command (a counter has no entry to choose): those words are ignored"
+                : "support: all, quadra and mp_turbo apply to a spell command only (the game pairs them with magic; Mega All covers a physical one): those words are ignored");
+    c->support_off = (BYTE)(applies & ~c->support_named);
+}
+
+/* After the file is read and the spells are known: each usable section has a name. A spell section's spells
+   exist and are not summons, its target byte (the spell's own record byte unless `target` is given) is not ff,
+   and it has no physical key; a physical section as command_resolve_physical; (stage 5) an item section as
+   command_resolve_item, and items / potency in any other section refused. Returns how many are usable. */
+static int command_resolve(struct new_command *commands, command_spell_fn spell_target, const struct command_game *game,
+                           command_problem_fn problem)
+{
+    int i, k, usable = 0;
+
+    for (i = 0; i < COMMAND_COUNT; i++) {
+        struct new_command *c = &commands[i];
+        int target, all;
+
+        if (!c->defined || !c->usable)
+            continue;
+        if (!c->has_name) {
+            problem(c->line, "a command needs a name (the battle menu's row): the command is not used");
+            c->usable = 0;
+            continue;
+        }
+        if (c->kind != COMMAND_KIND_ITEM && (c->items_line || c->potency_line)) {
+            problem(c->items_line ? c->items_line : c->potency_line, "items and potency are an item command's keys (kind = item): the command is not used");
+            c->usable = 0;
+            continue;
+        }
+        if (c->kind != COMMAND_KIND_LIST && c->list_line) {
+            problem(c->list_line, "spells is a list command's key (kind = list): the command is not used");     /* (stage 8) */
+            c->usable = 0;
+            continue;
+        }
+        command_resolve_support(c, problem);    /* (stage 6) a line only: never makes a section unusable */
+        if (c->kind == COMMAND_KIND_LIST) {
+            if (command_resolve_list(c, spell_target, problem))     /* (stage 8) */
+                usable++;
+            else
+                c->usable = 0;
+            continue;
+        }
+        if (c->kind == COMMAND_KIND_ITEM) {
+            if (command_resolve_item(c, problem))
+                usable++;
+            else
+                c->usable = 0;
+            continue;
+        }
+        if (c->kind == COMMAND_KIND_PHYSICAL) {
+            if (command_resolve_physical(c, game, problem))
+                usable++;
+            else
+                c->usable = 0;
+            continue;
+        }
+        for (k = COMMAND_KEY_PHYSICAL_FIRST; k < COMMAND_KEYS && !c->key_line[k]; k++)
+            ;
+        if (k < COMMAND_KEYS) {
+            problem(c->key_line[k], "this key is a physical command's (kind = physical): the command is not used");
+            c->usable = 0;
+            continue;
+        }
+        if (c->target_given && c->target == 0xff) {
+            problem(c->key_line[COMMAND_KEY_TARGET], "target is the spell file's target names (selectable enemy multiple toggle one_row short_range all_rows random) or a number 0 to 0xfe (0xff would aim at every living actor): the command is not used");
+            c->usable = 0;
+            continue;
+        }
+        if (!c->spell_given) {
+            problem(c->line, "a command needs a spell (the spell it casts): the command is not used");
+            c->usable = 0;
+            continue;
+        }
+        target = spell_target(c->spell);
+        all = c->has_all ? spell_target(c->spell_all) : 0;
+        if (target == COMMAND_SPELL_SUMMON || all == COMMAND_SPELL_SUMMON) {
+            problem(c->line, "a command casts its spell as magic: an extended summon (list = summon) cannot be its spell: the command is not used");
+            c->usable = 0;
+            continue;
+        }
+        if (target < 0 || all < 0) {
+            problem(c->line, target < 0 ? "spell is not defined: an extended spell of the spell file (3000 and up) or a kernel magic ID 0x00-0x35: the command is not used"
+                                        : "spell_all is not defined: an extended spell of the spell file (3000 and up) or a kernel magic ID 0x00-0x35: the command is not used");
+            c->usable = 0;
+            continue;
+        }
+        if (!c->target_given)
+            c->target = (BYTE)target;
+        if (c->target == 0xff) {
+            problem(c->line, "the spell's target byte is 0xff (the action would aim at every living actor): give target = ...: the command is not used");
+            c->usable = 0;
+            continue;
+        }
+        usable++;
+    }
+    return usable;
+}
+
+/* The kernel record of a usable command: `want` = cursor, target, ff x6 (a spell command); for a physical one
+   cursor, target, ff ff, camera one, camera several (words), each the like's record's (`like`, as loaded) unless
+   given. 1: `now` is ff x8, write it; 2: it is already `want` (written before, no kernel load since); 0: it is
+   anything else (another mod's kernel or an FFNx kernel.bin.chunk.1 uses the number: leave it); -1: not usable
+   or a spell command's target byte ff (never written); -2: physical, no `menu` and the like's cursor is neither
+   0 nor 7 (never written). (stage 5) An item command's `want` is Item's own record, 03 ff x7 (cursor and target
+   set by command_resolve_item). */
+static int command_record_decide(const BYTE *now, const struct new_command *c, const BYTE *like, BYTE *want)
+{
+    int k, all_ff = 1, same = 1;
+
+    if (!c->usable || (c->kind == COMMAND_KIND_SPELL && c->target == 0xff))
+        return -1;
+    want[0] = c->cursor;
+    want[1] = c->target;
+    for (k = 2; k < COMMAND_RECORD_SIZE; k++)
+        want[k] = 0xff;
+    if (c->kind == COMMAND_KIND_PHYSICAL) {
+        if (!c->menu_given)
+            want[0] = like[0];
+        if (want[0] != COMMAND_CURSOR_TARGET && want[0] != COMMAND_CURSOR_UNCOVERED)
+            return -2;
+        if (!c->target_given)
+            want[1] = like[1];
+        for (k = 4; k < COMMAND_RECORD_SIZE; k++)
+            want[k] = like[k];
+        if (c->key_line[COMMAND_KEY_CAMERA_SINGLE]) {
+            want[4] = (BYTE)c->camera_single;
+            want[5] = (BYTE)(c->camera_single >> 8);
+        }
+        if (c->key_line[COMMAND_KEY_CAMERA_MULTI]) {
+            want[6] = (BYTE)c->camera_multi;
+            want[7] = (BYTE)(c->camera_multi >> 8);
+        }
+    }
+    for (k = 0; k < COMMAND_RECORD_SIZE; k++) {
+        all_ff &= now[k] == 0xff;
+        same &= now[k] == want[k];
+    }
+    return all_ff ? 1 : same ? 2 : 0;
+}
+
+/* Handler 0x0c's first step (action_setup_hook) for an action whose command is a live new command. A party
+   member's (actor 0-2): the spell's cast as Magic makes it (see above); 1. Anyone else's: script -1, the hit loop
+   does nothing; -1 (the caller then runs no set-up). 0: not a live new command, nothing changed. (stage 8) A list
+   command's: the queued ID is the spell chosen in its list (the queue turned the handle back into the ID): cast as
+   above when it is one of the list's spells, with that spell's own target byte in [0x14] (the builder took the
+   record's 03), 1; else script -1, -2 (an AI's 0x92 or a stale ID: refused, no set-up). */
+static int command_list_index(const struct new_command *c, int id);
+static int command_setup(int *action, const struct new_command *commands)
+{
+    const struct new_command *c = command_of(commands, action[ACT_COMMAND]);
+    unsigned targets;
+    int spell, j;
+
+    if (!c)
+        return 0;
+    if (!c->live || (c->kind != COMMAND_KIND_SPELL && c->kind != COMMAND_KIND_LIST))
+        return 0;               /* (a physical command's list has no 0x0c: handler 0x0c never sees one) */
+    if (action[ACT_ACTOR] < 0 || action[ACT_ACTOR] > 2) {
+        action[ACT_SCRIPT] = -1;
+        return -1;
+    }
+    targets = (unsigned)action[ACT_TARGETS] & 0xffff;
+    if (c->kind == COMMAND_KIND_LIST) {
+        j = command_list_index(c, action[ACT_QUEUED_ID] & 0xffff);
+        if (j < 0) {
+            action[ACT_SCRIPT] = -1;
+            return -2;
+        }
+        spell = c->list_ids[j];
+        action[ACT_TARGET_FLAGS] = c->list_target[j];
+    } else {
+        spell = c->has_all && (targets & (targets - 1)) ? c->spell_all : c->spell;
+    }
+    action[ACT_ATTACK_ID] = action[ACT_QUEUED_ID] = action[ACT_DISPLAY_ID] = spell;
+    action[ACT_COMMAND_TYPE] = COMMAND_MAGIC;
+    action[ACT_SCRIPT] = SCRIPT_CAST_MAGIC;
+    return 1;
+}
+
+/* A type-5 text (descriptions in section `descriptions`, names TEXT_NAME_OFFSET after) of a live new command;
+   NULL for anything else. */
+static const BYTE *command_text(int section, int index, int descriptions, const struct new_command *commands)
+{
+    const struct new_command *c = command_of(commands, index);
+
+    if (!c || !c->live)
+        return NULL;
+    if (section == descriptions)
+        return c->description;
+    if (section == descriptions + TEXT_NAME_OFFSET)
+        return c->name;
+    return NULL;
+}
+
+/* (stage 4) Is the type-5 text (section `descriptions` or its names) of `index` answered with a blank when
+   command_text has none? Every index from 0x20 to 0xff: the two sections hold the game's 32 commands only, and
+   FFNx's kernel2_get_text reads any index with no bound. (No game call asks a constant index from 0x20 up;
+   0x00-0x1f are left to the kernel as before.) */
+static BOOL command_text_blank(int section, int index, int descriptions)
+{
+    return index >= COMMAND_KERNEL_RECORDS && index <= 0xff &&
+           (section == descriptions || section == descriptions + TEXT_NAME_OFFSET);
+}
+
+/* The live physical command an action is of, or NULL. */
+static const struct new_command *command_physical(const int *action, const struct new_command *commands)
+{
+    const struct new_command *c = command_of(commands, action[ACT_COMMAND]);
+
+    return c && c->live && c->kind == COMMAND_KIND_PHYSICAL ? c : NULL;
+}
+
+/* Before the game's weapon set-up (handler 0x0e): for a party actor's action of a live physical command, the
+   actor's weapon battle record `record` (COMMAND_WEAPON_RECORD bytes) is saved into `saved` and the command's
+   given values are written into it, where FUN_005c9c64 reads them: +2 formula, +3 accuracy, +4 impact effect,
+   +8 hit sound (word), +0xe element (word: the routine ORs the materia's element in again), +0x12 special flags
+   (word, inverted). 1: lent (command_weapon_setup puts it back); 0: nothing done. */
+static int command_weapon_lend(const int *action, const struct new_command *commands, BYTE *record, BYTE *saved)
+{
+    const struct new_command *c = command_physical(action, commands);
+    int k;
+
+    if (!c || action[ACT_ACTOR] < 0 || action[ACT_ACTOR] > 2)
+        return 0;
+    for (k = 0; k < COMMAND_WEAPON_RECORD; k++)
+        saved[k] = record[k];
+    if (c->key_line[COMMAND_KEY_FORMULA])
+        record[2] = c->formula;
+    if (c->key_line[COMMAND_KEY_ACCURACY])
+        record[3] = c->accuracy;
+    if (c->key_line[COMMAND_KEY_IMPACT])
+        record[4] = c->impact;
+    if (c->key_line[COMMAND_KEY_SOUND]) {
+        record[8] = (BYTE)c->sound;
+        record[9] = (BYTE)(c->sound >> 8);
+    }
+    if (c->key_line[COMMAND_KEY_ELEMENT]) {
+        record[0x0e] = (BYTE)c->element;
+        record[0x0f] = (BYTE)(c->element >> 8);
+    }
+    if (c->key_line[COMMAND_KEY_SPECIAL]) {
+        record[0x12] = (BYTE)c->special;
+        record[0x13] = (BYTE)(c->special >> 8);
+    }
+    return 1;
+}
+
+/* Right after the game's weapon set-up. `lent`: command_weapon_lend's answer; the record is put back first,
+   whatever follows. Then, for an action of a live physical command: an enemy's (actor not 0-2) gets script -1
+   (the hit loop does nothing), -1. A party member's gets the script (script_all with more than one target, if
+   given), its flags ORed into action[0x24] (0x1000 too with turns above 1), the like's command type, queued
+   and banner ID 0, the power and turns if given, and the status if given (`status`: FUN_005ca766 on the action),
+   unless `sevens` (the routine's own 0x1e61 rule, which has just cleared the element and status); 1. 0: not
+   such an action, nothing changed. (stage 3) `frog`: the actor is a frog (status 0x800, as FUN_005c9c64 reads
+   it): the script is the like's own row script, the one the game plays for its own command on a frog (and
+   FUN_005da0e7 maps at several targets as for it), not script or script_all; all else as for any actor (the game
+   changes nothing else for a frog here: FUN_005c9c64 gave the frog's sounds and impact 0, and FUN_005dbe6f plays
+   only type 1 for a frog). */
+static int command_weapon_setup(int *action, const struct new_command *commands, BYTE *record, const BYTE *saved,
+                                int lent, BOOL sevens, BOOL frog, command_status_fn status)
+{
+    const struct new_command *c;
+    unsigned targets;
+    int k;
+
+    if (lent)
+        for (k = 0; k < COMMAND_WEAPON_RECORD; k++)
+            record[k] = saved[k];
+    c = command_physical(action, commands);
+    if (!c)
+        return 0;
+    if (action[ACT_ACTOR] < 0 || action[ACT_ACTOR] > 2) {
+        action[ACT_SCRIPT] = -1;
+        return -1;
+    }
+    targets = (unsigned)action[ACT_TARGETS] & 0xffff;
+    action[ACT_SCRIPT] = c->key_line[COMMAND_KEY_SCRIPT_ALL] && (targets & (targets - 1)) ? c->script_all : c->script;
+    if (frog)
+        action[ACT_SCRIPT] = c->like_script;
+    action[ACT_FLAGS] |= c->flags;
+    if (c->key_line[COMMAND_KEY_TURNS] && c->turns > 1)
+        action[ACT_FLAGS] |= COMMAND_FLAG_KEEP_CAMERA;
+    action[ACT_COMMAND_TYPE] = c->like;
+    action[ACT_QUEUED_ID] = action[ACT_DISPLAY_ID] = 0;
+    if (c->key_line[COMMAND_KEY_POWER])
+        action[ACT_POWER] = c->power;
+    if (c->key_line[COMMAND_KEY_TURNS])
+        action[ACT_TURNS] = c->turns;
+    if (c->key_line[COMMAND_KEY_STATUS] && !sevens)
+        status(c->status_byte, c->status);
+    return 1;
+}
+
+/* The build-list guard's decision for an add of `command` to the list `list` (16 entries of 3 bytes) holding
+   `count` entries. COMMAND_ADD_GAME: the game's FUN_005cece9 (the command is listed, or there is room: every add
+   of the game's own worst cases takes this road). The list is full and the command not listed:
+   COMMAND_ADD_NO_STEAL: Steal while Mug is listed: not added (FUN_005cee69 blanks Steal at the finish anyway);
+   COMMAND_ADD_TAKE_STEAL: Steal is listed and Mug is, or is the one added: it takes Steal's entry;
+   COMMAND_ADD_TAKE_NEW: a game command takes the last new command's (0x1c-0x1f) entry;
+   COMMAND_ADD_NONE: not added (a new command with no room; or 16 game commands, which the game's materia cannot
+   give). *index: the entry taken, or 15 (only the W- callers use the index, and only for Magic and Summon). */
+enum { COMMAND_ADD_GAME, COMMAND_ADD_NO_STEAL, COMMAND_ADD_TAKE_STEAL, COMMAND_ADD_TAKE_NEW, COMMAND_ADD_NONE };
+
+static int command_add_decide(const BYTE *list, int count, int command, int *index)
+{
+    int i, c = command & 0xff, steal = -1, mug = 0, last_new = -1;
+
+    *index = COMMAND_BUILD_ENTRIES - 1;
+    for (i = 0; i < COMMAND_BUILD_ENTRIES; i++)
+        if (list[i * 3] == c)
+            return COMMAND_ADD_GAME;
+    if (count < COMMAND_BUILD_ENTRIES)
+        return COMMAND_ADD_GAME;
+    for (i = 0; i < COMMAND_BUILD_ENTRIES; i++) {
+        if (list[i * 3] == COMMAND_STEAL)
+            steal = i;
+        mug |= list[i * 3] == COMMAND_MUG;
+        if (command_number_new(list[i * 3]))
+            last_new = i;
+    }
+    if (c == COMMAND_STEAL && mug)
+        return COMMAND_ADD_NO_STEAL;
+    if (steal >= 0 && (c == COMMAND_MUG || mug)) {
+        *index = steal;
+        return COMMAND_ADD_TAKE_STEAL;
+    }
+    if (!command_number_new(c) && last_new >= 0) {
+        *index = last_new;
+        return COMMAND_ADD_TAKE_NEW;
+    }
+    return COMMAND_ADD_NONE;
+}
+
+/* (stage 4) The guard's first test, before command_add_decide: TRUE if the add of `command` (its low byte) is
+   refused outright (no row): a number from 0x20 that is not a live new command. 0x20-0x25 (the game's internal
+   ones: the game itself never adds a number from 0x20, its 17 calls push constants below 0x20 or the command
+   materia's attribute), 0x40 and up (an action keeps 6 bits) always; 0x26-0x3f unless the tables are moved and
+   its section is live. Below 0x20 nothing changes (0x1c-0x1f undefined: the harmless blank row, as before). */
+static BOOL command_add_refused(int command, const struct new_command *commands, BOOL moved)
+{
+    int c = command & 0xff;
+    const struct new_command *n = command_of(commands, c);
+
+    if (c < COMMAND_KERNEL_RECORDS)
+        return FALSE;
+    return !moved || !n || !n->live;
+}
+
+/* (stage 4) The 15 places the move repoints: the instruction bytes before the operand (none for the loader's
+   pointer, a data word), the stock value, and the table. Read from ff7_en.exe md5 659dc2b8 (objdump; stage4/
+   design_evidence/check_sites.txt; all readers of the three tables: stage4/verify/claim_0.md). */
+enum { COMMAND_TABLE_RECORDS, COMMAND_TABLE_ROWS, COMMAND_TABLE_OFFSETS, COMMAND_TABLES };
+struct command_site { DWORD at; BYTE table, code_count, code[4]; DWORD stock; };
+static const struct command_site command_move_sites[COMMAND_MOVE_SITES] = {
+    { 0x004361f5u, COMMAND_TABLE_RECORDS, 3, { 0x8a, 0x04, 0xd5 }, 0x00db9591u },        /* 00435d81: [0x14], gated < 0x20 */
+    { 0x00436496u, COMMAND_TABLE_RECORDS, 4, { 0x66, 0x8b, 0x04, 0xd5 }, 0x00db9594u },  /* 00435d81: [0x18], gated */
+    { 0x004364b2u, COMMAND_TABLE_RECORDS, 4, { 0x66, 0x8b, 0x0c, 0xc5 }, 0x00db9596u },  /* 00435d81: [0x19], gated */
+    { 0x00437a25u, COMMAND_TABLE_RECORDS, 1, { 0xa0 }, 0x00db9630u },                    /* 004379be: Limit's record */
+    { 0x00437a31u, COMMAND_TABLE_RECORDS, 2, { 0x8a, 0x15 }, 0x00db9631u },
+    { 0x005c8f9fu, COMMAND_TABLE_RECORDS, 3, { 0x8a, 0x14, 0xcd }, 0x00db9591u },        /* 005c8eeb: the counter decode */
+    { 0x005cf051u, COMMAND_TABLE_RECORDS, 3, { 0x8a, 0x14, 0xd5 }, 0x00db9590u },        /* 005cf002: a menu slot's cursor */
+    { 0x005cf076u, COMMAND_TABLE_RECORDS, 3, { 0x8a, 0x04, 0xc5 }, 0x00db9591u },        /* and its targets */
+    { 0x005cfee5u, COMMAND_TABLE_RECORDS, 3, { 0x8a, 0x0c, 0xc5 }, 0x00db9591u },        /* 005cfe67: battle start */
+    { 0x007ba070u, COMMAND_TABLE_RECORDS, 0, { 0 }, 0x00db9590u },                       /* the kernel loader's section 0 pointer */
+    { 0x00435ff8u, COMMAND_TABLE_ROWS, 3, { 0x8a, 0x0c, 0x85 }, 0x007b7510u },           /* 00435d81: the row's script */
+    { 0x00436012u, COMMAND_TABLE_ROWS, 3, { 0x8a, 0x14, 0x8d }, 0x007b7511u },           /* formula */
+    { 0x0043602du, COMMAND_TABLE_ROWS, 4, { 0x66, 0x8b, 0x04, 0x95 }, 0x007b7512u },     /* flags word */
+    { 0x0043655eu, COMMAND_TABLE_OFFSETS, 3, { 0x8b, 0x14, 0x8d }, 0x009ae9c8u },        /* 00435d81: the list read */
+    { 0x00436b58u, COMMAND_TABLE_OFFSETS, 3, { 0x89, 0x04, 0x95 }, 0x009ae9c8u },        /* 00436b1b: the offsets written */
+};
+static const DWORD command_table_old[COMMAND_TABLES] = { 0x00db9590u, 0x007b7510u, 0x009ae9c8u };
+static const DWORD command_table_span[COMMAND_TABLES] = { COMMAND_KERNEL_RECORDS * COMMAND_RECORD_SIZE, 4, 4 };
+
+/* (stage 4) The move's plan. values[k]: the dword at site k now; code_ok[k]: its instruction bytes are the
+   site's. -1 and planned[k] = the value repointed into the table (value - old base + new_base[table], for a
+   value in [old base, old base + span): Limit's record 0x14 at 00db9630 lands on new record 0x14); else the
+   index of the first site that is not as the exe has it (then nothing may be moved). */
+static int command_move_plan(const DWORD *values, const BYTE *code_ok, const DWORD *new_base, DWORD *planned)
+{
+    int k;
+
+    for (k = 0; k < COMMAND_MOVE_SITES; k++) {
+        const struct command_site *s = &command_move_sites[k];
+        DWORD old = command_table_old[s->table];
+
+        if (!code_ok[k] || values[k] != s->stock || values[k] - old >= command_table_span[s->table])
+            return k;
+        planned[k] = values[k] - old + new_base[s->table];
+    }
+    return -1;
+}
+
+/* (stage 4) The move's tables filled: records 0-0x1f from the loaded section 0 (`section`, 0x100 bytes), 0x20-0xff
+   ff x8 (a record nobody uses: OK does nothing); rows 0x00-0x25 (0x98 bytes) from the game's, 0x26-0x3f zero (as
+   0x1c's 00 00 0000); offsets 0x00-0x25 from the game's (FUN_00436b1b writes them again at each battle start),
+   the rest 0 (list 0, a lone 1f: nothing runs). */
+static void command_move_fill(BYTE *records, BYTE *rows, DWORD *offsets, const BYTE *section, const BYTE *game_rows,
+                              const DWORD *game_offsets)
+{
+    int k;
+
+    for (k = 0; k < COMMAND_RECORDS_MOVED * COMMAND_RECORD_SIZE; k++)
+        records[k] = k < COMMAND_KERNEL_RECORDS * COMMAND_RECORD_SIZE ? section[k] : 0xff;
+    for (k = 0; k < COMMAND_ROWS_MOVED * 4; k++)
+        rows[k] = k < COMMAND_GAME_NUMBERS * 4 ? game_rows[k] : 0;
+    for (k = 0; k < COMMAND_OFFSETS_MOVED; k++)
+        offsets[k] = k < COMMAND_GAME_NUMBERS ? game_offsets[k] : 0;
+}
+
+/* (stage 4) Where the records of a reading come from, the tables moved. `dll`: the moved table's first 0x100
+   bytes; `old`: 00db9590; `last`: what was mirrored at the last reading. 0: the moved table's (a kernel load
+   writes it through 007ba070, as FFNx's chunk loader does; restore_kernel_tables puts the kept copy back there;
+   or nothing changed); 1: the old place was written since and the moved table was not (something that kept the
+   old address): take it in. */
+static int command_records_source(const BYTE *dll, const BYTE *old, const BYTE *last)
+{
+    int k, dll_same = 1, old_same = 1;
+
+    for (k = 0; k < COMMAND_KERNEL_RECORDS * COMMAND_RECORD_SIZE; k++) {
+        dll_same &= dll[k] == last[k];
+        old_same &= old[k] == last[k];
+    }
+    return dll_same && !old_same ? 1 : 0;
+}
+
+/* (stage 4) The old offsets kept true: exactly the game's 38 (0x98 bytes). Never one more: 009ae9c8 + 0x98 is
+   009aea60, the builder's stop flag, and + 0x9c its actor. */
+static void command_offsets_mirror(DWORD *old, const DWORD *offsets)
+{
+    int k;
+
+    for (k = 0; k < COMMAND_GAME_NUMBERS; k++)
+        old[k] = offsets[k];
+}
+
+/* (stage 4) At a battle start, the tables moved, before the lends: every number 0x26-0x3f gets offset 0 (a lone
+   1f), as FUN_00436b1b rebuilds the game's own 38, so that whatever a lend of an earlier reading left goes (a
+   number no longer live would otherwise run Magic's list with row script 0, the idle); the live ones are then
+   lent again. Returns how many were not 0. */
+static int command_offsets_reset(DWORD *offsets)
+{
+    int n, reset = 0;
+
+    for (n = COMMAND_MOVED_FIRST; n <= COMMAND_LAST; n++)
+        if (offsets[n] != 0) {
+            offsets[n] = 0;
+            reset++;
+        }
+    return reset;
+}
+
+/* (stage 4) The gate fields of an action of a number 0x26-0x3f (slot_match_hook, the tables moved): the builder
+   reads record +1, +4, +6 only below 0x20 (004361e1, 00436481), zero-extended (`xor eax,eax; mov al / ax`), so
+   a camera ffff is 0x0000ffff, as FUN_005c9c64 compares it (005c9cff, 005c9d1f). 1 if written. */
+static int command_gate_write(int *action, const BYTE *records)
+{
+    const BYTE *r;
+    int n = action[ACT_COMMAND];
+
+    if (n < COMMAND_MOVED_FIRST || n > COMMAND_LAST)
+        return 0;
+    r = records + n * COMMAND_RECORD_SIZE;
+    action[ACT_TARGET_FLAGS] = r[1];
+    action[ACT_CAMERA_ONE] = r[4] | r[5] << 8;
+    action[ACT_CAMERA_SEVERAL] = r[6] | r[7] << 8;
+    return 1;
+}
+
+/* (stage 4) The game's Mime store (FUN_00435d81, 004365f4-0043675d), for an action of a number 0x26-0x3f, which
+   the game's skips (cmd < 0x20 at 00436616). `entries`: 009a9add, two of 8 bytes (+0 turn, +1 actor, +2 command,
+   +3 word [4], +5 word [0x25]); `values`: 009aad32, two words. As the game: for k = 0, 1: a priority-3 entry is
+   never stored; entry k is passed over if it holds this actor and turn and the command is 0x15 or more (always so
+   here: the W- rule, entry 1 then); else it is written, [0x3c] | [0x3e] << 8 into values[k] (the OR only when
+   [0x3e] is not 0), entry k + 1's actor byte set to ff when k + 1 < 2 (0043674e, for any command), and the
+   store ends. Returns the entry written, or -1. */
+static int command_mime_store(const int *action, int actor, int turn, int priority, BYTE *entries, WORD *values)
+{
+    int k, n = action[ACT_COMMAND];
+
+    if (actor < 0 || actor >= 3 || n < COMMAND_MOVED_FIRST || n > COMMAND_LAST)
+        return -1;
+    for (k = 0; k < 2; k++) {
+        BYTE *e = entries + k * 8;
+
+        if (priority == 3)
+            continue;
+        if ((signed char)e[1] == actor && e[0] == (BYTE)turn && n >= 0x15)
+            continue;
+        e[1] = (BYTE)actor;
+        e[0] = (BYTE)turn;
+        e[2] = (BYTE)n;
+        e[3] = (BYTE)action[ACT_QUEUED_ID];
+        e[4] = (BYTE)(action[ACT_QUEUED_ID] >> 8);
+        e[5] = (BYTE)action[COMMAND_ACT_MIME_WORD];
+        e[6] = (BYTE)(action[COMMAND_ACT_MIME_WORD] >> 8);
+        values[k] = (WORD)action[COMMAND_ACT_SLOT_VALUE];
+        if (action[COMMAND_ACT_SLOT_HIGH] != 0)
+            values[k] = (WORD)(values[k] | (WORD)(action[COMMAND_ACT_SLOT_HIGH] << 8));
+        if (k + 1 < 2)
+            entries[k * 8 + 9] = 0xff;
+        return k;
+    }
+    return -1;
+}
+
+/* (stage 7; stage 4's rule widened) Why attribute k of a replace-Attack materia (type byte 0x12: FUN_005cd567 ->
+   FUN_005cd5a2, which writes it straight into build entry 0, never through FUN_005cece9 and so never through the
+   guard) is read as 01 (Attack), or COMMAND_ATTACK_KEPT. Kept: the game's commands 0x00-0x1b, a later ff (an empty
+   level: the routine walks down from the materia's level past ff and stops at attribute 0, which it takes as it is),
+   and a live spell or physical command when `hooks_live` (the placement hook and the battle-start and slot-match
+   calls: command_attack_live). Read as 01: ff at attribute 0 and 0x20-0x25 or 0x40 and up (not a command a row can
+   have), a new number that is not live (the placement would leave entry 0 empty), a live item command (FFNx's
+   auto-attack issues the row with a stale item and no take-one), a live spell or physical one without the hooks.
+   (Writing ff is never safe: FUN_005cebe5 takes the type byte when every level is ff.) */
+static int command_attack_reason(BYTE a, int k, const struct new_command *commands, BOOL hooks_live)
+{
+    const struct new_command *c;
+
+    if (a == 0xff)
+        return k == 0 ? COMMAND_ATTACK_NOT_COMMAND : COMMAND_ATTACK_KEPT;
+    if (a < COMMAND_FIRST)
+        return COMMAND_ATTACK_KEPT;
+    c = command_of(commands, a);
+    if (!c)
+        return COMMAND_ATTACK_NOT_COMMAND;
+    if (!c->live)
+        return COMMAND_ATTACK_NOT_LIVE;
+    if (c->kind == COMMAND_KIND_ITEM)
+        return COMMAND_ATTACK_ITEM;
+    if (c->kind == COMMAND_KIND_LIST)
+        return COMMAND_ATTACK_LIST;     /* (stage 8) an automatic turn has no spell to choose */
+    return hooks_live ? COMMAND_ATTACK_KEPT : COMMAND_ATTACK_NO_HOOKS;
+}
+
+/* (stage 7) The rule on a materia's `count` attributes: for type byte 0x12 only, each attribute whose reason is not
+   KEPT becomes 01. reasons[k] (if not NULL): each attribute's reason (all KEPT for another type). Returns how many
+   changed. */
+static int command_attack_rule(BYTE type, BYTE *attributes, int count, const struct new_command *commands, BOOL hooks_live,
+                               BYTE *reasons)
+{
+    int k, why, changed = 0;
+
+    for (k = 0; k < count; k++) {
+        why = type == COMMAND_REPLACE_ATTACK ? command_attack_reason(attributes[k], k, commands, hooks_live) : COMMAND_ATTACK_KEPT;
+        if (reasons)
+            reasons[k] = (BYTE)why;
+        if (why != COMMAND_ATTACK_KEPT) {
+            attributes[k] = COMMAND_ATTACK;
+            changed++;
+        }
+    }
+    return changed;
+}
+
+/* (stage 7) Does this materia need the Attack-row hooks: type 0x12 naming a live spell or physical command? */
+static BOOL command_attack_wants(BYTE type, const BYTE *attributes, int count, const struct new_command *commands)
+{
+    int k;
+
+    if (type != COMMAND_REPLACE_ATTACK)
+        return FALSE;
+    for (k = 0; k < count; k++)
+        if (command_attack_reason(attributes[k], k, commands, FALSE) == COMMAND_ATTACK_NO_HOOKS)
+            return TRUE;
+    return FALSE;
+}
+
+/* (stage 5) The live item command numbered n, or NULL. */
+static const struct new_command *command_item_of(const struct new_command *commands, int n)
+{
+    const struct new_command *c = command_of(commands, n);
+
+    return c && c->live && c->kind == COMMAND_KIND_ITEM ? c : NULL;
+}
+
+/* (stage 5) May item `item` be used by item command c? Any, without an items line; else one of its set. */
+static BOOL command_item_allowed(const struct new_command *c, int item)
+{
+    if (!c->items_line)
+        return TRUE;
+    return item >= 0 && item < COMMAND_ITEM_NUMBERS && (c->items[item >> 3] >> (item & 7) & 1);
+}
+
+/* (stage 5) Handler 0x02's step (item_setup_hook), before the game's 005c8fdf, for an action of a live item command.
+   A party member's (actor 0-2) item that the command allows: command type 4 (Item's: the hit loop's effect, the
+   banner, the Silence rule, fixed_damage_hook's item guard), 1: the game's routine follows (it drops the
+   reservation and picks the script). An item the command does not allow (an AI 0x92, a Mime of an action whose
+   set changed at a Re-init): attack ID 0 (handler 0x0d reads a real record) and script -1 (the hit loop does
+   nothing), -1: the game's routine is NOT run, so a reserved item stays reserved and the game gives it back at the
+   end of the actor's turn (00436a5b). Anyone else's: queued and attack ID 0, script -1, -2 (not run either; a
+   command is party-only). 0: not a live item command, nothing changed. */
+static int command_item_setup(int *action, const struct new_command *commands)
+{
+    const struct new_command *c = command_item_of(commands, action[ACT_COMMAND]);
+
+    if (!c)
+        return 0;
+    if (action[ACT_ACTOR] < 0 || action[ACT_ACTOR] > 2) {
+        action[ACT_QUEUED_ID] = action[ACT_ATTACK_ID] = 0;
+        action[ACT_SCRIPT] = -1;
+        return -2;
+    }
+    if (!command_item_allowed(c, action[ACT_QUEUED_ID] & 0xffff)) {
+        action[ACT_ATTACK_ID] = 0;
+        action[ACT_SCRIPT] = -1;
+        return -1;
+    }
+    action[ACT_COMMAND_TYPE] = COMMAND_ITEM;
+    return 1;
+}
+
+/* (stage 5) The reservation (enqueue_hook, the queue's call 00432878: the menu's issues only): for an entry of a
+   live item command (byte 3 exactly the number, as 00432aa2 writes the menu's command byte) by a party member
+   (byte 2: 0-2), the actor, with *item = its item (word 4), for 004330c0(actor, item), as 00432aa2 does for 4, 8
+   and 0x17; else -1. */
+static int command_item_reserve_decide(const BYTE *entry, const struct new_command *commands, int *item)
+{
+    int actor = (signed char)entry[2];
+
+    if (!command_item_of(commands, entry[3]) || actor < 0 || actor > 2)
+        return -1;
+    *item = entry[4] | entry[5] << 8;
+    return actor;
+}
+
+/* (stage 5) Is the action one of a live item command made an item action (type 4, item_setup_hook)? FUN_00433887's
+   rule (005da663) then sees command 4, as for Item. */
+static BOOL command_item_as_item(const int *action, const struct new_command *commands)
+{
+    return command_item_of(commands, action[ACT_COMMAND]) && action[ACT_COMMAND_TYPE] == COMMAND_ITEM;
+}
+
+/* (stage 5) The item command whose list the menu opens or shows: the menu's command byte (00dc3c70) is a live item
+   command with an items line, and the cursor action (00dc3c74) is its record's: the Item list's 3, or (stage 7, w_form)
+   W-Item's 0x0a. Else NULL. */
+static const struct new_command *command_filter_want(const struct new_command *commands, int menu_command, int cursor)
+{
+    const struct new_command *c = command_item_of(commands, menu_command);
+
+    return c && c->items_line && cursor == c->cursor ? c : NULL;
+}
+
+/* (stage 5) The filter's notes: notes[r] is 0, or 1 + the number row r held when the filter set its bit 0x02 (only
+   ever on a row whose bit was clear). Undo: each noted row that still holds that number gets its bit cleared (the
+   same number is the same record, whose own bit is clear); a row that changed since (emptied: ffff with 0x0a; given
+   another item) is left as the game made it. Every note is dropped. Returns how many bits were cleared. */
+static int command_filter_undo(BYTE *rows, WORD *notes, int count)
+{
+    int r, undone = 0;
+
+    for (r = 0; r < count; r++) {
+        BYTE *row = rows + r * COMMAND_ITEM_ROW_SIZE;
+
+        if (!notes[r])
+            continue;
+        if ((WORD)(row[0] | row[1] << 8) == (WORD)(notes[r] - 1)) {
+            row[COMMAND_ITEM_ROW_USE] &= (BYTE)~COMMAND_ITEM_NOT_IN_BATTLE;
+            undone++;
+        }
+        notes[r] = 0;
+    }
+    return undone;
+}
+
+/* (stage 5) Apply command c's set: every row with an item (not ffff) that c does not allow and whose bit 0x02 is
+   clear gets it set and noted (a row the game dims already, gear or a Tent, is left and never noted: the filter only
+   adds dimming); a noted row whose bit was cleared since (a gain of the same item rewrites the use bits) is dimmed
+   again; a note whose row changed is dropped first (its bits are the game's). Returns the rows the filter dims. */
+static int command_filter_apply(BYTE *rows, WORD *notes, int count, const struct new_command *c)
+{
+    int r, dimmed = 0;
+
+    for (r = 0; r < count; r++) {
+        BYTE *row = rows + r * COMMAND_ITEM_ROW_SIZE;
+        WORD number = (WORD)(row[0] | row[1] << 8);
+
+        if (notes[r] && (WORD)(notes[r] - 1) != number)
+            notes[r] = 0;
+        if (number == COMMAND_ITEM_ROW_EMPTY)
+            continue;
+        if (command_item_allowed(c, number)) {
+            if (notes[r]) {             /* (never with one set: the caller undoes for another command or reading) */
+                row[COMMAND_ITEM_ROW_USE] &= (BYTE)~COMMAND_ITEM_NOT_IN_BATTLE;
+                notes[r] = 0;
+            }
+            continue;
+        }
+        if (!(row[COMMAND_ITEM_ROW_USE] & COMMAND_ITEM_NOT_IN_BATTLE) || notes[r]) {
+            row[COMMAND_ITEM_ROW_USE] |= COMMAND_ITEM_NOT_IN_BATTLE;
+            notes[r] = (WORD)(number + 1);
+            dimmed++;
+        }
+    }
+    return dimmed;
+}
+
+/* (stage 5) One sync of the filter (command_filter_sync: each opening of the Item list and every frame it is open).
+   `menu`, `cursor`: the menu's command byte and cursor action; *owner, *owner_reading: whose notes they are (-1:
+   none) and of which reading; `reading`: this one. The notes are undone when they are another command's or an older
+   reading's, or the list is not an item command's (Item, W-Item, Throw, Coin); then the menu's command's set is
+   applied when it is one at cursor 3. Returns the rows the filter dims, or -1 when it applies no set. */
+static int command_filter_step(BYTE *rows, WORD *notes, int count, const struct new_command *commands, int menu,
+                               int cursor, int *owner, DWORD *owner_reading, DWORD reading)
+{
+    const struct new_command *c = command_filter_want(commands, menu, cursor);
+
+    if (*owner >= 0 && (!c || *owner != menu || *owner_reading != reading)) {
+        command_filter_undo(rows, notes, count);
+        *owner = -1;
+    }
+    if (!c)
+        return -1;
+    *owner = menu;
+    *owner_reading = reading;
+    return command_filter_apply(rows, notes, count, c);
+}
+
+/* (stage 5) A hit's amount with an item command's potency (fixed_damage_hook, after FUN_005da5da's clamp): for an
+   action of a live item command made an item action (type 4) whose potency line is not 100, a hit that did not
+   miss (action[0x86] bit 0) with an amount above 0: amount x potency / 100 (in 32 bits: amount is at most
+   9,999,999), at least 1, held to `limit` (the one the game has just applied: the target's HP or MP limit).
+   Else `amount` as it is. */
+static int command_potency_amount(const int *action, const struct new_command *commands, int amount, DWORD limit)
+{
+    const struct new_command *c = command_item_of(commands, action[ACT_COMMAND]);
+    DWORD p, result;
+
+    if (!c || !c->potency_line || c->potency == COMMAND_POTENCY_DEFAULT || action[ACT_COMMAND_TYPE] != COMMAND_ITEM ||
+        (action[COMMAND_ACT_HIT_MISS] & 1) || amount < 1)
+        return amount;
+    p = c->potency;
+    result = (DWORD)amount / 100 * p + (DWORD)amount % 100 * p / 100;
+    if (result < 1)
+        result = 1;
+    if (result > limit)
+        result = limit;
+    return (int)result;
+}
+
+/* ---- (stage 6) Support materia linked to a new command (stage6/DESIGN.md 5) ----
+   The game's support routines serve a command partner only for the commands of their own lists: Counter, Sneak
+   Attack and Final Attack through FUN_005cc0d4 (05 06 08-0c); All, Quadra Magic and MP Turbo only a magic partner
+   (FUN_005ccd3d, 005ccb01, 005cc429); Mega All (FUN_005ccf03) adds its level to the rows of 05 06 09 0a 0b 11 only.
+   For a live new command the DLL writes what the game writes for a command of its lists: a counter entry (8 / 5 / 2,
+   the command, the support's value) for Counter / Sneak / Final (spell and physical kinds); the row's count (build
+   list byte +1, copied to menu entry byte 4 by FUN_005cf002: the byte FUN_004379be keeps "all" by and FUN_00435d81
+   spends for Steal) for All (spell) and Mega All (spell, physical); Quadra Magic's count and uses per party slot
+   (spell; the DLL's table: a command has no spell slot); MP Turbo in build-list byte +2's top 3 bits (-> entry byte
+   5 -> [0x3c] -> FUN_005ca9d0's damage percent, for any command; spell). Refused, with a line: any of these on an item
+   command, All / Quadra / Turbo on a physical one; Magic Counter (it takes a magic partner) says it does nothing. */
+
+/* (stage 6) The support bit of a support materia's code (record byte 0x0e); 0: a code this stage leaves to the game
+   (Elemental, Added Effect, the absorb / steal / cut flags: they already work on any command). */
+static BYTE command_support_bit(int code)
+{
+    switch (code) {
+    case COMMAND_CODE_COUNTER:          return COMMAND_SUP_COUNTER;
+    case COMMAND_CODE_SNEAK:            return COMMAND_SUP_SNEAK;
+    case COMMAND_CODE_FINAL:            return COMMAND_SUP_FINAL;
+    case COMMAND_CODE_ALL:              return COMMAND_SUP_ALL;
+    case COMMAND_CODE_QUADRA:           return COMMAND_SUP_QUADRA;
+    case COMMAND_CODE_TURBO:            return COMMAND_SUP_TURBO;
+    case COMMAND_CODE_MAGIC_COUNTER:    return COMMAND_SUP_MAGIC_COUNTER;
+    }
+    return 0;
+}
+
+/* (stage 6) What a support materia of `code` linked to the live new command `c` does (5.2's table): COMMAND_PAIR_NONE
+   (not this stage's: the game's own), _MAGIC_COUNTER (nothing: a line), _ITEM (refused on an item command: a line),
+   _KIND (All / Quadra / Turbo on a physical command: a line), _OFF (the command's support lines leave it out: a line),
+   else _COUNTER, _ALL, _QUADRA or _TURBO. */
+static int command_support_decide(const struct new_command *c, int code)
+{
+    BYTE bit = command_support_bit(code);
+
+    if (!bit)
+        return COMMAND_PAIR_NONE;
+    if (bit == COMMAND_SUP_MAGIC_COUNTER)
+        return COMMAND_PAIR_MAGIC_COUNTER;
+    if (c->kind == COMMAND_KIND_ITEM)
+        return COMMAND_PAIR_ITEM;
+    if (!(bit & command_support_applies(c->kind)))
+        return COMMAND_PAIR_KIND;
+    if (c->support_off & bit)
+        return COMMAND_PAIR_OFF;
+    return code == COMMAND_CODE_ALL ? COMMAND_PAIR_ALL : code == COMMAND_CODE_QUADRA ? COMMAND_PAIR_QUADRA
+         : code == COMMAND_CODE_TURBO ? COMMAND_PAIR_TURBO : COMMAND_PAIR_COUNTER;
+}
+
+/* (stage 6) A counter entry's type: 00c06970 + 00c068b8 for a command partner (FUN_005cba3f, 005cbe03, 005cbf4b
+   case 0): Counter 8 + 0, Sneak Attack 4 + 1, Final Attack 1 + 1. In battle FUN_005c8cfa(actor, kind) matches
+   kind * 3 + 1 + n: each is n = 1, the command entry (007b769c[1] = ff: FUN_005c8eeb). */
+static BYTE command_counter_type(int code)
+{
+    return (BYTE)(code == COMMAND_CODE_COUNTER ? 8 : code == COMMAND_CODE_SNEAK ? 5 : 2);
+}
+
+/* (stage 6) The command a command materia grants at `level` (as FUN_005cebe5): its attribute byte level - 1, or the
+   one below it past ff; the level is at most 5 (the game's level routine's answer). 0xff if none. */
+static int command_materia_grants(const BYTE *attributes, int level)
+{
+    int k;
+
+    if (level > COMMAND_SUPPORT_LEVELS)
+        level = COMMAND_SUPPORT_LEVELS;
+    for (k = level - 1; k >= 0 && attributes[k] == 0xff; k--)
+        ;
+    return k < 0 ? 0xff : attributes[k];
+}
+
+/* (stage 6) The entry of `command` in the command build list (16 x 3 bytes), the first, as FUN_005cce7b; or -1 (the
+   character does not have it: also a new command the guard left out). */
+static int command_build_index(const BYTE *build, int command)
+{
+    int i;
+
+    for (i = 0; i < COMMAND_BUILD_ENTRIES; i++)
+        if (build[i * 3] == command)
+            return i;
+    return -1;
+}
+
+/* (stage 6) FUN_005cc0d4's write for a command of its list (CF 235868-235875): (type, command, value) at
+   counters + count * 3, then count + 1; nothing when the list is full (8) or the count is out of range. The entry's
+   index, or -1. */
+static int command_counter_write(BYTE *counters, int *count, BYTE type, BYTE command, BYTE value)
+{
+    BYTE *e;
+
+    if (*count < 0 || *count >= COMMAND_COUNTERS)
+        return -1;
+    e = counters + *count * 3;
+    e[0] = type;
+    e[1] = command;
+    e[2] = value;
+    return (*count)++;
+}
+
+/* (stage 6) A row's All count with `level` more uses (All: build-list byte +1; Mega All: entry byte 4): at most 0xfe,
+   never ff (the game's "unlimited" for 0x18-0x1b); an ff already there is kept. */
+static BYTE command_count_add(BYTE count, int level)
+{
+    int sum = count + level;
+
+    if (count == 0xff)
+        return 0xff;
+    return (BYTE)(sum > COMMAND_COUNT_MOST ? COMMAND_COUNT_MOST : sum);
+}
+
+/* (stage 6) MP Turbo of `level` onto build-list byte +2 (as FUN_005cc6b5 onto a spell's staging flags): turbo + level
+   in the top 3 bits, at most 5; the absorb / steal / cut bits kept. */
+static BYTE command_turbo_add(BYTE flags, int level)
+{
+    int turbo = (flags >> 5) + level;
+
+    if (turbo > COMMAND_TURBO_MOST)
+        turbo = COMMAND_TURBO_MOST;
+    return (BYTE)((flags & 0x1f) | turbo << 5);
+}
+
+/* (stage 6) Quadra Magic of `level` linked (as FUN_005ccbb7): count + 1, uses + level. pair = { count, uses };
+   at most ff and 0xfe. */
+static void command_quadra_add(BYTE *pair, int level)
+{
+    if (pair[0] < 0xff)
+        pair[0]++;
+    pair[1] = command_count_add(pair[1], level);
+}
+
+/* (stage 6) Whether Quadra Magic fires for an action (handler 0x0c's Magic block, 005c94d3: a count and a use; not
+   for a Mime / W- repeat, flag 0x400000, which takes the count from its stored word). */
+static BOOL command_quadra_fires(const BYTE *pair, int flags)
+{
+    return !(flags & COMMAND_FLAG_REPEAT) && pair[0] && pair[1];
+}
+
+/* (stage 6) Quadra Magic's use: uses - 1 and the count for FUN_005ca811, or 0 (it does not fire). */
+static int command_quadra_take(BYTE *pair, int flags)
+{
+    if (!command_quadra_fires(pair, flags))
+        return 0;
+    pair[1]--;
+    return pair[0];
+}
+
+/* (stage 6) The MP a spell command charges with MP Turbo `turbo` on its row: the game's rebuild formula, cost + 1 +
+   cost * turbo / 10 (CF 235475-235484), capped at 0xff when the cost is 0xff or less (as the game caps Magic's,
+   CF 235480-235482), else at 999 (as mp_cost_of for an extended spell's cost above 255). */
+static DWORD command_turbo_cost(DWORD cost, int turbo)
+{
+    DWORD raised = turbo ? cost + 1 + cost * (DWORD)turbo / 10 : cost;
+
+    if (cost <= 0xff && raised > 0xff)
+        raised = 0xff;
+    return raised > COMMAND_MP_MOST ? COMMAND_MP_MOST : raised;
+}
+
+/* (stage 6) A command whose row may hold an All count: a live spell or physical command. */
+static BOOL command_takes_count(const struct new_command *c)
+{
+    return c && c->live && (c->kind == COMMAND_KIND_SPELL || c->kind == COMMAND_KIND_PHYSICAL);
+}
+
+/* (stage 8) A command whose row's All count is given and spent (All, Mega All): those of command_takes_count and a live
+   list command (its count reaches the list's toggle spells). The Attack row, the W- hook and the battle-start toggle rule
+   keep command_takes_count. */
+static BOOL command_takes_all(const struct new_command *c)
+{
+    return command_takes_count(c) || (c && c->live && c->kind == COMMAND_KIND_LIST);
+}
+
+/* (stage 6) The first battle-menu entry from 1 holding `command`, or -1. Entry 0 is the replace-Attack row: its byte
+   4 is also what keeps that command there (FUN_004379be, CF 36136-36146), so it is left to that stage. */
+static int command_menu_entry(const BYTE *entries, int command)
+{
+    int i;
+
+    for (i = 1; i < COMMAND_MENU_ENTRIES; i++)
+        if (entries[i * COMMAND_MENU_ENTRY_SIZE] == command)
+            return i;
+    return -1;
+}
+
+/* (stage 6) Mega All of `level` (FUN_005ccf03 adds it to the rows of 05 06 09 0a 0b 11, CF 236507-236524): the same
+   to every entry 1-15 of a live spell or physical command whose support lines do not leave mega_all out. A bit per
+   entry given. */
+static int command_mega_all_add(BYTE *entries, const struct new_command *commands, int level)
+{
+    int i, given = 0;
+
+    for (i = 1; i < COMMAND_MENU_ENTRIES; i++) {
+        BYTE *e = entries + i * COMMAND_MENU_ENTRY_SIZE;
+        const struct new_command *c = command_of(commands, e[0]);
+
+        if (!command_takes_all(c) || (c->support_off & COMMAND_SUP_MEGA_ALL))     /* (stage 8) a list command's too */
+            continue;
+        e[COMMAND_ENTRY_COUNT] = command_count_add(e[COMMAND_ENTRY_COUNT], level);
+        given |= 1 << i;
+    }
+    return given;
+}
+
+/* (stage 6) Battle start (battle_slots_hook, after FUN_005cfe67 made each entry's target byte): a new command's row
+   whose target byte has no toggle keeps no All use (Magic's rule for a spell that cannot switch, 005cfe67's header;
+   the DLL's own for extended spells): without it a row of innate "multiple" would spend a use at every cast. A bit
+   per entry cleared. */
+static int command_battle_counts(BYTE *entries, const struct new_command *commands)
+{
+    int i, cleared = 0;
+
+    for (i = 1; i < COMMAND_MENU_ENTRIES; i++) {
+        BYTE *e = entries + i * COMMAND_MENU_ENTRY_SIZE;
+
+        if (!command_takes_count(command_of(commands, e[0])) || !e[COMMAND_ENTRY_COUNT] ||
+            (e[COMMAND_ENTRY_TARGET] & COMMAND_TOGGLE))
+            continue;
+        e[COMMAND_ENTRY_COUNT] = 0;
+        cleared |= 1 << i;
+    }
+    return cleared;
+}
+
+/* (stage 6) slot_match_hook, after the game's FUN_005caa86, for a party actor's action: a new command's All use, as
+   FUN_00435d81 spends Steal's under Mega All (0043632d-004363bb) and handler 0x0c a spell slot's (005c94d3). Only for
+   a live spell or physical command, several targets asked (flag 0x200; a Sneak Attack's targets 0 have it too) and
+   not a repeat (0x400000). `entries` the actor's 16 menu entries; `record_target` the command's record byte 1;
+   `quadra` whether Quadra Magic fires for this action (Magic's order: Quadra first, no All use then). Answers 1: a
+   use spent, [0x14] = the row's target byte (as the game for its commands: a cursor-7 row's 0x0c reaches the aim; the
+   caller posts 00435139(2, actor, 0x15, 1)); 2: none left and the record's byte has toggle: [0x24] |= 0x100000, one
+   random target (Magic's rule: a byte of innate "multiple" keeps hitting all); 0: nothing. *index: the entry, -1.
+   (stage 8) A list command too, with `record_target` the chosen spell's own byte: no use and nothing else for a spell
+   whose byte has no toggle (its slot showed no count: innate multiple, as Magic), and [0x14] left to command_setup. */
+static int command_all_spend(int *action, BYTE *entries, const struct new_command *commands, int record_target, BOOL quadra,
+                             int *index)
+{
+    const struct new_command *c = command_of(commands, action[ACT_COMMAND]);
+    BYTE *e;
+
+    *index = -1;
+    if (!command_takes_all(c) || (action[ACT_FLAGS] & COMMAND_FLAG_REPEAT) || !(action[ACT_FLAGS] & COMMAND_FLAG_SEVERAL))
+        return 0;
+    *index = command_menu_entry(entries, action[ACT_COMMAND]);
+    if (*index < 0 || (quadra && (c->kind == COMMAND_KIND_SPELL || c->kind == COMMAND_KIND_LIST)))
+        return 0;
+    if (c->kind == COMMAND_KIND_LIST && (record_target == 0xff || !(record_target & COMMAND_TOGGLE)))
+        return 0;
+    e = entries + *index * COMMAND_MENU_ENTRY_SIZE;
+    if (!e[COMMAND_ENTRY_COUNT]) {
+        if (record_target == 0xff || !(record_target & COMMAND_TOGGLE))
+            return 0;
+        action[ACT_FLAGS] |= COMMAND_FLAG_ONE_RANDOM;
+        return 2;
+    }
+    if (e[COMMAND_ENTRY_COUNT] == 0xff)
+        return 0;               /* (never written by this DLL: "unlimited", as a spell slot's ff) */
+    e[COMMAND_ENTRY_COUNT]--;
+    if (c->kind != COMMAND_KIND_LIST)
+        action[ACT_TARGET_FLAGS] = e[COMMAND_ENTRY_TARGET];
+    return 1;
+}
+
+/* ---- (stage 7) The Attack row and the W- form (stage7/DESIGN.md 4) ---- */
+
+/* (stage 7) placement_hook, at the finish's call of FUN_005ceef0 (005cee10, for build index 0 to 15 in order): 0 (menu
+   entry 0, the Attack row) for a live spell or physical command at build entry 0 (`build0`, where FUN_005cd5a2 wrote
+   a replace-Attack materia's attribute) while menu entry 0's command byte (`entry0`) is still the ff FUN_005cf282 left,
+   not in the describe mode; -1: the game's routine answers (every other command, and a second build entry holding
+   the same number: the game's own place for it). Answering 0 skips nothing the game would have done for it but the
+   Magic / Summon flag of an "other" command, which the game's own replacers skip too. */
+static int command_place_attack(int command, int build0, int entry0, BOOL describe, const struct new_command *commands)
+{
+    int n = command & 0xff;
+
+    if (describe || n != build0 || entry0 != 0xff || !command_takes_count(command_of(commands, n)))
+        return -1;
+    return 0;
+}
+
+/* (stage 7) Battle start (battle_slots_hook, after FUN_005cfe67, before 00437370 copies entry 0 to 009aead0): menu entry
+   0 holding a live spell or physical command gets byte 4 = ff, as FUN_005cfe67 gives 0x18-0x1b (FUN_004379be keeps
+   entry 0 only while it is not 0: else it shows Attack), and the target byte of its record (`record_target`; ff: the
+   weapon's, `weapon_target`, as FUN_005cfe67 takes it) without multiple and toggle when it has toggle (a row with no
+   All use aims at one target, FUN_004379be's rule for entries 1-15); innate multiple without toggle is kept. Taken from
+   the record, not from FUN_005cfe67's byte: at a later battle start byte 4 is already ff, and its cursor-7 rule would
+   then have ORed 0x0c in. 1 if written. */
+static int command_attack_row(BYTE *entry, int record_target, int weapon_target, const struct new_command *commands)
+{
+    int target;
+
+    if (!command_takes_count(command_of(commands, entry[0])))
+        return 0;
+    target = (record_target == 0xff ? weapon_target : record_target) & 0xff;
+    entry[COMMAND_ENTRY_TARGET] = (BYTE)(target & COMMAND_TOGGLE ? target & COMMAND_ONE_TARGET : target);
+    entry[COMMAND_ENTRY_COUNT] = 0xff;
+    return 1;
+}
+
+/* (stage 7) slot_match_hook, when command_all_spend found no entry 1-15: an Attack-row action (entry 0 holds the
+   command) at several targets (0x200: an automatic turn's targets 0, or an AI 0x92) and not a repeat, whose record's
+   target byte has toggle: [0x24] |= 0x100000, one random target (Magic's rule; never a spend: entry 0's byte 4 is its
+   keep switch). 2 if so, else 0. (stage 8, the stage 7 review's minor 1) `remembered`: the command 009aead0 kept for the
+   party slot at battle start (FUN_00437370's copy of entry 0, which the automatic turns issue): the turn is also an
+   Attack-row one when entry 0 shows Limit (0x14, FUN_004379be) while the command is remembered there; 0xff: none. */
+static int command_attack_spend(int *action, const BYTE *entries, const struct new_command *commands, int record_target,
+                                int remembered)
+{
+    int n = action[ACT_COMMAND];
+
+    if (!command_takes_count(command_of(commands, n)) || (action[ACT_FLAGS] & COMMAND_FLAG_REPEAT) ||
+        !(action[ACT_FLAGS] & COMMAND_FLAG_SEVERAL) || (entries[0] != n && remembered != n) || command_menu_entry(entries, n) >= 0 ||
+        record_target == 0xff || !(record_target & COMMAND_TOGGLE))
+        return 0;
+    action[ACT_FLAGS] |= COMMAND_FLAG_ONE_RANDOM;
+    return 2;
+}
+
+/* (stage 7) A W- first pick: armed by command_w_decide, for one actor and command, with the mark written to 00dc3c54. */
+struct command_w {
+    BYTE on, actor, command, count;
+    WORD mark;
+};
+
+/* (stage 7) The live spell or physical command numbered n with `w_form`, or NULL (an item one's W- is W-Item's own). */
+static const struct new_command *command_w_row(const struct new_command *commands, int n)
+{
+    const struct new_command *c = command_of(commands, n);
+
+    return command_takes_count(c) && c->w_form ? c : NULL;
+}
+
+/* (stage 7) menu_target_hook_a / _b, after FUN_006d91fa wrote W = 0 and the return state 1 for a cursor-0 / 7 row of
+   `command` chosen by `actor`; `stored`: 00dc3638. 0: not a w_form row (or not a party actor): disarmed, W left 0.
+   2: this actor's first pick of this command is stored (00dc3638 holds the armed mark): the confirm issues both
+   (FUN_006d8963). 1: a first pick: *mark is a new mark (0xf000 | count, never `stored`) for 00dc3c54, armed. */
+static int command_w_decide(struct command_w *w, int actor, int command, WORD stored, const struct new_command *commands,
+                            WORD *mark)
+{
+    if (actor < 0 || actor > 2 || !command_w_row(commands, command)) {
+        w->on = 0;
+        return 0;
+    }
+    if (w->on && w->actor == actor && w->command == command && stored == w->mark)
+        return 2;
+    do {
+        w->count++;
+        *mark = (WORD)(COMMAND_W_MARK | w->count);
+    } while (*mark == stored);
+    w->on = 1;
+    w->actor = (BYTE)actor;
+    w->command = (BYTE)command;
+    w->mark = *mark;
+    return 1;
+}
+
+/* (stage 7) enqueue_hook: an issue by `actor` (every menu, Berserk, Confuse and FFNx issue passes the queue's call;
+   the W pair too, after both are issued) disarms its first pick. TRUE if it was armed. */
+static BOOL command_w_disarm(struct command_w *w, int actor)
+{
+    if (!w->on || w->actor != actor)
+        return FALSE;
+    w->on = 0;
+    return TRUE;
+}
+
+/* ---- (stage 8) kind = list: the command's own list in the Magic list's window (stage8/DESIGN.md 4) ---- */
+
+/* (stage 8) The place of spell `id` in list command c's list, or -1. */
+static int command_list_index(const struct new_command *c, int id)
+{
+    int j;
+
+    for (j = 0; j < c->list_count; j++)
+        if (c->list_ids[j] == id)
+            return j;
+    return -1;
+}
+
+/* (stage 8) The live list command numbered n, or NULL. */
+static const struct new_command *command_list_of(const struct new_command *commands, int n)
+{
+    const struct new_command *c = command_of(commands, n);
+
+    return c && c->live && c->kind == COMMAND_KIND_LIST ? c : NULL;
+}
+
+/* (stage 9a) What the last rebuild of a party slot read (rebuild_start_hook, from the record FUN_005cb2cc reads right
+   after it). `taken` 0: not rebuilt since the start, or an empty slot: every entry with a condition is hidden. */
+struct command_snapshot {
+    BYTE taken;
+    BYTE level;                         /* the record's byte 1 */
+    short character;                    /* the game's ID 0-11, a seat's roster number 12-31, -1 none */
+    DWORD materia[COMMAND_MATERIA_SLOTS];   /* the record's 16 materia: ID low byte (ff none), AP above */
+};
+
+/* (stage 9a) What command_list_offers asks about one party slot for one list command (command_offer_make). */
+struct command_offer {
+    int character;                      /* as the snapshot's; -1 none */
+    int level;                          /* the character's level, 0 none */
+    int materia_level;                  /* the highest level of an equipped materia giving the command, 0 none */
+    int command;                        /* (stage 9b) the list command asked about */
+    const struct command_learned *learned;  /* (stage 9b) the learned set (NULL: none, every learned entry hidden) */
+};
+/* (stage 9b) The entries learned by ways 3 and 4 in the game being played (the companion file's CMDL section). */
+struct command_learned {
+    int count;
+    BYTE frozen;                        /* a CMDL section this build does not read was loaded: nothing learned, nothing of its own written */
+    DWORD entries[COMMAND_LEARNED_MOST];    /* character << 24 | command << 16 | spell ID, ascending, no two the same */
+};
+typedef int (*command_level_fn)(int materia, DWORD ap);    /* a materia's real level, 1-20 (materia_level) */
+
+/* (stage 9a) The command a command materia (its 20-byte record) adds at `level`, as FUN_005cebe5 does (CODE, readable
+   237657): the level it is told (5 at most), then the attribute bytes from index level - 1 back past every ff, the first
+   other one. When every one is ff the game reads the byte before the attributes (index -1, the type byte), and so does
+   this. */
+static int command_materia_walk(const BYTE *record, int level)
+{
+    int k = level > COMMAND_MATERIA_WALK_MOST ? COMMAND_MATERIA_WALK_MOST : level;
+
+    while (--k >= 0 && record[COMMAND_MATERIA_ATTRIBUTES + k] == 0xff)
+        ;
+    return record[COMMAND_MATERIA_ATTRIBUTES + (k < 0 ? -1 : k)];
+}
+
+/* (stage 9a) The highest level, 1 to `total` (the levels it has), at which materia `record` gives command n; 0 if it
+   is not a command materia or no level gives n. */
+static int command_materia_most(const BYTE *record, int total, int n)
+{
+    int level;
+
+    if ((record[COMMAND_MATERIA_TYPE] & 0x0f) != COMMAND_MATERIA_COMMAND)
+        return 0;
+    for (level = total; level >= 1; level--)
+        if (command_materia_walk(record, level) == n)
+            return level;
+    return 0;
+}
+
+/* (stage 9a) The offer of party slot snapshot s for list command n: its character and level, and the highest level of
+   its materia that gives n (each of the 16: a command materia of the table, `count` records, at its real level from
+   `level`, the command its walk ends on). No snapshot, or not taken: character -1, everything 0. */
+static void command_offer_make(struct command_offer *o, const struct command_snapshot *s, int n, const BYTE *table, int count,
+                               command_level_fn level)
+{
+    int i;
+
+    o->character = -1;
+    o->level = o->materia_level = 0;
+    o->command = n;                     /* (stage 9b) */
+    o->learned = NULL;
+    if (!s || !s->taken)
+        return;
+    o->character = s->character;
+    o->level = s->level;
+    for (i = 0; i < COMMAND_MATERIA_SLOTS; i++) {
+        int id = (int)(s->materia[i] & 0xff), at;
+        const BYTE *record;
+
+        if (id == 0xff || id >= count)
+            continue;
+        record = table + id * COMMAND_MATERIA_SIZE;
+        if ((record[COMMAND_MATERIA_TYPE] & 0x0f) != COMMAND_MATERIA_COMMAND)
+            continue;
+        at = level(id, s->materia[i] >> 8);
+        if (command_materia_walk(record, at) == n && at > o->materia_level)
+            o->materia_level = at;
+    }
+}
+
+/* (stage 8) Does party slot `actor` see entry j of list command c? (stage 9a) By the entry's condition, from the offer
+   `o` (NULL: no snapshot): none, always; a materia level, a materia giving the command at that level or more; a
+   character level, that level or more; (stage 9b) an enemy attack, an item, a field event: the offer's character has
+   learned it (the learned set); anything else (COMMAND_COND_OFF) not. The cast checks the configured list
+   (command_list_index), as Stage 8. */
+static BOOL command_learned_has(const struct command_learned *l, int character, int command, int spell);
+static BOOL command_list_offers(const struct new_command *c, const struct command_offer *o, int j)
+{
+    switch (c->list_cond[j]) {
+    case COMMAND_COND_NONE:
+        return TRUE;
+    case COMMAND_COND_MATERIA:
+        return o && o->materia_level >= c->list_value[j];
+    case COMMAND_COND_LEVEL:
+        return o && o->level >= c->list_value[j];
+    case COMMAND_COND_ENEMY:
+    case COMMAND_COND_ITEM:
+    case COMMAND_COND_EVENT:
+        return o && command_learned_has(o->learned, o->character, o->command, c->list_ids[j]);     /* (stage 9b) */
+    }
+    return FALSE;
+}
+
+/* (stage 9a) How many entries of list command c have no condition [0], a materia level [1], a character level [2]. */
+static void command_list_counts(const struct new_command *c, int *counts)
+{
+    int j;
+
+    counts[0] = counts[1] = counts[2] = 0;
+    for (j = 0; j < c->list_count && j < COMMAND_LIST_MOST; j++)
+        if (c->list_cond[j] <= COMMAND_COND_LEVEL)
+            counts[c->list_cond[j]]++;
+}
+
+/* (stage 9a) The Materia screen's Check, OK on a row whose cursor opened the Magic view (0070ddf1, after the game's grid
+   set-up): the list command whose list party slot k's view shows. The row as the game read it (0070dd85-0070ddba):
+   entry row + column * 4 of the command entries at `at` (00dca7f8; byte 0 the command, byte 1 the cursor, 1 or 8).
+   `want` is k's own entries (00dba4e4 + k * 0x440): any other pointer -1 (fail closed: Magic's list stays). 0: Magic's
+   list (no live list command there, or the row out of the grid). */
+static int command_check_pick(DWORD at, DWORD want, int k, int row, int column, const BYTE *entries,
+                              const struct new_command *commands)
+{
+    const BYTE *entry;
+
+    if (k < 0 || k > 2)
+        return 0;
+    if (at != want)
+        return -1;
+    if (row < 0 || row >= COMMAND_CHECK_GRID || column < 0 || column >= COMMAND_CHECK_GRID)
+        return 0;
+    entry = entries + (row + column * COMMAND_CHECK_GRID) * COMMAND_MENU_ENTRY_SIZE;
+    if (entry[1] != COMMAND_CURSOR_MAGIC && entry[1] != COMMAND_CURSOR_W_MAGIC)
+        return 0;
+    return command_list_of(commands, entry[0]) ? entry[0] : 0;
+}
+
+/* (stage 8) Does a live list command hold spell `id` of the spell file? Its handle is then never released
+   (release_unused_handles): a pick of the list keeps its meaning until the queue turns it back into the ID. */
+static BOOL command_list_pins(const struct new_command *commands, int id)
+{
+    int i;
+
+    if (id <= COMMAND_KERNEL_SPELL_LAST)
+        return FALSE;
+    for (i = 0; i < COMMAND_COUNT; i++)
+        if (commands[i].live && commands[i].kind == COMMAND_KIND_LIST && command_list_index(&commands[i], id) >= 0)
+            return TRUE;
+    return FALSE;
+}
+
+/* (stage 8) The MP a list spell of cost `cost` takes with MP Turbo `turbo` on the row, as its slot shows it: a kernel
+   spell's (its slot byte) as the game raises a Magic slot, capped at 0xff (command_turbo_cost); a spell of the spell
+   file's as the DLL shows and checks it from the record and slot byte 7 (mp_cost_of: the same formula, capped at 999). */
+static DWORD command_list_turbo_cost(DWORD cost, int turbo, BOOL extended)
+{
+    DWORD raised = turbo ? cost + 1 + cost * (DWORD)turbo / 10 : cost;
+
+    if (!extended)
+        return command_turbo_cost(cost, turbo);
+    return raised > COMMAND_MP_MOST ? COMMAND_MP_MOST : raised;
+}
+
+/* (stage 8) Party slot `actor`'s 56 magic slots (8 bytes each) filled from list command c: entry j, when
+   command_list_offers, into slot j (the game's window shows slot j at column j % 3 of row j / 3; its OK issues slot
+   byte 0): [0] id_bytes[j] (the kernel ID, or the spell's handle; ff: no handle left, the slot stays empty), [1] the MP
+   byte (a kernel spell: costs[j] with the row's MP Turbo, command_list_turbo_cost; a spell of the spell file: its cost
+   capped at 0xff, as a Magic slot holds it: the DLL's hooks show and check the real one from the record and [7]),
+   [2] the row's All uses `all` when the spell's target byte has toggle (the game then keeps the toggle), [3] [4] 0
+   (Quadra Magic is taken at the cast, as for a spell command), [5] the spell's target byte, [6] 2, [7] turbo << 5.
+   Every other slot ff, 0 x7. The game's refresh (00437679 / 00437814, slot_flags_hook) then makes [5] and [6].
+   Returns the spells put in. (stage 9a) `o` is the party slot's offer (command_offer_make; NULL: none); an entry it does
+   not offer stays empty in its place, counted in *hidden (when given). */
+static int command_list_fill(BYTE *slots, const struct new_command *c, const struct command_offer *o, const BYTE *id_bytes,
+                             const WORD *costs, BYTE all, int turbo, int *hidden)
+{
+    int j, k, shown = 0;
+
+    if (hidden)
+        *hidden = 0;
+    for (j = 0; j < COMMAND_MAGIC_SLOTS; j++) {
+        BYTE *s = slots + j * COMMAND_SLOT_SIZE;
+
+        for (k = 0; k < COMMAND_SLOT_SIZE; k++)
+            s[k] = (BYTE)(k ? 0 : 0xff);
+        if (j >= c->list_count || j >= COMMAND_LIST_MOST)
+            continue;
+        if (!command_list_offers(c, o, j)) {
+            if (hidden)
+                (*hidden)++;
+            continue;
+        }
+        if (id_bytes[j] == 0xff)
+            continue;
+        s[0] = id_bytes[j];
+        if (c->list_ids[j] <= COMMAND_KERNEL_SPELL_LAST) {
+            DWORD cost = command_list_turbo_cost(costs[j], turbo, FALSE);
+
+            s[1] = (BYTE)(cost > 0xff ? 0xff : cost);
+        } else {
+            s[1] = (BYTE)(costs[j] > 0xff ? 0xff : costs[j]);
+        }
+        s[2] = (BYTE)(c->list_target[j] & COMMAND_TOGGLE ? all : 0);
+        s[5] = c->list_target[j];
+        s[6] = 2;
+        s[7] = (BYTE)((turbo & 7) << 5);
+        shown++;
+    }
+    return shown;
+}
+
+/* (stage 8) Whose list each party slot's magic slots hold (the view). owner[k]: 0 or the list command whose window holds
+   k's grid; content[k]: 0 (Magic's window) or that command (always 0 or owner[k]). The grid's four words of Magic while
+   a list's window has the grid, and each list's own (cursor memory). */
+struct command_view {
+    BYTE owner[3], content[3];
+    int magic_grid[3][COMMAND_GRID_WORDS];
+    int list_grid[3][COMMAND_COUNT][COMMAND_GRID_WORDS];
+};
+typedef void (*command_view_fn)(int k);             /* window_store / window_load of party slot k */
+typedef void (*command_view_fill_fn)(int k, int n); /* command_list_fill of list command n into k's slots */
+static const int command_grid_index[COMMAND_GRID_WORDS] = { 0, 1, 4, 5 };   /* the grid's ints (5: GRID_TOP_ROW) */
+
+static void command_grid_copy(int *to, const int *grid)
+{
+    int i;
+
+    for (i = 0; i < COMMAND_GRID_WORDS; i++)
+        to[i] = grid[command_grid_index[i]];
+}
+
+static void command_grid_give(int *grid, const int *from)
+{
+    int i;
+
+    for (i = 0; i < COMMAND_GRID_WORDS; i++)
+        grid[command_grid_index[i]] = from[i];
+}
+
+/* (stage 8) Party slot k's Magic window back in its slots: when the slots hold a list, `load` (window_load: Magic's
+   window from spell_list, the handles re-derived from the IDs) and the stale bits 0x03 in *stale (009a8b1e: the
+   command list's refresh then redoes Magic's row and slots). `with_grid`: the list's window gives the grid back too
+   (its four words kept as the list's, Magic's put back with cursor memory) and the view is over; else (content only)
+   the owner stays (a Magic action of k while its list is open: shown again the next frame). TRUE if the slots changed. */
+static BOOL command_view_restore(struct command_view *v, int k, int *grid, BOOL with_grid, BOOL memory, BYTE *stale,
+                                 command_view_fn load)
+{
+    BOOL was = v->content[k] != 0;
+
+    if (was) {
+        load(k);
+        *stale |= 0x03;
+        v->content[k] = 0;
+    }
+    if (with_grid && v->owner[k]) {
+        command_grid_copy(v->list_grid[k][v->owner[k] - COMMAND_FIRST], grid);
+        if (memory)
+            command_grid_give(grid, v->magic_grid[k]);
+        v->owner[k] = 0;
+    }
+    return was;
+}
+
+/* (stage 8) List command n shown in party slot k's slots: another list first put back; Magic's window stored (`store`,
+   window_store) when the slots hold it; `fill`; the stale bits 0x03. `with_grid` (the window opening for n): the grid's
+   four words kept as Magic's and n's own given (with cursor memory; without it the game's set-up has zeroed them), and
+   n owns the window. */
+static void command_view_show(struct command_view *v, int k, int n, int *grid, BOOL with_grid, BOOL memory, BYTE *stale,
+                              command_view_fn store, command_view_fn load, command_view_fill_fn fill)
+{
+    if (with_grid && v->owner[k] && v->owner[k] != n)
+        command_view_restore(v, k, grid, TRUE, memory, stale, load);
+    if (v->content[k] && v->content[k] != n)
+        command_view_restore(v, k, grid, FALSE, memory, stale, load);
+    if (!v->content[k])
+        store(k);
+    fill(k, n);
+    *stale |= 0x03;
+    v->content[k] = (BYTE)n;
+    if (with_grid && v->owner[k] != n) {
+        command_grid_copy(v->magic_grid[k], grid);
+        if (memory)
+            command_grid_give(grid, v->list_grid[k][n - COMMAND_FIRST]);
+        v->owner[k] = (BYTE)n;
+    }
+}
+
+/* (stage 8) A rebuild of party slot k (rebuild_start_hook): the game writes its slots afresh, so nothing is stored or
+   loaded; Magic's grid words are given back when a list's window had the grid. */
+static void command_view_drop(struct command_view *v, int k, int *grid, BOOL memory)
+{
+    v->content[k] = 0;
+    if (v->owner[k] && memory)
+        command_grid_give(grid, v->magic_grid[k]);
+    v->owner[k] = 0;
+}
+
+/* (stage 8) The follow (the command list's input, every frame it is open, before window 6's input): for party slot k
+   whose grid a list's window holds (`owner`), RESTORE (slots and grid back to Magic's) when k is not the menu's actor,
+   window 6 is not open (`w6_state` not 1 opening or 2 open) or not for that command (`menu_command`, 00dc3c70), or the
+   command is no longer a live list (`live_list`); SHOW (content only) when it is and the slots hold Magic's (a Magic
+   action of k put them back); else KEEP. */
+static int command_view_decide(int owner, int content, int k, int menu_actor, int w6_state, int menu_command, BOOL live_list)
+{
+    if (!owner)
+        return COMMAND_VIEW_KEEP;
+    if (k != menu_actor || (w6_state != 1 && w6_state != 2) || menu_command != owner || !live_list)
+        return COMMAND_VIEW_RESTORE;
+    return content ? COMMAND_VIEW_KEEP : COMMAND_VIEW_SHOW;
+}
+
+/* ---- (stage 9b) the learned set, the CMDL section, the learning decisions, the learned message ---- */
+
+static DWORD command_learned_key(int character, int command, int spell)
+{
+    return (DWORD)(character & 0xff) << 24 | (DWORD)(command & 0xff) << 16 | (DWORD)(spell & 0xffff);
+}
+
+/* (stage 9b) Where `key` is in the set: its index, or -(the index it would take) - 1. */
+static int command_learned_find(const struct command_learned *l, DWORD key)
+{
+    int low = 0, high = l->count - 1;
+
+    while (low <= high) {
+        int middle = (low + high) / 2;
+
+        if (l->entries[middle] == key)
+            return middle;
+        if (l->entries[middle] < key)
+            low = middle + 1;
+        else
+            high = middle - 1;
+    }
+    return -low - 1;
+}
+
+/* (stage 9b) Has `character` (0-11 the game's ID, 12 up the roster's number) learned spell `spell` of command `command`?
+   No set (NULL), no character (-1): no. */
+static BOOL command_learned_has(const struct command_learned *l, int character, int command, int spell)
+{
+    return l && character >= 0 && character <= 0xff && command_learned_find(l, command_learned_key(character, command, spell)) >= 0;
+}
+
+/* (stage 9b) 1: learned now; 0: learned before; -1: not (the set is full or frozen; no character). */
+static int command_learned_add(struct command_learned *l, int character, int command, int spell)
+{
+    DWORD key = command_learned_key(character, command, spell);
+    int at, i;
+
+    if (l->frozen || character < 0 || character > 0xff)
+        return -1;
+    at = command_learned_find(l, key);
+    if (at >= 0)
+        return 0;
+    if (l->count >= COMMAND_LEARNED_MOST)
+        return -1;
+    at = -at - 1;
+    for (i = l->count; i > at; i--)
+        l->entries[i] = l->entries[i - 1];
+    l->entries[at] = key;
+    l->count++;
+    return 1;
+}
+
+static void command_learned_clear(struct command_learned *l)
+{
+    l->count = 0;
+    l->frozen = 0;
+}
+
+/* (stage 9b) The CMDL section of the set, head included: its bytes (0: none, the set empty or frozen), and it written at
+   p (returns the end). Version 1: count (2 bytes), the bytes of an entry (4), 0, then each entry: the character, the
+   command, the spell ID (low byte first), ascending. */
+static DWORD command_learned_bytes(const struct command_learned *l)
+{
+    return l->frozen || l->count <= 0 ? 0 : COMMAND_CMDL_HEAD + 4 + (DWORD)l->count * COMMAND_CMDL_ENTRY;
+}
+
+static BYTE *command_learned_write(const struct command_learned *l, BYTE *p)
+{
+    DWORD length = 4 + (DWORD)l->count * COMMAND_CMDL_ENTRY;
+    int i;
+
+    p[0] = 'C', p[1] = 'M', p[2] = 'D', p[3] = 'L';
+    p[4] = p[5] = 0;                                /* flags: this build's own */
+    p[6] = COMMAND_CMDL_VERSION, p[7] = 0;
+    p[8] = (BYTE)length, p[9] = (BYTE)(length >> 8), p[10] = (BYTE)(length >> 16), p[11] = (BYTE)(length >> 24);
+    p += COMMAND_CMDL_HEAD;
+    p[0] = (BYTE)l->count, p[1] = (BYTE)(l->count >> 8);
+    p[2] = COMMAND_CMDL_ENTRY, p[3] = 0;
+    for (i = 0; i < l->count; i++) {
+        DWORD e = l->entries[i];
+        BYTE *q = p + 4 + i * COMMAND_CMDL_ENTRY;
+
+        q[0] = (BYTE)(e >> 24), q[1] = (BYTE)(e >> 16), q[2] = (BYTE)e, q[3] = (BYTE)(e >> 8);
+    }
+    return p + length;
+}
+
+static BOOL command_learned_tag(const BYTE *head)
+{
+    return head[0] == 'C' && head[1] == 'M' && head[2] == 'D' && head[3] == 'L';
+}
+
+enum { COMMAND_CMDL_READ, COMMAND_CMDL_OTHER_VERSION, COMMAND_CMDL_DAMAGED };    /* (stage 9b) command_learned_read's answers */
+
+/* (stage 9b) A CMDL section (its head; its length already checked to lie inside the file, as sxc3_sections does) into
+   the set: COMMAND_CMDL_READ, or COMMAND_CMDL_OTHER_VERSION / _DAMAGED with *why and the set left empty. The flags are
+   not looked at (a section an older build carried is still exact: an older build learns nothing). */
+static int command_learned_read(struct command_learned *l, const BYTE *head, const char **why)
+{
+    DWORD length = head[8] | (DWORD)head[9] << 8 | (DWORD)head[10] << 16 | (DWORD)head[11] << 24;
+    unsigned version = head[6] | head[7] << 8;
+    const BYTE *p = head + COMMAND_CMDL_HEAD;
+    int count, i;
+
+    l->count = 0;
+    if (version != COMMAND_CMDL_VERSION) {
+        *why = "a version this build does not read";
+        return COMMAND_CMDL_OTHER_VERSION;
+    }
+    if (length < 4) {
+        *why = "shorter than its count";
+        return COMMAND_CMDL_DAMAGED;
+    }
+    count = p[0] | p[1] << 8;
+    if (p[2] != COMMAND_CMDL_ENTRY || p[3]) {
+        *why = "its entries are not of 4 bytes";
+        return COMMAND_CMDL_DAMAGED;
+    }
+    if (count < 1 || count > COMMAND_LEARNED_MOST) {
+        *why = "a count that is not 1 to 512";
+        return COMMAND_CMDL_DAMAGED;
+    }
+    if (length != 4 + (DWORD)count * COMMAND_CMDL_ENTRY) {
+        *why = "its length does not agree with its count";
+        return COMMAND_CMDL_DAMAGED;
+    }
+    for (i = 0; i < count; i++) {
+        const BYTE *q = p + 4 + i * COMMAND_CMDL_ENTRY;
+
+        l->entries[i] = (DWORD)q[0] << 24 | (DWORD)q[1] << 16 | (DWORD)q[3] << 8 | q[2];
+        if (i && l->entries[i] <= l->entries[i - 1]) {
+            *why = "its entries are not in ascending order, or one is there twice";
+            return COMMAND_CMDL_DAMAGED;
+        }
+    }
+    l->count = count;
+    return COMMAND_CMDL_READ;
+}
+
+/* (stage 9b) Way 3, after the game's hit (FUN_005da5da): does it teach party slot `target`? The game's own test
+   (readable 244476-244479, 005db812): the acting actor an enemy (3 < action[0], a Manipulated enemy too), the target
+   after Cover and Reflect a party slot (action[0x82] < 3), and not while 009a88a6 has bit 0x40; no miss test. Its
+   Enemy Skill parts (command type 0x0d, the materia's mask) are not asked: a list entry names its own attack. */
+static BOOL command_enemy_teaches(int actor, int target, int battle_flags)
+{
+    return actor > 3 && target >= 0 && target < 3 && !(battle_flags & COMMAND_LEARN_ENEMY_FLAG);
+}
+
+/* (stage 9b) The core of ways 3 and 4: every entry with condition `cond` and value `value` of every live list command
+   that `character` has not learned yet is learned. `levels` (way 3: per command, the highest level of a materia giving
+   it on the character, command_offer_make's; NULL: not asked) leaves out a command whose level is 0. Returns the entries
+   learned; *command and *spell the first (0 none); *refused those the set could not take (full or frozen). */
+static int command_learn_entries(struct command_learned *l, const struct new_command *commands, int cond, int value, int character,
+                                 const BYTE *levels, int *command, int *spell, int *refused)
+{
+    int i, j, learned = 0;
+
+    *command = *spell = *refused = 0;
+    for (i = 0; i < COMMAND_COUNT; i++) {
+        const struct new_command *c = &commands[i];
+
+        if (!c->live || c->kind != COMMAND_KIND_LIST || (levels && !levels[i]))
+            continue;
+        for (j = 0; j < c->list_count && j < COMMAND_LIST_MOST; j++) {
+            int added;
+
+            if (c->list_cond[j] != cond || c->list_value[j] != value)
+                continue;
+            added = command_learned_add(l, character, COMMAND_FIRST + i, c->list_ids[j]);
+            if (added < 0)
+                (*refused)++;
+            if (added > 0 && !learned++) {
+                *command = COMMAND_FIRST + i;
+                *spell = c->list_ids[j];
+            }
+        }
+    }
+    return learned;
+}
+
+/* (stage 9b) Does an entry of a live list command name `cond` with `value` (an item that teaches, a lesson)? */
+static BOOL command_learn_named(const struct new_command *commands, int cond, int value)
+{
+    int i, j;
+
+    for (i = 0; i < COMMAND_COUNT; i++)
+        if (commands[i].live && commands[i].kind == COMMAND_KIND_LIST)
+            for (j = 0; j < commands[i].list_count && j < COMMAND_LIST_MOST; j++)
+                if (commands[i].list_cond[j] == cond && commands[i].list_value[j] == value)
+                    return TRUE;
+    return FALSE;
+}
+
+/* (stage 9b) How many entries of list command c are learned from an enemy attack [0], an item [1], a field event [2]. */
+static void command_list_learned_counts(const struct new_command *c, int *counts)
+{
+    int j;
+
+    counts[0] = counts[1] = counts[2] = 0;
+    for (j = 0; j < c->list_count && j < COMMAND_LIST_MOST; j++)
+        if (c->list_cond[j] >= COMMAND_COND_ENEMY && c->list_cond[j] <= COMMAND_COND_EVENT)
+            counts[c->list_cond[j] - COMMAND_COND_ENEMY]++;
+}
+
+/* (stage 9b) Way 4b: the characters a field request names (its character byte `who`: 0-15 the game's ID as field
+   scripts use it; 255 each of the three in the party, `party` = 00dc0230, ff an empty slot). The IDs in ids[3]; returns
+   their number, or -1 for a byte that is neither. */
+static int command_request_ids(int who, const BYTE *party, int *ids)
+{
+    int k, n = 0;
+
+    if (who >= 0 && who < COMMAND_REQUEST_IDS) {
+        ids[0] = who;
+        return 1;
+    }
+    if (who != COMMAND_REQUEST_PARTY)
+        return -1;
+    for (k = 0; k < 3; k++)
+        if (party[k] < COMMAND_REQUEST_IDS)
+            ids[n++] = party[k];
+    return n;
+}
+
+/* (stage 9b) A name in the game's text (ff ends it), its trailing spaces (00) left out: its length. */
+static int command_text_length(const BYTE *text, int most)
+{
+    int n = 0;
+
+    while (n < most && text[n] != 0xff)
+        n++;
+    while (n > 0 && text[n - 1] == 0x00)
+        n--;
+    return n;
+}
+
+/* (stage 9b) Does text t start with `word`? */
+static BOOL command_starts(const char *t, const char *word)
+{
+    while (*word && *t == *word)
+        t++, word++;
+    return !*word;
+}
+
+/* (stage 9b) The learned message in the game's text: `template` (as written; "" for the default Learned {command}
+   "{spell}".) with {command} the command's `name` and {spell} the spell's name `spell` (both the game's text, their
+   trailing spaces left out) or, with spell NULL, the composer's attack-name code ee ff ff (its argument then the spell's
+   ID: the battle's message); a typed " the game's pair b2 / b3 (as encode_text_range); every other character as
+   encode_text_range writes it. Only the first {spell} is written (the message has one argument word: a second code
+   would have the composer read past it); a later one is left out. At most capacity - 1 bytes, ended by ff; the code is
+   never cut. Returns the length. */
+static int command_learned_message(BYTE *out, int capacity, const char *template, const BYTE *name, const BYTE *spell)
+{
+    static const char fallback[] = "Learned {command} \"{spell}\".";
+    const char *t = template && template[0] ? template : fallback;
+    int n = 0, open = 0, k, length, spelled = 0;
+
+    while (*t && n < capacity - 1) {
+        if (command_starts(t, "{command}")) {
+            length = command_text_length(name, 32);
+            for (k = 0; k < length && n < capacity - 1; k++)
+                out[n++] = name[k];
+            t += 9;
+            continue;
+        }
+        if (command_starts(t, "{spell}")) {
+            if (spelled++)
+                ;
+            else if (!spell) {
+                if (n + 3 > capacity - 1)
+                    break;
+                out[n++] = COMMAND_TEXT_ATTACK_NAME, out[n++] = 0xff, out[n++] = 0xff;
+            } else {
+                length = command_text_length(spell, 64);
+                for (k = 0; k < length && n < capacity - 1; k++)
+                    out[n++] = spell[k];
+            }
+            t += 7;
+            continue;
+        }
+        if (*t == '"') {
+            out[n++] = (BYTE)(open ? 0xb3 : 0xb2);
+            open = !open;
+        } else
+            out[n++] = (BYTE)((*t >= 0x20 && *t < 0x7f ? *t : '?') - 0x20);
+        t++;
+    }
+    out[n] = 0xff;
+    return n;
+}
+/* ---- NEW COMMANDS PURE end ---- */
+
+static struct new_command new_commands[COMMAND_COUNT];
+static int command_file_problems, command_lines;
+static BOOL command_lists_said[COMMAND_COUNT];  /* this reading: the battle-start line said */
+static BOOL command_lists_refused_said;
+/* (stage 4) the moved tables, and where the DLL's own code reads them (the game's places until the move) */
+static BYTE command_records[COMMAND_RECORDS_MOVED * COMMAND_RECORD_SIZE] __attribute__((aligned(16)));
+static BYTE command_rows[COMMAND_ROWS_MOVED * 4] __attribute__((aligned(16)));
+static DWORD command_offsets[COMMAND_OFFSETS_MOVED];
+static BYTE command_records_last[COMMAND_KERNEL_RECORDS * COMMAND_RECORD_SIZE];     /* the last mirror to 00db9590 */
+static BYTE *command_records_at = (BYTE *)ADDR_COMMAND_RECORDS;
+static DWORD *command_offsets_at = (DWORD *)ADDR_COMMAND_LIST_AT;
+static BOOL command_tables_moved;       /* decided once, at the first reading; never goes back */
+static BOOL command_move_asked;
+static BOOL command_mime_live;
+static BOOL command_records_taken_said, command_records_mirror_said;
+/* (stage 7) the Attack row: the placement hook asked for (once) and in; the W- form: the target set-up hook ready */
+static BOOL command_attack_asked, command_attack_live, command_w_live;
+static void command_attack_install(void);   /* "The Attack row and the W- form", below */
+/* (stage 8) the list kind: the view, the command list's input entry followed, the show line said (a bit per party slot) */
+static struct command_view command_views;
+static BOOL command_list_live;
+static BYTE command_list_told[COMMAND_COUNT];
+/* (stage 9a) each party slot's last rebuild (the conditions' answers); the last fill's counts (the Check's line); the
+   Check's refusal said; the told bits of the Check's line (command_list_told, 0x10 << party slot) */
+static struct command_snapshot command_snapshots[3];
+static int command_view_last_shown, command_view_last_hidden;
+static BOOL command_check_said;
+#define COMMAND_TOLD_CHECK      0x10
+/* (stage 9b) the [learning] section of the last reading; the learned set of the game being played (cleared at every load
+   and New Game: sxc2_forget_loaded); this reading's live learned entries by way (an enemy attack, an item, a field event:
+   after the checks); ways 3 and 4 on; the message of way 3 can be raised; the CMDL sections of the file being loaded;
+   each live list command's battle message; the teaching items (a bit per number 0-9999) */
+static struct command_learning command_learning;
+static struct command_learned command_learned;
+static int command_learn_ways[3];
+static BOOL command_learn_on, command_learn_message_ok, command_learn_full_said, command_learn_frozen_said;
+static int command_cmdl_seen;
+static BYTE command_learned_texts[COMMAND_COUNT][COMMAND_MESSAGE_SIZE];
+static BYTE command_teach_bits[COMMAND_ITEM_NUMBERS / 8];
+
+static void command_problem(int line, const char *what)
+{
+    log_line("commands file line %d: %s", line, what);
+    command_file_problems++;
+}
+
+static int command_spell_target(int id)
+{
+    int index = ext_index(id);
+
+    if (index >= 0)
+        return spells[index].is_summon ? COMMAND_SPELL_SUMMON : spells[index].record[REC_TARGET_FLAGS];
+    if (id >= 0 && id <= COMMAND_KERNEL_SPELL_LAST)
+        return kernel_record(id)[REC_TARGET_FLAGS];
+    return COMMAND_SPELL_NONE;
+}
+
+static BOOL command_may_log(void)
+{
+    if (command_lines < COMMAND_LINES_MAX) {
+        command_lines++;
+        return TRUE;
+    }
+    if (command_lines++ == COMMAND_LINES_MAX)
+        log_line("new commands: %d lines in this reading; further actions and materia are not logged", COMMAND_LINES_MAX);
+    return FALSE;
+}
+
+/* text_fetch_hook: a live new command's name or description; (stage 4) a blank for any other index from 0x20 to
+   0xff of the two command sections; else NULL. */
+static const BYTE *command_text_answer(int section, int index)
+{
+    static const BYTE blank[1] = { 0xff };
+    int descriptions = *(const BYTE *)(ADDR_TEXT_SECTION_BASE + TEXT_TYPE_COMMAND);
+    const BYTE *text;
+
+    if (command_learn_message_ok) {
+        /* (stage 9b) a list command's learned message (battle text 0x80 + n - 0x1c, past the game's 128), and an extended
+           spell's name for its ee code (the attack names, from 3000) */
+        if (section == COMMAND_BATTLE_TEXTS && index >= COMMAND_LEARNED_TEXT_FIRST && index < COMMAND_LEARNED_TEXT_FIRST + COMMAND_COUNT &&
+            command_list_of(new_commands, COMMAND_FIRST + index - COMMAND_LEARNED_TEXT_FIRST))
+            return command_learned_texts[index - COMMAND_LEARNED_TEXT_FIRST];
+        if (index >= EXT_FIRST_ID && section == *(const BYTE *)(ADDR_TEXT_SECTION_BASE + TEXT_TYPE_MAGIC) + TEXT_NAME_OFFSET &&
+            ext_index(index) >= 0)
+            return spells[ext_index(index)].name;
+    }
+    text = command_text(section, index, descriptions, new_commands);
+    return text ? text : command_text_blank(section, index, descriptions) ? blank : NULL;
+}
+
+static void command_quadra_use(int *action);   /* (stage 6) "Support materia", below */
+
+/* action_setup_hook's first step. Returns 1 (a party member's cast set up), -1 (an enemy's: script -1, no set-up)
+   or 0 (not a new command). (stage 6) A party member's cast: Quadra Magic, when linked. */
+static int command_action_setup(int *action)
+{
+    int command = action[ACT_COMMAND], queued = action[ACT_QUEUED_ID] & 0xffff;
+    int way = command_setup(action, new_commands);
+    BOOL list = command_list_of(new_commands, command) != NULL;     /* (stage 8) */
+
+    if (way > 0 && command_may_log())
+        log_line("new command %02x (%s): actor %d casts spell %d%s (queued ID %04x; targets %04x): command type 2, script %02x",
+                 command, new_commands[command - COMMAND_FIRST].label, action[ACT_ACTOR], action[ACT_ATTACK_ID],
+                 list ? " from its list" : "", queued, action[ACT_TARGETS] & 0xffff, SCRIPT_CAST_MAGIC);
+    else if (way == -2 && command_may_log())
+        log_line("new command %02x (%s): actor %d: spell %d is not in its list: refused (script -1, the hit loop does nothing)",
+                 command, new_commands[command - COMMAND_FIRST].label, action[ACT_ACTOR], queued);
+    else if (way < 0 && command_may_log())
+        log_line("new command %02x (%s): actor %d is not a party member: refused (script -1, the hit loop does nothing; a command is party-only)",
+                 command, new_commands[command - COMMAND_FIRST].label, action[ACT_ACTOR]);
+    if (way > 0)
+        command_quadra_use(action);     /* (stage 6) before the game's set-up, which does not touch [0x2b] / [0x3e] */
+    return way;
+}
+
+/* (stage 2) FUN_005ca766 on the current action, as FUN_005c9c64 calls it (cdecl, two arguments) */
+static void command_status_call(DWORD mode_chance, DWORD mask)
+{
+    ((void (__cdecl *)(DWORD, DWORD))FN_SET_STATUS_FIELDS)(mode_chance, mask);
+}
+
+/* weapon_setup_hook, before the game's FUN_005c9c64: a physical command's values lent to the weapon record.
+   Returns command_weapon_lend's answer. */
+static int command_weapon_before(BYTE *saved)
+{
+    const int *action = current_action();
+    int actor = action[ACT_ACTOR];
+
+    if (actor < 0 || actor > 2)
+        return 0;
+    return command_weapon_lend(action, new_commands, (BYTE *)(ADDR_WEAPON_RECORDS + (DWORD)actor * COMMAND_WEAPON_RECORD), saved);
+}
+
+/* weapon_setup_hook, right after the game's FUN_005c9c64: the weapon record put back, then the physical
+   command's own writes (command_weapon_setup), with a line. */
+static void command_weapon_after(const BYTE *saved, int lent)
+{
+    int *action = current_action();
+    int actor = action[ACT_ACTOR], command = action[ACT_COMMAND], queued = action[ACT_QUEUED_ID] & 0xffff, way;
+    BYTE *record = (BYTE *)(ADDR_WEAPON_RECORDS + (DWORD)(actor >= 0 && actor <= 2 ? actor : 0) * COMMAND_WEAPON_RECORD);
+    BOOL sevens = actor >= 0 && actor < 10 && *(const short *)(ADDR_SEVENS_RULE + (DWORD)actor * 0x44) == 0x1e61;
+    BOOL frog = actor >= 0 && actor <= 2 && (state_actor_status(actor) & 0x800) != 0;   /* (stage 3) as FUN_005c9c64 reads it */
+
+    way = command_weapon_setup(action, new_commands, record, saved, lent, sevens, frog, command_status_call);
+    if (way > 0 && command_may_log())
+        log_line("new command %02x (%s): actor %d: a weapon attack like %s (targets %04x): script %02x, power %d, formula %02x, accuracy %d, element %04x, status %08lx/%08lx/%08lx chance %d, flags %04x, turns %d, type %02x (queued ID was %04x)%s%s; the like's own steps follow",
+                 command, new_commands[command - COMMAND_FIRST].label, actor, state_command_name(action[ACT_COMMAND_TYPE]),
+                 action[ACT_TARGETS] & 0xffff, action[ACT_SCRIPT], action[ACT_POWER], action[ACT_FORMULA], action[ACT_ACCURACY],
+                 action[ACT_ELEMENT], (DWORD)action[ACT_STATUS_INFLICT], (DWORD)action[ACT_STATUS_INFLICT + 1],
+                 (DWORD)action[ACT_STATUS_INFLICT + 2], action[ACT_STATUS_CHANCE], action[ACT_FLAGS] & 0xffff,
+                 action[ACT_TURNS], action[ACT_COMMAND_TYPE], queued, sevens ? " (the 0x1e61 rule: no element, no status)" : "",
+                 !frog ? "" : action[ACT_COMMAND_TYPE] == 1 ? " (the actor is a frog: the like's own script, as the game plays Attack for a frog, with the frog's sounds)"
+                 : " (the actor is a frog: the game ends an action of this type for a frog, as it does its own command's)");
+    else if (way < 0 && command_may_log())
+        log_line("new command %02x (%s): actor %d is not a party member: refused (script -1, the hit loop does nothing; a command is party-only)",
+                 command, new_commands[command - COMMAND_FIRST].label, actor);
+}
+
+/* ---- The build-list guard (stage 2) ----
+   FUN_005cece9(command) appends to the 16-entry list 00c06920 at its count 00c06974 with no bound (5ced26: no
+   compare with 16 before the write). Its 17 calls (all e8 rel32, no jump to it and no stored pointer to it in the
+   exe: stage2/DESIGN.md 1.11 and its Verification) go to command_add_guard, as do the DLL's own two adds (fill_magic_slots_hook).
+   Put in once, all 17 checked first and then all patched, never taken out. */
+static const DWORD command_add_sites[COMMAND_ADD_SITES] = {
+    0x005cd71d, 0x005cd770,             /* W-Magic, W-Summon: the only two that use the index (byte A) */
+    0x005cdaa1,                         /* Enemy Skill */
+    0x005cdac7, 0x005cdad1, 0x005cdadb, 0x005cdae5, 0x005cdaef, 0x005cdaf9, 0x005cdb03,     /* Master Command */
+    0x005cdb4f, 0x005cdbdc, 0x005cea12, 0x005ceb48,     /* magic and summon materia */
+    0x005cec60,                         /* command materia */
+    0x005cf5c1, 0x005cf5cb,             /* the clear: Attack, Item */
+};
+static BOOL command_guard_live;
+static BYTE command_guard_said[4][32];  /* a line said for (way, command): this reading */
+static BYTE command_refused_said[32];   /* (stage 4) a line said for a refused number: this reading */
+
+static int __cdecl command_add_guard(int command)
+{
+    BYTE *list = (BYTE *)ADDR_COMMAND_BUILD;
+    int c = command & 0xff, index, way;
+    BYTE replaced, *said;
+
+    if (command_add_refused(c, new_commands, command_tables_moved)) {
+        /* (stage 4) fail closed: never a raw number from 0x20 in a menu (FUN_005cf002 would read another table's
+           bytes as its cursor and targets, the builder a row and an offset that are not a command's) */
+        if (!(command_refused_said[c >> 3] & (1u << (c & 7)))) {
+            command_refused_said[c >> 3] |= (BYTE)(1u << (c & 7));
+            log_line("build list: command %02x is not a live new command (0x1c-0x1f, or 0x26-0x3f with the command tables moved): not added: no row (the materia that names it is named at the reading)", c);
+        }
+        return COMMAND_BUILD_ENTRIES - 1;
+    }
+    way = command_add_decide(list, *(const signed char *)ADDR_COMMAND_BUILD_COUNT, c, &index);
+    replaced = list[index * 3];
+    if (way == COMMAND_ADD_GAME)
+        return ((int (__cdecl *)(char))FN_ADD_COMMAND)((char)c);
+    said = &command_guard_said[way - 1][c >> 3];
+    if (way == COMMAND_ADD_TAKE_STEAL || way == COMMAND_ADD_TAKE_NEW) {
+        list[index * 3] = (BYTE)c;
+        list[index * 3 + 1] = list[index * 3 + 2] = 0;      /* (bytes A and B: written by the callers and links after) */
+    }
+    if (*said & (1u << (c & 7)))
+        return index;
+    *said |= (BYTE)(1u << (c & 7));
+    if (way == COMMAND_ADD_NO_STEAL)
+        log_line("build list: the character's command list is full (16): Steal (05) is not added (Mug is listed: the game drops Steal at the end anyway)");
+    else if (way == COMMAND_ADD_TAKE_STEAL)
+        log_line("build list: the character's command list is full (16): command %02x takes Steal's place (entry %d; Mug is %s: the game drops Steal at the end)",
+                 c, index, c == COMMAND_MUG ? "the one added" : "listed");
+    else if (way == COMMAND_ADD_TAKE_NEW)
+        log_line("build list: the character's command list is full (16): command %02x takes the place of new command %02x (entry %d), which is not in this character's menu",
+                 c, replaced, index);
+    else if (command_number_new(c))
+        log_line("build list: the character's command list is full (16): new command %02x is not added (no room): not in this character's menu", c);
+    else
+        log_line("build list: the character's command list is full (16 game commands): command %02x is not added", c);
+    return index;
+}
+
+/* The guard's 17 sites, all checked (e8 to 005cece9) before any is patched. */
+static BOOL command_guard_install(void)
+{
+    int i, patched = 0;
+
+    if (command_guard_live)
+        return TRUE;
+    for (i = 0; i < COMMAND_ADD_SITES; i++) {
+        const BYTE *p = (const BYTE *)command_add_sites[i];
+        DWORD target = command_add_sites[i] + 5 + *(const DWORD *)(p + 1);
+
+        if (p[0] != 0xe8 || target != FN_ADD_COMMAND) {
+            log_line("build list: NOT followed: site %08lx is not the game's call (byte %02x, goes to %08lx, expected e8 to %08lx): at most one new command is used",
+                     command_add_sites[i], p[0], target, FN_ADD_COMMAND);
+            return FALSE;
+        }
+    }
+    for (i = 0; i < COMMAND_ADD_SITES; i++)
+        patched += patch_call(command_add_sites[i], FN_ADD_COMMAND, command_add_guard);
+    command_guard_live = patched == COMMAND_ADD_SITES;
+    if (command_guard_live)
+        log_line("build list: the %d calls of %08lx are followed (no command list grows past 16)", COMMAND_ADD_SITES, FN_ADD_COMMAND);
+    else
+        log_line("build list: only %d of the %d calls of %08lx could be patched (see the patch lines above): at most one new command is used",
+                 patched, COMMAND_ADD_SITES, FN_ADD_COMMAND);
+    return command_guard_live;
+}
+
+/* The kernel records of the usable commands, written where the kernel still has ff x8 (see above). `when`: the
+   moment, for the log. */
+static void commands_write_records(const char *when)
+{
+    BYTE *table = command_records_at;   /* (stage 4) 00db9590, or command_records once moved */
+    int i;
+
+    for (i = 0; i < COMMAND_COUNT; i++)
+        new_commands[i].live = 0;
+    if (*(BYTE **)ADDR_COMMAND_SECTION_AT != table ||
+        IsBadWritePtr(table, (command_tables_moved ? COMMAND_LAST + 1 : COMMAND_KERNEL_RECORDS) * COMMAND_RECORD_SIZE)) {
+        log_line("new commands: OFF (%s): the kernel's command section is not at %08lx (pointer %08lx) or cannot be written",
+                 when, (DWORD)table, (DWORD)*(BYTE **)ADDR_COMMAND_SECTION_AT);
+        return;
+    }
+    for (i = 0; i < COMMAND_COUNT; i++) {
+        struct new_command *c = &new_commands[i];
+        BYTE *record = table + (COMMAND_FIRST + i) * COMMAND_RECORD_SIZE, want[COMMAND_RECORD_SIZE];
+        int decision;
+
+        if (!c->defined || !c->usable)
+            continue;
+        if (COMMAND_FIRST + i >= COMMAND_KERNEL_RECORDS && !command_tables_moved)
+            continue;               /* (stage 4) never: such a section was refused (load_commands); 00db9590 + 0x100 is the attack table */
+        decision = command_record_decide(record, c, table + c->like * COMMAND_RECORD_SIZE, want);
+        if (decision == -2)
+            log_line("new command %02x (%s): NOT used: the record of %s (%02x), which it is made like, has cursor %02x, neither the target cursor (00) nor Attack's (07): give menu = target or target_uncovered (%s)",
+                     COMMAND_FIRST + i, c->label, state_command_name(c->like), c->like, table[c->like * COMMAND_RECORD_SIZE], when);
+        if (decision < 0)
+            continue;               /* (not usable: said by command_resolve) */
+        if (decision == 1)
+            copy_bytes(record, want, COMMAND_RECORD_SIZE);
+        if (decision > 0 && c->kind == COMMAND_KIND_ITEM) {
+            c->live = 1;
+            log_line("new command %02x (%s): kernel record %08lx %s (%s): %02x %02x %02x %02x %02x %02x %02x %02x (OK: %s; the target flags and cameras are the chosen item's); item: Item's handlers, %s %u, potency %u%%",
+                     COMMAND_FIRST + i, c->label, (DWORD)record, decision == 1 ? "written over ff x8" : "already holds it", when,
+                     want[0], want[1], want[2], want[3], want[4], want[5], want[6], want[7],
+                     want[0] == COMMAND_CURSOR_W_ITEM ? "W-Item's list, two picks (w_form)" : "the Item list",
+                     c->items_line ? "item numbers allowed (the other rows dimmed):" : "every item (no items line): numbers allowed",
+                     c->items_line ? (unsigned)c->items_count : (unsigned)COMMAND_ITEM_NUMBERS,
+                     c->potency_line ? (unsigned)c->potency : (unsigned)COMMAND_POTENCY_DEFAULT);
+        } else if (decision > 0 && c->kind == COMMAND_KIND_LIST) {
+            c->live = 1;            /* (stage 8) */
+            log_line("new command %02x (%s): kernel record %08lx %s (%s): %02x %02x ff ff ff ff ff ff (OK: its own list of %d spell(s) in the Magic list's window%s; the target flags are the chosen spell's); list: Magic's handlers",
+                     COMMAND_FIRST + i, c->label, (DWORD)record, decision == 1 ? "written over ff x8" : "already holds it", when,
+                     want[0], want[1], c->list_count, want[0] == COMMAND_CURSOR_W_MAGIC ? ", two picks (w_form, as W-Magic)" : "");
+        } else if (decision > 0 && c->kind == COMMAND_KIND_PHYSICAL) {
+            c->live = 1;
+            log_line("new command %02x (%s): kernel record %08lx %s (%s): %02x %02x %02x %02x %02x %02x %02x %02x (OK: %s; target flags %02x%s); physical, like %s (handler list at %x)",
+                     COMMAND_FIRST + i, c->label, (DWORD)record, decision == 1 ? "written over ff x8" : "already holds it", when,
+                     want[0], want[1], want[2], want[3], want[4], want[5], want[6], want[7],
+                     want[0] == COMMAND_CURSOR_TARGET ? "the target cursor" : "Attack's target cursor", want[1],
+                     want[1] == 0xff ? " = the weapon's" : "", state_command_name(c->like), c->like_list);
+        } else if (decision > 0) {
+            c->live = 1;
+            log_line("new command %02x (%s): kernel record %08lx %s (%s): %02x %02x ff ff ff ff ff ff (OK: %s; target flags %02x); casts spell %d%s",
+                     COMMAND_FIRST + i, c->label, (DWORD)record, decision == 1 ? "written over ff x8" : "already holds it", when,
+                     want[0], want[1], c->cursor == COMMAND_CURSOR_TARGET ? "the target cursor" : "Attack's target cursor", c->target,
+                     c->spell, c->has_all ? ", spell_all on several targets" : "");
+            if (c->has_all)
+                log_line("new command %02x: on several targets it casts spell %d", COMMAND_FIRST + i, c->spell_all);
+        } else {
+            log_line("new command %02x (%s): NOT used: the loaded kernel's record for it is %02x %02x %02x %02x %02x %02x %02x %02x, not ff x8 (another mod's kernel or an FFNx kernel.bin.chunk.1 uses this number) (%s)",
+                     COMMAND_FIRST + i, c->label, record[0], record[1], record[2], record[3], record[4], record[5], record[6],
+                     record[7], when);
+        }
+    }
+}
+
+/* A command materia (type low digit 6) naming a free number no live command has: one line each, to the bound.
+   (stage 4) Also one naming a number from 0x20 that is not live (the guard gives it no row), and the replace-Attack
+   rule (command_attack_rule) applied to the loaded materia table (the materia file is not touched). (stage 7) The
+   Attack-row hooks are asked for first when a replace-Attack materia names a live spell or physical command; the rule
+   keeps such a number only with them, and says why it reads any other as Attack. */
+static void commands_check_materia(void)
+{
+    static const char *const why[] = {
+        "", "0x20 and up is not a command a menu row can have", "not a live new command",
+        "an item command cannot take the Attack row (Berserk, Confuse and auto-attack would use items not taken from the list)",
+        "the Attack-row hooks are not in (see the Attack row line above)",
+        "a list command cannot take the Attack row (an automatic turn has no spell to choose)",     /* (stage 8) */
+    };
+    int count = materia_base == materia_table ? MATERIA_COUNT_EXTENDED - 1 : MATERIA_COUNT_ORIGINAL, id, k;
+
+    for (id = 0; id < count && !command_attack_asked; id++)
+        if (command_attack_wants(materia_base[id * MATERIA_RECORD_SIZE + MATERIA_TYPE],
+                                 materia_base + id * MATERIA_RECORD_SIZE + MATERIA_ATTRIBUTES, MATERIA_ATTRIBUTE_COUNT, new_commands))
+            command_attack_install();   /* (stage 7) once: it sets command_attack_asked */
+    for (id = 0; id < count; id++) {
+        BYTE *m = materia_base + id * MATERIA_RECORD_SIZE, before[MATERIA_ATTRIBUTE_COUNT], reasons[MATERIA_ATTRIBUTE_COUNT];
+
+        copy_bytes(before, m + MATERIA_ATTRIBUTES, MATERIA_ATTRIBUTE_COUNT);
+        if (command_attack_rule(m[MATERIA_TYPE], m + MATERIA_ATTRIBUTES, MATERIA_ATTRIBUTE_COUNT, new_commands, command_attack_live, reasons)) {
+            for (k = 0; k < MATERIA_ATTRIBUTE_COUNT - 1 && reasons[k] == COMMAND_ATTACK_KEPT; k++)
+                ;
+            if (command_may_log())
+                log_line("materia %d (type 12, replace Attack) names command %02x (attribute %d): read as Attack (01): %s",
+                         id, before[k], k + 1, why[reasons[k] < sizeof why / sizeof why[0] ? reasons[k] : 0]);
+        }
+        if ((m[MATERIA_TYPE] & 0x0f) != 6)
+            continue;
+        for (k = 0; k < MATERIA_ATTRIBUTE_COUNT; k++) {
+            BYTE command = m[MATERIA_ATTRIBUTES + k];
+            const struct new_command *c = command_of(new_commands, command);
+
+            if (command < COMMAND_FIRST || command == 0xff || (c && c->live))
+                continue;               /* (ff: an empty level, FUN_005cebe5 walks past it) */
+            if (!command_may_log())
+                break;
+            if (command <= COMMAND_IN_PLACE_LAST)
+                log_line("materia %d gives command %02x (attribute %d), which the commands file does not define (or was refused above): its battle-menu row has no name and OK does nothing",
+                         id, command, k + 1);
+            else
+                log_line("materia %d gives command %02x (attribute %d), which is not a live new command (0x1c-0x1f, or 0x26-0x3f with the command tables moved): the build list leaves it out, no row",
+                         id, command, k + 1);
+            break;
+        }
+    }
+}
+
+/* (stage 4) Does any command materia name a number from 0x20 (0xff aside)? The guard is then put in even with no
+   usable command, so that number never reaches a menu. */
+static BOOL commands_materia_need_guard(void)
+{
+    int count = materia_base == materia_table ? MATERIA_COUNT_EXTENDED - 1 : MATERIA_COUNT_ORIGINAL, id, k;
+
+    for (id = 0; id < count; id++) {
+        const BYTE *m = materia_base + id * MATERIA_RECORD_SIZE;
+
+        if ((m[MATERIA_TYPE] & 0x0f) == 6)
+            for (k = 0; k < MATERIA_ATTRIBUTE_COUNT; k++)
+                if (m[MATERIA_ATTRIBUTES + k] >= COMMAND_KERNEL_RECORDS && m[MATERIA_ATTRIBUTES + k] != 0xff)
+                    return TRUE;
+    }
+    return FALSE;
+}
+
+/* The battle-start call (00437efd), installed once for whoever needs it first: the new characters
+   (install_limit_hooks, which then sets battle_start_hooked) or the new commands. */
+static BOOL battle_start_site_in;
+
+static BOOL battle_start_install(void)
+{
+    if (!battle_start_site_in)
+        battle_start_site_in = patch_call(SITE_BATTLE_START_PARTY, FN_BATTLE_START_PARTY, battle_start_party_hook);
+    return battle_start_site_in;
+}
+
+/* ---- The command tables moved (stage 4) ---- */
+
+/* (stage 4) Does the e8 rel32 at `site` go to `target`? */
+static BOOL command_call_goes_to(DWORD site, const void *target)
+{
+    const BYTE *p = (const BYTE *)site;
+
+    return p[0] == 0xe8 && site + 5 + *(const DWORD *)(p + 1) == (DWORD)target;
+}
+
+/* (stage 4) Writes the planned dwords at the sites, all or none: a VirtualProtect that fails part-way puts the
+   ones already written back. TRUE if all were written. */
+static BOOL command_write_sites(const DWORD *planned, const DWORD *stock)
+{
+    DWORD old_protect;
+    int k, undo;
+
+    for (k = 0; k < COMMAND_MOVE_SITES; k++) {
+        DWORD *p = (DWORD *)command_move_sites[k].at;
+
+        if (!VirtualProtect(p, 4, PAGE_EXECUTE_READWRITE, &old_protect)) {
+            log_line("command tables NOT moved: VirtualProtect failed at %08lx (error %lu) after %d of %d places: those put back: only 0x1c-0x1f are used; sections 0x26-0x3f are not",
+                     command_move_sites[k].at, GetLastError(), k, COMMAND_MOVE_SITES);
+            for (undo = 0; undo < k; undo++) {
+                DWORD *q = (DWORD *)command_move_sites[undo].at;
+
+                if (VirtualProtect(q, 4, PAGE_EXECUTE_READWRITE, &old_protect)) {
+                    *q = stock[undo];
+                    VirtualProtect(q, 4, old_protect, &old_protect);
+                    FlushInstructionCache(GetCurrentProcess(), q, 4);
+                } else {
+                    log_line("command tables: %08lx could NOT be put back (error %lu)", command_move_sites[undo].at, GetLastError());
+                }
+            }
+            return FALSE;
+        }
+        *p = planned[k];
+        VirtualProtect(p, 4, old_protect, &old_protect);
+        FlushInstructionCache(GetCurrentProcess(), p, 4);
+    }
+    return TRUE;
+}
+
+/* (stage 4) The move, once, at the first reading, with a usable section from 0x26 up (load_commands). TRUE if
+   the tables are moved. Preconditions, all or nothing (the first that fails is named): the build-list guard is
+   live (no number that is not live can reach a menu), the slot-match call 00436266 is this DLL's (the gate
+   fields), the text fetch call 00419733 is (the names and the blanks), the battle-start call 00437efd is (the
+   lends and the offsets mirror), the handler lists hold the game's 38 (offsets 0x00-0x25: the mirror's 0x98
+   bytes), the old record table and the loader's pointer can be written, and the 15 places are as the exe has them. */
+static BOOL commands_move_tables(void)
+{
+    DWORD values[COMMAND_MOVE_SITES], planned[COMMAND_MOVE_SITES], stock[COMMAND_MOVE_SITES], new_base[COMMAND_TABLES];
+    BYTE code_ok[COMMAND_MOVE_SITES];
+    const char *why = NULL;
+    int k, bad;
+
+    if (!command_guard_live)
+        why = "the build-list guard is not in (see the build list lines above)";
+    else if (!command_call_goes_to(SITE_SLOT_MATCH, slot_match_hook))
+        why = "the slot-match call 00436266 is not this DLL's hook";
+    else if (!command_call_goes_to(SITE_TEXT_FETCH, text_fetch_hook))
+        why = "the text fetch call 00419733 is not this DLL's hook";
+    else if (!battle_start_site_in || !command_call_goes_to(SITE_BATTLE_START_PARTY, battle_start_party_hook))
+        why = "the battle-start call 00437efd is not this DLL's hook";
+    else if (command_list_offset((const BYTE *)ADDR_COMMAND_LISTS, COMMAND_LISTS_SIZE, COMMAND_GAME_NUMBERS - 1) < 0 ||
+             command_list_offset((const BYTE *)ADDR_COMMAND_LISTS, COMMAND_LISTS_SIZE, COMMAND_GAME_NUMBERS) >= 0)
+        why = "the handler lists 007b75a8 do not hold the game's 38 lists";
+    else if (IsBadWritePtr((void *)ADDR_COMMAND_RECORDS, COMMAND_KERNEL_RECORDS * COMMAND_RECORD_SIZE) ||
+             IsBadWritePtr((void *)ADDR_COMMAND_LIST_AT, COMMAND_GAME_NUMBERS * 4))
+        why = "the old record table 00db9590 or the old offsets 009ae9c8 cannot be written";
+    if (why) {
+        log_line("command tables NOT moved: %s: only 0x1c-0x1f are used; sections 0x26-0x3f are not", why);
+        return FALSE;
+    }
+    for (k = 0; k < COMMAND_MOVE_SITES; k++) {
+        const struct command_site *s = &command_move_sites[k];
+
+        values[k] = *(const DWORD *)s->at;
+        stock[k] = s->stock;
+        code_ok[k] = (BYTE)bytes_are(s->at - s->code_count, s->code, s->code_count);
+    }
+    new_base[COMMAND_TABLE_RECORDS] = (DWORD)command_records;
+    new_base[COMMAND_TABLE_ROWS] = (DWORD)command_rows;
+    new_base[COMMAND_TABLE_OFFSETS] = (DWORD)command_offsets;
+    if ((bad = command_move_plan(values, code_ok, new_base, planned)) >= 0) {
+        const struct command_site *s = &command_move_sites[bad];
+
+        if (!code_ok[bad])
+            log_line("command tables NOT moved: the instruction at %08lx is not the game's (%d bytes before the operand differ): only 0x1c-0x1f are used; sections 0x26-0x3f are not",
+                     s->at - s->code_count, s->code_count);
+        else
+            log_line("command tables NOT moved: %s at %08lx holds %08lx, expected %08lx: only 0x1c-0x1f are used; sections 0x26-0x3f are not",
+                     s->code_count ? "operand" : "the loader's pointer", s->at, values[bad], s->stock);
+        return FALSE;
+    }
+    command_move_fill(command_records, command_rows, command_offsets, (const BYTE *)ADDR_COMMAND_RECORDS,
+                      (const BYTE *)ADDR_COMMAND_ROWS, (const DWORD *)ADDR_COMMAND_LIST_AT);
+    copy_bytes(command_records_last, command_records, sizeof command_records_last);
+    if (!command_write_sites(planned, stock))
+        return FALSE;
+    command_records_at = command_records;
+    command_offsets_at = command_offsets;
+    log_line("command tables moved (sections 0x26-0x3f defined): kernel records -> %08lx (9 operands, loader pointer), set-up rows -> %08lx (3), list offsets -> %08lx (2); the old tables are kept true for 0x00-0x25",
+             (DWORD)command_records, (DWORD)command_rows, (DWORD)command_offsets);
+    return TRUE;
+}
+
+/* (stage 4) Before the records of a reading are written, the tables moved: the records come from the moved table
+   (or are taken in from 00db9590 if only that was written since: command_records_source); records 0x20-0xff are
+   reset to ff x8 (they are this DLL's alone: written again for the live sections). */
+static void commands_records_sync(void)
+{
+    BYTE *old = (BYTE *)ADDR_COMMAND_RECORDS;
+    int k;
+
+    if (!command_tables_moved)
+        return;
+    if (command_records_source(command_records, old, command_records_last) == 1) {
+        copy_bytes(command_records, old, COMMAND_KERNEL_RECORDS * COMMAND_RECORD_SIZE);
+        if (!command_records_taken_said) {
+            command_records_taken_said = TRUE;
+            log_line("command tables: the old command records at 00db9590 were written by something else after the move: taken in");
+        }
+    }
+    for (k = COMMAND_KERNEL_RECORDS * COMMAND_RECORD_SIZE; k < COMMAND_RECORDS_MOVED * COMMAND_RECORD_SIZE; k++)
+        command_records[k] = 0xff;
+}
+
+/* (stage 4) After the records of a reading are written, the tables moved: records 0x00-0x1f mirrored to 00db9590
+   (0x100 bytes), for any reader no scan can see; the mirror kept for command_records_source. */
+static void commands_records_mirror(void)
+{
+    BYTE *old = (BYTE *)ADDR_COMMAND_RECORDS;
+
+    if (!command_tables_moved)
+        return;
+    if (IsBadWritePtr(old, COMMAND_KERNEL_RECORDS * COMMAND_RECORD_SIZE)) {
+        if (!command_records_mirror_said) {
+            command_records_mirror_said = TRUE;
+            log_line("command tables: the old command records at 00db9590 cannot be written: not mirrored");
+        }
+        return;
+    }
+    copy_bytes(old, command_records, COMMAND_KERNEL_RECORDS * COMMAND_RECORD_SIZE);
+    copy_bytes(command_records_last, command_records, sizeof command_records_last);
+}
+
+/* (stage 4) slot_match_hook, right after the game's FUN_005caa86, for every party action: the gate fields of an
+   action of 0x26-0x3f (command_gate_write), the tables moved. */
+static void command_gate_fields(int *action)
+{
+    if (command_tables_moved)
+        command_gate_write(action, command_records);
+}
+
+/* (stage 4) The call at 004365ef: the game's 00436cf2 first, as there; then the Mime store for an action of 0x26-0x3f
+   (the game's own, just after, skips it: 00436616). Reached exactly when the game's store is: after 009aea60 == 0
+   (004365e1) and by the state-2 jump at 00435da4. */
+static void __cdecl command_mime_hook(void)
+{
+    int *action, actor, k;
+
+    ((void (__cdecl *)(void))FN_MIME_STORE_BEFORE)();
+    if (!command_tables_moved)
+        return;
+    action = current_action();
+    actor = *(const int *)ADDR_COMMAND_BUILD_ACTOR;
+    if (actor < 0 || actor > 2 || action[ACT_COMMAND] < COMMAND_MOVED_FIRST || action[ACT_COMMAND] > COMMAND_LAST)
+        return;
+    k = command_mime_store(action, actor, ((const BYTE *)ADDR_COMMAND_ACTOR_TURNS)[actor * 0x44],
+                           *(const BYTE *)ADDR_COMMAND_QUEUE_ENTRY, (BYTE *)ADDR_COMMAND_MIME_ENTRIES, (WORD *)ADDR_COMMAND_MIME_VALUES);
+    if (command_may_log())
+        log_line("new command %02x: Mime: actor %d's action %s", action[ACT_COMMAND], actor,
+                 k == 0 ? "stored (entry 0; entry 1 cleared)" : k == 1 ? "stored (entry 1: the same actor and turn hold entry 0)"
+                 : "not stored (priority 3, or both entries hold this actor's turn: as the game's store)");
+}
+
+/* (stage 4) The Mime call hook, once, after the move. Not a precondition of the move: without it Mime repeats the
+   action before a 0x26-0x3f one (a wrong result, never a lock). */
+static void command_mime_install(void)
+{
+    if (command_mime_live)
+        return;
+    command_mime_live = patch_call(SITE_MIME_STORE_CALL, FN_MIME_STORE_BEFORE, command_mime_hook);
+    if (command_mime_live)
+        log_line("Mime: the call at %08lx (-> %08lx, before the game's store) is followed: 0x26-0x3f are stored for Mime", SITE_MIME_STORE_CALL, FN_MIME_STORE_BEFORE);
+    else
+        log_line("Mime: the call at %08lx is not the game's (byte %02x; see the patch line above): Mime does not repeat 0x26-0x3f",
+                 SITE_MIME_STORE_CALL, *(const BYTE *)SITE_MIME_STORE_CALL);
+}
+
+/* ---- Kind = item (stage 5) ---- */
+static BOOL command_item_setup_live, command_item_list_live, command_hit_rule_asked, command_hit_rule_live;
+static DWORD command_reading;           /* (stage 5) counts the readings: the filter's notes belong to one */
+static WORD command_filter_notes[WIDE_ROWS_MAX + WIDE_GUARD_ROWS];  /* command_filter_apply's notes, one per row of the battle's list */
+static int command_filter_owner = -1;   /* the command the notes are of, or -1: none */
+static DWORD command_filter_reading;
+static BOOL command_filter_said[COMMAND_COUNT];     /* this reading: the first opening's line said */
+
+/* (stage 5) Handler 0x02's entry 008fee50 (Item's and W-Item's first step): for an action of a live item command,
+   command_item_setup first; the game's 005c8fdf unless refused. Every other action: the game's routine alone. */
+static void __cdecl item_setup_hook(void)
+{
+    int *action = current_action();
+    int command = action[ACT_COMMAND], actor = action[ACT_ACTOR], item = action[ACT_QUEUED_ID] & 0xffff;
+    int way = command_item_setup(action, new_commands);
+
+    if (way >= 0)
+        ((void (__cdecl *)(void))FN_ITEM_SETUP)();
+    if (!way || !command_may_log())
+        return;
+    if (way > 0)
+        log_line("new command %02x (%s): actor %d uses item %d (targets %04x): command type 4, Item's handlers (script %02x)",
+                 command, new_commands[command - COMMAND_FIRST].label, actor, item, action[ACT_TARGETS] & 0xffff, action[ACT_SCRIPT]);
+    else if (way == -1)
+        log_line("new command %02x (%s): actor %d: item %d is not one of the command's items: refused (script -1, the hit loop does nothing; a reserved item is given back at the end of the turn)",
+                 command, new_commands[command - COMMAND_FIRST].label, actor, item);
+    else
+        log_line("new command %02x (%s): actor %d is not a party member: refused (script -1, the hit loop does nothing; a command is party-only)",
+                 command, new_commands[command - COMMAND_FIRST].label, actor);
+}
+
+/* (stage 5) enqueue_hook, before the game's 0043258a (the queue's call 00432878, which takes the menu's issues only):
+   the item of a party member's item command reserved, as 00432aa2 reserves Item's at the issue (the game gives a
+   reserved item back when the action never runs: the turn over, the actor KO'd, the battle's end). */
+static void command_item_reserve(const BYTE *entry)
+{
+    int item, actor = command_item_reserve_decide(entry, new_commands, &item);
+
+    if (actor < 0)
+        return;
+    ((void (__cdecl *)(int, int))FN_ITEM_RESERVE)(actor, item);
+    if (command_may_log())
+        log_line("new command %02x (%s): actor %d's item %d reserved at the queue (as the game does for Item; given back if the action never runs)",
+                 entry[3], new_commands[entry[3] - COMMAND_FIRST].label, actor, item);
+}
+
+/* (stage 5) The call at 005da663 (FUN_00433887, the hit's status and Shield rule, which tests [3] != 4): for an item
+   command's item action the call sees command 4, as Item's does, and the number is put back right after; every
+   other action, the call as it was. */
+static void __cdecl command_hit_rule_hook(void)
+{
+    int *action = current_action();
+    int command = action[ACT_COMMAND];
+
+    if (command_item_as_item(action, new_commands)) {
+        action[ACT_COMMAND] = COMMAND_ITEM;
+        ((void (__cdecl *)(void))FN_HIT_STATUS_RULE)();
+        action[ACT_COMMAND] = command;
+        return;
+    }
+    ((void (__cdecl *)(void))FN_HIT_STATUS_RULE)();
+}
+
+/* (stage 5) The limit FUN_005da5da applied to an enemy (its two immediates: the DLL's damage limit when written),
+   or the game's 9999 / 999 when the instruction is not the expected one. */
+static DWORD command_enemy_limit(BOOL mp)
+{
+    const BYTE *p = (const BYTE *)(mp ? SITE_ENEMY_MP_LIMIT : SITE_ENEMY_HP_LIMIT);
+
+    if (p[0] == 0xc7 && p[1] == 0x45 && p[2] == (mp ? 0xf0 : 0xfc))
+        return *(const DWORD *)(p + 3);
+    return mp ? 999 : 9999;
+}
+
+/* (stage 5) fixed_damage_hook, after the game's clamp and fixed_damage, before test_party_damage: an item command's
+   potency (command_potency_amount), held to the limit the game applied. */
+static void command_potency_hit(int *action, int target)
+{
+    BOOL mp = (action[COMMAND_ACT_HIT_RESULT] & 4) != 0;
+    int before = action[COMMAND_ACT_HIT_AMOUNT], after;
+    DWORD limit;
+
+    if (!command_item_of(new_commands, action[ACT_COMMAND]))
+        return;
+    if (target >= 0 && target < 3)
+        limit = *(const WORD *)((mp ? ADDR_PARTY_MP_LIMIT : ADDR_PARTY_HP_LIMIT) + (DWORD)target * 0x34);
+    else
+        limit = command_enemy_limit(mp);
+    after = command_potency_amount(action, new_commands, before, limit);
+    action[COMMAND_ACT_HIT_AMOUNT] = after;
+    if (after != before && command_may_log())
+        log_line("new command %02x (%s): potency %u%%: actor %d's hit on actor %d: %s %d -> %d (limit %lu)",
+                 action[ACT_COMMAND], new_commands[action[ACT_COMMAND] - COMMAND_FIRST].label,
+                 (unsigned)new_commands[action[ACT_COMMAND] - COMMAND_FIRST].potency, action[ACT_ACTOR], target,
+                 mp ? "MP" : "HP", before, after, limit);
+}
+
+/* (stage 5) The filter at each opening of the Item list and every frame it is open: the notes undone when they are
+   another command's or an older reading's, or the list is not an item command's (Item, W-Item, Throw, Coin); the set
+   of the menu's command applied when it is one at cursor 3. The battle's list as the DLL walks it (wide_battle_at,
+   battle_rows()). */
+static void command_filter_sync(void)
+{
+    int menu = *(const BYTE *)ADDR_MENU_COMMAND, count = battle_rows(), dimmed;
+
+    if (count > WIDE_ROWS_MAX + WIDE_GUARD_ROWS)
+        count = WIDE_ROWS_MAX + WIDE_GUARD_ROWS;
+    dimmed = command_filter_step(wide_battle_at, command_filter_notes, count, new_commands, menu, *(const BYTE *)ADDR_MENU_CURSOR_ACTION,
+                                 &command_filter_owner, &command_filter_reading, command_reading);
+    if (dimmed >= 0 && !command_filter_said[menu - COMMAND_FIRST] && command_may_log()) {
+        command_filter_said[menu - COMMAND_FIRST] = TRUE;
+        log_line("new command %02x (%s): the Item list: %d row(s) dimmed (not among its %u items); the others as the game shows them; said once a reading",
+                 menu, new_commands[menu - COMMAND_FIRST].label, dimmed, (unsigned)new_commands[menu - COMMAND_FIRST].items_count);
+    }
+}
+
+static void __cdecl item_list_setup_hook(void)
+{
+    command_filter_sync();
+    ((void (__cdecl *)(void))FN_ITEM_LIST_SETUP)();
+}
+
+static void __cdecl item_list_input_hook(void)
+{
+    command_filter_sync();
+    ((void (__cdecl *)(void))FN_ITEM_LIST_INPUT)();
+}
+
+/* (stage 5) What an item command needs, put in once (never taken out: each hook passes every other action, list
+   and frame to the game's routine as it is). `c`: the command. TRUE if its record may be written. Handler 0x02's
+   entry (008fee50 holds 005c8fdf), the game's reservation routine 004330c0 and the queue's call 00432878 being
+   enqueue_hook (without them an item chosen and never used would be lost); with an items line the two window
+   entries (both or neither); with a potency line the hit's call 005daae5 being fixed_damage_hook. */
+static BOOL command_item_ready(const struct new_command *c)
+{
+    static const BYTE reserve_code[] = { 0x55, 0x8b, 0xec, 0x51, 0xc7, 0x45, 0xfc, 0x00, 0x00, 0x00, 0x00 };    /* 004330c0 */
+
+    if (!bytes_are(FN_ITEM_RESERVE, reserve_code, sizeof reserve_code) || !command_call_goes_to(SITE_ENQUEUE, enqueue_hook)) {
+        log_line("new command %02x (%s): NOT used: the reservation routine 004330c0 is not the game's, or the queue's call %08lx is not this DLL's (an item chosen and never used would be lost)",
+                 (int)(c - new_commands) + COMMAND_FIRST, c->label, SITE_ENQUEUE);
+        return FALSE;
+    }
+    if (!command_item_setup_live) {
+        command_item_setup_live = patch_pointer(ADDR_ITEM_SETUP_ENTRY, FN_ITEM_SETUP, item_setup_hook);
+        if (command_item_setup_live)
+            log_line("new commands: item set-up (handler 0x02, %08lx -> %08lx) is followed for the item commands", ADDR_ITEM_SETUP_ENTRY, FN_ITEM_SETUP);
+    }
+    if (!command_item_setup_live || *(const DWORD *)ADDR_ITEM_SETUP_ENTRY != (DWORD)item_setup_hook) {
+        log_line("new command %02x (%s): NOT used: handler 0x02's entry %08lx holds %08lx, not this DLL's item set-up (see the patch line above)",
+                 (int)(c - new_commands) + COMMAND_FIRST, c->label, ADDR_ITEM_SETUP_ENTRY, *(const DWORD *)ADDR_ITEM_SETUP_ENTRY);
+        return FALSE;
+    }
+    if (c->items_line && !command_item_list_live) {
+        if (*(const DWORD *)ADDR_ITEM_LIST_SETUP_ENTRY == FN_ITEM_LIST_SETUP && *(const DWORD *)ADDR_ITEM_LIST_INPUT_ENTRY == FN_ITEM_LIST_INPUT &&
+            patch_pointer(ADDR_ITEM_LIST_SETUP_ENTRY, FN_ITEM_LIST_SETUP, item_list_setup_hook)) {
+            command_item_list_live = patch_pointer(ADDR_ITEM_LIST_INPUT_ENTRY, FN_ITEM_LIST_INPUT, item_list_input_hook);
+            if (!command_item_list_live)
+                patch_pointer(ADDR_ITEM_LIST_SETUP_ENTRY, (DWORD)item_list_setup_hook, (void *)FN_ITEM_LIST_SETUP);
+        }
+        if (command_item_list_live)
+            log_line("new commands: the Item list's window entries (%08lx -> %08lx, %08lx -> %08lx) are followed for the item filter",
+                     ADDR_ITEM_LIST_SETUP_ENTRY, FN_ITEM_LIST_SETUP, ADDR_ITEM_LIST_INPUT_ENTRY, FN_ITEM_LIST_INPUT);
+    }
+    if (c->items_line && (!command_item_list_live || *(const DWORD *)ADDR_ITEM_LIST_SETUP_ENTRY != (DWORD)item_list_setup_hook ||
+                          *(const DWORD *)ADDR_ITEM_LIST_INPUT_ENTRY != (DWORD)item_list_input_hook)) {
+        log_line("new command %02x (%s): NOT used: the Item list's window entries (%08lx holds %08lx, %08lx holds %08lx; the game's: %08lx, %08lx) are not this DLL's: a command with an items line would show every item",
+                 (int)(c - new_commands) + COMMAND_FIRST, c->label, ADDR_ITEM_LIST_SETUP_ENTRY, *(const DWORD *)ADDR_ITEM_LIST_SETUP_ENTRY,
+                 ADDR_ITEM_LIST_INPUT_ENTRY, *(const DWORD *)ADDR_ITEM_LIST_INPUT_ENTRY, FN_ITEM_LIST_SETUP, FN_ITEM_LIST_INPUT);
+        return FALSE;
+    }
+    if (c->potency_line && c->potency != COMMAND_POTENCY_DEFAULT && !command_call_goes_to(SITE_HIT_IMMUNE_CHECK, fixed_damage_hook)) {
+        log_line("new command %02x (%s): NOT used: the hit's call %08lx is not this DLL's (fixed_damage_hook): its potency could not be applied",
+                 (int)(c - new_commands) + COMMAND_FIRST, c->label, SITE_HIT_IMMUNE_CHECK);
+        return FALSE;
+    }
+    if (!command_hit_rule_asked) {
+        command_hit_rule_asked = TRUE;
+        command_hit_rule_live = patch_call(SITE_HIT_STATUS_RULE, FN_HIT_STATUS_RULE, command_hit_rule_hook);
+        if (command_hit_rule_live)
+            log_line("new commands: the hit's call %08lx (-> %08lx, the Resist / Death Force / Shield rule) is followed: an item command's item acts there as Item's",
+                     SITE_HIT_STATUS_RULE, FN_HIT_STATUS_RULE);
+        else
+            log_line("new commands: the hit's call %08lx is not the game's (see the patch line above): an item command's item acts as W-Item's against a target's Resist, Death Force and Shield",
+                     SITE_HIT_STATUS_RULE);
+    }
+    return TRUE;
+}
+
+/* ---- Support materia (stage 6) ----
+   The pairing: the two calls of FUN_005cba3f (005cba19, 005cba33: every pair of the rebuild and of the DLL's link
+   chains, which call FUN_005cb94a) go to support_link_hook, which runs the game's routine with the same four
+   arguments and then command_support_pair. Put in once (load_commands, when a new command is live), both calls or
+   neither, never taken out; with no live new command the hook only calls the game's routine. The rest rides in hooks
+   already in: mega_all_hook (Mega All), battle_slots_hook (the toggle rule), slot_match_hook (the All use),
+   action_setup_hook (Quadra Magic through command_action_setup, the MP Turbo cost). All and Mega All are given only
+   when the use can be spent (slot_match_hook and both battle_slots_hook calls this DLL's, 00435139 the game's);
+   Quadra only when 005ca811 and 00435139 are the game's (005ca830, New Threat's 7, is not compared: Octa, as Magic)
+   and handler 0x0c is this DLL's. */
+static BOOL command_support_asked, command_support_live, command_spend_ok, command_quadra_ok;
+static BYTE command_quadra[3][COMMAND_COUNT][2];    /* per party slot and command: Quadra Magic's count and uses */
+static BYTE command_support_said[COMMAND_COUNT];    /* this reading: a bit per support whose refusal line was said */
+static BYTE command_support_told[3][COMMAND_COUNT]; /* this reading: a bit per (party slot, support) whose rebuild line was said */
+
+static const char *command_support_name(BYTE bit)
+{
+    switch (bit) {
+    case COMMAND_SUP_COUNTER:   return "Counter";
+    case COMMAND_SUP_SNEAK:     return "Sneak Attack";
+    case COMMAND_SUP_FINAL:     return "Final Attack";
+    case COMMAND_SUP_ALL:       return "All";
+    case COMMAND_SUP_QUADRA:    return "Quadra Magic";
+    case COMMAND_SUP_MEGA_ALL:  return "Mega All";
+    case COMMAND_SUP_TURBO:     return "MP Turbo";
+    }
+    return "Magic Counter";
+}
+
+/* The party slot whose battle record FUN_005cb2cc is rebuilding (00c068b0), or -1. */
+static int command_rebuild_slot(void)
+{
+    DWORD offset = *(const DWORD *)ADDR_REBUILD_RECORD - ADDR_CHARACTER_RECORD;
+
+    return offset % CHARACTER_STRIDE || offset / CHARACTER_STRIDE > 2 ? -1 : (int)(offset / CHARACTER_STRIDE);
+}
+
+/* A refusal or "does nothing" line, once a reading for (command, support). */
+static void command_support_refused(int n, BYTE bit, int way)
+{
+    const struct new_command *c = &new_commands[n - COMMAND_FIRST];
+
+    if (command_support_said[n - COMMAND_FIRST] & bit)
+        return;
+    command_support_said[n - COMMAND_FIRST] |= bit;
+    if (way == COMMAND_PAIR_MAGIC_COUNTER)
+        log_line("support: Magic Counter linked to new command %02x (%s): nothing: Magic Counter takes a magic materia; link Counter to a command materia; said once a reading",
+                 n, c->label);
+    else if (way == COMMAND_PAIR_ITEM)
+        log_line("support: %s linked to new command %02x (%s): refused: an item command %s; said once a reading", command_support_name(bit), n, c->label,
+                 bit & (COMMAND_SUP_COUNTER | COMMAND_SUP_SNEAK | COMMAND_SUP_FINAL)
+                 ? "cannot be used by Counter, Sneak Attack or Final Attack (no item to pick)" : "takes no All, Quadra Magic or MP Turbo (they have no meaning for an item)");
+    else if (way == COMMAND_PAIR_KIND && c->kind == COMMAND_KIND_LIST)  /* (stage 8) */
+        log_line("support: %s linked to new command %02x (%s): refused: Counter, Sneak Attack and Final Attack do not apply to a list command (a counter has no entry to choose); said once a reading",
+                 command_support_name(bit), n, c->label);
+    else if (way == COMMAND_PAIR_KIND)
+        log_line("support: %s linked to new command %02x (%s): refused: All, Quadra Magic and MP Turbo work on spell commands only (the game pairs them with magic); said once a reading",
+                 command_support_name(bit), n, c->label);
+    else if (way == COMMAND_PAIR_OFF)
+        log_line("support: %s linked to new command %02x (%s): off (support line %d); said once a reading", command_support_name(bit), n, c->label, c->support_line);
+    else if (way == COMMAND_PAIR_ALL)
+        log_line("support: All linked to new command %02x (%s): NOT given: its use could not be spent (see the support materia line at the reading); said once a reading", n, c->label);
+    else
+        log_line("support: Quadra Magic linked to new command %02x (%s): NOT given: 005ca811 or 00435139 is not the game's, or handler 0x0c or the rebuild-start call is not this DLL's (see the support materia line at the reading); said once a reading",
+                 n, c->label);
+}
+
+/* support_link_hook's step, after the game's FUN_005cba3f(support, partner): for a support materia linked to a
+   command materia that grants a live new command, what the game would have written for one of its own commands
+   (5.2). Only in a rebuild (not the describe mode, 00c068b0 a party slot's battle record); the values are the game's
+   own, 00c068bf[level], as FUN_005cba3f has just copied them (the level at most 5: the DLL's level routine). */
+static void command_support_pair(DWORD support, DWORD partner)
+{
+    BYTE sid = (BYTE)support, pid = (BYTE)partner, *record = *(BYTE **)ADDR_REBUILD_RECORD, *build = (BYTE *)ADDR_COMMAND_BUILD;
+    const BYTE *srec = materia_base + sid * MATERIA_RECORD_SIZE, *prec = materia_base + pid * MATERIA_RECORD_SIZE;
+    const struct new_command *c;
+    int slot = command_rebuild_slot(), n, way, index, level, entry;
+    BYTE bit, value;
+
+    if (*(const BYTE *)ADDR_DESCRIBE_MODE || slot < 0 || sid == 0xff || pid == 0xff || (srec[0x0d] & 0x0f) != 5 ||
+        (prec[0x0d] & 0x0f) != 6)
+        return;
+    n = command_materia_grants(prec + 0x0e, materia_level(pid, partner >> 8));
+    c = command_of(new_commands, n);
+    if (!c || !c->live)
+        return;
+    way = command_support_decide(c, srec[0x0e]);
+    bit = command_support_bit(srec[0x0e]);
+    if ((way == COMMAND_PAIR_ALL && !command_spend_ok) || (way == COMMAND_PAIR_QUADRA && !command_quadra_ok)) {
+        command_support_refused(n, bit, way);
+        return;
+    }
+    if (way == COMMAND_PAIR_NONE)
+        return;
+    if (way != COMMAND_PAIR_COUNTER && way != COMMAND_PAIR_ALL && way != COMMAND_PAIR_QUADRA && way != COMMAND_PAIR_TURBO) {
+        command_support_refused(n, bit, way);
+        return;
+    }
+    index = command_build_index(build, n);
+    if (index < 0)
+        return;                         /* the character does not have it (the guard left it out): as the game */
+    level = materia_level(sid, support >> 8);
+    if (level > COMMAND_SUPPORT_LEVELS)
+        level = COMMAND_SUPPORT_LEVELS;
+    value = *(const BYTE *)(ADDR_SUPPORT_VALUES + level);
+    entry = -1;
+    if (way == COMMAND_PAIR_COUNTER)
+        entry = command_counter_write(record + CHR_COUNTERS, (int *)ADDR_COUNTER_COUNT, command_counter_type(srec[0x0e]), (BYTE)n, value);
+    else if (way == COMMAND_PAIR_ALL)
+        build[index * 3 + 1] = command_count_add(build[index * 3 + 1], level);
+    else if (way == COMMAND_PAIR_QUADRA)
+        command_quadra_add(command_quadra[slot][n - COMMAND_FIRST], level);
+    else
+        build[index * 3 + 2] = command_turbo_add(build[index * 3 + 2], level);
+    if (command_support_told[slot][n - COMMAND_FIRST] & bit)
+        return;
+    if (!command_may_log())
+        return;                         /* (stage 7) the said-once bit only with the line written */
+    command_support_told[slot][n - COMMAND_FIRST] |= bit;
+    if (way == COMMAND_PAIR_COUNTER && entry < 0)
+        log_line("rebuild: party slot %d: %s (level %d) linked to new command %02x (%s): the counter list is full (8): not added, as the game; said once a reading",
+                 slot, command_support_name(bit), level, n, c->label);
+    else if (way == COMMAND_PAIR_COUNTER)
+        log_line("rebuild: party slot %d: %s (level %d) linked to new command %02x (%s): counter entry %d (type %d, value %d); said once a reading",
+                 slot, command_support_name(bit), level, n, c->label, entry, command_counter_type(srec[0x0e]), value);
+    else if (way == COMMAND_PAIR_ALL)
+        log_line("rebuild: party slot %d: All (level %d) linked to new command %02x (%s): %d use(s); said once a reading",
+                 slot, level, n, c->label, build[index * 3 + 1]);
+    else if (way == COMMAND_PAIR_QUADRA)
+        log_line("rebuild: party slot %d: Quadra Magic (level %d) linked to new command %02x (%s): count %d, %d use(s); said once a reading",
+                 slot, level, n, c->label, command_quadra[slot][n - COMMAND_FIRST][0], command_quadra[slot][n - COMMAND_FIRST][1]);
+    else
+        log_line("rebuild: party slot %d: MP Turbo (level %d) linked to new command %02x (%s): turbo %d; said once a reading",
+                 slot, level, n, c->label, build[index * 3 + 2] >> 5);
+}
+
+/* The two calls of FUN_005cba3f (005cba19, 005cba33). */
+static void __cdecl support_link_hook(DWORD support, DWORD partner, DWORD x, DWORD armour)
+{
+    ((void (__cdecl *)(DWORD, DWORD, DWORD, DWORD))FN_SUPPORT_APPLY)(support, partner, x, armour);
+    command_support_pair(support, partner);
+}
+
+/* rebuild_start_hook, before the game's FUN_005cf282: the slot's Quadra Magic counts (filled again by its pairs). */
+static void command_rebuild_start(int character)
+{
+    int i;
+
+    if ((BYTE)character < 3)
+        for (i = 0; i < COMMAND_COUNT; i++)
+            command_quadra[(BYTE)character][i][0] = command_quadra[(BYTE)character][i][1] = 0;
+}
+
+/* mega_all_hook, after the game's FUN_005ccf03: a Mega All materia's level onto the new commands' rows too. */
+static void command_mega_all(DWORD materia)
+{
+    BYTE id = (BYTE)materia, *record = *(BYTE **)ADDR_REBUILD_RECORD;
+    int slot = command_rebuild_slot(), level, given, i;
+
+    if (!command_spend_ok || slot < 0 || id == 0xff || (materia_base[id * MATERIA_RECORD_SIZE + 0x0d] & 0x0f) != MATERIA_TYPE_MEGA_ALL)
+        return;
+    level = materia_level(id, materia >> 8);
+    if (level > COMMAND_SUPPORT_LEVELS)
+        level = COMMAND_SUPPORT_LEVELS;
+    given = command_mega_all_add(record + COMMAND_REC_MENU, new_commands, level);
+    for (i = 1; i < COMMAND_MENU_ENTRIES; i++) {
+        int n = record[COMMAND_REC_MENU + i * COMMAND_MENU_ENTRY_SIZE];
+
+        if (!(given & 1 << i) || (command_support_told[slot][n - COMMAND_FIRST] & COMMAND_SUP_MEGA_ALL) || !command_may_log())
+            continue;
+        command_support_told[slot][n - COMMAND_FIRST] |= COMMAND_SUP_MEGA_ALL;    /* (stage 7) only with the line written */
+        log_line("rebuild: party slot %d: Mega All (level %d): new command %02x (%s) %d use(s) (entry %d); said once a reading",
+                 slot, level, n, new_commands[n - COMMAND_FIRST].label, record[COMMAND_REC_MENU + i * COMMAND_MENU_ENTRY_SIZE + COMMAND_ENTRY_COUNT], i);
+    }
+}
+
+/* battle_slots_hook, after the game's FUN_005cfe67: (stage 7) the Attack row of a live spell or physical command
+   (command_attack_row: byte 4 ff, one target), before 00437370 copies entry 0 to 009aead0; then a new command's row whose
+   target byte has no toggle keeps no All use (command_battle_counts). */
+static BYTE command_attack_told[3][COMMAND_COUNT];  /* (stage 7) this reading: the Attack row line said for (slot, command) */
+
+static void command_battle_slots(int character)
+{
+    BYTE *entries;
+    int cleared, n;
+
+    if (character < 0 || character > 2)
+        return;
+    entries = (BYTE *)(ADDR_MENU_ENTRIES + (DWORD)character * CHARACTER_STRIDE);
+    n = entries[0];
+    if (command_attack_live && command_takes_count(command_of(new_commands, n)) &&
+        command_attack_row(entries, command_records_at[n * COMMAND_RECORD_SIZE + 1],
+                           *(const BYTE *)(ADDR_WEAPON_RECORDS + (DWORD)character * COMMAND_WEAPON_RECORD), new_commands) &&
+        !command_attack_told[character][n - COMMAND_FIRST] && command_may_log()) {
+        command_attack_told[character][n - COMMAND_FIRST] = 1;
+        log_line("new commands: party slot %d: the Attack row is new command %02x (%s) (target flags %02x); said once a reading",
+                 character, n, new_commands[n - COMMAND_FIRST].label, entries[COMMAND_ENTRY_TARGET]);
+    }
+    if (!command_spend_ok)
+        return;
+    cleared = command_battle_counts(entries, new_commands);
+    if (cleared && command_may_log())
+        log_line("new commands: party slot %d: battle start: the All uses of entries %04x taken (their target flags have no toggle, as for a spell)",
+                 character, cleared);
+}
+
+/* slot_match_hook, after the game's FUN_005caa86 and command_gate_fields: a new command's All use (command_all_spend);
+   (stage 7) with no entry 1-15 for it, an Attack-row action at several targets (command_attack_spend). */
+static void command_all_use(int actor, int *action)
+{
+    const struct new_command *c;
+    int n = action[ACT_COMMAND], way = 0, index = -1, record_target;
+    BYTE *entries;
+
+    if ((!command_spend_ok && !command_attack_live) || actor < 0 || actor > 2 || !command_takes_all(c = command_of(new_commands, n)))
+        return;
+    entries = (BYTE *)(ADDR_MENU_ENTRIES + (DWORD)actor * CHARACTER_STRIDE);
+    record_target = command_records_at[n * COMMAND_RECORD_SIZE + 1];
+    if (c->kind == COMMAND_KIND_LIST) {
+        record_target = command_spell_target(action[ACT_QUEUED_ID] & 0xffff);  /* (stage 8) the chosen spell's own byte */
+        if (record_target < 0)
+            record_target = 0xff;
+    }
+    if (command_spend_ok)
+        way = command_all_spend(action, entries, new_commands, record_target,
+                                command_quadra_fires(command_quadra[actor][n - COMMAND_FIRST], action[ACT_FLAGS]), &index);
+    if (!way && command_attack_live &&
+        command_attack_spend(action, entries, new_commands, record_target,
+                             *(const BYTE *)(ADDR_ENTRY0_KEPT + (DWORD)actor * COMMAND_ENTRY0_KEPT_STRIDE))) {  /* (stage 8) the kept entry 0 too */
+        if (command_may_log())
+            log_line("new command %02x (%s): actor %d at several targets from the Attack row: one random target (as Magic)", n, c->label, actor);
+        return;
+    }
+    if (way == 1) {
+        ((void (__cdecl *)(int, int, int, int))FN_COMMAND_POST)(2, actor, 0x15, 1);    /* as 00436380: the row is refreshed */
+        if (command_may_log())
+            log_line("new command %02x (%s): actor %d at several targets: an All use spent (%d left; entry %d)",
+                     n, c->label, actor, entries[index * COMMAND_MENU_ENTRY_SIZE + COMMAND_ENTRY_COUNT], index);
+    } else if (way == 2 && command_may_log())
+        log_line("new command %02x (%s): actor %d at several targets: no All use left: one random target (as Magic)", n, c->label, actor);
+}
+
+/* command_action_setup, after command_setup: Quadra Magic of a spell command's cast, as 005c94d3 does for Magic: a use
+   taken, FUN_005ca811(count) (the hit loop then repeats the cast at random targets), the lists post. */
+static void command_quadra_use(int *action)
+{
+    int actor = action[ACT_ACTOR], n = action[ACT_COMMAND], count;
+
+    if (!command_quadra_ok || actor < 0 || actor > 2 || !command_number_new(n))
+        return;
+    count = command_quadra_take(command_quadra[actor][n - COMMAND_FIRST], action[ACT_FLAGS]);
+    if (!count)
+        return;
+    ((void (__cdecl *)(int))FN_QUADRA_REPEAT)(count);
+    ((void (__cdecl *)(int, int, int, int))FN_COMMAND_POST)(2, actor, 0x15, 6);         /* as 005c94d3 */
+    if (command_may_log())
+        log_line("new command %02x (%s): Quadra Magic: count %d (%d casts), %d use(s) left", n, new_commands[n - COMMAND_FIRST].label,
+                 count, action[0x2b], command_quadra[actor][n - COMMAND_FIRST][1]);
+}
+
+/* action_setup_hook, after the game's set-up of a spell command's cast: MP Turbo on its row (entry byte 5's top 3
+   bits) raises the MP as the game raises a spell slot's (command_turbo_cost). Not when no MP is charged ([0xe] 0:
+   Mime, a priority-3 action) or for a repeat. The damage needs nothing: the game's entry loop gives [0x3c] = entry
+   byte 5 for a menu action, and FUN_005ca9d0 applies its percent for any command. */
+static void command_mp_turbo(int *action)
+{
+    const struct new_command *c = command_of(new_commands, action[ACT_COMMAND]);
+    int actor = action[ACT_ACTOR], index, turbo, before = action[COMMAND_ACT_MP_COST];
+    const BYTE *entries;
+
+    if (!c || !c->live || (c->kind != COMMAND_KIND_SPELL && c->kind != COMMAND_KIND_LIST) || actor < 0 || actor > 2 || before <= 0 ||
+        (action[ACT_FLAGS] & COMMAND_FLAG_REPEAT))
+        return;
+    entries = (const BYTE *)(ADDR_MENU_ENTRIES + (DWORD)actor * CHARACTER_STRIDE);
+    index = command_menu_entry(entries, action[ACT_COMMAND]);
+    turbo = index < 0 ? 0 : entries[index * COMMAND_MENU_ENTRY_SIZE + COMMAND_ENTRY_FLAGS] >> 5;
+    if (!turbo)
+        return;
+    action[COMMAND_ACT_MP_COST] = c->kind == COMMAND_KIND_LIST     /* (stage 8) as its slot showed it */
+        ? (int)command_list_turbo_cost((DWORD)before, turbo, ext_record(action[ACT_ATTACK_ID]) != NULL)
+        : (int)command_turbo_cost((DWORD)before, turbo);
+    if (command_may_log())
+        log_line("new command %02x (%s): MP Turbo %d: MP cost %d -> %d", action[ACT_COMMAND], c->label, turbo, before, action[COMMAND_ACT_MP_COST]);
+}
+
+/* Once, at the first reading with a live new command: the two calls checked (both e8 to 005cba3f) and then patched,
+   both or neither; and what All, Mega All and Quadra need, checked. */
+static void command_support_install(void)
+{
+    static const BYTE post_code[] = { 0x55, 0x8b, 0xec, 0x83, 0xec, 0x08, 0x8b, 0x45, 0x08 };    /* 00435139 */
+    static const BYTE quadra_code[] = {                                 /* 005ca811-005ca82f (005ca830 is the 3 of + 3) */
+        0x55, 0x8b, 0xec, 0xa1, 0x0c, 0xce, 0x99, 0x00, 0x8b, 0x4d, 0x08, 0x89, 0x88, 0xf8, 0x00, 0x00, 0x00,
+        0x8b, 0x15, 0x0c, 0xce, 0x99, 0x00, 0x8b, 0x82, 0xf8, 0x00, 0x00, 0x00, 0x83, 0xc0 };
+    BOOL post_ok;
+    int i;
+
+    for (i = 0; i < COMMAND_COUNT && !new_commands[i].live; i++)
+        ;
+    if (command_support_asked || i == COMMAND_COUNT)
+        return;
+    command_support_asked = TRUE;
+    post_ok = bytes_are(FN_COMMAND_POST, post_code, sizeof post_code);
+    command_spend_ok = post_ok && command_call_goes_to(SITE_SLOT_MATCH, slot_match_hook) &&
+                       command_call_goes_to(battle_slots_sites[0], battle_slots_hook) && command_call_goes_to(battle_slots_sites[1], battle_slots_hook);
+    command_quadra_ok = post_ok && bytes_are(FN_QUADRA_REPEAT, quadra_code, sizeof quadra_code) &&
+                        *(const DWORD *)ADDR_ACTION_SETUP_ENTRY == (DWORD)action_setup_hook &&
+                        command_call_goes_to(SITE_REBUILD_START, rebuild_start_hook);   /* (stage 7) the counts are cleared only there */
+    if (command_call_goes_to(SITE_SUPPORT_PAIR_A, (const void *)FN_SUPPORT_APPLY) && command_call_goes_to(SITE_SUPPORT_PAIR_B, (const void *)FN_SUPPORT_APPLY) &&
+        patch_call(SITE_SUPPORT_PAIR_A, FN_SUPPORT_APPLY, support_link_hook)) {
+        command_support_live = patch_call(SITE_SUPPORT_PAIR_B, FN_SUPPORT_APPLY, support_link_hook);
+        if (!command_support_live)
+            patch_call(SITE_SUPPORT_PAIR_A, (DWORD)support_link_hook, (void *)FN_SUPPORT_APPLY);    /* both or neither */
+    }
+    if (command_support_live)
+        log_line("support materia: the calls %08lx and %08lx of %08lx are followed for the new commands (Counter, Sneak Attack, Final Attack, All, Quadra Magic, MP Turbo)",
+                 SITE_SUPPORT_PAIR_A, SITE_SUPPORT_PAIR_B, FN_SUPPORT_APPLY);
+    else
+        log_line("support materia: NOT followed: %08lx (%02x %08lx) or %08lx (%02x %08lx) is not the game's call of %08lx (e8 21 00 00 00, e8 07 00 00 00): Counter, Sneak Attack, Final Attack, All, Quadra Magic and MP Turbo do nothing on new commands",
+                 SITE_SUPPORT_PAIR_A, ((const BYTE *)SITE_SUPPORT_PAIR_A)[0], *(const DWORD *)(SITE_SUPPORT_PAIR_A + 1),
+                 SITE_SUPPORT_PAIR_B, ((const BYTE *)SITE_SUPPORT_PAIR_B)[0], *(const DWORD *)(SITE_SUPPORT_PAIR_B + 1), FN_SUPPORT_APPLY);
+    if (!command_spend_ok)
+        log_line("support materia: All and Mega All are NOT given to new commands: the slot match call %08lx or the battle-start calls %08lx / %08lx are not this DLL's, or %08lx is not the game's post: a use could not be spent",
+                 SITE_SLOT_MATCH, battle_slots_sites[0], battle_slots_sites[1], FN_COMMAND_POST);
+    if (!command_quadra_ok)
+        log_line("support materia: Quadra Magic is NOT given to new commands: %08lx or %08lx is not the game's, or handler 0x0c (%08lx) or the rebuild-start call %08lx is not this DLL's",
+                 FN_QUADRA_REPEAT, FN_COMMAND_POST, ADDR_ACTION_SETUP_ENTRY, SITE_REBUILD_START);
+}
+
+/* ---- The Attack row and the W- form (stage 7) ----
+   The Attack row: the finish's placement call 005cee10 goes to placement_hook (command_place_attack), put in once when
+   a replace-Attack materia names a live spell or physical command and the battle-start and slot-match calls are this
+   DLL's (the row is kept there and spent there: command_battle_slots, command_all_use); without all of it the rule
+   reads such a materia as Attack. The W- form of a spell or physical command: the existing target set-up hook
+   (menu_target_hook_a / _b) and the queue's call (enqueue_hook) must be this DLL's, else the command is not used. */
+static struct command_w command_w_state;
+static BYTE command_w_told[COMMAND_COUNT];      /* this reading: a bit per line (1 first pick, 2 second) said */
+
+static int __cdecl placement_hook(int command)
+{
+    const BYTE *record = *(const BYTE **)ADDR_REBUILD_RECORD;
+
+    if (record && command_place_attack(command, *(const BYTE *)ADDR_COMMAND_BUILD, record[COMMAND_REC_MENU],
+                                       *(const BYTE *)ADDR_DESCRIBE_MODE != 0, new_commands) == 0)
+        return 0;
+    return ((int (__cdecl *)(int))FN_PLACEMENT)(command);
+}
+
+/* Once, when a replace-Attack materia first names a live spell or physical command (commands_check_materia): what the
+   row needs checked, then the placement call patched (patch_call checks its e8 and target), with one line. */
+static void command_attack_install(void)
+{
+    static const BYTE before[] = { 0x50 };                                  /* push eax: the build entry's command */
+    static const BYTE after[] = { 0x83, 0xc4, 0x04, 0x89, 0x45, 0xfc };     /* add esp,4; mov [ebp-4],eax */
+    static const BYTE routine[] = { 0x55, 0x8b, 0xec, 0x51 };               /* FUN_005ceef0's prologue */
+    const BYTE *p = (const BYTE *)SITE_PLACEMENT;
+
+    if (command_attack_asked)
+        return;
+    command_attack_asked = TRUE;
+    if (!command_call_goes_to(battle_slots_sites[0], battle_slots_hook) || !command_call_goes_to(battle_slots_sites[1], battle_slots_hook) ||
+        !command_call_goes_to(SITE_SLOT_MATCH, slot_match_hook))
+        log_line("new commands: the Attack row NOT followed: the battle-start calls %08lx / %08lx or the slot-match call %08lx are not this DLL's: replace-Attack materia naming a new command read as Attack (01)",
+                 battle_slots_sites[0], battle_slots_sites[1], SITE_SLOT_MATCH);
+    else if (!bytes_are(SITE_PLACEMENT - 1, before, sizeof before) || !bytes_are(SITE_PLACEMENT + 5, after, sizeof after) ||
+             !bytes_are(FN_PLACEMENT, routine, sizeof routine) || !command_call_goes_to(SITE_PLACEMENT, (const void *)FN_PLACEMENT))
+        log_line("new commands: the Attack row NOT followed: %08lx holds %02x %08lx, not e8 to %08lx (or the code around it or the routine's start is not the game's): replace-Attack materia naming a new command read as Attack (01)",
+                 SITE_PLACEMENT, p[0], *(const DWORD *)(p + 1), FN_PLACEMENT);
+    else
+        command_attack_live = patch_call(SITE_PLACEMENT, FN_PLACEMENT, placement_hook);
+    if (command_attack_live)
+        log_line("new commands: the Attack row: the placement call %08lx (-> %08lx) is followed for new commands named by a replace-Attack (type 12) materia",
+                 SITE_PLACEMENT, FN_PLACEMENT);
+}
+
+/* menu_target_hook_a / _b: the W flag of a w_form row (command_w_decide). */
+static void command_w_menu(void)
+{
+    int actor = *(const BYTE *)ADDR_BATTLE_MENU_ACTOR, command = *(const BYTE *)ADDR_MENU_COMMAND, w;
+    WORD mark = 0;
+
+    if (!command_w_live)
+        return;
+    w = command_w_decide(&command_w_state, actor, command, *(const WORD *)ADDR_MENU_STORED_SLOT, new_commands, &mark);
+    if (!w)
+        return;
+    if (w == 1)
+        *(WORD *)ADDR_MENU_SLOT = mark;
+    *(BYTE *)ADDR_MENU_W = (BYTE)w;
+    if (!(command_w_told[command - COMMAND_FIRST] & w) && command_may_log()) {
+        command_w_told[command - COMMAND_FIRST] |= (BYTE)w;
+        log_line(w == 1 ? "new command %02x (%s): W- form: actor %d: first pick (the target confirm stores it and goes back to the command list; mark %04x); said once a reading"
+                        : "new command %02x (%s): W- form: actor %d: second pick: the target confirm issues two actions (mark %04x); said once a reading",
+                 command, new_commands[command - COMMAND_FIRST].label, actor, command_w_state.mark);
+    }
+}
+
+/* enqueue_hook: any issue by the armed actor disarms its first pick. */
+static void command_w_issued(const BYTE *entry)
+{
+    if (command_w_live)
+        command_w_disarm(&command_w_state, (signed char)entry[2]);
+}
+
+/* load_commands, for a usable spell or physical command with w_form: TRUE if its row can get the W flag. The target
+   set-up hook is put in here when the limit states have not (install_menu_target_hook, its one line on a refusal). */
+static BOOL command_w_ready(const struct new_command *c)
+{
+    BOOL was = command_w_live;
+
+    if (!menu_all_live)
+        menu_all_live = install_menu_target_hook();
+    command_w_live = menu_all_live && command_call_goes_to(SITE_MENU_TARGET_A, menu_target_hook_a) &&
+                     command_call_goes_to(SITE_MENU_TARGET_B, menu_target_hook_b) && command_call_goes_to(SITE_ENQUEUE, enqueue_hook);
+    if (command_w_live && !was)
+        log_line("new commands: the W- form (w_form) of spell and physical commands: the target set-up calls %08lx / %08lx are followed",
+                 SITE_MENU_TARGET_A, SITE_MENU_TARGET_B);
+    if (!command_w_live)
+        log_line("new command %02x (%s): NOT used: w_form needs the target set-up hook (%08lx / %08lx) and the queue's call %08lx, which are not this DLL's",
+                 (int)(c - new_commands) + COMMAND_FIRST, c->label, SITE_MENU_TARGET_A, SITE_MENU_TARGET_B, SITE_ENQUEUE);
+    return command_w_live;
+}
+
+/* ---- The list kind (stage 8) ----
+   A list command's record is Magic's (cursor 1, or W-Magic's 8): OK opens window 6, the game's Magic list, which reads
+   only the actor's magic slots and grid. While it is open for the command the slots hold the command's list (the
+   view, command_view_* above): shown by battle_magic_open_hook (006d9b8c, the end of window 6's set-up), followed every
+   frame by the command list's input entry 0091e6bc (command_list_menu_hook, the only new site: window 1's input runs
+   every frame it is open, before window 6's input, CODE 006db247-006db2ce) and put back by the triggers of the header's
+   26. The pick is the game's (00dc3c78 = the slot's byte, the target cursor from slot byte 5); the queue turns a handle
+   back into the ID; command_setup casts it. */
+static void command_view_store(int k)
+{
+    window_store(k);
+}
+
+static void command_view_load(int k)
+{
+    window_load(k);
+}
+
+static int *command_view_grid(int k)
+{
+    return (int *)(ADDR_BATTLE_MAGIC_GRID + (DWORD)k * BATTLE_GRID_STRIDE);
+}
+
+static BYTE *command_view_stale(int k)
+{
+    return (BYTE *)(ADDR_SLOT_FLAGS_STALE + (DWORD)k * BATTLE_ACTOR_STRIDE);
+}
+
+static BOOL command_view_memory(void)
+{
+    return *(const int *)ADDR_CURSOR_MEMORY != 0;
+}
+
+/* (stage 9a) rebuild_start_hook (005cb31a), before the game's FUN_005cf282: party slot k's level, 16 materia and
+   character, from the record FUN_005cb2cc reads right after it (005cb329-005cb342: id = 00dc0230[k], index =
+   00919928[id], the record 00dbfd8c + index * 0x84; nothing in between writes it). The game rebuilds a slot only when it
+   holds a character (ff: no call); an ID past the seats is taken as none. */
+static void command_snapshot_take(int character)
+{
+    struct command_snapshot *s;
+    const BYTE *record;
+    int k = (BYTE)character, id, i;
+
+    if (k > 2)
+        return;
+    s = &command_snapshots[k];
+    s->taken = 0;
+    s->level = 0;
+    s->character = -1;
+    for (i = 0; i < COMMAND_MATERIA_SLOTS; i++)
+        s->materia[i] = 0xffffffffu;
+    id = ((const BYTE *)ADDR_PARTY)[k];
+    if (id >= NEW_CHARACTER_FIRST_ID + SEAT_MAX)
+        return;
+    record = record_at_index(((const int *)ADDR_SAVE_RECORD_INDEX)[id]);
+    s->level = record[1];
+    for (i = 0; i < COMMAND_MATERIA_SLOTS; i++)
+        s->materia[i] = ((const DWORD *)(record + SAVE_RECORD_MATERIA))[i];
+    if (id < NEW_CHARACTER_FIRST_ID)
+        s->character = (short)id;
+    else if (new_character(id))
+        s->character = (short)character_file_id(new_character(id));
+    s->taken = 1;
+}
+
+static int command_real_level(int materia, DWORD ap)
+{
+    return materia_level((BYTE)materia, ap);
+}
+
+/* (stage 9a) Party slot k's offer for list command n, from its snapshot and the loaded materia table. */
+static void command_offer_of(struct command_offer *o, int k, int n)
+{
+    int count = materia_base == materia_table ? MATERIA_COUNT_EXTENDED - 1 : MATERIA_COUNT_ORIGINAL;
+
+    command_offer_make(o, k >= 0 && k < 3 ? &command_snapshots[k] : NULL, n, materia_base, count, command_real_level);
+    o->learned = &command_learned;      /* (stage 9b) */
+}
+
+/* The fill of list command n into party slot k's slots: each spell's slot byte (a kernel ID raw, a spell of the spell
+   file's handle) and MP cost, the row's All uses and MP Turbo (menu entry bytes 4 and 5), then command_list_fill. */
+static void command_view_fill(int k, int n)
+{
+    const struct new_command *c = &new_commands[n - COMMAND_FIRST];
+    const BYTE *entries = (const BYTE *)(ADDR_MENU_ENTRIES + (DWORD)k * CHARACTER_STRIDE);
+    BYTE ids[COMMAND_LIST_MOST], all = 0;
+    WORD costs[COMMAND_LIST_MOST];
+    struct command_offer offer;
+    int index = command_menu_entry(entries, n), turbo = 0, j, shown, hidden;
+
+    if (index >= 0) {
+        all = entries[index * COMMAND_MENU_ENTRY_SIZE + COMMAND_ENTRY_COUNT];
+        turbo = entries[index * COMMAND_MENU_ENTRY_SIZE + COMMAND_ENTRY_FLAGS] >> 5;
+    }
+    for (j = 0; j < c->list_count && j < COMMAND_LIST_MOST; j++) {
+        int id = c->list_ids[j];
+        const BYTE *record = ext_record(id);
+
+        ids[j] = 0xff;
+        costs[j] = 0;
+        if (record) {
+            ids[j] = handle_for_id(id);
+            costs[j] = *(const WORD *)(record + REC_MP_COST);
+        } else if (id <= COMMAND_KERNEL_SPELL_LAST) {
+            ids[j] = (BYTE)id;
+            costs[j] = *(const WORD *)(kernel_record(id) + REC_MP_COST);
+        }
+    }
+    command_offer_of(&offer, k, n);     /* (stage 9a) the slot's answers to the entries' conditions */
+    shown = command_list_fill(spell_slots(k), c, &offer, ids, costs, all, turbo, &hidden);
+    command_view_last_shown = shown;
+    command_view_last_hidden = hidden;
+    if (!(command_list_told[n - COMMAND_FIRST] & 1 << k) && command_may_log()) {
+        command_list_told[n - COMMAND_FIRST] |= (BYTE)(1 << k);
+        if (hidden)                     /* (stage 9a) the entries not offered, apart from those with no handle */
+            log_line("new command %02x (%s): party slot %d: its list shown in the Magic window (%d spell(s); %d hidden (not offered: level %d, materia level %d)%s); said once a reading",
+                     n, c->label, k, shown, hidden, offer.level, offer.materia_level,
+                     shown + hidden < c->list_count ? "; the others have no handle left (168 in use)" : "");
+        else
+            log_line("new command %02x (%s): party slot %d: its list shown in the Magic window (%d spell(s)%s); said once a reading",
+                     n, c->label, k, shown, shown < c->list_count ? "; the others have no handle left (168 in use)" : "");
+    }
+}
+
+/* Party slot k's Magic window back in its slots (and, with_grid, its grid; the view is then over). */
+static void command_view_put_back(int character, BOOL with_grid)
+{
+    if (character < 0 || character > 2 ||
+        (!command_views.content[character] && !(with_grid && command_views.owner[character])))
+        return;
+    command_view_restore(&command_views, character, command_view_grid(character), with_grid, command_view_memory(),
+                         command_view_stale(character), command_view_load);
+}
+
+static void command_view_show_list(int k, int n, BOOL with_grid)
+{
+    command_view_show(&command_views, k, n, command_view_grid(k), with_grid, command_view_memory(), command_view_stale(k),
+                      command_view_store, command_view_load, command_view_fill);
+}
+
+/* (stage 9a) The Materia screen's Check (FUN_0070cf0b): OK on a row whose cursor is 1 or 8 opens the Magic view (state
+   5) of the shown member (00dd1638), whose list draw and detail (00708970 / 00708fdf, 00708cfc / 00709365) and help
+   line (00709fd8 / 0070a60a) read only that member's magic slots. After the game's grid set-up: the row's list lent to
+   them (content only: the Check's grid 00dd13d0 is its own), when the row is a live list command's and 00dca7f8 holds
+   the member's entries (command_check_pick). Put back by the next reader (menu_grid_setup_hook: Check again, the field
+   Magic menu; a rebuild; the battle start; Re-init). */
+#define ADDR_CHECK_ENTRIES      0x00dca7f8u  /* the shown member's command entries (0070cf5a: 00dba4e4 + [00dd1638] * 0x440) */
+#define ADDR_CHECK_COLUMN       0x00dd1398u  /* the Check's command grid: OK reads entry [00dd139c] + [00dd1398] * 4 (0070dd85) */
+#define ADDR_CHECK_ROW          0x00dd139cu
+
+static void command_check_view(void)
+{
+    int k = *(const int *)ADDR_MATERIA_CHARACTER, n;
+    DWORD at = *(const DWORD *)ADDR_CHECK_ENTRIES, want = ADDR_MENU_ENTRIES + (DWORD)k * CHARACTER_STRIDE;
+    const struct new_command *c;
+
+    if (!command_list_live || k < 0 || k > 2)
+        return;
+    n = command_check_pick(at, want, k, *(const int *)ADDR_CHECK_ROW, *(const int *)ADDR_CHECK_COLUMN, (const BYTE *)at,
+                           new_commands);
+    if (n < 0) {
+        if (!command_check_said)
+            log_line("materia check: the command entries pointer %08lx is %08lx, not party slot %d's %08lx: Magic's list shown (said once)",
+                     ADDR_CHECK_ENTRIES, at, k, want);
+        command_check_said = TRUE;
+        return;
+    }
+    if (!n || !spell_list[k])
+        return;
+    c = &new_commands[n - COMMAND_FIRST];
+    command_view_show_list(k, n, FALSE);
+    if (!(command_list_told[n - COMMAND_FIRST] & COMMAND_TOLD_CHECK << k) && command_may_log()) {
+        command_list_told[n - COMMAND_FIRST] |= (BYTE)(COMMAND_TOLD_CHECK << k);
+        log_line("materia check: party slot %d: command %02x (%s): its list shown (%d of %d entries offered, %d hidden); said once a reading",
+                 k, n, c->label, command_view_last_shown, c->list_count, command_view_last_hidden);
+    }
+}
+
+/* 0070ddf1 (in FUN_0070cf0b): the Check's Magic view set-up. */
+static void __cdecl materia_check_grid_hook(int *grid, int a, int b, int c, int d, int e, int f, int g, int h, int i, int j, int k,
+                                            int l, int m, int n)
+{
+    menu_grid_setup_hook(grid, a, b, c, d, e, f, g, h, i, j, k, l, m, n);
+    command_check_view();
+}
+
+/* draw_list_scrollbar, battle_grid_input_hook: the slots hold a list (no sliding window under it). */
+static BOOL command_view_shown(int character)
+{
+    return character >= 0 && character <= 2 && command_views.content[character] != 0;
+}
+
+/* rebuild_start_hook. */
+static void command_view_forget(int character)
+{
+    if ((BYTE)character < 3)
+        command_view_drop(&command_views, (BYTE)character, command_view_grid((BYTE)character), command_view_memory());
+}
+
+/* battle_magic_open_hook (006d9b8c, the end of window 6's set-up, before its refresh 00437679(actor, 1)): the list of
+   the menu's command when it is a live list command; else Magic's window put back. TRUE when a list is shown. */
+static BOOL command_view_open(int actor)
+{
+    int n = *(const BYTE *)ADDR_MENU_COMMAND;
+
+    if (actor < 0 || actor > 2)
+        return FALSE;
+    if (command_list_live && command_list_of(new_commands, n) && spell_list[actor]) {
+        command_view_show_list(actor, n, TRUE);
+        return TRUE;
+    }
+    command_view_put_back(actor, TRUE);
+    return FALSE;
+}
+
+/* slot_match_hook, before the game's FUN_005caa86: a Magic or W-Magic action of a party slot whose slots hold a list (a
+   Magic Counter, Mime of Magic while its list is open) finds Magic's slots; the follow shows the list again. */
+static void command_view_slot_match(int actor)
+{
+    const int *action = current_action();
+
+    if (actor < 0 || actor > 2 || !command_views.content[actor] ||
+        (action[ACT_COMMAND] != COMMAND_MAGIC && action[ACT_COMMAND] != COMMAND_W_MAGIC))
+        return;
+    command_view_restore(&command_views, actor, command_view_grid(actor), FALSE, command_view_memory(),
+                         command_view_stale(actor), command_view_load);
+    if (command_may_log())
+        log_line("new commands: party slot %d: a Magic action (command %02x) while its list command's list is open: the Magic list put back for it (the list again at the menu's next frame)",
+                 actor, action[ACT_COMMAND]);
+}
+
+/* enqueue_hook (the queue's call 00432878: every menu issue): a list command's handle back into its spell's ID (as for
+   Magic); any issue by a party slot ends its view. */
+static void command_list_enqueue(BYTE *entry)
+{
+    WORD *id = (WORD *)(entry + 4);
+    int actor = (signed char)entry[2], command = entry[3] & 0x3f, real;
+
+    if (command_list_of(new_commands, command) && (real = handle_to_id(*id)) != 0) {
+        if (command_may_log())
+            log_line("queue: actor %d list command %02x, handle %02x -> ID %d", actor, command, *id, real);
+        *id = (WORD)real;
+    }
+    command_view_put_back(actor, TRUE);
+}
+
+/* release_unused_handles: a live list's spell keeps its handle. */
+static BOOL command_list_pinned(int id)
+{
+    return command_list_pins(new_commands, id);
+}
+
+/* reload_config, before the spell file is read again (load_spells frees spell_list and the handles): every view put
+   back and over. A list window left open shows Magic's slots until it is opened again (an OK there is refused at the
+   cast: not in the list). */
+static void commands_views_reinit(void)
+{
+    int k;
+
+    for (k = 0; k < 3; k++)
+        command_view_put_back(k, TRUE);
+}
+
+/* The follow, each frame of the command list's input (window 1 open): command_view_decide for each party slot. */
+static void command_view_follow(void)
+{
+    int actor = *(const BYTE *)ADDR_BATTLE_MENU_ACTOR, w6 = *(const BYTE *)(ADDR_MENU_WINDOW_STATES + COMMAND_MAGIC_WINDOW);
+    int menu = *(const BYTE *)ADDR_MENU_COMMAND, k, owner;
+
+    for (k = 0; k < 3; k++) {
+        owner = command_views.owner[k];
+        switch (command_view_decide(owner, command_views.content[k], k, actor, w6, menu,
+                                    owner && command_list_of(new_commands, owner) && spell_list[k])) {
+        case COMMAND_VIEW_RESTORE:
+            command_view_put_back(k, TRUE);
+            break;
+        case COMMAND_VIEW_SHOW:
+            command_view_show_list(k, owner, FALSE);
+            break;
+        }
+    }
+}
+
+/* 0091e6bc: window 1's (the command list's) input, every frame it is open. */
+static void __cdecl command_list_menu_hook(void)
+{
+    command_view_follow();
+    ((void (__cdecl *)(void))FN_COMMAND_LIST_INPUT)();
+}
+
+/* load_commands, for a usable list command: TRUE if its list can be lent to window 6. Every call the view relies on
+   must be this DLL's (else the slots could keep a list, or Magic's lose its spells), the party's lists of the spell
+   file must be there (window_store / window_load), and the command list's input entry is put in once (0091e6bc
+   holding the game's 006d91fa, its start and the window loop's call checked first; never taken out). */
+static BOOL command_list_ready(const struct new_command *c)
+{
+    static const BYTE input_code[] = { 0x55, 0x8b, 0xec, 0x83, 0xec, 0x20 };                  /* 006d91fa */
+    static const BYTE caller_code[] = { 0xff, 0x14, 0x85, 0xb8, 0xe6, 0x91, 0x00 };          /* 006db2b8: call [eax*4 + 0091e6b8] */
+    const struct { DWORD site; const void *hook; } calls[] = {
+        { SITE_ENQUEUE, enqueue_hook }, { SITE_SLOT_MATCH, slot_match_hook }, { SITE_BATTLE_MAGIC_OPEN, battle_magic_open_hook },
+        { SITE_BATTLE_GRID_INPUT, battle_grid_input_hook },
+        { slot_flag_sites[0], slot_flags_hook }, { slot_flag_sites[1], slot_flags_hook }, { slot_flag_sites[2], slot_flags_hook },
+        { text_sites[0], get_text_hook }, { text_sites[1], get_text_hook }, { text_sites[2], get_text_hook },     /* 006dfb3a 006e01c6 006d75b1 */
+        { SITE_RECORD_FIELD, record_field_hook }, { SITE_REBUILD_START, rebuild_start_hook }, { SITE_ORDER_SLOTS, order_slots_hook },
+        { battle_slots_sites[0], battle_slots_hook }, { battle_slots_sites[1], battle_slots_hook },
+        { SITE_MENU_GRID_SETUP, menu_grid_setup_hook }, { SITE_MATERIA_GRID_SETUP, materia_check_grid_hook },   /* (stage 9a) */
+    };
+    unsigned i;
+
+    for (i = 0; i < sizeof calls / sizeof calls[0]; i++)
+        if (!command_call_goes_to(calls[i].site, calls[i].hook)) {
+            log_line("new command %02x (%s): NOT used: a list command needs the call %08lx (it holds %02x %08lx) to be this DLL's: its list could not be lent to the Magic list's window and put back safely",
+                     (int)(c - new_commands) + COMMAND_FIRST, c->label, calls[i].site, *(const BYTE *)calls[i].site,
+                     *(const DWORD *)(calls[i].site + 1));
+            return FALSE;
+        }
+    if (!spell_list[0] || !spell_list[1] || !spell_list[2]) {
+        log_line("new command %02x (%s): NOT used: the party's magic lists (spell_list) are not there: Magic's own slots could not be put back after its list",
+                 (int)(c - new_commands) + COMMAND_FIRST, c->label);
+        return FALSE;
+    }
+    if (!command_list_live && *(const DWORD *)ADDR_COMMAND_LIST_INPUT_ENTRY == FN_COMMAND_LIST_INPUT &&
+        bytes_are(FN_COMMAND_LIST_INPUT, input_code, sizeof input_code) && bytes_are(SITE_MENU_WINDOW_INPUT, caller_code, sizeof caller_code)) {
+        command_list_live = patch_pointer(ADDR_COMMAND_LIST_INPUT_ENTRY, FN_COMMAND_LIST_INPUT, command_list_menu_hook);
+        if (command_list_live)
+            log_line("new commands: the list kind (kind = list): the command list's input entry %08lx (-> %08lx) is followed; the Magic list's hooks are this DLL's",
+                     ADDR_COMMAND_LIST_INPUT_ENTRY, FN_COMMAND_LIST_INPUT);
+    }
+    if (!command_list_live || *(const DWORD *)ADDR_COMMAND_LIST_INPUT_ENTRY != (DWORD)command_list_menu_hook) {
+        log_line("new command %02x (%s): NOT used: a list command needs the command list's input entry %08lx (it holds %08lx; the game's %08lx, starting 55 8b ec 83 ec 20, called by %08lx) to be this DLL's",
+                 (int)(c - new_commands) + COMMAND_FIRST, c->label, ADDR_COMMAND_LIST_INPUT_ENTRY,
+                 *(const DWORD *)ADDR_COMMAND_LIST_INPUT_ENTRY, FN_COMMAND_LIST_INPUT, SITE_MENU_WINDOW_INPUT);
+        return FALSE;
+    }
+    return TRUE;
+}
+
+/* Reads FF7_SpellExt_Commands.ini and writes the records (after the spell and materia files; at a kernel load
+   and on "Re-init .ini files", after restore_kernel_tables). Nothing is written for a command unless what its
+   battle path needs is in: handler 0x0c is this DLL's (a spell command), the weapon set-up 0x0e is this DLL's
+   and FUN_005ca766 is the game's (a physical one), the battle-start call (both): a row would show a name and do
+   nothing. With more than one usable command the build-list guard must be in too; without it only the lowest
+   number is used (one new command cannot overflow the list, two can). (stage 4) At the first reading only, with a
+   usable section from 0x26 up: the command tables are moved (commands_move_tables); a section from 0x26 up is
+   used only when they are. The guard also goes in when a command materia names a number from 0x20. */
+static BOOL command_move_refused;      /* (stage 4) the move was tried and refused */
+
+static void commands_moved_numbers(void)
+{
+    int n;
+
+    if (!command_move_asked) {
+        command_move_asked = TRUE;
+        for (n = COMMAND_MOVED_FIRST; n <= COMMAND_LAST && !new_commands[n - COMMAND_FIRST].usable; n++)
+            ;
+        if (n <= COMMAND_LAST) {
+            command_tables_moved = commands_move_tables();
+            command_move_refused = !command_tables_moved;
+            if (command_tables_moved)
+                command_mime_install();
+        }
+    }
+    if (command_tables_moved)
+        return;
+    for (n = COMMAND_MOVED_FIRST; n <= COMMAND_LAST; n++) {
+        struct new_command *c = &new_commands[n - COMMAND_FIRST];
+
+        if (!c->usable)
+            continue;
+        if (command_move_refused)
+            log_line("new command %02x (%s): NOT used: the command tables were not moved (see the line above): only 0x1c-0x1f can be used in this run", n, c->label);
+        else
+            log_line("new command %02x (%s): needs a restart (the command tables are moved at start-up only, when a section from 0x26 up is there)", n, c->label);
+        c->usable = 0;
+    }
+}
+
+/* (stage 9a) At each reading, for each live list command: how its entries are offered, and a warning (not a refusal)
+   for an entry whose materia level no materia giving the command has (the loaded materia table, each command
+   materia's levels as materia_level_of counts them): it is never offered. */
+static void commands_list_report(void)
+{
+    int count = materia_base == materia_table ? MATERIA_COUNT_EXTENDED - 1 : MATERIA_COUNT_ORIGINAL, i, j, id, total, most;
+    int counts[3];
+
+    for (i = 0; i < COMMAND_COUNT; i++) {
+        const struct new_command *c = &new_commands[i];
+
+        if (!c->live || c->kind != COMMAND_KIND_LIST)
+            continue;
+        command_list_counts(c, counts);
+        log_line("new command %02x (%s): its list: %d always, %d by materia level, %d by character level",
+                 COMMAND_FIRST + i, c->label, counts[0], counts[1], counts[2]);
+        if (!counts[1])
+            continue;
+        for (most = 0, id = 0; id < count; id++) {
+            int at;
+
+            materia_level_of((BYTE)id, 0xffffffu, &total, NULL);
+            at = command_materia_most(materia_base + id * MATERIA_RECORD_SIZE, total, COMMAND_FIRST + i);
+            if (at > most)
+                most = at;
+        }
+        for (j = 0; j < c->list_count; j++)
+            if (c->list_cond[j] == COMMAND_COND_MATERIA && c->list_value[j] > most)
+                log_line("commands file line %d: spells: spell %d wants materia level %d, but no materia that gives command %02x has that many levels (the most: %d): it is never offered",
+                         c->list_lines[j], c->list_ids[j], c->list_value[j], COMMAND_FIRST + i, most);
+    }
+}
+
+/* ==== (stage 9b) learned list entries: the glue ====
+   Ways 3 (an enemy attack, hit_target_hook), 4a (an item, limit_item_use) and 4b (a field request, the polls) teach the
+   learned set; the offers read it (command_offer_of); the companion file keeps it (CMDL: sxc3_add_sections,
+   sxc3_take_sections, sxc2_forget_loaded); commands_learn_settle decides, after both files, whether they are on. */
+#define ADDR_LEARN_BATTLE_FLAGS 0x009a88a6u  /* the battle's flags (from 00db958a at its start): bit 0x40, no Enemy Skill is learned (005db812) */
+#define FN_TEXT_EVENT           0x005c7d59u  /* FUN_005c7d59(actor, battle text, count, WORD *arguments), cdecl: the battle's top line (005db898 raises 0x73) */
+#define SITE_TEXT_BATTLE        0x0041944du  /* FUN_00419442's fetch of a battle text (section 0x10): text_fetch_hook */
+#define SITE_TEXT_COPY          0x00419dc5u  /* FUN_00419db6's fetch (the ee code's attack name, section 9): text_fetch_hook */
+#define COMMAND_ATTACK_NAMES    9            /* the section 00419a8f gives FUN_00419db6 for the code ee */
+#define COMMAND_MENU_LINE_BYTES 0x50         /* FUN_00717923 copies 0x50 bytes of a line */
+typedef char command_check_cmdl_room[SXC3_CMDL_ROOM == COMMAND_CMDL_MOST && SXC3_SECTION_HEAD == COMMAND_CMDL_HEAD &&
+                                     SXC3_SECTION_CARRIED == 1 ? 1 : -1];    /* the companion's room for CMDL is the PURE block's longest section */
+
+/* save_work_on, sxc3_keep_section: the companion file must keep the learned set (the ways are on, or the set holds
+   entries, or a CMDL section this build does not read is carried). */
+static BOOL command_learn_wanted(void)
+{
+    return command_learn_on || command_learned.count > 0 || command_learned.frozen;
+}
+
+/* sxc2_forget_loaded (every load, before its file is taken; New Game): the set of the game that was played. */
+static void command_learned_forget(void)
+{
+    if (command_learned.count)
+        log_line("learned: the %d learned list entries of the game that was being played are forgotten (another load, or a new game)",
+                 command_learned.count);
+    command_learned_clear(&command_learned);
+    command_cmdl_seen = 0;
+    command_learn_full_said = command_learn_frozen_said = FALSE;
+}
+
+/* sxc3_add_sections, sxc3_room_for: the CMDL section of the file being built (0: none), and it written at p. */
+static DWORD command_cmdl_bytes(void)
+{
+    return command_learned_bytes(&command_learned);
+}
+
+static BYTE *command_cmdl_write(BYTE *p)
+{
+    return command_learned_write(&command_learned, p);
+}
+
+/* sxc3_take_sections, for each section of the companion file that decides a load: TRUE if it is a CMDL section (read
+   into the set, or carried as it is), FALSE for any other. `fallback`: the file was found by the fallback search. */
+static BOOL command_cmdl_met(const BYTE *head, BOOL fallback)
+{
+    const char *why = "";
+    int read;
+
+    if (!command_learned_tag(head))
+        return FALSE;
+    if (command_cmdl_seen++) {
+        log_line("load: *** CMDL: %s holds more than one CMDL section: only the first counts; this one is left out of the files this game writes ***",
+                 sxc2_load_name);
+        return TRUE;
+    }
+    if (!command_learn_on) {
+        sxc3_keep_section(head);
+        log_line("load: CMDL: the learned list entries of %s are not read (no entry learned from an enemy attack, an item or a field event is on in this run): carried as they are",
+                 sxc2_load_name);
+        return TRUE;
+    }
+    read = command_learned_read(&command_learned, head, &why);
+    if (read != COMMAND_CMDL_READ) {
+        command_learned.frozen = 1;
+        sxc3_keep_section(head);
+        log_line("load: *** CMDL: the section of %s (version %u, %lu bytes) is not read: %s; it is carried as it is, and learning is OFF for this game (nothing is learned, nothing of this build's own is written) ***",
+                 sxc2_load_name, get16(head + 6), get32(head + 8), why);
+        return TRUE;
+    }
+    log_line("load: CMDL: %d learned entries read (version 1, %s)", command_learned.count,
+             fallback ? "from the nearest older save found by the fallback search, as its characters are"
+                      : get16(head + 4) & SXC3_SECTION_CARRIED ? "carried by an older build" : "own file");
+    return TRUE;
+}
+
+/* A character number from the game's ID: 0-11 itself; a seat 12-15 its occupant's roster number (character_file_id);
+   -1 none (an empty seat, an ID past the seats). As command_snapshot_take. */
+static int command_character_of(int id)
+{
+    if (id >= 0 && id < NEW_CHARACTER_FIRST_ID)
+        return id;
+    if (id >= NEW_CHARACTER_FIRST_ID && id < NEW_CHARACTER_FIRST_ID + SEAT_MAX && new_character(id))
+        return character_file_id(new_character(id));
+    return -1;
+}
+
+/* The entries the set could not take: one line a game (the set full, or frozen). */
+static void command_learn_refused(int refused, const char *way)
+{
+    if (!refused)
+        return;
+    if (command_learned.frozen && !command_learn_frozen_said) {
+        command_learn_frozen_said = TRUE;
+        log_line("learned: *** %d entr(ies) from %s NOT learned: learning is off for this game (its CMDL section is not this build's: see the load line); said once a game ***",
+                 refused, way);
+    } else if (!command_learned.frozen && !command_learn_full_said) {
+        command_learn_full_said = TRUE;
+        log_line("learned: the set is full (%d): %d entr(ies) from %s NOT learned; said once a game", COMMAND_LEARNED_MOST, refused, way);
+    }
+}
+
+/* A learn for party slot k while its slots show a list (its window open in battle): the list put back, content only;
+   the follow shows it again at the menu's next frame with the new entry (stage 8's SHOW). */
+static void command_learned_shown(int k)
+{
+    if (k >= 0 && k <= 2 && command_views.content[k])
+        command_view_put_back(k, FALSE);
+}
+
+/* (way 3) hit_target_hook, after the game's FUN_005da5da: the target learns each entry naming the attack, of each
+   list command a materia on it gives (command_enemy_teaches, command_learn_entries); one message for the hit. */
+static void command_learn_hit(const int *action)
+{
+    struct command_offer o;
+    BYTE levels[COMMAND_COUNT];
+    int k = action[0x82], actor = action[ACT_ACTOR], attack = action[ACT_ATTACK_ID] & 0xffff, character, i, n, command, spell, refused;
+    BOOL message;
+
+    if (!command_learn_on || !command_learn_ways[0] || !command_enemy_teaches(actor, k, *(const BYTE *)ADDR_LEARN_BATTLE_FLAGS) ||
+        !command_learn_named(new_commands, COMMAND_COND_ENEMY, attack))
+        return;
+    character = command_snapshots[k].taken ? command_snapshots[k].character : -1;
+    if (character < 0)
+        return;
+    for (i = 0; i < COMMAND_COUNT; i++) {
+        levels[i] = 0;
+        if (command_list_of(new_commands, COMMAND_FIRST + i)) {
+            command_offer_of(&o, k, COMMAND_FIRST + i);
+            levels[i] = (BYTE)(o.materia_level > 0xff ? 0xff : o.materia_level);
+        }
+    }
+    n = command_learn_entries(&command_learned, new_commands, COMMAND_COND_ENEMY, attack, character, levels, &command, &spell, &refused);
+    command_learn_refused(refused, "an enemy attack");
+    if (!n)
+        return;
+    message = command_learn_message_ok && (spell & 0xff) != 0xff && (spell >> 8 & 0xff) != 0xff;  /* (an ID with an ff byte: none; the game's own learned IDs never have one) */
+    if (message) {
+        DWORD word = (DWORD)spell;      /* the composer takes a WORD from here (005db812 passes its own local the same way) */
+
+        ((void (__cdecl *)(int, int, int, DWORD *))FN_TEXT_EVENT)(k, COMMAND_LEARNED_TEXT_FIRST + command - COMMAND_FIRST, 1, &word);
+    }
+    command_learned_shown(k);
+    log_line("learned: actor %d (character %d) learned spell %d of command %02x (%s) from enemy actor %d's attack %d (and %d more)%s",
+             k, character, spell, command, new_commands[command - COMMAND_FIRST].label, actor, attack, n - 1,
+             message ? "" : !command_learn_message_ok ? "; no message (see the learning line of the reading)" : "; no message (the spell's ID has a byte ff)");
+}
+
+/* The name of spell `id` of a list in the game's text: the spell file's, or the kernel's through the DLL's text path
+   (a rename counts). */
+static const BYTE *command_spell_name(int id)
+{
+    static const BYTE none[1] = { 0xff };
+    int e = id >= EXT_FIRST_ID ? ext_index(id) : -1;
+    const BYTE *text;
+
+    if (e >= 0)
+        return spells[e].name;
+    if (id < 0 || id > COMMAND_KERNEL_SPELL_LAST)
+        return none;
+    text = text_fetch_hook(*(const BYTE *)(ADDR_TEXT_SECTION_BASE + TEXT_TYPE_MAGIC) + TEXT_NAME_OFFSET, id, 0);
+    return text && !IsBadReadPtr(text, 32) ? text : none;
+}
+
+/* item_restrictions_hook, battle_inventory_hook, limit_item_use: is `item` a teaching item of a live entry? */
+static BOOL command_teaches_item(int item)
+{
+    return command_learn_on && item >= 0 && item < COMMAND_ITEM_NUMBERS && (command_teach_bits[item >> 3] >> (item & 7) & 1);
+}
+
+/* (way 4a) limit_item_use: the Item menu's use of a teaching item on the character with the game's ID `who`. As a limit
+   manual: learned, the manual's sound, the item used up, the help line; nothing left to learn: "Already learned.", the
+   buzzer, the item kept. The materia need not be on. */
+static void command_item_use(int item, int who)
+{
+    static const char already[] = "Already learned.";
+    static BYTE line[COMMAND_MENU_LINE_BYTES + 0x10];
+    void (__cdecl *sound)(int) = (void (__cdecl *)(int))FN_MENU_SOUND;
+    int character = command_character_of(who), n = 0, command = 0, spell = 0, refused = 0, i;
+    const struct new_command *c;
+
+    for (i = 0; i < (int)sizeof line; i++)
+        line[i] = 0xff;
+    if (character >= 0)
+        n = command_learn_entries(&command_learned, new_commands, COMMAND_COND_ITEM, item, character, NULL, &command, &spell, &refused);
+    command_learn_refused(refused, "an item");
+    if (!n) {
+        encode_text_range(line, COMMAND_MENU_LINE_BYTES, already, already + sizeof already - 1);
+        menu_line(line);
+        sound(3);
+        log_line("learned: item %d used on character %d (ID %d): nothing left to learn: kept", item, character, who);
+        return;
+    }
+    sound(0x180);
+    stock_remove(item, 1);
+    if (!stock_holds(item))
+        *(DWORD *)ADDR_ITEM_MENU_STATE = 1;
+    c = &new_commands[command - COMMAND_FIRST];
+    command_learned_message(line, COMMAND_MENU_LINE_BYTES, c->learned_text, c->name, command_spell_name(spell));
+    menu_line(line);
+    log_line("learned: item %d used on character %d (ID %d): spell %d of command %02x (%s) learned (and %d more)", item, character, who,
+             spell, command, c->label, n - 1);
+}
+
+/* (way 4b) A field request, lesson `lesson` for the game's ID `who` (255: the party), taken at `moment`. */
+static void command_request_take(int lesson, int who, const char *moment)
+{
+    int ids[3], count = command_request_ids(who, (const BYTE *)ADDR_PARTY, ids), i, total = 0, command, spell, refused, character;
+
+    if (count < 0) {
+        log_line("learned: request lesson %d for character %d (%s): no such character (0 to 15, or 255 for the party): cleared", lesson, who, moment);
+        return;
+    }
+    if (!command_learn_named(new_commands, COMMAND_COND_EVENT, lesson)) {
+        log_line("learned: request lesson %d for character %d (%s): names no entry: cleared", lesson, who, moment);
+        return;
+    }
+    for (i = 0; i < count; i++) {
+        character = command_character_of(ids[i]);
+        if (character < 0)
+            continue;
+        total += command_learn_entries(&command_learned, new_commands, COMMAND_COND_EVENT, lesson, character, NULL, &command, &spell, &refused);
+        command_learn_refused(refused, "a field request");
+    }
+    log_line("learned: request lesson %d for character %d (%s): %d entries learned", lesson, who, moment, total);
+}
+
+/* The field request's two save bytes, at a field read, a party slot's rebuild, the end of a load and a save's start:
+   taken, then both cleared (a request is never lost: until it is taken its bytes are in the save). */
+static void command_learn_poll(const char *moment)
+{
+    BYTE *bytes;
+
+    if (!command_learn_on || !command_learn_ways[2] || command_learning.request < 0)
+        return;
+    bytes = (BYTE *)ADDR_FORGET_BANKS + command_learning.request;
+    if (!bytes[0])
+        return;
+    command_request_take(bytes[0], bytes[1], moment);
+    bytes[0] = bytes[1] = 0;
+}
+
+/* load_accepted_hook, after the companion file was taken: the request, then the testing aid test_lesson. */
+static void command_learn_after_load(void)
+{
+    command_learn_poll("the end of a load");
+    if (command_learn_on && command_learn_ways[2] && command_learning.test_lesson)
+        command_request_take(command_learning.test_lesson, command_learning.test_who, "the end of a load, test_lesson");
+}
+
+/* Is a teaching item usable as one: a new item of the items file, no new character's limit item, nothing restored in
+   the menu? NULL, or what is wrong. */
+static const char *command_teach_problem(int item)
+{
+    const struct wide_item *w = item >= WIDE_ITEM_FIRST ? wide_item(item) : NULL;
+    int n = w ? -1 : new_item_slot(item);
+
+    if (!w && !is_new_item(item))
+        return "is not a new item of the items file";
+    if (is_limit_item(item))
+        return "is a new character's limit item";
+    if (w ? w->menu_hp || w->menu_mp : item_menu_hp[n] || item_menu_mp[n])
+        return "restores HP or MP in the menu (a teaching item does nothing else there)";
+    return NULL;
+}
+
+/* Every live entry of a learned way `cond` (0: all three) turned off: a blank place, never offered. */
+static void command_learn_off(int cond)
+{
+    int i, j;
+
+    for (i = 0; i < COMMAND_COUNT; i++)
+        if (new_commands[i].live && new_commands[i].kind == COMMAND_KIND_LIST)
+            for (j = 0; j < new_commands[i].list_count && j < COMMAND_LIST_MOST; j++)
+                if (cond ? new_commands[i].list_cond[j] == cond
+                         : new_commands[i].list_cond[j] >= COMMAND_COND_ENEMY && new_commands[i].list_cond[j] <= COMMAND_COND_EVENT)
+                    new_commands[i].list_cond[j] = COMMAND_COND_OFF;
+}
+
+static void command_learn_count(int *ways)
+{
+    int i, counts[3];
+
+    ways[0] = ways[1] = ways[2] = 0;
+    for (i = 0; i < COMMAND_COUNT; i++)
+        if (new_commands[i].live && new_commands[i].kind == COMMAND_KIND_LIST) {
+            command_list_learned_counts(&new_commands[i], counts);
+            ways[0] += counts[0], ways[1] += counts[1], ways[2] += counts[2];
+        }
+}
+
+/* Does a section carried forward (sxc3_kept) have the tag CMDL? (A Re-init that turns learning on in a game whose
+   CMDL section was carried while it was off.) */
+static BOOL command_cmdl_carried(void)
+{
+    DWORD at = 0;
+
+    while (at + COMMAND_CMDL_HEAD <= sxc3_kept_size) {
+        if (command_learned_tag(sxc3_kept + at))
+            return TRUE;
+        at += COMMAND_CMDL_HEAD + get32(sxc3_kept + at + 8);
+    }
+    return FALSE;
+}
+
+/* After the commands file and the items file are both read (a kernel load: after load_commands; Re-init: after the
+   characters, whose limit items a teaching item must not be): the learned entries' checks, then ways 3 and 4 on or
+   off. An entry a check refuses is turned off (COMMAND_COND_OFF: a blank place, never offered), one line each. */
+static void commands_learn_settle(const char *when)
+{
+    static const BYTE event_code[3] = { 0x55, 0x8b, 0xec };    /* 005c7d59: push ebp; mov ebp, esp */
+    const char *why = NULL;
+    int i, j, counts[3];
+    BOOL put = FALSE;
+
+    command_learn_on = command_learn_message_ok = FALSE;
+    for (i = 0; i < COMMAND_ITEM_NUMBERS / 8; i++)
+        command_teach_bits[i] = 0;
+    for (i = 0; i < COMMAND_COUNT; i++) {
+        struct new_command *c = &new_commands[i];
+
+        if (!c->live || c->kind != COMMAND_KIND_LIST)
+            continue;
+        for (j = 0; j < c->list_count && j < COMMAND_LIST_MOST; j++)
+            if (c->list_cond[j] == COMMAND_COND_ITEM && (why = command_teach_problem(c->list_value[j])) != NULL) {
+                log_line("commands file line %d: spells: spell %d: item %d %s: that entry is never offered", c->list_lines[j], c->list_ids[j],
+                         c->list_value[j], why);
+                c->list_cond[j] = COMMAND_COND_OFF;
+            }
+    }
+    command_learn_count(command_learn_ways);
+    if (!command_learn_ways[0] && !command_learn_ways[1] && !command_learn_ways[2])
+        return;
+    why = NULL;
+    if (!save_prepare_live || !load_slot_live || !load_accepted_live || !save_write_live)
+        why = "the four save and load hooks are not all in (see the save work lines): learned entries could not be saved";
+    else if (!command_call_goes_to(SITE_NEW_GAME, (const void *)new_game_hook)) {
+        put = patch_call(SITE_NEW_GAME, FN_NEW_GAME_DEFAULTS, new_game_hook);
+        if (!put || !command_call_goes_to(SITE_NEW_GAME, (const void *)new_game_hook))
+            why = "the call at 00409758 (New Game) is not the game's and cannot be this DLL's (see the patch line above): a new game would keep the last game's learned entries";
+    }
+    if (why) {
+        log_line("new commands: *** learned list entries (enemy:, item:, event:) are OFF (%s): %s; each is a blank place ***", when, why);
+        command_learn_off(0);
+        command_learn_count(command_learn_ways);
+        return;
+    }
+    if (put)
+        log_line("new commands: the DLL's hook on the new game (00409758) is put in for the learned list entries (new characters and the wide list are off); by itself it changes nothing but clearing them");
+    if (command_learn_ways[0] && !command_call_goes_to(SITE_HIT_TARGET, (const void *)hit_target_hook)) {
+        log_line("new commands: *** entries learned from an enemy attack are OFF: the hit loop's call 005d9e12 is not this DLL's hook (see the patch lines above); each is a blank place ***");
+        command_learn_off(COMMAND_COND_ENEMY);
+    }
+    if (command_learn_ways[1]) {
+        if (limit_item_hook_state == 0)
+            install_limit_item();       /* (as wide items do: the Item menu's use step for items above 94) */
+        if (limit_item_hook_state != 1) {
+            log_line("new commands: *** entries learned from an item are OFF: the Item menu's use step (007167c7) is not hooked (see the Item menu line above); each is a blank place ***");
+            command_learn_off(COMMAND_COND_ITEM);
+        }
+    }
+    command_learn_count(command_learn_ways);
+    for (i = 0; i < COMMAND_COUNT; i++) {
+        struct new_command *c = &new_commands[i];
+
+        if (!c->live || c->kind != COMMAND_KIND_LIST)
+            continue;
+        for (j = 0; j < c->list_count && j < COMMAND_LIST_MOST; j++) {
+            if (c->list_cond[j] == COMMAND_COND_ITEM)
+                command_teach_bits[c->list_value[j] >> 3] |= (BYTE)(1 << (c->list_value[j] & 7));
+            if (c->list_cond[j] == COMMAND_COND_EVENT && command_learning.request < 0 && command_learning.test_lesson != c->list_value[j])
+                log_line("commands file line %d: spells: spell %d: event:%d: never learned until [learning] request names two save bytes (or test_lesson names the lesson)",
+                         c->list_lines[j], c->list_ids[j], c->list_value[j]);
+        }
+        command_learned_message(command_learned_texts[i], COMMAND_MESSAGE_SIZE, c->learned_text, c->name, NULL);
+        command_list_learned_counts(c, counts);
+        log_line("new command %02x (%s): its learned entries: %d by enemy attack, %d by item, %d by field request", COMMAND_FIRST + i, c->label,
+                 counts[0], counts[1], counts[2]);
+    }
+    command_learn_on = command_learn_ways[0] || command_learn_ways[1] || command_learn_ways[2];
+    if (command_learn_ways[0]) {
+        command_learn_message_ok = command_call_goes_to(SITE_TEXT_BATTLE, (const void *)text_fetch_hook) &&
+                                   command_call_goes_to(SITE_TEXT_COPY, (const void *)text_fetch_hook) &&
+                                   bytes_are(FN_TEXT_EVENT, event_code, sizeof event_code) &&
+                                   *(const BYTE *)(ADDR_TEXT_SECTION_BASE + TEXT_TYPE_MAGIC) + TEXT_NAME_OFFSET == COMMAND_ATTACK_NAMES;
+        if (!command_learn_message_ok)
+            log_line("new commands: entries learned from an enemy attack are learned WITHOUT a message: the text fetches 0041944d / 00419dc5 are not both this DLL's, 005c7d59 is not the game's, or the attack names are not section 9");
+    }
+    if (command_learn_on && !command_learned.count && !command_learned.frozen && command_cmdl_carried()) {
+        command_learned.frozen = 1;
+        log_line("new commands: *** the loaded game's CMDL section was carried while learning was off (before this %s): learning is OFF for this game; load the save again to learn ***", when);
+    }
+    log_line("new commands: learned list entries: %s (%d by enemy attack, %d by item, %d by field request; [learning] request %s, test_lesson %s)",
+             command_learn_on ? "on" : "off", command_learn_ways[0], command_learn_ways[1], command_learn_ways[2],
+             command_learning.request < 0 ? "none" : "set", command_learning.test_lesson ? "on (a testing aid)" : "none");
+}
+
+static void load_commands(const char *when)
+{
+    static const BYTE status_fields[] = { 0x55, 0x8b, 0xec, 0x83, 0xec, 0x08, 0x8b, 0x45, 0x08, 0xc1, 0xe8, 0x06 };
+    struct command_game game;
+    char *text;
+    DWORD size = 0;
+    int read, usable, i, k;
+    BOOL weapon_was = weapon_hook_live, weapon_ok = TRUE, spell_ok = TRUE;
+
+    command_file_problems = command_lines = 0;
+    command_lists_refused_said = FALSE;
+    command_reading++;                  /* (stage 5) the filter's notes of an older reading are undone at the next opening */
+    for (i = 0; i < COMMAND_COUNT; i++) {
+        command_lists_said[i] = command_filter_said[i] = FALSE;
+        command_support_said[i] = command_support_told[0][i] = command_support_told[1][i] = command_support_told[2][i] = 0;   /* (stage 6) */
+        command_attack_told[0][i] = command_attack_told[1][i] = command_attack_told[2][i] = command_w_told[i] = 0;  /* (stage 7) */
+        command_list_told[i] = 0;       /* (stage 8) */
+    }
+    command_w_state.on = 0;             /* (stage 7) a stored W- first pick is not carried over a reading */
+    for (i = 0; i < 4; i++)
+        for (k = 0; k < 32; k++)
+            command_guard_said[i][k] = 0;
+    for (k = 0; k < 32; k++)
+        command_refused_said[k] = 0;    /* (stage 4) */
+    text = read_whole_file(COMMAND_FILE_NAME, &size);
+    if (!text) {
+        for (i = 0; i < COMMAND_COUNT; i++)
+            new_commands[i].defined = new_commands[i].usable = new_commands[i].live = 0;
+        log_line("commands file: none (no new commands)");
+        if (commands_materia_need_guard())
+            command_guard_install();    /* (stage 4) a materia naming 0x20 and up gets no row */
+        command_move_asked = TRUE;      /* (stage 4) decided at the first reading: no section, no move */
+        commands_records_sync();        /* (stage 4) the tables moved (a Re-init with the file gone): records 0x20-0xff ff again */
+        commands_records_mirror();
+        commands_check_materia();
+        return;
+    }
+    game.rows = (const BYTE *)ADDR_COMMAND_ROWS;
+    game.lists = (const BYTE *)ADDR_COMMAND_LISTS;
+    game.lists_size = COMMAND_LISTS_SIZE;
+    game.classes = (const BYTE *)ADDR_FORMULA_CLASSES;
+    game.formulas = (const DWORD *)ADDR_FORMULA_ROUTINES;
+    read = command_file_read(text, size, new_commands, &command_learning, command_problem);     /* (stage 9b) and the [learning] section */
+    VirtualFree(text, 0, MEM_RELEASE);
+    usable = command_resolve(new_commands, command_spell_target, &game, command_problem);
+    for (i = 0; i < COMMAND_COUNT; i++) {
+        struct new_command *c = &new_commands[i];
+        int index = ext_index(c->spell);
+
+        if (c->usable && c->kind == COMMAND_KIND_SPELL && !c->has_description && index >= 0)
+            copy_bytes(c->description, spells[index].description, sizeof c->description);  /* the spell's own */
+    }
+    for (i = 0; i < COMMAND_COUNT; i++) {
+        struct new_command *c = &new_commands[i];
+
+        if (!c->usable)
+            continue;
+        if ((c->kind == COMMAND_KIND_SPELL || c->kind == COMMAND_KIND_LIST) && *(const DWORD *)ADDR_ACTION_SETUP_ENTRY != (DWORD)action_setup_hook) {
+            if (spell_ok)
+                log_line("new commands: spell and list commands OFF: handler 0x0c's entry %08lx is %08lx, not this DLL's set-up: their records are not written",
+                         ADDR_ACTION_SETUP_ENTRY, *(const DWORD *)ADDR_ACTION_SETUP_ENTRY);
+            spell_ok = FALSE;
+            c->usable = 0;
+        } else if (c->kind == COMMAND_KIND_PHYSICAL && weapon_ok &&
+                   (!weapon_setup_install() || !bytes_are(FN_SET_STATUS_FIELDS, status_fields, sizeof status_fields))) {
+            weapon_ok = FALSE;
+        }
+        if (c->kind == COMMAND_KIND_PHYSICAL && !weapon_ok) {
+            log_line("new command %02x (%s): NOT used: the weapon set-up (handler 0x0e, %08lx) is not this DLL's hook (holds %08lx), or %08lx is not the game's status set-up",
+                     COMMAND_FIRST + i, c->label, ADDR_WEAPON_SETUP_ENTRY, *(const DWORD *)ADDR_WEAPON_SETUP_ENTRY, FN_SET_STATUS_FIELDS);
+            c->usable = 0;
+        }
+        if (c->kind == COMMAND_KIND_ITEM && !command_item_ready(c))
+            c->usable = 0;              /* (stage 5) one line said why */
+        if (c->usable && c->w_form && c->kind != COMMAND_KIND_ITEM && c->kind != COMMAND_KIND_LIST && !command_w_ready(c))
+            c->usable = 0;              /* (stage 7) one line said why; (stage 8) a list command's W- form is W-Magic's own (cursor 8) */
+        if (c->usable && c->kind == COMMAND_KIND_LIST && !command_list_ready(c))
+            c->usable = 0;              /* (stage 8) one line said why */
+    }
+    if (weapon_hook_live && !weapon_was)
+        log_line("new commands: the weapon set-up (handler 0x0e, table entry %08lx -> %08lx) is followed for the physical commands",
+                 ADDR_WEAPON_SETUP_ENTRY, FN_WEAPON_SETUP);
+    for (usable = 0, i = 0; i < COMMAND_COUNT; i++)
+        usable += new_commands[i].usable;
+    if (usable && !battle_start_install()) {
+        log_line("new commands: OFF: the battle-start call %08lx is not the game's (see the patch line above): the records are not written",
+                 SITE_BATTLE_START_PARTY);
+        usable = 0;
+    }
+    if (!usable)
+        for (i = 0; i < COMMAND_COUNT; i++)
+            new_commands[i].usable = 0;
+    if (usable || commands_materia_need_guard())
+        command_guard_install();        /* (stage 4) also for a materia naming 0x20 and up alone: fail closed */
+    commands_moved_numbers();           /* (stage 4) the move at the first reading; 0x26-0x3f used only with it */
+    for (usable = 0, i = 0; i < COMMAND_COUNT; i++)
+        usable += new_commands[i].usable;
+    if (usable && !command_guard_live && usable > 1)
+        for (k = 0, i = 0; i < COMMAND_COUNT; i++) {
+            if (!new_commands[i].usable)
+                continue;
+            if (k++ == 0)
+                continue;               /* the lowest number is kept */
+            log_line("new command %02x (%s): NOT used: it needs the build-list guard (one new command cannot overflow a character's command list, two can), which is not in (see above)",
+                     COMMAND_FIRST + i, new_commands[i].label);
+            new_commands[i].usable = 0;
+        }
+    commands_records_sync();            /* (stage 4) nothing unless the tables are moved */
+    commands_write_records(when);
+    commands_records_mirror();
+    for (usable = 0, i = 0; i < COMMAND_COUNT; i++)
+        usable += new_commands[i].live;
+    log_line("commands file: %d command(s) defined, %d in use, %d line(s) with problems", read, usable, command_file_problems);
+    command_support_install();          /* (stage 6) once, with a live command */
+    commands_check_materia();
+    commands_list_report();             /* (stage 9a) */
+}
+
+/* battle_start_party_hook, after the game's FUN_005cf650 (FUN_00437db0 rebuilt 009ae9c8 at 00437e2c, before it):
+   each live command's handler list is lent: a spell command's becomes Magic's, a physical one's its like's.
+   Only if the reader in FUN_00435d81 is the game's, the list lent is the one expected (Magic's `00 0c 09 1f` and
+   handler 0x0c this DLL's; or a weapon command's list and handler 0x0e this DLL's) and the command's own list is
+   still the empty one (or already the one lent: FUN_00437db0 did not run again); else the command stays without
+   handlers this battle (OK on its row spends the turn and nothing happens). (stage 4) The tables moved: the offsets
+   are the moved ones (the game's FUN_00436b1b has just written 0x00-0x25 there), every 0x26-0x3f is first reset to
+   0 (the game rebuilds only its own 38: a lend of an earlier reading must not stay), the live ones are lent as
+   0x1c-0x1f are, and then the game's 38 are mirrored to the old 009ae9c8 (0x98 bytes). */
+static void commands_battle_start(void)
+{
+    static const BYTE list_byte[] = { 0x8a, 0x88, 0xa8, 0x75, 0x7b, 0x00 };          /* mov cl, [eax + 007b75a8] */
+    static const BYTE magic_list[] = { 0x00, 0x0c, 0x09, 0x1f };
+    static const BYTE item_list[] = { 0x02, 0x0d, 0x09, 0x1f };     /* (stage 5) Item's */
+    DWORD *offsets = command_offsets_at, magic = offsets[COMMAND_MAGIC], item = offsets[COMMAND_ITEM];
+    BYTE reader[] = { 0x8b, 0x14, 0x8d, 0, 0, 0, 0 };   /* mov edx, [ecx*4 + 009ae9c8 / command_offsets] */
+    const BYTE *lists = (const BYTE *)ADDR_COMMAND_LISTS;
+    BOOL base_ok, spell_ok, weapon_ok, item_ok;
+    int i;
+
+    for (i = 0; i < 4; i++)
+        reader[3 + i] = (BYTE)((DWORD)offsets >> (8 * i));
+    for (i = 0; i < WIDE_ROWS_MAX + WIDE_GUARD_ROWS; i++)
+        command_filter_notes[i] = 0;    /* (stage 5) the build at 00437f02, right after, writes every row afresh */
+    command_filter_owner = -1;
+    command_w_state.on = 0;             /* (stage 7) no W- first pick carried into a battle */
+    for (i = 0; i < (int)(sizeof command_views.list_grid / sizeof command_views.list_grid[0][0][0]); i++)
+        (&command_views.list_grid[0][0][0])[i] = 0;     /* (stage 8) each list's cursor positions start afresh */
+    if (command_tables_moved)
+        command_offsets_reset(offsets);
+    for (i = 0; i < COMMAND_COUNT && !new_commands[i].live; i++)
+        ;
+    if (i == COMMAND_COUNT) {
+        if (command_tables_moved)
+            command_offsets_mirror((DWORD *)ADDR_COMMAND_LIST_AT, offsets);
+        return;
+    }
+    base_ok = bytes_are(SITE_COMMAND_LIST_READ, reader, sizeof reader) && bytes_are(SITE_COMMAND_LIST_BYTE, list_byte, sizeof list_byte);
+    spell_ok = magic <= COMMAND_LISTS_SIZE - sizeof magic_list && bytes_are(ADDR_COMMAND_LISTS + magic, magic_list, sizeof magic_list) &&
+               *(const DWORD *)ADDR_ACTION_SETUP_ENTRY == (DWORD)action_setup_hook;
+    weapon_ok = *(const DWORD *)ADDR_WEAPON_SETUP_ENTRY == (DWORD)weapon_setup_hook;
+    item_ok = item <= COMMAND_LISTS_SIZE - sizeof item_list && bytes_are(ADDR_COMMAND_LISTS + item, item_list, sizeof item_list) &&
+              *(const DWORD *)ADDR_ITEM_SETUP_ENTRY == (DWORD)item_setup_hook;     /* (stage 5) */
+    for (i = 0; i < COMMAND_COUNT; i++) {
+        const struct new_command *c = &new_commands[i];
+        DWORD own, wanted;
+        BOOL physical = c->kind == COMMAND_KIND_PHYSICAL, is_item = c->kind == COMMAND_KIND_ITEM, ok;
+
+        if (!c->live || (COMMAND_FIRST + i >= COMMAND_KERNEL_RECORDS && !command_tables_moved))
+            continue;               /* (stage 4: 009ae9c8 + 0x98 on is the builder's own state) */
+        own = offsets[COMMAND_FIRST + i];
+        wanted = physical ? offsets[c->like] : is_item ? item : magic;
+        ok = base_ok && (physical ? weapon_ok && wanted < COMMAND_LISTS_SIZE &&
+                                    command_list_is_weapon(lists, COMMAND_LISTS_SIZE, (int)wanted)
+                                  : is_item ? item_ok : spell_ok);
+        if (!ok || (own != wanted && (own >= COMMAND_LISTS_SIZE || lists[own] != 0x1f))) {
+            if (!command_lists_refused_said) {
+                command_lists_refused_said = TRUE;
+                log_line("new command %02x: NOT given %s handlers in this battle (reader %02x %02x %02x, the list to lend at %lx, its own %lx -> %02x, handler 0x0c %08lx, 0x0e %08lx, 0x02 %08lx): its row spends the turn and does nothing",
+                         COMMAND_FIRST + i, physical ? "its like's" : is_item ? "Item's" : "Magic's", ((const BYTE *)SITE_COMMAND_LIST_READ)[0],
+                         ((const BYTE *)SITE_COMMAND_LIST_READ)[1], ((const BYTE *)SITE_COMMAND_LIST_READ)[2], wanted, own,
+                         own < COMMAND_LISTS_SIZE ? lists[own] : 0xff, *(const DWORD *)ADDR_ACTION_SETUP_ENTRY,
+                         *(const DWORD *)ADDR_WEAPON_SETUP_ENTRY, *(const DWORD *)ADDR_ITEM_SETUP_ENTRY);
+            }
+            continue;
+        }
+        offsets[COMMAND_FIRST + i] = wanted;
+        if (!command_lists_said[i]) {
+            command_lists_said[i] = TRUE;
+            if (physical)
+                log_line("new command %02x (%s): battle start: its handler list is %s's (009ae9c8[%02x] = %lx); said once a reading",
+                         COMMAND_FIRST + i, c->label, state_command_name(c->like), COMMAND_FIRST + i, wanted);
+            else if (is_item)
+                log_line("new command %02x (%s): battle start: its handler list is Item's (009ae9c8[%02x] = %lx: 02 0d 09); said once a reading",
+                         COMMAND_FIRST + i, c->label, COMMAND_FIRST + i, item);
+            else
+                log_line("new command %02x (%s): battle start: its handler list is Magic's (009ae9c8[%02x] = %lx: 00 0c 09); said once a reading",
+                         COMMAND_FIRST + i, c->label, COMMAND_FIRST + i, magic);
+        }
+    }
+    if (command_tables_moved)
+        command_offsets_mirror((DWORD *)ADDR_COMMAND_LIST_AT, offsets);     /* (stage 4) exactly the game's 38 */
+}
+/* ==== NEW COMMANDS END ==== */
+
 /* ---- Names that are too wide are drawn narrower ----------------------------
    The menus were laid out for the game's own names. A name supplied by the DLL (a renamed kernel
    spell, a spell from the spell file, a new character's limit) that is wider than the widest of the
@@ -46262,6 +52728,7 @@ static void __cdecl bl_draw_body_hook(int pack, int animation, int frame, BYTE *
    sets, groups, vertices, and that each vertex is where this block last left it. Any difference: the file is read again, at most
    BS_RELOADS_MOST times a battle. */
 #define BS_FOLDER               "skins\\"
+#define BS_DIRECT_FOLDER        "direct\\"   /* asked first: <game>\direct\skins\<xx>.skin (bs_read_skin_file) */
 #define BS_FILE_END             ".skin"
 #define BS_SITE_CLEAR           0x0042f7e2u  /* c7 40 04 00 00 00 00: movl $0,4(%eax): 0042f3e8 clears skeleton+4 */
 #define BS_SITE_WALK_TEST       0x00684995u  /* 83 79 04 00 74 22: the walk's cmpl $0,4(%ecx) / je, before its draw */
@@ -46675,10 +53142,82 @@ static void bs_no_skin(struct bs_skin *skin, const struct bs_seen_parts *seen, c
                  seen->first_stem ? seen->first_stem : "", file, file[0] ? "did not open" : "not tried");
 }
 
-/* A model's first draw of a battle: its file is looked for, and taken or refused whole. */
+/* ---- SKIN SOURCE PURE begin (test/run_tests.sh extracts this block and compiles it natively against stubs) */
+/* <game>\direct\<file> from the exe's own path (`exe`, n characters as GetModuleFileNameA gave them): the exe's folder,
+   then BS_DIRECT_FOLDER, then `file` (BS_FOLDER "xx" BS_FILE_END). FALSE (out left empty) when n is 0 or MAX_PATH or
+   more, or the whole would not fit in `cap` characters with its 0. */
+static BOOL bs_direct_path(char *out, DWORD cap, const char *exe, DWORD n, const char *file)
+{
+    DWORD f = (DWORD)lstrlenA(file), d = (DWORD)lstrlenA(BS_DIRECT_FOLDER), i;
+
+    if (cap)
+        out[0] = 0;
+    if (n == 0 || n >= MAX_PATH)
+        return FALSE;
+    while (n > 0 && exe[n - 1] != '\\' && exe[n - 1] != '/')
+        n--;
+    if (n + d + f + 1 > cap)
+        return FALSE;
+    for (i = 0; i < n; i++)
+        out[i] = exe[i];
+    out[n] = 0;
+    lstrcatA(out, BS_DIRECT_FOLDER);
+    lstrcatA(out, file);
+    return TRUE;
+}
+
+/* A skin file's text (VirtualAlloc'd, one byte more than *size) or NULL, from the first place that has it, the order and
+   the open of read_character_ai_file:
+     1. <game>\direct\skins\<xx>.skin, opened with the wide CreateFile. A mod manager answers that open (7th Heaven
+        serves a path under <game>\direct\ from the active mod folders: a folder's skins\<xx>.skin), so a ModFolder's
+        ActiveWhen (a mod option, such as which look of the models is on) picks the skin together with the models.
+        A file that opens but cannot be read: one line (under bs_may_log's limit), and 2. is tried.
+     2. SpellExtConfig\skins\<xx>.skin, as before (read_whole_file).
+   `file` is BS_FOLDER "xx" BS_FILE_END; *from is "<game>\\direct\\" or "SpellExtConfig\\" for the log, NULL with NULL. */
+static char *bs_read_skin_file(const char *file, DWORD *size, const char **from)
+{
+    char exe[MAX_PATH + 1], path[MAX_PATH + 96];
+    WCHAR wide[MAX_PATH + 96];
+    DWORD n = GetModuleFileNameA(NULL, exe, MAX_PATH), got = 0;
+    HANDLE handle;
+    char *text = NULL;
+    int i;
+
+    *from = NULL;
+    if (bs_direct_path(path, sizeof path, exe, n, file)) {
+        for (i = 0; path[i]; i++)
+            wide[i] = (BYTE)path[i];
+        wide[i] = 0;
+        handle = CreateFileW(wide, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+        if (handle != INVALID_HANDLE_VALUE && handle != NULL) {
+            *size = GetFileSize(handle, NULL);
+            if (*size != INVALID_FILE_SIZE)
+                text = VirtualAlloc(NULL, *size + 1, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            if (text && (!ReadFile(handle, text, *size, &got, NULL) || got != *size)) {
+                VirtualFree(text, 0, MEM_RELEASE);
+                text = NULL;
+            }
+            CloseHandle(handle);
+            if (text) {
+                *from = "<game>\\direct\\";
+                return text;
+            }
+            if (bs_may_log())
+                log_line("model_skinning: <game>\\direct\\%s opens but cannot be read: SpellExtConfig\\%s is tried", file, file);
+        }
+    }
+    text = read_whole_file(file, size);
+    if (text)
+        *from = "SpellExtConfig\\";
+    return text;
+}
+/* ---- SKIN SOURCE PURE end */
+
+/* A model's first draw of a battle: its file is looked for (bs_read_skin_file: <game>\direct\ first, then
+   SpellExtConfig\), and taken or refused whole. */
 static void bs_load(struct bs_skin *skin, const BYTE *skeleton)
 {
-    const char *problem = NULL;
+    const char *problem = NULL, *from = NULL;
     char file[64], *text;
     DWORD size = 0;
     int bones = *(const int *)(skeleton + 0x10), bone, rsd, parts = 0, at_line = 0;
@@ -46742,9 +53281,9 @@ static void bs_load(struct bs_skin *skin, const BYTE *skeleton)
     lstrcpyA(file, BS_FOLDER);
     lstrcatA(file, skin->name);
     lstrcatA(file, BS_FILE_END);
-    text = read_whole_file(file, &size);
+    text = bs_read_skin_file(file, &size, &from);
     if (!text) {
-        bs_no_skin(skin, &seen, "no file for it", file);
+        bs_no_skin(skin, &seen, "no file for it (neither <game>\\direct\\ nor SpellExtConfig\\)", file);
         return;
     }
     if (size > BS_FILE_MOST)
@@ -46756,14 +53295,14 @@ static void bs_load(struct bs_skin *skin, const BYTE *skeleton)
         bs_free(skin);
         skin->state = BS_REFUSED;
         if (bs_may_log())
-            log_line("model_skinning: %s refused whole, nothing is written: %s (line %d)", file, problem, at_line);
+            log_line("model_skinning: %s%s refused whole, nothing is written: %s (line %d)", from, file, problem, at_line);
         return;
     }
     skin->bones = bones;
     skin->state = BS_READY;
     bs_count_used(skin);
     if (bs_may_log())
-        log_line("model_skinning: %s taken: %d vertices in %d part(s) of a model of %d bones", file, skin->entry_count, skin->host_count, bones);
+        log_line("model_skinning: %s%s taken: %d vertices in %d part(s) of a model of %d bones", from, file, skin->entry_count, skin->host_count, bones);
 }
 
 /* The inverse of a matrix of the bone table (16 floats, rows, translation in 12-14) as four rows of three.
@@ -47019,7 +53558,7 @@ static void bs_keys_settle(void)
         return;
     }
     bs_on = 1;
-    log_line("model_skinning: on: a battle model's %s<first two letters of its parts>%s is honoured", BS_FOLDER, BS_FILE_END);
+    log_line("model_skinning: on: a battle model's %s<first two letters of its parts>%s is honoured, from <game>\\%s first, then SpellExtConfig\\", BS_FOLDER, BS_FILE_END, BS_DIRECT_FOLDER);
 }
 /* ==== VERTEX BONES END ==== */
 
@@ -58327,12 +64866,14 @@ static void reload_config(void)
     load_game_settings();
     enemies_reread("Re-init .ini files");   /* (enemies) the registry and the folders again; nothing when off */
     load_effect_copies();       /* (before the spell file: a spell's `animation = 0x100` is looked up in it) */
+    commands_views_reinit();    /* (new commands, stage 8) a lent list put back and forgotten before the spell file frees the lists and handles */
     load_spells();
     effect_copies_check_files();    /* (a copy whose files are missing is dropped) */
     effect_copies_install();    /* (a copy defined for the first time: its one hook, if not in yet) */
     refresh_materia_table();
     refresh_weapon_table();
     load_materia();
+    load_commands("Re-init .ini files");   /* (new commands) after the spell and materia files; restore_kernel_tables put ff x8 back */
     load_weapons();
     mirror_new_weapons();
     refresh_gear_tables();
@@ -58341,6 +64882,7 @@ static void reload_config(void)
     gear_wide_loaded();         /* (the box, stage B5) as after a kernel load: a lent slot's record is filled again from the definitions as they are now */
     shop_adds_gear_check();     /* (wide shop) the shop files' wide gear entries against the definitions as they are now */
     reload_characters();
+    commands_learn_settle("Re-init .ini files");   /* (new commands, stage 9b) the learned list entries, after the items file and the characters (their limit items) */
     rebuild_item_ranks();       /* the sort-by-name places of every 16-bit item number (0-511 placed as before), from the names as they are now (after the characters: a limit item is named in a sheet) */
     wide_items_report();        /* (stage 2) wide items of the items file as it is now: admitted, or why not; nothing with none defined */
     seat_equipment();
@@ -63585,8 +70127,10 @@ static int __cdecl kernel_loader_hook(void)
     shop_adds_gear_check();     /* (wide shop) the shop files' wide gear entries against the definitions as they are now */
     install_limit_safety();     /* (limits work, step 0) three tables moved, the spoils and battle gain calls followed: once */
     enable_new_characters();
+    load_commands("a kernel load");    /* (new commands) after the spell and materia files and the new characters (the battle-start call is shared) */
     if (limit_item_hook_state == 0 && wide_items_mode == WIDE_ON)
         install_limit_item();   /* (C0b) with no new character defined the Item menu's use step was never hooked, and a wide item is admitted only with it: the hook serves new items alone then (no limit item can exist) */
+    commands_learn_settle("a kernel load");    /* (new commands, stage 9b) the learned list entries, after the commands and items files and the characters */
     rebuild_item_ranks();       /* (a later kernel load read the files again; after the characters: a limit item is named in a sheet) */
     follow_esui_battle_avatars();
     fix_equipment_power();
