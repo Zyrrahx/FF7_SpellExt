@@ -275,6 +275,8 @@ struct spell {
     WORD animation_copy;                /* `animation = 0x100` and up: an effect copy of the effects file (the record
                                            holds its base's number); 0 = none */
     WORD animation_all_copy;            /* the same for `animation_all` */
+    WORD battle_mp;                     /* `battle_mp`: MP each landed hit gives (takes, when it hurt) besides its
+                                           formula ("Spell battle MP"); 0 = none */
 };
 /* index_reaching needs every record 4-byte aligned. */
 typedef char spell_size_is_a_multiple_of_4[sizeof(struct spell) % 4 == 0 ? 1 : -1];
@@ -662,6 +664,7 @@ static void atb_dex_follow(void);      /* atb_follows_dexterity (game file): see
 static void command_item_reserve(const BYTE *entry);  /* ("New commands", stage 5) */
 static void command_w_issued(const BYTE *entry);    /* ("New commands", stage 7) */
 static void command_list_enqueue(BYTE *entry);      /* ("New commands", stage 8) */
+static void command_mix_enqueue(BYTE *entry);       /* ("New commands", kind = mix) */
 static void __cdecl enqueue_hook(BYTE *entry)
 {
     WORD *id = (WORD *)(entry + 4);
@@ -673,6 +676,7 @@ static void __cdecl enqueue_hook(BYTE *entry)
         *id = (WORD)real_id;
     }
     command_list_enqueue(entry);    /* (new commands, stage 8) a list command's handle -> its spell's ID; the actor's Magic list put back */
+    command_mix_enqueue(entry);     /* (new commands, mix) a mix command's two items reserved, the first taken; word 4 its result's */
     command_item_reserve(entry);    /* (new commands, stage 5) an item command's item reserved, as 00432aa2 does for Item */
     command_w_issued(entry);        /* (new commands, stage 7) an issue by the actor of a stored W- first pick: disarmed */
     ((void (__cdecl *)(BYTE *))FN_ENQUEUE)(entry);
@@ -685,6 +689,7 @@ static void __cdecl enqueue_hook(BYTE *entry)
 static void command_gate_fields(int *action);  /* ("New commands", stage 4) */
 static void command_all_use(int actor, int *action);  /* ("New commands", stage 6) */
 static void command_view_slot_match(int actor);  /* ("New commands", stage 8) */
+static void command_mix_list(const int *action);   /* ("New commands", kind = mix) */
 static void __cdecl slot_match_hook(int actor)
 {
     int *action;
@@ -696,6 +701,7 @@ static void __cdecl slot_match_hook(int actor)
     action = current_action();
     command_gate_fields(action);    /* (new commands, stage 4) [0x14] [0x18] [0x19] of a command 0x26-0x3f: the builder's gates skip 0x20 and up */
     command_all_use(actor, action); /* (new commands, stage 6) a new command's All use, as the builder spends Steal's */
+    command_mix_list(action);       /* (new commands, mix) a mix command's action: Item's handler list, or Magic's for a spell */
     id = action[ACT_QUEUED_ID];
     if (action[ACT_COMMAND] == 3 && actor >= 0 && actor <= 2 && spell_is_summon(id)) {
         /* an extended summon: its slot is the summon slot holding its handle */
@@ -778,24 +784,83 @@ static int index_reaching(const BYTE *record)
 #define ADDR_FADE_TIMER         0x00bfd0f0u
 #define ADDR_BATTLE_KIND        0x00bfd0e0u
 #define SOUND_SUMMON            0x29
-#define SUMMON_FADE_FRAMES      14
+#define SUMMON_FADE_FRAMES      14   /* the game's summon: frames of the party's fade, and before it is hidden */
+#define SITE_SUMMON_FADE_CODE   0x005c0ebau  /* FUN_005c0e4b: c6 05 f0 d0 bf 00 0e, mov byte [00bfd0f0], 0x0e */
+#define SUMMON_FADE_LINES       8    /* log lines about the fade length, a run */
+
+/* SUMMON FADE PURE BEGIN  (no Win32 call inside: tested natively, fps60/summon_fade/build/test) */
+/* The party's fade-out length for an extended summon's opening, from the 7 bytes at SITE_SUMMON_FADE_CODE: the length
+   the game's own summon fades the party over, as the exe holds it now. With the game's code that is 14. FFNx at 30 and
+   60 fps (1.24.3 animations.cpp:1229, 1.25.2 1036b26a-1036b284) multiplies that immediate once, at its start, by its
+   battle frame multiplier (2 at 30, 4 at 60), because it runs the summon task and the fade (0042c66d) every frame, while
+   it runs summon_intro_task's count of 14 one frame in M (the others with 00dc0e6c set). So the immediate is 14 x M at
+   every rate, whatever animation files are served. 0042c31c reads it as a signed byte.
+   Gives SUMMON_FADE_FRAMES, the old length, when the six bytes before the immediate are not the game's (*why 1) or the
+   immediate is not 14 x 1..9 (*why 2: 0, not a multiple, or past 127); else the immediate (*why 0). */
+static int summon_fade_length(const unsigned char *code, int *why)
+{
+    static const unsigned char game[6] = { 0xc6, 0x05, 0xf0, 0xd0, 0xbf, 0x00 };
+    int i, length = code[6];
+
+    for (i = 0; i < 6; i++)
+        if (code[i] != game[i]) {
+            *why = 1;
+            return SUMMON_FADE_FRAMES;
+        }
+    if (length < SUMMON_FADE_FRAMES || length > 127 || length % SUMMON_FADE_FRAMES) {
+        *why = 2;
+        return SUMMON_FADE_FRAMES;
+    }
+    *why = 0;
+    return length;
+}
+
+/* Whether to log the fade length found (`length`, `why` from summon_fade_length): only when it is not what the last line
+   said (*said, at first SUMMON_FADE_FRAMES with why 0: the game's own length says nothing) and fewer than
+   SUMMON_FADE_LINES were written (*lines). */
+static int summon_fade_say(int length, int why, int *said, int *lines)
+{
+    int key = why ? -why : length;
+
+    if (key == *said || *lines >= SUMMON_FADE_LINES)
+        return 0;
+    *said = key;
+    ++*lines;
+    return 1;
+}
+/* SUMMON FADE PURE END */
 
 static int summon_show_actor = -1;      /* actor whose next effect is an extended summon's */
 static void start_effect_copy(int actor_arg);  /* FUN_00427c22 with an effect copy's files ("Effect copies") */
 static int summon_intro_actor, summon_intro_frame;
+static int summon_fade_said = SUMMON_FADE_FRAMES, summon_fade_lines;
 
 static void __cdecl summon_intro_task(void)
 {
     short *task = (short *)(0x00bfb718u + *(const short *)0x00bf23b8u * 0x20);
-    int i, watcher;
+    int i, watcher, length, why;
 
     if (*(const BYTE *)0x00dc0e6cu)     /* effects paused */
         return;
     if (summon_intro_frame == 0) {
+        const BYTE *code = (const BYTE *)SITE_SUMMON_FADE_CODE;
+
         ((void (__cdecl *)(int))FN_PLAY_EFFECT_SOUND)(SOUND_SUMMON);
         for (i = 0; i < 3; i++)
             *(BYTE *)(ADDR_ACTOR_FADE_FLAGS + i * ACTOR_EFFECT_STRIDE) |= 2;
-        *(BYTE *)ADDR_FADE_TIMER = SUMMON_FADE_FRAMES;
+        length = summon_fade_length(code, &why);    /* the game's summon's, as FFNx left it (14 x its multiplier) */
+        *(BYTE *)ADDR_FADE_TIMER = (BYTE)length;
+        if (summon_fade_say(length, why, &summon_fade_said, &summon_fade_lines)) {
+            if (why == 1)
+                log_line("summon presentation: %08x is not the game's c6 05 f0 d0 bf 00 (%02x %02x %02x %02x %02x %02x): the party fades over %d frames",
+                         SITE_SUMMON_FADE_CODE, code[0], code[1], code[2], code[3], code[4], code[5], length);
+            else if (why == 2)
+                log_line("summon presentation: the game's summon fade length at %08x is %d, not 14 x 1-9: the party fades over %d frames",
+                         SITE_SUMMON_FADE_CODE + 6, code[6], length);
+            else
+                log_line("summon presentation: the party fades over %d frames, as the game's own summon (%08x = %d: the driver's battle frame multiplier %d)",
+                         length, SITE_SUMMON_FADE_CODE + 6, length, length / SUMMON_FADE_FRAMES);
+        }
         if (*(const BYTE *)ADDR_BATTLE_KIND == 4)
             ((void (__cdecl *)(void))FN_HIDE_OTHER_ENEMIES)();
     }
@@ -1863,6 +1928,7 @@ static void spell_bytes_put_back(void);
 static void spell_bytes_forget(void);
 static int command_action_setup(int *action);   /* ("New commands", after the materia file code) */
 static void command_mp_turbo(int *action);      /* ("New commands", stage 6) */
+static void command_mix_no_mp(int *action);     /* ("New commands", kind = mix) */
 
 static void __cdecl action_setup_hook(void)
 {
@@ -1897,6 +1963,7 @@ static void __cdecl action_setup_hook(void)
     if (!record || action[ACT_COMMAND_TYPE] == 0x20) {
         ((void (__cdecl *)(void))FN_ACTION_SETUP)();
         command_mp_turbo(action);       /* (new commands, stage 6) MP Turbo on a spell command's row: the cost as a spell slot's */
+        command_mix_no_mp(action);      /* (new commands, mix) a mix command's spell result costs no MP */
         note_limit_action(action[ACT_ACTOR], action[ACT_COMMAND_TYPE], id);
         return_scratch_slot(action[ACT_ACTOR]);
         enemies_attack_note(action);    /* an enemy's attack with extras of the enemies files (nothing with enemies off) */
@@ -1952,6 +2019,7 @@ static void __cdecl action_setup_hook(void)
         action[0xe] = (int)mp_cost_of(record, slot[7]);
     }
     command_mp_turbo(action);           /* (new commands, stage 6) MP Turbo on a spell command's row (it has no slot) */
+    command_mix_no_mp(action);          /* (new commands, mix) a mix command's spell result costs no MP */
     {
         /* `animation_all`: another effect when the cast has more than one target. Chosen here from
            the targets asked for, and again at the effect step from the targets the game kept
@@ -2649,6 +2717,12 @@ static void command_snapshot_take(int character);  /* ("New commands", stage 9a)
 static void command_learn_poll(const char *moment);    /* ("New commands", stage 9b: learned list entries) */
 static void command_learn_after_load(void);
 static void command_learn_hit(const int *action);
+static void command_hp_cost_after_hit(const int *action);   /* ("New commands", hp_cost) */
+static void item_battle_mp_after_hit(const int *action);    /* ("Item battle MP", the items file's battle_mp) */
+static void item_battle_mp_report(void);
+static int spell_battle_mp_before(void);                     /* ("Spell battle MP", the spell file's battle_mp) */
+static void spell_battle_mp_after_hit(const int *action, int attacker, int results);
+static void spell_battle_mp_report(void);
 static BOOL command_teaches_item(int item);
 static void command_item_use(int item, int who);
 static BOOL command_learn_wanted(void);
@@ -3535,6 +3609,7 @@ static void log_spare_regions(const char *when)
 
 #define WEAPON_POWER            0x04
 #define WEAPON_GROWTH           0x06
+#define WEAPON_MODEL_BYTE       0x09    /* low digit the weapon model; high digit characters 1's and 7's model variant (and a stance's: STANCE PURE) */
 #define WEAPON_SLOTS            0x1c
 #define WEAPON_RESTRICTIONS     0x2a
 
@@ -3701,6 +3776,8 @@ static BYTE accessory_names[NEW_ACCESSORY_COUNT][32], accessory_descriptions[NEW
 static BYTE item_names[NEW_ITEM_COUNT][32], item_descriptions[NEW_ITEM_COUNT][96], item_given[NEW_ITEM_COUNT],
             item_defined[NEW_ITEM_COUNT];
 static short item_menu_hp[NEW_ITEM_COUNT], item_menu_mp[NEW_ITEM_COUNT];   /* what it restores from the Item menu */
+static short item_battle_mp[NEW_ITEM_COUNT];   /* (battle_mp) MP each landed hit restores in battle, besides its formula ("Item battle MP") */
+#define ITEM_BATTLE_MP_MOST     9999         /* (battle_mp) the key's bound: the menu keys' */
 static BYTE item_table[ITEM_TABLE_RECORDS * ITEM_RECORD_SIZE];
 static LONG armour_table_live, accessory_table_live, item_table_live, gear_sites_moved;
 static int price_first_materia = 384;       /* where materia prices start in the price table */
@@ -3873,6 +3950,7 @@ struct wide_item {
     BYTE record[ITEM_RECORD_SIZE];
     BYTE name[32], description[96];
     WORD icon;                               /* (custom icons) icon = file:...: the file's place + 1 (custom_icon_of); 0 the game's icon */
+    short battle_mp;                         /* (battle_mp) as item_battle_mp ("Item battle MP") */
 };
 static struct wide_item *wide_items;        /* the catalogue: reserved once for the whole band */
 static int wide_item_count, wide_item_room; /* definitions; definitions the committed memory holds */
@@ -5243,6 +5321,7 @@ static void refresh_gear_tables(void)
         item_names[i][0] = item_descriptions[i][0] = 0xff;
         item_given[i] = item_defined[i] = 0;
         item_menu_hp[i] = item_menu_mp[i] = 0;
+        item_battle_mp[i] = 0;      /* (battle_mp) */
     }
     /* (wide items) no wide item is defined until the items file is read: every record from 512 up is ff, every
        price from 1024 up is 0 (entries 512-767 of the price table are the materia prices) */
@@ -11103,6 +11182,131 @@ static int enemies_models_entry(const char *key, const char *key_end, const char
 }
 /* ENEMIES MODEL PURE END */
 
+/* ==== BATTLE FRAME FACTOR BEGIN ====
+   The battle animations' frame factor F. A mod that ships battle animations with F times the frames (a record of n
+   frames played once has F*n - F + 1, one a script loops F*n, original frame k at F*k: the 60 fps sets have F = 4)
+   ships beside them one file, spellext\battle_frame_factor.txt, holding the number F. A mod manager serves it at
+       <game>\direct\spellext\battle_frame_factor.txt
+   (the open of read_character_ai_file: 7th Heaven answers a path under <game>\direct\ from its active mod folders, so
+   the ModFolder's ActiveWhen that picks the animations picks the marker with them). Read at start-up (install_hooks,
+   before the enemies are set up) and at "Re-init .ini files"; one line says the factor at each reading. Two things
+   follow it, nothing else:
+     - prop_frames goes on counting the ORIGINAL frames: the prop is shown while floor(frame / F) is in
+       [FIRST, LAST] (prop_frames_outside), so original key LAST stays on screen until key LAST + 1 replaces it;
+     - a DLL-served pool model's animations (its `da`) come from SpellExtConfig\enemies\<folder>\model_x<F>\da when
+       the folder has that file, else from model\da as before, with one line per folder (enemies_model_file).
+   No marker, or one that is not a number from 1 to BATTLE_FRAME_FACTOR_MAX: F = 1, and both are exactly as they were
+   before the factor existed. */
+#define BATTLE_FRAME_FACTOR_FILE    "direct\\spellext\\battle_frame_factor.txt"
+#define BATTLE_FRAME_FACTOR_MAX     8
+#define BATTLE_FRAME_FACTOR_BYTES   64      /* a longer marker is not one number */
+#define ENEMIES_X_MISSING_LOG_MAX   20      /* "its animations are 1x" lines in a run (one per folder assignment) */
+
+/* BATTLE FRAME FACTOR PURE BEGIN  (no Win32 call inside: tested natively, fps60/variants/build/dll/test) */
+/* The marker's `length` bytes: an optional UTF-8 BOM, white space, one decimal number of one or two digits, white
+   space. The number when it is 1 to BATTLE_FRAME_FACTOR_MAX; else 0. */
+static int battle_frame_factor_parse(const char *text, int length)
+{
+    int i = 0, value = 0, digits = 0;
+
+    if (!text || length < 0)
+        return 0;
+    if (length >= 3 && (BYTE)text[0] == 0xef && (BYTE)text[1] == 0xbb && (BYTE)text[2] == 0xbf)
+        i = 3;
+    while (i < length && (text[i] == ' ' || text[i] == '\t' || text[i] == '\r' || text[i] == '\n'))
+        i++;
+    for (; i < length && text[i] >= '0' && text[i] <= '9'; i++) {
+        if (++digits > 2)
+            return 0;
+        value = value * 10 + (text[i] - '0');
+    }
+    while (i < length && (text[i] == ' ' || text[i] == '\t' || text[i] == '\r' || text[i] == '\n'))
+        i++;
+    return digits && i == length && value >= 1 && value <= BATTLE_FRAME_FACTOR_MAX ? value : 0;
+}
+
+/* The original frame a file frame of a factor-F set stands for: floor(frame / F). With F 1 (or less) the frame itself. */
+static int battle_frame_original(int frame, int factor)
+{
+    if (factor <= 1)
+        return frame;
+    return frame >= 0 ? frame / factor : (frame + 1) / factor - 1;
+}
+
+/* `config` (ending with a separator) + enemies\<folder>\model_x<factor>\<suffix>, for a factor of 2 to 9; FALSE (out
+   empty) for any other factor or when it would not fit `capacity`. With config "" it is relative, for the log. */
+static BOOL enemies_model_x_path(const char *config, const char *folder, int factor, const char *suffix, char *out, int capacity)
+{
+    char part[] = "\\model_x?\\";
+    int length = 0;
+
+    if (capacity < 1)
+        return FALSE;
+    out[0] = 0;
+    if (factor < 2 || factor > 9)
+        return FALSE;
+    part[8] = (char)('0' + factor);
+    if (enemies_append(out, capacity, &length, config) && enemies_append(out, capacity, &length, ENEMIES_FOLDER_NAME "\\") &&
+        enemies_append(out, capacity, &length, folder) && enemies_append(out, capacity, &length, part) &&
+        enemies_append(out, capacity, &length, suffix))
+        return TRUE;
+    out[0] = 0;
+    return FALSE;
+}
+/* BATTLE FRAME FACTOR PURE END */
+
+static volatile LONG battle_frame_factor = 1;   /* F: 1 unless the marker says otherwise (read by the game's and the driver's threads) */
+
+/* Reads the marker (start-up, Re-init) and says the factor in one line. `why` names the reading. */
+static void battle_frame_factor_read(const char *why)
+{
+    char path[MAX_PATH + 96], text[BATTLE_FRAME_FACTOR_BYTES + 1];
+    WCHAR wide[MAX_PATH + 96];
+    DWORD n = GetModuleFileNameA(NULL, path, MAX_PATH), size, got = 0;
+    HANDLE file = INVALID_HANDLE_VALUE;
+    int i, factor = 0;
+    const char *problem = NULL;
+
+    if (n > 0 && n < MAX_PATH) {
+        while (n > 0 && path[n - 1] != '\\' && path[n - 1] != '/')
+            n--;
+        lstrcpyA(path + n, BATTLE_FRAME_FACTOR_FILE);
+        for (i = 0; path[i]; i++)
+            wide[i] = (BYTE)path[i];
+        wide[i] = 0;
+        file = CreateFileW(wide, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+    }
+    if (file == INVALID_HANDLE_VALUE || file == NULL) {
+        InterlockedExchange(&battle_frame_factor, 1);
+        log_line("battle animations: factor 1 (%s): no <game>\\%s is served, so they are taken as the original frames; prop_frames and the pool models' files as always",
+                 why, BATTLE_FRAME_FACTOR_FILE);
+        return;
+    }
+    size = GetFileSize(file, NULL);
+    text[0] = 0;
+    if (size == INVALID_FILE_SIZE || size > BATTLE_FRAME_FACTOR_BYTES)
+        problem = "it is longer than one number";
+    else if (!ReadFile(file, text, size, &got, NULL) || got != size)
+        problem = "it opens but cannot be read";
+    else if ((factor = battle_frame_factor_parse(text, (int)got)) == 0)
+        problem = "it is not one number from 1 to 8";     /* (BATTLE_FRAME_FACTOR_MAX) */
+    CloseHandle(file);
+    if (problem) {
+        InterlockedExchange(&battle_frame_factor, 1);
+        log_line("battle animations: factor 1 (%s): <game>\\%s is served but %s: they are taken as the original frames",
+                 why, BATTLE_FRAME_FACTOR_FILE, problem);
+        return;
+    }
+    InterlockedExchange(&battle_frame_factor, factor);
+    if (factor == 1)
+        log_line("battle animations: factor 1 (%s, <game>\\%s): the original frames; prop_frames and the pool models' files as always",
+                 why, BATTLE_FRAME_FACTOR_FILE);
+    else
+        log_line("battle animations: factor %d (%s, <game>\\%s): prop_frames counts the original frames (a prop is shown while frame / %d is in its range); a pool model's animations come from enemies\\<folder>\\model_x%d\\da where the folder has one, else from model\\da",
+                 factor, why, BATTLE_FRAME_FACTOR_FILE, factor, factor);
+}
+/* ==== BATTLE FRAME FACTOR END ==== */
+
 static LONG enemies_asked, enemies_given, enemies_settled;  /* the game file's key at this reading; taken at the first */
 static LONG enemies_on;             /* for the run: the start-up reading said on */
 static LONG enemies_live;           /* serving: on and set up by enemies_start */
@@ -11111,6 +11315,8 @@ static LONG enemies_served_bits[(ENEMIES_POOL_COUNT * ENEMIES_SUFFIXES + 31) / 3
 static LONG enemies_missing_bits[(ENEMIES_POOL_COUNT * ENEMIES_SUFFIXES + 31) / 32];
 static LONG enemies_failed_bits[(ENEMIES_POOL_COUNT * ENEMIES_SUFFIXES + 31) / 32];
 static LONG enemies_served_logged, enemies_missing_logged, enemies_failed_logged;
+static LONG enemies_x_missing_bits[(ENEMIES_POOL_COUNT + 31) / 32];    /* (battle frame factor) per pool number: "its animations are 1x" said */
+static LONG enemies_x_missing_logged;
 
 /* Sets (set TRUE) or clears bit `n` of `bits` from any thread; returns whether it was set before. */
 static BOOL enemies_bit(LONG *bits, int n, BOOL set)
@@ -11137,6 +11343,7 @@ static void enemies_model_assign(int index, const char *folder)
         enemies_bit(enemies_missing_bits, i, FALSE);
         enemies_bit(enemies_failed_bits, i, FALSE);
     }
+    enemies_bit(enemies_x_missing_bits, index, FALSE);
     lstrcpyA(enemies_models[index], folder);
 }
 
@@ -11151,11 +11358,13 @@ static void enemies_model_clear(void)
 /* Whether a file request names an assigned pool model's file that its folder holds: copies the file's
    full path into `path` (MAX_PATH + 200 bytes) and returns TRUE. `bare` is the request's last part,
    `who` says who asked (for the log). A file the folder lacks: one line (the first time), and FALSE.
-   The caller opens `path` and says how it went: enemies_model_opened. */
+   The caller opens `path` and says how it went: enemies_model_opened. With a battle frame factor F above 1
+   (battle_frame_factor_read) the animations, `da`, are model_x<F>\da when the folder has it; else model\da
+   as always, with one line per assignment of the folder. */
 static BOOL enemies_model_file(const char *bare, const char *who, char *path)
 {
     char suffix[3], relative[MAX_PATH], folder[ENEMIES_NAME_MAX + 1];
-    int index = enemies_model_index(bare, ENEMIES_POOL_FIRST, ENEMIES_POOL_COUNT, suffix), bit;
+    int index = enemies_model_index(bare, ENEMIES_POOL_FIRST, ENEMIES_POOL_COUNT, suffix), bit, factor;
     DWORD attributes;
 
     if (index < 0)
@@ -11164,6 +11373,17 @@ static BOOL enemies_model_file(const char *bare, const char *who, char *path)
     if (!folder[0])
         return FALSE;
     bit = index * ENEMIES_SUFFIXES + (suffix[0] - 'a') * 26 + (suffix[1] - 'a');
+    factor = battle_frame_factor;
+    if (factor > 1 && suffix[0] == 'd' && suffix[1] == 'a') {
+        if (enemies_model_x_path(config_dir, folder, factor, suffix, path, MAX_PATH + 200)) {
+            attributes = GetFileAttributesA(path);
+            if (attributes != INVALID_FILE_ATTRIBUTES && !(attributes & FILE_ATTRIBUTE_DIRECTORY))
+                return TRUE;
+        }
+        if (!enemies_bit(enemies_x_missing_bits, index, TRUE) && InterlockedIncrement(&enemies_x_missing_logged) <= ENEMIES_X_MISSING_LOG_MAX)
+            log_line("enemies: model file %s: enemies\\%s\\model_x%d\\da is missing (the battle animations are x%d): model\\da is served, so model %d's animations are the original frames",
+                     bare, folder, factor, factor, ENEMIES_POOL_FIRST + index);
+    }
     if (!enemies_model_path(config_dir, folder, suffix, path, MAX_PATH + 200) ||
         !enemies_model_path("", folder, suffix, relative, sizeof relative))
         return FALSE;
@@ -11211,6 +11431,10 @@ static BOOL enemies_driver_answers(const char *full, DWORD access, DWORD disposi
 }
 static void enemies_start(int *ok, int *total);        /* with the game file's keys */
 static void enemies_battle_watch(void);                 /* (enemies, scenes) a battle's pool models: given back when it is over */
+static LONG stage_armed;                                /* (stage model) a battle's stage is served (STAGE RUN) */
+static void stage_watch(void);                          /* (stage model) given back when its battle is over */
+static BOOL stage_driver_answers(const char *full, DWORD access, DWORD disposition, char *path);
+static void stage_file_opened(const char *bare, const char *path, BOOL opened, DWORD error);
 /* ==== ENEMIES (models) END ==== */
 
 static BOOL effect_swap_answers(const char *full, DWORD access, DWORD disposition, char *path)
@@ -11235,10 +11459,20 @@ static HANDLE WINAPI driver_create_file_a(LPCSTR name, DWORD access, DWORD share
 
     if (enemies_live)
         enemies_battle_watch();
+    if (enemies_live)
+        stage_watch();                  /* (stage model) */
     if (enemies_live && name && !IsBadStringPtrA(name, 1024) && enemies_driver_answers(name, access, disposition, path)) {
         HANDLE file = before(path, access, share, security, disposition, flags, template_file);
 
         enemies_model_opened(enemies_driver_bare(name), "the driver", path, file != INVALID_HANDLE_VALUE, GetLastError());
+        if (file != INVALID_HANDLE_VALUE)
+            return file;
+    }
+    /* (stage model) a file of the battle's served stage, from its folder */
+    if (stage_armed && name && !IsBadStringPtrA(name, 1024) && stage_driver_answers(name, access, disposition, path)) {
+        HANDLE file = before(path, access, share, security, disposition, flags, template_file);
+
+        stage_file_opened(enemies_driver_bare(name), path, file != INVALID_HANDLE_VALUE, GetLastError());
         if (file != INVALID_HANDLE_VALUE)
             return file;
     }
@@ -11259,6 +11493,8 @@ static HANDLE WINAPI driver_create_file_w(LPCWSTR name, DWORD access, DWORD shar
 
     if (enemies_live)
         enemies_battle_watch();
+    if (enemies_live)
+        stage_watch();                  /* (stage model) */
     if (name && !IsBadStringPtrW(name, 1024)) {
         for (i = 0; i < (int)sizeof narrow - 1 && name[i] && name[i] < 0x80; i++)
             narrow[i] = (char)name[i];
@@ -11272,6 +11508,17 @@ static HANDLE WINAPI driver_create_file_w(LPCWSTR name, DWORD access, DWORD shar
             if (MultiByteToWideChar(CP_ACP, 0, path, -1, wide, MAX_PATH + 200) > 0)
                 file = before(wide, access, share, security, disposition, flags, template_file);
             enemies_model_opened(enemies_driver_bare(narrow), "the driver", path, file != INVALID_HANDLE_VALUE, GetLastError());
+            if (file != INVALID_HANDLE_VALUE)
+                return file;
+        }
+        /* (stage model) a file of the battle's served stage, from its folder (as the pool models' above) */
+        if (stage_armed && !name[i] && stage_driver_answers(narrow, access, disposition, path)) {
+            WCHAR wide[MAX_PATH + 200];
+            HANDLE file = INVALID_HANDLE_VALUE;
+
+            if (MultiByteToWideChar(CP_ACP, 0, path, -1, wide, MAX_PATH + 200) > 0)
+                file = before(wide, access, share, security, disposition, flags, template_file);
+            stage_file_opened(enemies_driver_bare(narrow), path, file != INVALID_HANDLE_VALUE, GetLastError());
             if (file != INVALID_HANDLE_VALUE)
                 return file;
         }
@@ -11326,6 +11573,7 @@ static void set_import_slot(DWORD *slot, DWORD value)
    back when the last one goes, never by one under another. With enemies off this does exactly what
    effect_swap_on and effect_swap_off did themselves: take on the swap's set-up, give back at its end. */
 static LONG driver_opens_lock, driver_opens_in, enemies_holds_opens, enemies_battle_holds;
+static LONG stage_battle_holds;     /* (stage model) a battle's served stage, from its overwrite until it is given back */
 
 static void driver_opens_settle(void)
 {
@@ -11333,7 +11581,7 @@ static void driver_opens_settle(void)
 
     while (InterlockedExchange(&driver_opens_lock, 1))
         Sleep(0);
-    wanted = driver_opens_taken || enemies_holds_opens || enemies_battle_holds;
+    wanted = driver_opens_taken || enemies_holds_opens || enemies_battle_holds || stage_battle_holds;
     if (wanted && !driver_opens_in) {
         if (driver_open_slot[0]) {
             driver_open_before[0] = *driver_open_slot[0];
@@ -11646,6 +11894,7 @@ static void __cdecl hit_target_hook(int attacker, int target)
     const int *action;
     DWORD before[10];
     BOOL counting = state_landed_before(before);
+    int spell_results = spell_battle_mp_before();   /* (battle_mp, spells) where this hit's result will be; -1: no step */
 
     if (limit_elements.count && attacker == limit_elements.actor) {
         /* `hit_elements`: this hit's element (the last one listed goes on for any further hits) */
@@ -11657,6 +11906,9 @@ static void __cdecl hit_target_hook(int attacker, int target)
     ((void (__cdecl *)(int, int))FN_HIT_TARGET)(attacker, target);
     action = *(const int **)ADDR_ACTION_PTR;
     command_learn_hit(action);      /* (new commands, stage 9b) an enemy's attack that a list entry names: learned */
+    command_hp_cost_after_hit(action);  /* (new commands, hp_cost) a command's HP cost, at the action's first hit */
+    item_battle_mp_after_hit(action);   /* (battle_mp) an item's MP besides its formula, at each landed hit */
+    spell_battle_mp_after_hit(action, attacker, spell_results);    /* (battle_mp) a spell's, the same way */
     if (counting)
         state_landed_after(before);
     /* the ACTING actor, not the hit's attacker: for a reflected hit that is the one it bounced off */
@@ -11729,6 +11981,10 @@ static BOOL enemies_describe(LONG battle, char *scene, int slot, char *folder); 
 static void enemies_load_scene(DWORD number, void *callback);                       /* (enemies, scenes) */
 static void enemies_game_scene(void);                                               /* (enemies, scenes) */
 static void surrounded_new_load(void);                                              /* (surrounded) */
+static void far_apply(int want, const char *where);                                 /* (far plane) */
+static void stage_release(const char *why);                                         /* (stage model) */
+static void stage_move_release(const char *why);                                    /* (stage section) */
+static void stage_move_placed(void);                                                /* (stage section) */
 static unsigned sur_reach_begin(const int *action);                                 /* (surrounded, stage 2: the reach rule) */
 static void sur_reach_trim(int *action, unsigned out, unsigned asked, const char *where);
 static void sur_reach_end(int *action, unsigned out);
@@ -11778,6 +12034,10 @@ static void __cdecl load_scene_hook(DWORD number, void *callback)
     follow_esui_battle_avatars();       /* a mod's patches may arrive after the kernel was loaded */
     if (!*(const DWORD *)0x00c069bcu)
         surrounded_new_load();          /* (surrounded) a load begins (the loader's state 0): nothing armed until written */
+    if (!*(const DWORD *)0x00c069bcu)
+        stage_release("a new battle loads");    /* (stage model) a served stage given back before any other is set up */
+    if (!*(const DWORD *)0x00c069bcu && !*(const DWORD *)0x009adfd8u)
+        stage_move_release("a new battle loads");   /* (stage section) not at a `next`'s load (its 3D data made): the move goes on */
     if (enemies_live && number >= 1024 && number <= 16383)
         enemies_load_scene(number, callback);   /* (enemies) a DLL scene: its stand-in loaded, then written over */
     else if (number >= 1020) {
@@ -12188,6 +12448,7 @@ static void install_hooks(void)
         log_line("loose files on: %lu file(s) indexed under %s; each replaces the archive file of the same name",
                  loose_count, override_dir);
     }
+    battle_frame_factor_read("start-up");   /* (battle frame factor) the marker, before the pool models' files are served */
     if (enemies_on)
         enemies_start(&ok, &total);     /* (enemies) the pool models' files; nothing at all when off */
     log_line("hooks installed: %d of %d", ok, total);
@@ -12464,6 +12725,8 @@ static void apply_flag_changes(const struct spell_draft *draft, BYTE *record)
 /* EFFECT COPIES PURE BEGIN */
 #define EFFECT_BASE_COUNT       0x36         /* magic effects 0x00-0x35: the ones a copy may be of */
 #define EFFECT_COPY_FIRST       0x100        /* the DLL's own effect numbers start here */
+#define EFFECT_LIMIT_COUNT      0x50         /* (limit effects) `limit = N`: the game's limit effects 0x00-0x4f, the 80 entries of
+                                                its set-up table 008fe860 (= LIMIT_EFFECT_ENTRIES) */
 #define EFFECT_COPY_LAST        0xffff
 #define EFFECT_COPY_MAX         1024         /* [effect N] sections, copies and native effects together (64 before stage 3a, 256
                                                 before stage 6b; the refusal text says 1024) */
@@ -12481,6 +12744,54 @@ static void apply_flag_changes(const struct spell_draft *draft, BYTE *record)
 
 typedef void (*effect_problem_fn)(int line, const char *what);
 
+/* (persistent effect; tools/work/persistent_effect/arena/KEYS.md) A native effect's LOOP, from keys of its [effect N]
+   section: after the cast (the script's `length` frames, played and waited for as always) ONE task of this DLL in the
+   list of 60, which nothing waits on, plays the script's frames past the cast: `loop_intro` once, then `loop` again and
+   again, drawing only (sprite and model lines; sound lines on the first pass unless loop_sound = yes), until the
+   battle's end or an end the keys give. The keys are read here; the script's own rules for its loop part
+   (nfx_loop_check) when it is read. Keys that do not read, or a loop part that breaks a rule, leave the loop OFF: the
+   effect plays as a cast only and stays usable (an older DLL refuses the whole section: "unknown key"). */
+#define NFX_LOOP_FRAME_MAX      599          /* the loop's frames are the script's own: 0 to 599 (NFX_LENGTH_MAX - 1) */
+#define NFX_LOOP_ENDS_KO        0x01         /* loop_ends = ko: the caster's shown KO (as a state's ends) */
+#define NFX_LOOP_ENDS_FROG      0x02         /* loop_ends = frog */
+#define NFX_LOOP_HIDE_SUMMON    0x01         /* loop_hide = summon: not drawn while a summon is shown */
+#define NFX_LOOP_HIDE_LIMIT     0x02         /* loop_hide = limit */
+#define NFX_LOOP_AT_HELD        0            /* loop_at = held: at=centre stays at the cast's targets' centre */
+#define NFX_LOOP_AT_ARENA       1            /* loop_at = arena: the world's origin (+ loop_x, loop_z) */
+#define NFX_LOOP_AT_ACTORS      2            /* loop_at = actors: the middle of every actor with a model at the hand-over */
+#define NFX_LOOP_FOR_MAX        32767
+#define NFX_LOOP_GLIDE_MAX      600
+#define NFX_LOOP_PLACE_MAX      32767        /* loop_x, loop_z; loop_wall's radii; loop_wall_fade */
+#define NFX_LOOP_ONE            4096         /* a fade or an easing of 1 */
+#define NFX_LK_LOOP             0x0001       /* `given`: the keys a section names (each once) */
+#define NFX_LK_INTRO            0x0002
+#define NFX_LK_ENDS             0x0004
+#define NFX_LK_FOR              0x0008
+#define NFX_LK_HIDE             0x0010
+#define NFX_LK_SOUND            0x0020
+#define NFX_LK_AT               0x0040
+#define NFX_LK_X                0x0080
+#define NFX_LK_Z                0x0100
+#define NFX_LK_GLIDE            0x0200
+#define NFX_LK_WALL             0x0400
+#define NFX_LK_WALL_FADE        0x0800
+#define NFX_LK_OUTSIDE          0x1000
+struct nfx_loop_keys {
+    int given;                          /* NFX_LK_* (0: no loop key: the effect is as it always was) */
+    int bad;                            /* a key did not read (said on its line) */
+    int on;                             /* the loop plays (nfx_loop_settle; nfx_loop_check may turn it off) */
+    int line;                           /* the section's first loop key's line */
+    int a, b;                           /* loop = A-B */
+    int intro_a, intro_b;               /* loop_intro = I-J; -1 none */
+    int ends, hide, sound, at, outside; /* NFX_LOOP_ENDS_*, NFX_LOOP_HIDE_*, loop_sound yes 1, NFX_LOOP_AT_*, hide 1 */
+    int x, z, glide, frames;            /* loop_x, loop_z, loop_glide, loop_for (0 no limit) */
+    int wall1, wall2, fade;             /* loop_wall = R1-R2, loop_wall_fade = D (0 off) */
+};
+static void nfx_loop_reset(struct nfx_loop_keys *k);
+static int nfx_loop_key(struct nfx_loop_keys *k, const char *key, const char *key_end, char *value, char *end, int line,
+                        const char **why);
+static void nfx_loop_settle(struct nfx_loop_keys *k, int native, effect_problem_fn problem);
+
 struct effect_rename { char from[EFFECT_NAME_MAX], to[EFFECT_NAME_MAX]; int line; };
 struct effect_copy {
     DWORD number;                       /* 0x100 and up */
@@ -12495,6 +12806,11 @@ struct effect_copy {
     int play_base;                      /* the record's effect while it plays (`base =`); -1 = not given */
     int play_base_line;
     char play_name[EFFECT_NAME_MAX];    /* play = NAME: SpellExtConfig\effects\NAME.txt */
+    struct nfx_loop_keys loop;          /* (persistent effect) a native effect's loop keys */
+    /* (limit effects) `limit = N`: the game's limit effect N played at a spell's effect step in place of the game's magic
+       routine (limit_effect_step); the record holds `base` (play_base) as a native effect's does. Not a copy, not native */
+    int limit;                          /* 0x00-0x4f; -1 = not given */
+    int limit_line;
 };
 #define EFFECT_PLAY_SCRIPT      1            /* play = NAME: the script effects\NAME.txt (stage 1) */
 /* What a magic effect's loader loads, read from its code by effect_template_read */
@@ -12695,6 +13011,7 @@ static int effect_file_parse(char *text, DWORD size, struct effect_copy *copies,
     char *line, *end, *file_end = text + size;
     int line_number = 0, count = 0, i, skipping = 0;
     struct effect_copy *c = NULL;
+    const char *loop_why = NULL;
 
     for (line = text; line < file_end; line = end + 1) {
         char *start = line, *stop, *equals, *key_end, *value, *p;
@@ -12759,6 +13076,9 @@ static int effect_file_parse(char *text, DWORD size, struct effect_copy *copies,
             c->play_base = -1;
             c->play_base_line = 0;
             c->play_name[0] = 0;
+            nfx_loop_reset(&c->loop);   /* (persistent effect) */
+            c->limit = -1;              /* (limit effects) */
+            c->limit_line = 0;
             continue;
         }
         if (!c) {
@@ -12851,13 +13171,39 @@ static int effect_file_parse(char *text, DWORD size, struct effect_copy *copies,
                 c->play_base = (int)n;
                 c->play_base_line = line_number;
             }
+        } else if (word_is(start, key_end, "limit")) {
+            /* (limit effects) a game limit's effect, by its number in the game's table */
+            p = value;
+            if (!parse_number(&p, stop, &n) || p != stop || n >= EFFECT_LIMIT_COUNT) {
+                problem(line_number, "limit is a game limit's effect number, 0x00 to 0x4f (the 80 entries of the game's table 008fe860)");
+                c->usable = 0;
+            } else if (c->limit >= 0 && c->limit != (int)n) {
+                problem(line_number, "limit is given twice, with two different effects");
+                c->usable = 0;
+            } else {
+                c->limit = (int)n;
+                c->limit_line = line_number;
+            }
+        } else if ((n = (DWORD)nfx_loop_key(&c->loop, start, key_end, value, stop, line_number, &loop_why)) != 0) {
+            /* (persistent effect) a loop key: one that does not read turns the loop off, never the effect */
+            if (n == 2)
+                problem(line_number, loop_why);
         } else {
             problem(line_number, "unknown key (a copy has copy = and file = lines; a native effect play = and base =)");
             c->usable = 0;
         }
     }
     for (i = 0; i < count; i++) {
-        if (copies[i].play) {
+        if (copies[i].limit >= 0) {
+            /* (limit effects) the game's routine plays: nothing is copied or scripted; the record holds `base`, a file-less
+               magic effect as a native effect's (Cure's 0x00 when not given), so the spell's `e8` loads and frees nothing */
+            if (copies[i].play || copies[i].base >= 0 || copies[i].rename_count) {
+                problem(copies[i].limit_line, "a game limit's effect (limit =) takes no play =, copy = or file = lines");
+                copies[i].usable = 0;
+            }
+            if (copies[i].play_base < 0)
+                copies[i].play_base = 0x00;
+        } else if (copies[i].play) {
             if (copies[i].base >= 0 || copies[i].rename_count) {
                 problem(copies[i].line, "a native effect (play =) takes no copy = or file = lines: it is not a copy of the game's");
                 copies[i].usable = 0;
@@ -12865,7 +13211,7 @@ static int effect_file_parse(char *text, DWORD size, struct effect_copy *copies,
             if (copies[i].play_base < 0)
                 copies[i].play_base = 0x00;     /* Cure's number: it loads no files at the preload */
         } else if (copies[i].play_base >= 0) {
-            problem(copies[i].play_base_line, "base = is for a native effect (play =); a copy names its effect with copy =");
+            problem(copies[i].play_base_line, "base = is for a native effect (play =) or a game limit's effect (limit =); a copy names its effect with copy =");
             copies[i].usable = 0;
         } else if (copies[i].base < 0) {
             problem(copies[i].line, "this copy has no copy = line (which effect it copies)");
@@ -12874,6 +13220,7 @@ static int effect_file_parse(char *text, DWORD size, struct effect_copy *copies,
             problem(copies[i].line, "this copy renames no file: it would be the effect itself (give file = FROM:TO lines)");
             copies[i].usable = 0;
         }
+        nfx_loop_settle(&copies[i].loop, copies[i].play, problem);     /* (persistent effect) */
     }
     return count;
 }
@@ -12944,6 +13291,98 @@ static int effect_native_choice(int single, int several, int is_several, int num
     if (c < 0 || c >= count || !copies[c].usable || !copies[c].play || copies[c].play_base != number)
         return -1;
     return c;
+}
+
+/* (limit effects) The same for a game limit's effect (`limit =`): the index of the one the action plays for the record's
+   effect number (its `base`), -1 none. */
+static int effect_limit_choice(int single, int several, int is_several, int number, const struct effect_copy *copies, int count)
+{
+    int c = is_several ? several : single;
+
+    if (c < 0 || c >= count || !copies[c].usable || copies[c].limit < 0 || copies[c].play_base != number)
+        return -1;
+    return c;
+}
+
+/* (limit effects) What limit_effect_step relies on in the game's code, read before each use (the bytes of ff7_en.exe 659dc2b8):
+   FUN_00427c22's start (its preamble, which the step does in its place), FUN_00429322's (it calls it), and the one read of
+   the set-up table in 00427c22's limit case, 0042802d `mov edx, [ecx*4 + TABLE]`, whose operand (00428030) is the game's
+   008fe860 or this DLL's copy (move_limit_tables). A routine known by its bytes must have them; any other must load its
+   files itself (the game's limit preload, `e8` of a limit, would; a spell's `e8` loads only its record's effect's). */
+#define EFFECT_LIMIT_STEP       0x00427c22u  /* FUN_00427c22 (= FN_START_EFFECT) */
+#define EFFECT_LIMIT_DESTROY    0x00429322u  /* FUN_00429322(): frees every group with keep 0 */
+#define EFFECT_LIMIT_LOOKUP     0x0042802du  /* 00427c22's limit case: mov edx, [ecx*4 + 008fe860] */
+#define EFFECT_LIMIT_SETUP      0x008fe860u  /* the game's set-up table (= ADDR_LIMIT_EFFECT_SETUP) */
+#define EFFECT_LIMIT_INDEX      0x007c19a8u  /* a short per limit effect: its loader's index (= ADDR_LIMIT_EFFECT_INDEX) */
+#define EFFECT_LIMIT_LOADERS    0x007c1208u  /* the loaders by index (= ADDR_EFFECT_LOADERS) */
+#define EFFECT_LIMIT_LOADER_MAX 358          /* (= EFFECT_LOADER_COUNT) */
+#define EFFECT_LIMIT_ROUTINE_LOOK 0x1c       /* bytes of a known routine compared */
+static const BYTE effect_limit_step_bytes[32] = {
+    0x55,0x8b,0xec,0x81,0xec,0xa8,0x01,0x00,0x00,0x83,0x3d,0xd8,0x10,0x7c,0x00,0x00,   /* ... cmp dword [007c10d8], 0 */
+    0x74,0x02,0xeb,0x05,0xe8,0xe7,0x16,0x00,0x00,0xc6,0x05,0xbc,0x23,0xbf,0x00,0x00,   /* call 00429322; mov byte [00bf23bc], 0 */
+};
+static const BYTE effect_limit_destroy_bytes[10] = { 0x55,0x8b,0xec,0x83,0x3d,0xd8,0xdf,0x9a,0x00,0x00 };
+static const BYTE effect_limit_lookup_bytes[3] = { 0x8b,0x14,0x8d };
+static const struct { int number; DWORD routine; BYTE code[EFFECT_LIMIT_ROUTINE_LOOK]; } effect_limit_known[] = {
+    /* 0x3b, FUN_004c4010: FUN_004c3f80() (loads its group if its handle is 0), FUN_004c402c(mask, actor) (its tasks), return 0 */
+    { 0x3b, 0x004c4010u, { 0x55,0x8b,0xec,0xe8,0x68,0xff,0xff,0xff,0x8b,0x45,0x0c,0x50,0x8b,0x4d,0x08,0x51,
+                           0xe8,0x07,0x00,0x00,0x00,0x83,0xc4,0x08,0x33,0xc0,0x5d,0xc3 } },
+};
+
+/* `size` bytes of the game's memory (or of this DLL's copy of the table) at an address, or NULL where none may be read. */
+typedef const BYTE *(*effect_read_fn)(DWORD address, DWORD size);
+
+static int effect_limit_same(const BYTE *at, const BYTE *bytes, int count)
+{
+    int i;
+
+    for (i = 0; at && i < count; i++)
+        if (at[i] != bytes[i])
+            return 0;
+    return at != NULL;
+}
+
+/* NULL if game limit effect n may play at a spell's effect step, and *routine its set-up routine (the entry of the table
+   0042802d reads now: the game's, or `own_table`, this DLL's copy); otherwise why not. */
+static const char *effect_limit_why(int n, effect_code_fn code_at, effect_read_fn read, DWORD own_table, DWORD *routine)
+{
+    const BYTE *p;
+    DWORD table, loader;
+    int index;
+    unsigned k;
+
+    *routine = 0;
+    if (n < 0 || n >= EFFECT_LIMIT_COUNT)
+        return "it is not one of the game's limit effects 0x00-0x4f";
+    if (!effect_limit_same(read(EFFECT_LIMIT_STEP, sizeof effect_limit_step_bytes), effect_limit_step_bytes, sizeof effect_limit_step_bytes))
+        return "FUN_00427c22 does not start as the game has it (another DLL changed it?)";
+    if (!effect_limit_same(read(EFFECT_LIMIT_DESTROY, sizeof effect_limit_destroy_bytes), effect_limit_destroy_bytes, sizeof effect_limit_destroy_bytes))
+        return "FUN_00429322 does not start as the game has it (another DLL changed it?)";
+    p = read(EFFECT_LIMIT_LOOKUP, 7);
+    if (!effect_limit_same(p, effect_limit_lookup_bytes, sizeof effect_limit_lookup_bytes))
+        return "the limit case's table read at 0042802d is not the game's instruction";
+    table = effect_dword(p + 3);
+    if (table != EFFECT_LIMIT_SETUP && (!own_table || table != own_table))
+        return "the limit case reads a set-up table that is neither the game's nor this DLL's (another DLL moved it?)";
+    if ((p = read(table + (DWORD)n * 4, 4)) == NULL || (*routine = effect_dword(p)) == 0)
+        return "the game's table has no routine for it";
+    if (!code_at(*routine))
+        return "its routine is not in the game's code";
+    if (n == 0x02)
+        return "its routine reads a byte the limit's own effect step sets for it (00bfb2a0), which a spell's does not";
+    for (k = 0; k < sizeof effect_limit_known / sizeof effect_limit_known[0]; k++)
+        if (effect_limit_known[k].number == n &&
+            (*routine != effect_limit_known[k].routine || !effect_limit_same(code_at(*routine), effect_limit_known[k].code, EFFECT_LIMIT_ROUTINE_LOOK)))
+            return "its routine is not the game's (its address or its first bytes differ: another DLL changed it?)";
+    if ((p = read(EFFECT_LIMIT_INDEX + (DWORD)n * 2, 2)) == NULL)
+        return "the game's loader index table cannot be read";
+    index = (short)(p[0] | p[1] << 8);
+    if (index < 0 || index >= EFFECT_LIMIT_LOADER_MAX || (p = read(EFFECT_LIMIT_LOADERS + (DWORD)index * 4, 4)) == NULL)
+        return "its loader index is outside the game's loader table";
+    loader = effect_dword(p);
+    if (loader && !effect_run_calls(code_at, *routine, loader))
+        return "its routine does not load its files itself (the limit's own `e8` preloads them; a spell's cannot)";
+    return NULL;
 }
 
 /* A native effect's clock, one call of its task at a time (see "Native effects"). The task is called once per
@@ -14528,6 +14967,369 @@ static const char *nfx_text_with(const char *form, unsigned a, unsigned b, unsig
     return text;
 }
 
+/* ---- (persistent effect) the loop keys and the loop part's rules (KEYS.md sections 2 and 3) ---- */
+static void nfx_loop_reset(struct nfx_loop_keys *k)
+{
+    BYTE *z = (BYTE *)k;
+    unsigned i;
+
+    for (i = 0; i < sizeof *k; i++)
+        z[i] = 0;
+    k->intro_a = k->intro_b = -1;
+    k->hide = NFX_LOOP_HIDE_SUMMON;     /* the defaults: battle's end only, hidden for summons, sounds once, at=centre held */
+}
+
+/* [p, end) as FIRST-LAST, two whole numbers (decimal or 0x), FIRST <= LAST: 1 and *a, *b; else 0. */
+static int nfx_loop_range(const char *p, const char *end, int *a, int *b)
+{
+    const char *dash = p;
+    char *q;
+    DWORD n = 0, m = 0;
+
+    while (dash < end && *dash != '-')
+        dash++;
+    q = (char *)p;
+    if (dash == end || !parse_number(&q, dash, &n) || q != dash)
+        return 0;
+    q = (char *)dash + 1;
+    if (!parse_number(&q, end, &m) || q != end || n > 0x7fffu || m > 0x7fffu || m < n)
+        return 0;
+    *a = (int)n, *b = (int)m;
+    return 1;
+}
+
+/* A loop key of an [effect N] section (key [key, key_end), value [value, end)): 0 if `key` is none of them (the reader's
+   "unknown key" then); 1 read; 2 not read (*why: the problem, said on its line; the loop is then off, the effect usable). */
+static int nfx_loop_key(struct nfx_loop_keys *k, const char *key, const char *key_end, char *value, char *end, int line,
+                        const char **why)
+{
+    static const struct { const char *name; int bit; } keys[] = {
+        { "loop", NFX_LK_LOOP }, { "loop_intro", NFX_LK_INTRO }, { "loop_ends", NFX_LK_ENDS }, { "loop_for", NFX_LK_FOR },
+        { "loop_hide", NFX_LK_HIDE }, { "loop_sound", NFX_LK_SOUND }, { "loop_at", NFX_LK_AT }, { "loop_x", NFX_LK_X },
+        { "loop_z", NFX_LK_Z }, { "loop_glide", NFX_LK_GLIDE }, { "loop_wall", NFX_LK_WALL },
+        { "loop_wall_fade", NFX_LK_WALL_FADE }, { "loop_outside", NFX_LK_OUTSIDE },
+    };
+    int i, bit = 0, a = 0, b = 0, words = 0;
+    char *p, *word_end;
+
+    for (i = 0; i < (int)(sizeof keys / sizeof keys[0]) && !bit; i++)
+        if (word_is(key, key_end, keys[i].name))
+            bit = keys[i].bit;
+    if (!bit)
+        return 0;
+    if (!k->given)
+        k->line = line;
+    *why = NULL;
+    if (k->given & bit)
+        *why = "this loop key is given twice in the section: the loop is off (the effect plays as a cast only)";
+    k->given |= bit;
+    if (*why)
+        ;
+    else if (bit == NFX_LK_LOOP) {
+        if (!nfx_loop_range(value, end, &a, &b) || a == b || b > NFX_LOOP_FRAME_MAX)
+            *why = "loop is FIRST-LAST, the script's frames played again and again after the cast (0 <= FIRST < LAST <= 599): the loop is off (the effect plays as a cast only)";
+        else
+            k->a = a, k->b = b;
+    } else if (bit == NFX_LK_INTRO) {
+        if (!nfx_loop_range(value, end, &a, &b) || b > NFX_LOOP_FRAME_MAX)
+            *why = "loop_intro is FIRST-LAST, the frames played once before the loop (from the length on, LAST the loop's FIRST - 1): the loop is off (the effect plays as a cast only)";
+        else
+            k->intro_a = a, k->intro_b = b;
+    } else if (bit == NFX_LK_ENDS || bit == NFX_LK_HIDE) {
+        int none = 0;
+
+        for (p = value; (word_end = next_word(&p, end)) != NULL; p = word_end, words++) {
+            if (bit == NFX_LK_ENDS && word_is(p, word_end, "battle"))
+                ;                       /* always on: it may be written */
+            else if (bit == NFX_LK_ENDS && word_is(p, word_end, "ko"))
+                k->ends |= NFX_LOOP_ENDS_KO;
+            else if (bit == NFX_LK_ENDS && word_is(p, word_end, "frog"))
+                k->ends |= NFX_LOOP_ENDS_FROG;
+            else if (bit == NFX_LK_HIDE && word_is(p, word_end, "summon"))
+                a |= NFX_LOOP_HIDE_SUMMON;
+            else if (bit == NFX_LK_HIDE && word_is(p, word_end, "limit"))
+                a |= NFX_LOOP_HIDE_LIMIT;
+            else if (bit == NFX_LK_HIDE && word_is(p, word_end, "none"))
+                none = 1;
+            else {
+                *why = bit == NFX_LK_ENDS ? "loop_ends is words: battle (always), ko, frog (the caster's shown KO or frog): the loop is off (the effect plays as a cast only)"
+                                          : "loop_hide is words: summon, limit, or none: the loop is off (the effect plays as a cast only)";
+                break;
+            }
+        }
+        if (!*why && (!words || (none && (a || words > 1))))
+            *why = bit == NFX_LK_ENDS ? "loop_ends is words: battle (always), ko, frog (the caster's shown KO or frog): the loop is off (the effect plays as a cast only)"
+                                      : "loop_hide is words: summon, limit, or none alone: the loop is off (the effect plays as a cast only)";
+        if (!*why && bit == NFX_LK_HIDE)
+            k->hide = a;
+    } else if (bit == NFX_LK_SOUND || bit == NFX_LK_AT || bit == NFX_LK_OUTSIDE) {
+        static const char *const names[3][3] = { { "no", "yes", NULL }, { "held", "arena", "actors" }, { "show", "hide", NULL } };
+        int set = bit == NFX_LK_SOUND ? 0 : bit == NFX_LK_AT ? 1 : 2;
+
+        for (a = 0; a < 3 && !(names[set][a] && word_is(value, end, names[set][a])); a++)
+            ;
+        if (a == 3)
+            *why = set == 0 ? "loop_sound is no (the loop's sounds on its first pass only) or yes (on every pass): the loop is off (the effect plays as a cast only)"
+                 : set == 1 ? "loop_at is held (the cast's targets' centre), arena (the world's origin) or actors (the middle of every actor): the loop is off (the effect plays as a cast only)"
+                            : "loop_outside is show or hide (not drawn while the camera is outside the wall): the loop is off (the effect plays as a cast only)";
+        else if (set == 0)
+            k->sound = a;
+        else if (set == 1)
+            k->at = a;
+        else
+            k->outside = a;
+    } else if (bit == NFX_LK_WALL) {
+        if (!nfx_loop_range(value, end, &a, &b) || a < 1 || b > NFX_LOOP_PLACE_MAX)
+            *why = "loop_wall is R1-R2, the wall's floor distance from the loop's anchor, least to most (1 <= R1 <= R2 <= 32767): the loop is off (the effect plays as a cast only)";
+        else
+            k->wall1 = a, k->wall2 = b;
+    } else {
+        /* loop_for, loop_x, loop_z, loop_glide, loop_wall_fade: one whole number */
+        int low = bit == NFX_LK_X || bit == NFX_LK_Z ? -NFX_LOOP_PLACE_MAX : 0;
+        int high = bit == NFX_LK_FOR ? NFX_LOOP_FOR_MAX : bit == NFX_LK_GLIDE ? NFX_LOOP_GLIDE_MAX : NFX_LOOP_PLACE_MAX;
+
+        if (!nfx_int(value, end, &a) || a < low || a > high)
+            *why = bit == NFX_LK_FOR ? "loop_for is the frames the loop plays at most, 0 (no limit) to 32767: the loop is off (the effect plays as a cast only)"
+                 : bit == NFX_LK_GLIDE ? "loop_glide is frames, 0 to 600: the loop is off (the effect plays as a cast only)"
+                 : bit == NFX_LK_WALL_FADE ? "loop_wall_fade is battle units, 0 (off) to 32767: the loop is off (the effect plays as a cast only)"
+                                           : "loop_x and loop_z are battle units, -32767 to 32767: the loop is off (the effect plays as a cast only)";
+        else if (bit == NFX_LK_FOR)
+            k->frames = a;
+        else if (bit == NFX_LK_X)
+            k->x = a;
+        else if (bit == NFX_LK_Z)
+            k->z = a;
+        else if (bit == NFX_LK_GLIDE)
+            k->glide = a;
+        else
+            k->fade = a;
+    }
+    if (*why)
+        k->bad = 1;
+    return *why ? 2 : 1;
+}
+
+/* At the end of the effects file: whether section k's loop plays (`native`: the section is a native effect, play =). Each
+   rule that fails is said once on the section's first loop key, and the loop is off (the effect is as it would be with no
+   loop key). The script's own rules come when it is read (nfx_loop_check). */
+static void nfx_loop_settle(struct nfx_loop_keys *k, int native, effect_problem_fn problem)
+{
+    k->on = 0;
+    if (!k->given || k->bad)
+        return;                         /* (a key that did not read said so on its line) */
+    if (!native)
+        problem(k->line, "loop keys are for a native effect (play =): they are not used here");
+    else if (!(k->given & NFX_LK_LOOP))
+        problem(k->line, "loop keys without loop = FIRST-LAST (the frames played again and again): the loop is off (the effect plays as a cast only)");
+    else if ((k->given & NFX_LK_INTRO) && k->intro_b != k->a - 1)
+        problem(k->line, "loop_intro must end on the frame before the loop's first (loop_intro = I-J with J = FIRST - 1): the loop is off (the effect plays as a cast only)");
+    else if ((k->fade || k->outside) && !(k->given & NFX_LK_WALL))
+        problem(k->line, "loop_wall_fade and loop_outside = hide need loop_wall = R1-R2 (the wall's band): the loop is off (the effect plays as a cast only)");
+    else {
+        k->on = 1;
+        if (k->at == NFX_LOOP_AT_HELD && (k->given & (NFX_LK_GLIDE | NFX_LK_X | NFX_LK_Z)))
+            problem(k->line, "(note) loop_glide, loop_x and loop_z move at=centre to loop_at's place: with loop_at = held they are not used");
+    }
+}
+
+/* Whether [from, to] and [a, b] share a frame. */
+static int nfx_loop_meets(int from, int to, int a, int b)
+{
+    return a >= 0 && from <= b && to >= a;
+}
+
+/* The loop part's rules (KEYS.md section 3, rules 1-6), for script s of `length` frames (`length_given`: a length line),
+   its `count` lines in items (frames as given; a line with no frame is the cast's: 0 to length - 1, a hit at a third).
+   1 if they hold; else 0, said once on the line that breaks one (a note: the script stays usable, its loop is off). */
+static int nfx_loop_check(const struct nfx_item *items, int count, const struct nfx_script *s, const struct nfx_loop_keys *k,
+                          int length_given, int length_line, nfx_say_fn say)
+{
+    int i, hits = 0, length = s->length, ia = k->intro_a, ib = k->intro_b;
+
+    if (!length_given) {
+        say(0, 0, "the loop keys need the script's length = line (the cast's frames; the loop part comes after them): the loop is off (the effect plays as a cast only)");
+        return 0;
+    }
+    if (ia >= 0 && ia < length) {
+        say(length_line, 0, nfx_text_with("loop_intro starts at frame #, before the cast's length #: the intro comes after the cast: the loop is off (the effect plays as a cast only)",
+                                          (unsigned)ia, (unsigned)length, 0));
+        return 0;
+    }
+    for (i = 0; i < count; i++) {
+        const struct nfx_item *it = &items[i];
+        int from = it->from, to = it->to, in;
+
+        if (it->flags & NFX_F_NOFRAME) {
+            from = it->kind == NFX_HIT ? length / 3 : 0;
+            to = it->kind == NFX_SPRITE || it->kind == NFX_MODEL || it->kind == NFX_STAGE || it->kind == NFX_FILL ||
+                 it->kind == NFX_SHAKE || it->kind == NFX_ACTORS ? length - 1 : from;
+        }
+        hits += it->kind == NFX_HIT;
+        in = nfx_loop_meets(from, to, ia, ib) || nfx_loop_meets(from, to, k->a, k->b);
+        if (in && it->kind != NFX_SPRITE && it->kind != NFX_MODEL && it->kind != NFX_SOUND) {
+            say(it->line, 0, "a loop part (loop_intro, loop) draws only: sprite, model and sound lines; this hit, stage, fill, flash, shake or actors line is in it: the loop is off (the effect plays as a cast only)");
+            return 0;
+        }
+        if ((from < length && to >= length) || (ia >= 0 && from < ia && to >= ia) || (from < k->a && to >= k->a) ||
+            (from <= k->b && to > k->b)) {
+            say(it->line, 0, "this line runs across the cast's end, the intro's first frame, or the loop's first or last frame: each line belongs wholly to one part: the loop is off (the effect plays as a cast only)");
+            return 0;
+        }
+        if (in && it->each) {
+            say(it->line, 0, "each= staggers the targets of a cast: not in a loop part: the loop is off (the effect plays as a cast only)");
+            return 0;
+        }
+        if (to >= length && !(ia >= 0 && from >= ia && to <= ib) && !(from >= k->a && to <= k->b)) {
+            say(it->line, 0, "this line is past the cast's length but in neither loop_intro nor loop: the loop is off (the effect plays as a cast only)");
+            return 0;
+        }
+        if (in && (k->fade || k->outside) && (it->kind == NFX_SPRITE || it->kind == NFX_MODEL) && it->entry < s->file_count &&
+            s->file[it->entry].blend != NFX_BLEND_ADD && s->file[it->entry].blend != NFX_BLEND_QUARTER) {
+            say(it->line, 0, "loop_wall_fade and loop_outside = hide fade the loop part out: every file it draws must be blend=add or quarter (a solid or averaged one would darken, not go): the loop is off (the effect plays as a cast only)");
+            return 0;
+        }
+    }
+    if (!hits && (nfx_loop_meets(length / 3, length / 3, ia, ib) || nfx_loop_meets(length / 3, length / 3, k->a, k->b))) {
+        say(length_line, 0, nfx_text_with("the script has no hit line, so its targets are hit at frame # (a third of its length), which is in the loop: give a hit line in the cast: the loop is off (the effect plays as a cast only)",
+                                          (unsigned)(length / 3), 0, 0));
+        return 0;
+    }
+    return 1;
+}
+
+/* ---- (persistent effect) the loop's run, the arithmetic only (the task: "Native effects, the loop") ---- */
+struct nfx_loop_clock { int frame, played, passes; };  /* the frame to show; frames advanced since the hand-over; passes done */
+
+static void nfx_loop_clock_start(const struct nfx_loop_keys *k, struct nfx_loop_clock *c)
+{
+    c->frame = k->intro_a >= 0 ? k->intro_a : k->a;
+    c->played = c->passes = 0;
+}
+
+/* An advancing call has shown c->frame: the next frame (past the loop's last, its first again). 1 when loop_for's frames
+   are played (the loop ends). */
+static int nfx_loop_advance(const struct nfx_loop_keys *k, struct nfx_loop_clock *c)
+{
+    c->played++;
+    if (++c->frame > k->b) {
+        c->frame = k->a;
+        c->passes++;
+    }
+    return k->frames > 0 && c->played >= k->frames;
+}
+
+/* Whether the sound lines of frame f play now (a script of `length` frames): the intro's always (it plays once), the loop's
+   on its first pass, or on every pass with loop_sound = yes. A loop of the cast's own frames (FIRST below the length) had
+   its first pass in the cast: its sounds again only with loop_sound = yes. */
+static int nfx_loop_sounds_due(const struct nfx_loop_keys *k, const struct nfx_loop_clock *c, int f, int length)
+{
+    if (k->intro_a >= 0 && f >= k->intro_a && f <= k->intro_b)
+        return 1;
+    return k->sound || (c->passes == 0 && k->a >= length);
+}
+
+/* NFX_LOOP_ONE x smoothstep(n / d), n held to 0..d (d > 0), in 4096ths: the bake's easing x x (3 - 2 x). */
+static int nfx_loop_smooth(int n, int d)
+{
+    int x;
+
+    if (d <= 0 || n >= d)
+        return NFX_LOOP_ONE;
+    if (n <= 0)
+        return 0;
+    x = (int)(((unsigned)n * NFX_LOOP_ONE + (unsigned)d / 2) / (unsigned)d);  /* (n < d <= 32767: within 32 bits; rounded) */
+    /* x x (3 - 2 x) in 4096ths, rounded once (so it never falls as n rises): 64-bit products and a shift, no division */
+    return (int)(((unsigned long long)x * (unsigned)x * (unsigned)(3 * NFX_LOOP_ONE - 2 * x) + (1ull << 23)) >> 24);
+}
+
+/* loop_glide: the at=centre place's coordinate on the loop task's frame g (0 its first) of a glide of `frames` from
+   `from` to `to`: from + (to - from) x smoothstep((g + 1) / frames); `to` from frame frames - 1 on, or with no glide. */
+static int nfx_loop_glide(int from, int to, int g, int frames)
+{
+    if (frames <= 0 || g + 1 >= frames)
+        return to;
+    return from + (to - from) * nfx_loop_smooth(g + 1, frames) / NFX_LOOP_ONE;
+}
+
+/* The floor distance of (dx, dz), whole units (rounded down). */
+static int nfx_loop_distance(int dx, int dz)
+{
+    unsigned long long v, r = 0, bit = 1ull << 40;
+    unsigned ax = (unsigned)(dx < 0 ? -dx : dx), az = (unsigned)(dz < 0 ? -dz : dz);
+
+    v = (unsigned long long)ax * ax + (unsigned long long)az * az;     /* (shifts and adds only: no library call) */
+    while (bit > v)
+        bit >>= 2;
+    while (bit) {
+        if (v >= r + bit) {
+            v -= r + bit;
+            r = (r >> 1) + bit;
+        } else
+            r >>= 1;
+        bit >>= 2;
+    }
+    return (int)r;
+}
+
+/* loop_wall_fade / loop_outside: the loop part's brightness factor (NFX_LOOP_ONE = as drawn, 0 = not drawn) for the camera
+   eye at floor distance d from the anchor (KEYS.md: 1 up to R1 - D; smoothstep((R1 - d) / D) up to R1; 0 from R1 to R2;
+   smoothstep((d - R2) / D) up to R2 + D; 1 beyond, or 0 with loop_outside = hide from R2 on). No loop_wall: always 1. */
+static int nfx_loop_fade(int d, const struct nfx_loop_keys *k)
+{
+    if (!(k->given & NFX_LK_WALL))
+        return NFX_LOOP_ONE;
+    if (k->outside && d >= k->wall2)
+        return 0;
+    if (k->fade <= 0 || d <= k->wall1 - k->fade)
+        return NFX_LOOP_ONE;
+    if (d < k->wall1)
+        return nfx_loop_smooth(k->wall1 - d, k->fade);
+    if (d <= k->wall2)
+        return 0;
+    return nfx_loop_smooth(d - k->wall2, k->fade);
+}
+
+/* A model's fade (0-255) or a sprite's colour (FUN_005d1ffb's 0x2c | b g r, each 0-0x80) times the factor f (4096ths). */
+static int nfx_loop_fade_value(int v, int f)
+{
+    return v * f / NFX_LOOP_ONE;
+}
+
+static DWORD nfx_loop_colour(DWORD colour, int f)
+{
+    DWORD out = colour & 0xff000000u;
+    int k;
+
+    for (k = 0; k < 3; k++)
+        out |= (DWORD)nfx_loop_fade_value((int)(colour >> (8 * k) & 0xff), f) << (8 * k);
+    return out;
+}
+
+/* loop_hide = summon: a summon is "shown" from its party fade to its end: while the list of 100 holds the game's summon
+   task or this DLL's summon opening, or the list of 60 the summon's end watcher (`task`), and after that while the
+   battle's time-stop byte 00bfb2ec is set (`flag`: set by the summon 14 frames in, cleared by its watcher at the end). The
+   byte alone is not taken (some limits and enemy attacks set it too): it only holds a summon already seen. */
+static int nfx_loop_summon(int shown, int task, int flag)
+{
+    return task || (shown && flag);
+}
+
+/* Whether a loop with these `hide` words is hidden now. */
+static int nfx_loop_hidden(int hide, int summon, int limit)
+{
+    return ((hide & NFX_LOOP_HIDE_SUMMON) && summon) || ((hide & NFX_LOOP_HIDE_LIMIT) && limit);
+}
+
+/* loop_ends: why the loop ends for a caster with these shown statuses (bit 0 KO, 0x800 frog, as a state's ends); NULL not. */
+static const char *nfx_loop_end_reason(int ends, DWORD status)
+{
+    if ((ends & NFX_LOOP_ENDS_KO) && (status & 1))
+        return "the caster was knocked out (loop_ends = ko)";
+    if ((ends & NFX_LOOP_ENDS_FROG) && (status & 0x800))
+        return "the caster was turned into a frog (loop_ends = frog)";
+    return NULL;
+}
+
 /* (fx morph) Where a model line is among its file's vertex sets at its own frame `own` (from..to): 256 x the set, plus
    with tween=smooth the 256ths of the way to the next. shape=A>B steps as a sprite's page=A>B (nfx_lerp: whole sets, the
    quotient truncated toward zero); smooth: A x 256 + (B - A) x 256 x (own - from) / (to - from), truncated the same way.
@@ -14585,10 +15387,15 @@ static int nfx_morph_conflict(const struct nfx_item *items, int count, const str
     return 0;
 }
 
-static int nfx_parse(char *text, DWORD size, struct nfx_script *s, struct nfx_item *pool, int used, int capacity, nfx_say_fn say)
+/* (persistent effect) `loop`: the effect section's loop keys, or NULL (none: the reader as it always was, nfx_parse). With
+   keys whose loop is on, the lines past the length that the loop part holds are kept (nfx_loop_check judges them first,
+   and turns loop->on off when a rule fails); with keys whose loop is off, every line past the length is left out with one
+   note instead of refusing the script: the effect plays as a cast only. */
+static int nfx_parse_loop(char *text, DWORD size, struct nfx_script *s, struct nfx_item *pool, int used, int capacity, nfx_say_fn say,
+                          struct nfx_loop_keys *loop)
 {
     char *line, *end, *file_end = text + size;
-    int line_number = 0, i, length_line = 0, hits = 0, ignored;
+    int line_number = 0, i, length_line = 0, hits = 0, ignored, loop_last = -1;
 
     s->usable = 1;
     s->problems = s->notes = 0;
@@ -14722,6 +15529,28 @@ static int nfx_parse(char *text, DWORD size, struct nfx_script *s, struct nfx_it
         } else
             s->length = last + 1;
     }
+    if (s->length && loop && loop->given && s->usable) {
+        /* (persistent effect) the loop part: kept when its rules hold; else every line past the length left out */
+        if (loop->on && !nfx_loop_check(pool + used, s->count, s, loop, length_line != 0, length_line, say))
+            loop->on = 0;
+        if (loop->on)
+            loop_last = loop->b;
+        else {
+            int kept = 0, dropped = 0;
+
+            for (i = 0; i < s->count; i++)
+                if (!(pool[used + i].flags & NFX_F_NOFRAME) && pool[used + i].to >= s->length)
+                    dropped++;
+                else
+                    pool[used + kept++] = pool[used + i];
+            s->count = kept;
+            if (dropped) {
+                say(length_line, 0, nfx_text_with("# line(s) past the length (#) are not played: the loop is off, the effect plays as a cast only",
+                                                  (unsigned)dropped, (unsigned)s->length, 0));
+                s->notes++;
+            }
+        }
+    }
     if (s->length) {
         for (i = 0; i < s->count; i++) {
             struct nfx_item *it = &pool[used + i];
@@ -14731,7 +15560,7 @@ static int nfx_parse(char *text, DWORD size, struct nfx_script *s, struct nfx_it
                 it->to = it->kind == NFX_SPRITE || it->kind == NFX_MODEL || it->kind == NFX_STAGE || it->kind == NFX_FILL || it->kind == NFX_SHAKE ||
                          it->kind == NFX_ACTORS
                          ? (short)(s->length - 1) : it->from;
-            } else if (it->to >= s->length)
+            } else if (it->to >= s->length && it->to > loop_last)
                 NFX_REFUSE(it->line, "this frame is past the effect's length (frames run from 0 to length - 1)");
             if (it->kind == NFX_SPRITE) {
                 if (it->entry >= s->file_count || !s->file[it->entry].second[0])
@@ -14816,6 +15645,12 @@ static int nfx_parse(char *text, DWORD size, struct nfx_script *s, struct nfx_it
         return used;
     }
     return used + s->count;
+}
+
+/* Reads a script with no loop keys (the reader as it always was). */
+static int nfx_parse(char *text, DWORD size, struct nfx_script *s, struct nfx_item *pool, int used, int capacity, nfx_say_fn say)
+{
+    return nfx_parse_loop(text, size, s, pool, used, capacity, say, NULL);
 }
 
 /* A loaded sprite sheet (FUN_0068a195's record: +0 the .S data, page count at +4; +4 a table of 8 bytes a page,
@@ -15767,6 +16602,7 @@ static int spell_bytes_settle(struct spell_bytes_entry *lines, int count, const 
                               struct spell_bytes_note *notes, int *note_count);
 static int spell_bytes_codes_text(const struct spell_bytes_entry *e, char *out);
 static void spell_bytes_forget_log(void);
+static const char *spell_battle_mp_value(char *value, char *end, DWORD *out);   /* ("Spell battle MP") */
 static const char *state_bytes(BYTE *out, BYTE *out_length, int most, char *value, char *stop);   /* (a state's scripts, after the forms) */
 
 /* Applies one `key = value` line to the draft. Returns NULL, or what was
@@ -15930,6 +16766,18 @@ static const char *apply_key(struct spell_draft *draft, char *key, char *key_end
         if (!parse_number(&p, end, &number) || p != end || number < 1 || number > 9999999)
             return "fixed_damage must be a number from 1 to 9999999, or none";
         draft->spell.fixed_damage = number;
+        return NULL;
+    }
+    if (word_is(key, key_end, "battle_mp")) {
+        /* (battle_mp) MP at each landed hit besides the record's formula ("Spell battle MP"); a spell file key: a limit's
+           hits are its own (the limits file reaches apply_key with its record keys) */
+        const char *why;
+
+        if (!spell_file_reading)
+            return "battle_mp is a spell file key (the items file has its own): a limit has none";
+        if ((why = spell_battle_mp_value(value, end, &number)) != NULL)
+            return why;
+        draft->spell.battle_mp = (WORD)number;
         return NULL;
     }
     if (word_is(key, key_end, "party_vanishes")) {
@@ -16535,6 +17383,7 @@ static void load_spells(void)
     if (spell_count)
         log_line("first spell: ID %d, record reached through index %08lx", spells[0].id,
                  (DWORD)index_reaching(spells[0].record));
+    spell_battle_mp_report();       /* (battle_mp) the spells with the key: one line (and the hit lines' budget anew) */
 }
 
 /* ---- Effect copies --------------------------------------------------------------------------------
@@ -16605,6 +17454,7 @@ static struct effect_base {
 static struct effect_copy effect_copies[EFFECT_COPY_MAX];
 static int effect_copy_count, effect_copies_usable, effect_file_problems;
 static int effect_natives_usable;       /* usable native effects (`play =`): not counted in effect_copies_usable */
+static int effect_limits_usable;        /* (limit effects) usable game limit effects (`limit =`): in neither count */
 static LONG effect_preload_live, effect_logs;
 static DWORD effect_preload_next = FN_EFFECT_PRELOAD;
 static struct { short single, several, now; } effect_copy_cast[10];    /* copy indexes per actor, -1 none */
@@ -16630,7 +17480,7 @@ static int effect_copy_base(DWORD number)
 {
     int i = effect_copy_index(number);
 
-    return i < 0 ? -1 : effect_copies[i].play ? effect_copies[i].play_base : effect_copies[i].base;
+    return i < 0 ? -1 : effect_copies[i].play || effect_copies[i].limit >= 0 ? effect_copies[i].play_base : effect_copies[i].base;
 }
 
 /* A name in the game's data: a short plain string. */
@@ -16652,6 +17502,18 @@ static BOOL effect_name_ok(DWORD p)
 static const BYTE *effect_code_at(DWORD address)
 {
     return address >= EFFECT_CODE_FIRST && address + EFFECT_RUN_LOOK <= EFFECT_CODE_END ? (const BYTE *)address : NULL;
+}
+
+/* (limit effects) The game's memory, or this DLL's copy of the limit set-up table, for effect_limit_why. */
+static const BYTE *limit_effect_read(DWORD address, DWORD size)
+{
+    DWORD own = (DWORD)limit_effect_setup;
+
+    if (address >= EFFECT_CODE_FIRST && address < EFFECT_DATA_END && size <= EFFECT_DATA_END - address)
+        return (const BYTE *)address;
+    if (address >= own && address < own + sizeof limit_effect_setup && size <= own + sizeof limit_effect_setup - address)
+        return (const BYTE *)address;
+    return NULL;
 }
 
 /* Reads magic effect n's loader once: where its files are, or why it cannot be copied (logged once, with the
@@ -16922,6 +17784,7 @@ static void __cdecl effect_preload_hook(int actor_arg)
 }
 
 static BOOL native_effect_step(int actor_arg);  /* ("Native effects", below) */
+static BOOL limit_effect_step(int actor_arg);   /* (limit effects; with the limit tables, further down) */
 static void native_script_read(int i);         /* (the same) */
 static void native_scripts_forget(void);
 static void native_scripts_check_files(void);
@@ -16934,6 +17797,8 @@ static void start_effect_copy(int actor_arg)
     struct effect_base *b;
 
     if (native_effect_step(actor_arg))  /* a native effect: the DLL's task plays it, not the game's routine */
+        return;
+    if (limit_effect_step(actor_arg))   /* (limit effects) a game limit's routine played in place of the magic one */
         return;
     effect_settle();
     b = effect_pending_base < 0 ? effect_for_actor(actor, TRUE, &set) : NULL;
@@ -16958,6 +17823,12 @@ static void start_effect_copy(int actor_arg)
     effect_note_loaded(number, b, set, actor, "effect step");
 }
 
+/* What effect entry i is, for the log: a copy (also for none), a native effect, (limit effects) a game limit's effect. */
+static const char *effect_kind_name(int i)
+{
+    return i < 0 ? "copy" : effect_copies[i].limit >= 0 ? "limit effect" : effect_copies[i].play ? "native effect" : "copy";
+}
+
 /* At an action's set-up (action_setup_hook): the copies its spell names, -1 (spell) for none. */
 static void effect_copy_note(int *action, int spell)
 {
@@ -16979,11 +17850,10 @@ static void effect_copy_note(int *action, int spell)
     effect_copy_cast[actor].now = (short)((targets & (targets - 1)) ? several : one);
     if (InterlockedIncrement(&effect_logs) <= EFFECT_LOGS)
         log_line("effect copies: actor %d's spell %d: effect %02lx, %s %04x on one target, %s %04x on several (0 = its own files)%s", actor,
-                 spells[spell].id, (DWORD)action[9], one >= 0 && effect_copies[one].play ? "native effect" : "copy",
-                 one >= 0 ? (unsigned)effect_copies[one].number : 0u,
-                 several >= 0 && effect_copies[several].play ? "native effect" : "copy",
-                 several >= 0 ? (unsigned)effect_copies[several].number : 0u,
-                 effect_preload_live || (one >= 0 && effect_copies[one].play) ? "" : "; effect copies are OFF (see the start of the log)");
+                 spells[spell].id, (DWORD)action[9], effect_kind_name(one), one >= 0 ? (unsigned)effect_copies[one].number : 0u,
+                 effect_kind_name(several), several >= 0 ? (unsigned)effect_copies[several].number : 0u,
+                 effect_preload_live || (one >= 0 && (effect_copies[one].play || effect_copies[one].limit >= 0)) ? ""
+                 : "; effect copies are OFF (see the start of the log)");
 }
 
 /* A battle starts: nothing of the last one's loads is known any more (the engine freed every group). */
@@ -17204,6 +18074,7 @@ static void load_effect_copies(void)
     effect_copies_battle_start();       /* every list holds its own names, nothing is noted */
     native_scripts_forget();            /* no native task or group of the last reading is used again */
     effect_copy_count = effect_copies_usable = effect_file_problems = effect_natives_usable = 0;
+    effect_limits_usable = 0;           /* (limit effects) */
     for (i = 0; i < EFFECT_BASE_COUNT; i++)
         effect_bases[i].copies = 0;
     text = read_whole_file(EFFECT_FILE_NAME, &size);
@@ -17222,6 +18093,20 @@ static void load_effect_copies(void)
 
         if (!c->usable)
             continue;
+        if (c->limit >= 0) {
+            /* (limit effects) the game's routine, played by limit_effect_step; what it relies on is read again at each step */
+            DWORD routine;
+            const char *why = effect_limit_why(c->limit, effect_code_at, limit_effect_read, (DWORD)limit_effect_setup, &routine);
+
+            effect_limits_usable++;
+            if (why)
+                log_line("effects file line %d: (note) limit effect %04lx: the game's limit effect %02x cannot play now: %s; its spells play effect %02x (base =) while it cannot",
+                         c->limit_line, c->number, c->limit, why, c->play_base);
+            else
+                log_line("limit effect %04lx: the game's limit effect %02x (%08lx) at a spell's effect step; the record holds effect %02x (base =)",
+                         c->number, c->limit, routine, c->play_base);
+            continue;
+        }
         if (c->play) {
             /* a native effect: its script, SpellExtConfig\effects\NAME.txt (see "Native effects") */
             native_script_read(i);
@@ -17531,7 +18416,8 @@ static DWORD native_list_models[EFFECT_COPY_MAX];       /* the list's entries wr
 static int native_list_count[EFFECT_COPY_MAX];  /* its entries written since the battle started (the most) */
 static int native_morph_state;          /* (fx morph) the lock routines: 0 not looked at, 1 as expected, -1 not */
 static DWORD native_morph_total;        /* (fx morph) the bytes of this reading's .MRF files (NFX_MORPH_TOTAL_BYTES at most) */
-static struct {
+struct native_loop;                     /* (persistent effect: "Native effects, the loop", below) */
+struct native_run {
     BYTE running, draw_said, limit_said, model_said, model_limit_said, centre_said, screen_said, zoom_said;
     BYTE arena_said;                    /* (arena anchor) the first at=arena draw logged */
     BYTE morph_said, morph_bad_said;    /* (fx morph) the first set written logged; a set not written logged */
@@ -17541,7 +18427,13 @@ static struct {
     DWORD number;
     struct native_clock clock;
     signed char bones[NFX_ITEMS_MAX][10];   /* bone=random: the place chosen for each target, -1 not yet */
-} native_play;
+    struct native_loop *loop;           /* (persistent effect) the loop this context draws for; NULL: a cast (native_play) */
+};
+static struct native_run native_play;
+/* (persistent effect) The context the draw routines (native_draw and what it calls) draw for: the cast's, native_play,
+   except while the loops' task draws a loop (native_loop_draw sets its own and puts this back). The two lists' passes
+   never overlap, so one pointer serves. */
+static struct native_run *native_now = &native_play;
 
 static BOOL native_say(void)
 {
@@ -17892,17 +18784,20 @@ static BOOL native_load(int e, int actor)
         native_list_models[e] = models;
         if (s->file_count > native_list_count[e])
             native_list_count[e] = s->file_count;
-        args[0] = 0;                    /* keep 0: freed by the game at a preload with a loader, as its own effects' */
+        args[0] = effect_copies[e].loop.on ? 1 : 0;     /* keep 0: freed by the game at a preload with a loader, as its own
+                                                   effects'; (persistent effect) keep 1 for an effect with a loop, as the props:
+                                                   only the battle's end frees it (its loop draws from it after the cast) */
         args[1] = 0x5dc;                /* as FUN_0068a9e0 sets it */
         args[2] = ((DWORD (__cdecl *)(const char *, char *))FN_NATIVE_FOLDER)(s->folder, path);
         native_managers[e] = manager;
         ((void (__cdecl *)(int, void *, DWORD *, DWORD *, DWORD))FN_NATIVE_LOAD_GROUP)(s->file_count, native_lists[e], args,
                                                                                        &native_handles[e], manager);
         if (native_say())
-            log_line("native effect %04lx: group of %d file(s) from effects\\%s.txt (%s, folder %s) %s %08lx; the manager holds %lu of %lu groups",
+            log_line("native effect %04lx: group of %d file(s) from effects\\%s.txt (%s, folder %s) %s %08lx; the manager holds %lu of %lu groups%s",
                      effect_copies[e].number, s->file_count, effect_copies[e].play_name, s->file[0].name, s->folder,
                      native_handles[e] ? "loaded as" : "NOT loaded (manager full, or no memory):", native_handles[e],
-                     ((const DWORD *)manager)[0], ((const DWORD *)manager)[1]);
+                     ((const DWORD *)manager)[0], ((const DWORD *)manager)[1],
+                     args[0] ? " (kept for the battle: the effect has a loop)" : "");
         if (!native_handles[e])
             return FALSE;
         for (k = 0; k < s->file_count; k++) {
@@ -18089,6 +18984,55 @@ static void native_events(int f)
     }
 }
 
+/* (persistent effect) A running loop: what the hand-over held of the cast (its targets' places, their centre), its clock,
+   and the context its draws are made in. See "Native effects, the loop", after native_battle_start. */
+#define NATIVE_LOOPS_MAX        4            /* loops at once, all drawn by one task */
+struct native_loop {
+    int on, effect, generation;         /* effect: its index in effect_copies; generation: the scripts' reading */
+    DWORD number;
+    struct nfx_loop_clock clock;
+    int hidden, fade, drawn, hidden_frames, said;
+    int models;                         /* the cast's targets with a battle model at the hand-over (held: drawn as they were) */
+    short bones[10], height[10];        /* each one's bones and model height then */
+    short held[10][NFX_BONE_MAX + 1][3];    /* its bone places then (FUN_005d2e00), the first min(bones, 50) */
+    short floor[10][2];                 /* its floor place then (00be12de, 00be12e2) */
+    int centre_held;                    /* 1: centre[] is the targets' centre then (FUN_005bfec9 over `models`) */
+    short centre[2], centre_y[NFX_BONE_MAX + 1], centre_height;     /* its x, z; their mean y at each bone; mean height */
+    short anchor[2];                    /* loop_at's place (x, z): arena + loop_x / loop_z, or the actors' middle */
+    short now[2];                       /* this frame's at=centre place (x, z): held, or the glide from it to the anchor */
+    struct native_run play;             /* the context native_draw draws it in (native_now while it does) */
+};
+static struct native_loop native_loops[NATIVE_LOOPS_MAX];
+
+/* (persistent effect) Whether pass t of the draw loops draws line it on actor t, and its bones: a cast's (and a loop's
+   at=caster) the actor's model now, as always; a loop's at=target the target as the hand-over held it, alive or not. */
+static int native_actor_drawn(const struct nfx_item *it, int t, int *bones)
+{
+    DWORD base = (DWORD)t * ACTOR_EFFECT_STRIDE;
+
+    if (native_now->loop && it->at == NFX_AT_TARGET) {
+        if (t < 0 || t >= 10 || !(native_now->loop->models >> t & 1))
+            return 0;
+        *bones = native_now->loop->bones[t];
+        return 1;
+    }
+    return *(const DWORD *)(ADDR_NATIVE_MODEL + base) && (*bones = *(const short *)(ADDR_NATIVE_BONES + base)) >= 1;
+}
+
+/* (persistent effect) Actor t's model height for a sprite's depth=model (as native_actor_drawn: held for a loop's at=target). */
+static int native_actor_height(const struct nfx_item *it, int t)
+{
+    if (native_now->loop && it->at == NFX_AT_TARGET && t >= 0 && t < 10)
+        return native_now->loop->height[t];
+    return *(const short *)(ADDR_NATIVE_HEIGHT + (DWORD)t * ACTOR_EFFECT_STRIDE);
+}
+
+/* (persistent effect) The fade factor of the loop being drawn (NFX_LOOP_ONE: as drawn). */
+static int native_loop_factor(const struct native_loop *l)
+{
+    return l->fade;
+}
+
 /* The place a sprite or model line `i` is drawn at on actor t (whose model has `bones` bones): stage 3b's
    bone=ground is the floor under the actor's place now (x and z of 00be12de / 00be12e2, which the battle's
    scripts move as the actor steps; y 0, the floor's height, as the game draws every shadow); otherwise the bone
@@ -18098,6 +19042,32 @@ static int native_place(const struct nfx_item *it, int i, int t, int bones, shor
     DWORD base = (DWORD)t * ACTOR_EFFECT_STRIDE;
     int bone;
 
+    if (native_now->loop && it->at == NFX_AT_TARGET) {
+        /* (persistent effect) a loop's at=target: the target's place as the hand-over held it (bone=random: a held bone
+           chosen once per line and target, as a cast's) */
+        const struct native_loop *l = native_now->loop;
+
+        if (it->bone == NFX_BONE_GROUND) {
+            place[0] = l->floor[t][0];
+            place[1] = 0;
+            place[2] = l->floor[t][1];
+            return NFX_BONE_GROUND;
+        }
+        if (it->bone == NFX_BONE_RANDOM) {
+            if (native_now->bones[i][t] < 0 || native_now->bones[i][t] >= bones || native_now->bones[i][t] > NFX_BONE_MAX) {
+                native_random = native_random * 1103515245u + 12345u;
+                native_now->bones[i][t] = (signed char)((native_random >> 16) % (DWORD)(bones < NFX_BONE_MAX + 1 ? bones : NFX_BONE_MAX + 1));
+            }
+            bone = native_now->bones[i][t];
+        } else
+            bone = it->bone < bones ? it->bone : bones - 1;
+        if (bone > NFX_BONE_MAX)
+            bone = NFX_BONE_MAX;        /* (it->bone is 0..49: only a model of more than 50 bones; held up to 50) */
+        place[0] = l->held[t][bone][0];
+        place[1] = l->held[t][bone][1];
+        place[2] = l->held[t][bone][2];
+        return bone;
+    }
     if (it->bone == NFX_BONE_GROUND) {
         place[0] = *(const short *)(ADDR_NATIVE_PLACE_X + base);
         place[1] = 0;
@@ -18105,11 +19075,11 @@ static int native_place(const struct nfx_item *it, int i, int t, int bones, shor
         return NFX_BONE_GROUND;
     }
     if (it->bone == NFX_BONE_RANDOM) {
-        if (native_play.bones[i][t] < 0 || native_play.bones[i][t] >= bones) {
+        if (native_now->bones[i][t] < 0 || native_now->bones[i][t] >= bones) {
             native_random = native_random * 1103515245u + 12345u;
-            native_play.bones[i][t] = (signed char)((native_random >> 16) % (DWORD)(bones < NFX_BONE_MAX + 1 ? bones : NFX_BONE_MAX + 1));
+            native_now->bones[i][t] = (signed char)((native_random >> 16) % (DWORD)(bones < NFX_BONE_MAX + 1 ? bones : NFX_BONE_MAX + 1));
         }
-        bone = native_play.bones[i][t];
+        bone = native_now->bones[i][t];
     } else
         bone = it->bone < bones ? it->bone : bones - 1;
     ((void (__cdecl *)(int, int, short *))FN_NATIVE_BONE_PLACE)(t, bone, place);
@@ -18126,11 +19096,33 @@ static BOOL native_centre_place(const struct nfx_item *it, short *place, int *he
     int t, n = 0, mask = 0, y = 0, h = 0;
     short bone_place[4] = { 0, 0, 0, 0 };
 
+    if (native_now->loop) {
+        /* (persistent effect) a loop's at=centre: this frame's place (held, or gliding to loop_at's: native_loop_step), y 0
+           with bone=ground, else the targets' mean y at that bone as the hand-over held it */
+        const struct native_loop *l = native_now->loop;
+
+        if (!l->centre_held && effect_copies[l->effect].loop.at == NFX_LOOP_AT_HELD) {
+            if (!native_now->centre_said && native_say())
+                log_line("native effect %04lx: loop: at=centre: no target had a battle model at the hand-over: those lines are not drawn (said once)",
+                         native_now->number);
+            native_now->centre_said = 1;
+            return FALSE;
+        }
+        place[0] = l->now[0];
+        place[1] = it->bone == NFX_BONE_GROUND || it->bone < 0 || it->bone > NFX_BONE_MAX ? 0 : l->centre_y[it->bone];
+        place[2] = l->now[1];
+        *height = l->centre_height;
+        if (!native_now->centre_said && native_say())
+            log_line("native effect %04lx: loop: at=centre: the first at (%d, %d, %d) (line %d, %s)", native_now->number, place[0],
+                     place[1], place[2], it->line, it->bone == NFX_BONE_GROUND ? "on the ground" : "the targets' mean bone height then");
+        native_now->centre_said = 1;
+        return TRUE;
+    }
     for (t = 0; t < 10; t++) {
         DWORD base = (DWORD)t * ACTOR_EFFECT_STRIDE;
         int bones;
 
-        if (!(native_play.mask >> t & 1) || !*(const DWORD *)(ADDR_NATIVE_MODEL + base) || (bones = *(const short *)(ADDR_NATIVE_BONES + base)) < 1)
+        if (!(native_now->mask >> t & 1) || !*(const DWORD *)(ADDR_NATIVE_MODEL + base) || (bones = *(const short *)(ADDR_NATIVE_BONES + base)) < 1)
             continue;
         mask |= 1 << t;
         n++;
@@ -18141,32 +19133,32 @@ static BOOL native_centre_place(const struct nfx_item *it, short *place, int *he
         }
     }
     if (!n) {
-        if (!native_play.centre_said && native_say())
+        if (!native_now->centre_said && native_say())
             log_line("native effect %04lx: at=centre: no target (%04x) has a battle model: those lines are not drawn (said once)",
-                     native_play.number, native_play.mask);
-        native_play.centre_said = 1;
+                     native_now->number, native_now->mask);
+        native_now->centre_said = 1;
         return FALSE;
     }
     ((short *(__cdecl *)(unsigned, short *))FN_NATIVE_CENTRE)((unsigned)mask, place);
     place[1] = it->bone == NFX_BONE_GROUND ? 0 : (short)nfx_mean(y, n);
     *height = nfx_mean(h, n);
-    if (!native_play.centre_said && native_say())
+    if (!native_now->centre_said && native_say())
         log_line("native effect %04lx: at=centre: the first at (%d, %d, %d), the middle of targets %04x (line %d, %s)",
-                 native_play.number, place[0], place[1], place[2], mask, it->line,
+                 native_now->number, place[0], place[1], place[2], mask, it->line,
                  it->bone == NFX_BONE_GROUND ? "on the ground" : "their mean bone height");
-    native_play.centre_said = 1;
+    native_now->centre_said = 1;
     return TRUE;
 }
 
 /* (screen anchor) The first at=screen draw of a cast, logged once (bounded by NATIVE_LOGS). */
 static void native_screen_said(int f, const struct nfx_item *it, int x, int y, int z, int sx, int sy, int sz)
 {
-    if (native_play.screen_said)
+    if (native_now->screen_said)
         return;
-    native_play.screen_said = 1;
+    native_now->screen_said = 1;
     if (native_say())
         log_line("native effect %04lx: first screen draw at frame %d: line %d (%s) at (%d, %d, %d) in the camera's space, scale (%d, %d, %d)",
-                 native_play.number, f, it->line, it->kind == NFX_MODEL ? "model" : "sprite", x, y, z, sx, sy, sz);
+                 native_now->number, f, it->line, it->kind == NFX_MODEL ? "model" : "sprite", x, y, z, sx, sy, sz);
 }
 
 static int camera_battle_h_now(void);
@@ -18177,13 +19169,13 @@ static int camera_battle_h_now(void);
 static void native_arena_place(int f, const struct nfx_item *it, int x, int y, int z, short *place)
 {
     place[0] = (short)x, place[1] = (short)y, place[2] = (short)z;
-    if (native_play.arena_said)
+    if (native_now->arena_said)
         return;
-    native_play.arena_said = 1;
+    native_now->arena_said = 1;
     if (native_say())
         log_line("native effect %04lx: first arena draw at frame %d: line %d (%s) at (%d, %d, %d) in the world (caster %d, targets %04x)",
-                 native_play.number, f, it->line, it->kind == NFX_MODEL ? "model" : "sprite", x, y, z, native_play.actor,
-                 native_play.mask);
+                 native_now->number, f, it->line, it->kind == NFX_MODEL ? "model" : "sprite", x, y, z, native_now->actor,
+                 native_now->mask);
 }
 
 /* (screen anchor) zoom=fixed: the line's matrix m (written by nfx_screen_model / nfx_screen_sprite) made the size it
@@ -18197,11 +19189,11 @@ static void native_screen_zoom(int f, const struct nfx_item *it, BYTE *m)
     if (!(it->flags & NFX_F_ZOOM_FIXED))
         return;
     h = camera_battle_h_now();
-    if (nfx_screen_zoom(m, h) && !native_play.zoom_said) {
-        native_play.zoom_said = 1;
+    if (nfx_screen_zoom(m, h) && !native_now->zoom_said) {
+        native_now->zoom_said = 1;
         if (native_say())
             log_line("native effect %04lx: frame %d: line %d (zoom=fixed) is drawn smaller than at H %d (the battle's H is %d): at its size the matrix would pass the engine's range (a smaller scale= on it, or a bigger model file, keeps it whole)",
-                     native_play.number, f, it->line, NFX_SCREEN_H_HOME, h);
+                     native_now->number, f, it->line, NFX_SCREEN_H_HOME, h);
     }
 }
 
@@ -18210,7 +19202,7 @@ static void native_screen_zoom(int f, const struct nfx_item *it, BYTE *m)
    and draw. */
 static int native_draw_models(DWORD group, int f, int *last, int *at, struct nfx_model_draw *shown)
 {
-    const struct nfx_script *s = &nfx_scripts[native_play.effect];
+    const struct nfx_script *s = &nfx_scripts[native_now->effect];
     const struct nfx_item *items = nfx_pool + s->first;
     DWORD records[NFX_FILES_MAX];
     int i, k, t, models = 0, coloured = 0, full = 0;
@@ -18236,28 +19228,29 @@ static int native_draw_models(DWORD group, int f, int *last, int *at, struct nfx
         if (it->kind != NFX_MODEL || !records[it->entry])
             continue;
         for (t = 0; t <= NFX_ARENA_PASS; t++) {
-            DWORD base = (DWORD)t * ACTOR_EFFECT_STRIDE;
             struct nfx_model_draw d;
-            int own, bones = 0, turn = nfx_pass_turn(it, t, native_play.mask, native_play.actor), height = 0;
+            int own, bones = 0, turn = nfx_pass_turn(it, t, native_now->mask, native_now->actor), height = 0;
             int moved[3] = { 0, 0, 0 };         /* (fx morph) face=yaw: the offsets turned into the world */
 
             if (turn < 0 || (own = nfx_item_frame(it, f, turn)) < 0)
                 continue;
             if (t >= NFX_SCREEN_PASS ? 0        /* (screen and arena anchors) no actor, no place to look up */
                 : t == NFX_CENTRE_PASS ? !native_centre_place(it, place, &height)
-                                       : (!*(const DWORD *)(ADDR_NATIVE_MODEL + base) || (bones = *(const short *)(ADDR_NATIVE_BONES + base)) < 1))
+                                       : !native_actor_drawn(it, t, &bones))
                 continue;
             if (unwritten >> it->entry & 1)
                 continue;                       /* (fx morph) its set could not be written this update: not drawn */
             if (models == NFX_MODEL_DRAWS_MAX) {
-                if (!native_play.model_limit_said && native_say())
+                if (!native_now->model_limit_said && native_say())
                     log_line("native effect %04lx: frame %d asks for more than %d models: the rest are not drawn (said once)",
-                             native_play.number, f, NFX_MODEL_DRAWS_MAX);
-                native_play.model_limit_said = 1;
+                             native_now->number, f, NFX_MODEL_DRAWS_MAX);
+                native_now->model_limit_said = 1;
                 full = 1;               /* (the colour is put back below) */
                 break;
             }
             nfx_model_at(it, own, &d);
+            if (native_now->loop)
+                d.fade = nfx_loop_fade_value(d.fade, native_loop_factor(native_now->loop));   /* (persistent effect) loop_wall_fade */
             if (t < NFX_CENTRE_PASS)
                 native_place(it, i, t, bones, place);
             else if (t == NFX_ARENA_PASS) {
@@ -18321,23 +19314,23 @@ static int native_draw_models(DWORD group, int f, int *last, int *at, struct nfx
 
                 if (!native_morph_write(records[it->entry], mf, value)) {
                     unwritten |= 1u << it->entry;
-                    if (!native_play.morph_bad_said && native_say())
+                    if (!native_now->morph_bad_said && native_say())
                         log_line("native effect %04lx: frame %d: file %d (%s): the morph file's set could not be written (its polygon set is no longer the one checked at the cast): that file is not drawn (said once)",
-                                 native_play.number, f, it->entry, s->file[it->entry].name);
-                    native_play.morph_bad_said = 1;
+                                 native_now->number, f, it->entry, s->file[it->entry].name);
+                    native_now->morph_bad_said = 1;
                     continue;
                 }
                 written |= 1u << it->entry;
-                if (!native_play.morph_said && native_say()) {
+                if (!native_now->morph_said && native_say()) {
                     if (value & 255)
                         log_line("native effect %04lx: first morph set at frame %d: line %d, file %d (%s, %s): set %d and %d/256 of the way to set %d, %d vertices",
-                                 native_play.number, f, it->line, it->entry, s->file[it->entry].name, mf->name, value >> 8, value & 255,
+                                 native_now->number, f, it->line, it->entry, s->file[it->entry].name, mf->name, value >> 8, value & 255,
                                  (value >> 8) + 1, mf->verts);
                     else
                         log_line("native effect %04lx: first morph set at frame %d: line %d, file %d (%s, %s): set %d, %d vertices",
-                                 native_play.number, f, it->line, it->entry, s->file[it->entry].name, mf->name, value >> 8, mf->verts);
+                                 native_now->number, f, it->line, it->entry, s->file[it->entry].name, mf->name, value >> 8, mf->verts);
                 }
-                native_play.morph_said = 1;
+                native_now->morph_said = 1;
             }
             /* {record, 0x80, 0, 0x20} with none of stage 3b's keys (stage 3a's call to the bit) */
             nfx_model_context(&d, (it->flags & NFX_F_COLOUR) != 0, (int)(pinned >> it->entry & 1), records[it->entry], native_model_ctx);
@@ -18364,7 +19357,7 @@ static int native_draw_models(DWORD group, int f, int *last, int *at, struct nfx
    (stage 3a) every model line. */
 static void native_draw(DWORD group, int f)
 {
-    const struct nfx_script *s = &nfx_scripts[native_play.effect];
+    const struct nfx_script *s = &nfx_scripts[native_now->effect];
     const struct nfx_item *items = nfx_pool + s->first;
     DWORD sheets[NFX_FILES_MAX], drawables[NFX_FILES_MAX];
     int pages[NFX_FILES_MAX], i, k, j, t, drawn = 0, last = -1, models = 0, model_last = -1, model_at[3] = { 0, 0, 0 };
@@ -18396,24 +19389,25 @@ static void native_draw(DWORD group, int f)
         if (it->kind != NFX_SPRITE || !sheets[it->entry])
             continue;
         for (t = 0; t <= NFX_ARENA_PASS; t++) {
-            DWORD base = (DWORD)t * ACTOR_EFFECT_STRIDE;
             struct nfx_draw d;
-            int own, bones = 0, depth, turn = nfx_pass_turn(it, t, native_play.mask, native_play.actor), height = 0;
+            int own, bones = 0, depth, turn = nfx_pass_turn(it, t, native_now->mask, native_now->actor), height = 0;
 
             if (turn < 0 || (own = nfx_item_frame(it, f, turn)) < 0)
                 continue;
             if (t >= NFX_SCREEN_PASS ? 0        /* (screen and arena anchors) no actor, no place to look up */
                 : t == NFX_CENTRE_PASS ? !native_centre_place(it, place, &height)
-                                       : (!*(const DWORD *)(ADDR_NATIVE_MODEL + base) || (bones = *(const short *)(ADDR_NATIVE_BONES + base)) < 1))
+                                       : !native_actor_drawn(it, t, &bones))
                 continue;
             if (drawn == NFX_DRAWS_MAX) {
-                if (!native_play.limit_said && native_say())
+                if (!native_now->limit_said && native_say())
                     log_line("native effect %04lx: frame %d asks for more than %d sprites: the rest are not drawn (said once)",
-                             native_play.number, f, NFX_DRAWS_MAX);
-                native_play.limit_said = 1;
+                             native_now->number, f, NFX_DRAWS_MAX);
+                native_now->limit_said = 1;
                 break;
             }
             nfx_sprite_at(it, own, pages[it->entry], &d);
+            if (native_now->loop)
+                d.colour = nfx_loop_colour(d.colour, native_loop_factor(native_now->loop));     /* (persistent effect) loop_wall_fade */
             if (t == NFX_SCREEN_PASS) {
                 /* (screen anchor) the DLL's own matrix, written directly: scale and rot in the screen's plane, the place
                    (x, y, z) in the camera's own space (z held in depth); FUN_005d2b44 is not called */
@@ -18432,7 +19426,7 @@ static void native_draw(DWORD group, int f)
             } else if (t == NFX_CENTRE_PASS)
                 depth = it->flags & NFX_F_DEPTH_MODEL ? -height : d.depth;      /* the targets' mean height */
             else {
-                depth = it->flags & NFX_F_DEPTH_MODEL ? -*(const short *)(ADDR_NATIVE_HEIGHT + base) : d.depth;
+                depth = it->flags & NFX_F_DEPTH_MODEL ? -native_actor_height(it, t) : d.depth;
                 native_place(it, i, t, bones, place);
             }
             if (t == NFX_SCREEN_PASS)
@@ -18465,20 +19459,20 @@ static void native_draw(DWORD group, int f)
     if (s->model_files)
         models = native_draw_models(group, f, &model_last, model_at, &shown);
     if (!*(const DWORD *)ADDR_NATIVE_DRAWING || (!drawn && !models)) {
-        native_play.undrawn++;          /* a catch-up update (FUN_005d1ffb draws nothing), or nothing on at this frame */
+        native_now->undrawn++;          /* a catch-up update (FUN_005d1ffb draws nothing), or nothing on at this frame */
         return;
     }
-    native_play.drawn++;
-    if (models && !native_play.model_said) {
+    native_now->drawn++;
+    if (models && !native_now->model_said) {
         const struct nfx_item *mi = &items[model_last];
 
-        native_play.model_said = 1;
+        native_now->model_said = 1;
         if ((mi->flags & (NFX_F_COLOUR | NFX_F_FACE | NFX_F_PALETTE)) || mi->face || mi->bone == NFX_BONE_GROUND || mi->fade.a != NFX_FADE_MAX ||
             mi->fade.b != NFX_FADE_MAX || mi->u.a || mi->u.b || mi->v.a || mi->v.b) {
             /* stage 3b's keys: the same line and what they gave (a line with none of them is logged as before) */
             if (native_say())
                 log_line("native effect %04lx: first model draw at frame %d: %d sprite(s), %d model(s), the last model of line %d at (%d, %d, %d)%s%s, turn (%d, %d, %d), scale (%d, %d, %d), fade %d colour %s%02x%02x%02x uv %d,%d row %d (context %08lx %08lx %08lx)",
-                         native_play.number, f, drawn, models, mi->line, model_at[0], model_at[1], model_at[2],
+                         native_now->number, f, drawn, models, mi->line, model_at[0], model_at[1], model_at[2],
                          mi->bone == NFX_BONE_GROUND ? " on the ground" : "",
                          (mi->flags & NFX_F_FACE) ? " facing the camera" : (mi->face & NFX_FACE_YAW) ? " turned to the camera's yaw" : "",
                          shown.turn[0], shown.turn[1], shown.turn[2], shown.scale[0], shown.scale[1], shown.scale[2], shown.fade,
@@ -18487,21 +19481,21 @@ static void native_draw(DWORD group, int f)
                          native_model_ctx[1], native_model_ctx[2], native_model_ctx[3]);
         } else if (native_say())
             log_line("native effect %04lx: first model draw at frame %d: %d sprite(s), %d model(s), the last model of line %d at (%d, %d, %d), turn (%d, %d, %d), scale (%d, %d, %d)",
-                     native_play.number, f, drawn, models, items[model_last].line, model_at[0], model_at[1], model_at[2], shown.turn[0],
+                     native_now->number, f, drawn, models, items[model_last].line, model_at[0], model_at[1], model_at[2], shown.turn[0],
                      shown.turn[1], shown.turn[2], shown.scale[0], shown.scale[1], shown.scale[2]);
     }
     if (!drawn)
         return;                         /* (the sprites' first-draw line below names a sprite line) */
-    if (!native_play.draw_said) {
-        native_play.draw_said = 1;
+    if (!native_now->draw_said) {
+        native_now->draw_said = 1;
         if (native_say()) {
             if (native_ctx[3] & 0x8000)
                 log_line("native effect %04lx: first draw at frame %d: %d sprite(s), the last of line %d (page %lu, palette row %lu, colour %08lx), at (%d, %d, %d)",
-                         native_play.number, f, drawn, items[last].line, native_ctx[3] & 0x7fff, native_ctx[3] >> 22,
+                         native_now->number, f, drawn, items[last].line, native_ctx[3] & 0x7fff, native_ctx[3] >> 22,
                          native_ctx[2], place[0], place[1], place[2]);
             else
                 log_line("native effect %04lx: first draw at frame %d: %d sprite(s), the last of line %d (page %lu, colour %08lx), at (%d, %d, %d)",
-                         native_play.number, f, drawn, items[last].line, native_ctx[3], native_ctx[2], place[0], place[1], place[2]);
+                         native_now->number, f, drawn, items[last].line, native_ctx[3], native_ctx[2], place[0], place[1], place[2]);
         }
     }
 }
@@ -18530,6 +19524,11 @@ static BOOL stage_shake_site_ok(void);
 /* stage fx 3: the actors and the backdrop (in the STAGE FX block too) */
 static BOOL stage_back_site_ok(void);
 static void native_task_actors(WORD serial, const struct nfx_item *items, int count, int frame, DWORD effect, int todo, int caster, int mask);
+
+/* (persistent effect) "Native effects, the loop" (after native_battle_start) */
+static void native_loop_begin(void);
+static void native_loop_end_effect(int c, const char *why);
+static void native_loops_battle_start(void);
 
 /* The task, in the list of 100. */
 static void __cdecl native_task(void)
@@ -18575,6 +19574,8 @@ static void __cdecl native_task(void)
                                               : (todo & NATIVE_END_GROUP) ? "its files were freed (another effect's preload?)"
                                               : "WATCHDOG: too many calls", native_play.drawn, native_play.undrawn,
                      native_play.clock.calls);
+        if ((todo & NATIVE_END_LENGTH) && effect_copies[native_play.effect].loop.on)
+            native_loop_begin();        /* (persistent effect) the cast hands over to its loop (the list of 60) */
         native_play.running = 0;
         *task = -1;
     }
@@ -18640,6 +19641,7 @@ static BOOL native_start(int actor, int c, unsigned shown, int number, int limit
             *(BYTE *)0x00be4776u = 1;
         }
     }
+    native_loop_end_effect(c, "the effect is cast again: its loop starts afresh after this cast");    /* (persistent effect) */
     native_play.serial = ++native_serial;
     camera_roll_begin(native_play.serial);
     if (!camera_clock_keeps(effect_copies[c].number))  /* (an action's clock under the same camera keeps the player) */
@@ -18764,6 +19766,7 @@ static void native_battle_start(void)
     camera_roll_battle_start();     /* camera stage 0: no roll is carried over */
     camera_ff8_battle_start();      /* camera stage 1: no play is carried over */
     stage_fx_battle_start();        /* stage fx 1: no stage write is carried over */
+    native_loops_battle_start();    /* (persistent effect) no loop is carried over */
     for (e = 0; e < EFFECT_COPY_MAX; e++) {
         held += native_handles[e] != 0;
         native_handles[e] = native_managers[e] = 0;
@@ -18773,6 +19776,379 @@ static void native_battle_start(void)
     if (held)
         log_line("native effects: %d group handle(s) still held as a battle started: set to 0", held);
 }
+
+/* ---- Native effects, the loop (persistent effect; tools/work/persistent_effect/arena/KEYS.md section 4) ----------
+   An effect whose [effect N] section has a loop (`loop`, `loop_intro`, ...: nfx_loop_key) plays its cast as every native
+   effect does (native_task in the list of 100, its hits, sounds, camera, stage and actors lines, waited for by the
+   battle). When the cast ends at its length, native_task hands over (native_loop_begin): the cast's caster, targets and
+   their places now are held in a loop record (at most NATIVE_LOOPS_MAX), and ONE task of this DLL in the list of 60
+   (native_loop_task), which nothing waits on, draws every running loop each frame from then on: the script's frames
+   past the cast (loop_intro once, then loop again and again), drawing only (the reader allows sprite, model and sound
+   lines there: nfx_loop_check). The battle never waits for it.
+     - Its files: the effect's group is loaded keep 1 (native_load), as the props', so no preload frees it; only the
+       battle's end does (FUN_00428c99 -> FUN_0068a567, which writes 0 in the handle). A loop that ends before the battle
+       does LEAVES the group loaded (the next cast of the effect uses it): a group the manager may still draw this frame
+       is never freed from here.
+     - The task: started with FUN_005bed92 (its first six bytes checked, 55 8b ec 51 66 c7, or another module's jump)
+       only with NATIVE_LOOP_FREE_LEAST places free in the list of 60 and one free at or after its running index (the
+       place the routine takes); the game's own callers do not check its -1 (00425fc4, 0043886e write before the list),
+       so the loops never leave the list nearly full, and with no room the loop is not started (one line) and FUN_005bed92
+       is not called. Word [2] of its data: a serial (an older task ends itself).
+     - Each call (every frame that is not paused, after the models and the camera's eye 00bf2158 of this frame, written by
+       FUN_005c2350 from the call at 0042da8d, before 0042dabb): the ends (the battle's 3D data gone: nothing read; the
+       group gone; the scripts read again; the caster's shown KO or frog with loop_ends), loop_hide (summon: the game's
+       summon task 005c0e4b or this DLL's opening in the list of 100, its end watcher 005c18bc in the list of 60, and the
+       time-stop byte 00bfb2ec after them; limit: the acting actor's command type 0x14 while the list of 100 runs),
+       at=centre's place (loop_at, loop_glide), the fade (loop_wall_fade, loop_outside: the eye's floor distance from that
+       place), then native_draw with the loop's context (native_now), its at=target lines at the places held. The clock
+       advances (and the loop's sounds are due) only when 00dc0e6c is 0 (FFNx's frames between at 30 / 60 fps draw the
+       same frame), as native_clock_step's.
+     - A second cast of the effect ends its running loop as the cast starts (native_start): the cast then hands over a
+       new one at its end. A loop is one per effect; different effects loop side by side.
+   Nothing is patched: the loop calls FUN_005bed92, FUN_005bfec9, FUN_005d2e00, FUN_005c0132, FUN_005bfff3 and what
+   native_draw calls, as the native player and the state's task already do; 0042dabb / 0042dac0 are not touched. */
+#define NATIVE_LOOP_FREE_LEAST  12           /* places free in the list of 60 for the loops' task to be started */
+#define NATIVE_LOOP_LIST60      60           /* the list of 60's places (WATCH_TASKS, with the states) */
+#define NATIVE_LOOP_LINES       40           /* log lines of the loops, a battle */
+#define NATIVE_LOOP_HIDE_LINES  8            /* hidden / shown again lines of one loop, a battle */
+#define ADDR_LOOP_EYE           0x00bf2158u  /* 3 shorts: the battle camera's eye (FUN_005c2350; = ADDR_CAMERA_EYE) */
+#define ADDR_LOOP_LIST60_COUNT  0x00be10e8u  /* short: tasks in the list of 60 (for the log) */
+#define ADDR_LOOP_LIST100_COUNT 0x00c05ebcu  /* short: tasks in the list of 100 (movsx word at 005c18e1) */
+#define ADDR_LOOP_SHOWN_STATUS  0x00bf23c0u  /* dword, 0x74 per actor: the statuses the display has shown (= ADDR_SHOWN_STATUS) */
+#define ADDR_LOOP_TICK_STATUS   0x009a8800u  /* dword, 0x10 per actor: their copy FUN_004326bf reads (= ADDR_TICK_STATUS) */
+#define FN_LOOP_GAME_SUMMON     0x005c0e4bu  /* the game's summon task (list of 100): 55 8b ec 83 ec 1c */
+static int native_loop_task_on;         /* the loops' task is in the list of 60 */
+static int native_loop_list_state;      /* FUN_005bed92's first bytes: 0 not looked at, 1 as expected, -1 not */
+static int native_loop_summon_shown;    /* loop_hide's summon latch (nfx_loop_summon) */
+static WORD native_loop_serial;
+static LONG native_loop_logs;
+
+static BOOL native_loop_say(void)
+{
+    return InterlockedIncrement(&native_loop_logs) <= NATIVE_LOOP_LINES;
+}
+
+static void __cdecl native_loop_task(void);
+
+/* The loops' task in the list of 60 (it may be there already): NULL, or why not (written into why). FUN_005bed92 is called
+   only when the list has NATIVE_LOOP_FREE_LEAST places free and one at or after its running index, and its slot is used
+   only when it holds this task: nothing is written for a slot of -1. */
+static const char *native_loop_task_start(char *why)
+{
+    static const BYTE first[6] = { 0x55, 0x8b, 0xec, 0x51, 0x66, 0xc7 };
+    const BYTE *at = (const BYTE *)FN_NEW_WATCH_TASK;
+    const DWORD *fns = (const DWORD *)ADDR_HIT_LIST60_FNS;
+    int i, free_places = 0, slot, from = *(const short *)ADDR_HIT_LIST60_INDEX;
+    short *task;
+
+    if (native_loop_task_on) {
+        for (i = 0; i < NATIVE_LOOP_LIST60 && fns[i] != (DWORD)native_loop_task; i++)
+            ;
+        if (i < NATIVE_LOOP_LIST60)
+            return NULL;                /* (it is there: it draws the new loop too) */
+        if (native_loop_say())
+            log_line("native effects: the loops' task is no longer in the list of 60: started again");
+        native_loop_task_on = 0;
+    }
+    if (!native_loop_list_state) {
+        native_loop_list_state = 1;
+        for (i = 0; i < 6 && at[0] != 0xe9; i++)
+            if (at[i] != first[i]) {
+                log_line("native effects: loops OFF: %08lx does not start as expected (byte %d is %02x): no loop task in the list of 60",
+                         FN_NEW_WATCH_TASK, i, at[i]);
+                native_loop_list_state = -1;
+                break;
+            }
+    }
+    if (native_loop_list_state < 0)
+        return lstrcpyA(why, "FUN_005bed92 is not the routine expected (said at the first loop)");
+    for (i = 0; i < NATIVE_LOOP_LIST60; i++)
+        free_places += !fns[i];
+    for (i = from < 0 || from >= NATIVE_LOOP_LIST60 ? 0 : from; i < NATIVE_LOOP_LIST60 && fns[i]; i++)
+        ;
+    if (free_places < NATIVE_LOOP_FREE_LEAST || i >= NATIVE_LOOP_LIST60) {
+        wsprintfA(why, "the list of 60 has %d place(s) free (%d are kept free for the game's own tasks, which do not check for a full list)",
+                  free_places, NATIVE_LOOP_FREE_LEAST);
+        return why;
+    }
+    slot = ((short (__cdecl *)(DWORD))FN_NEW_WATCH_TASK)((DWORD)native_loop_task);
+    if (slot < 0 || slot >= NATIVE_LOOP_LIST60 || fns[slot] != (DWORD)native_loop_task) {
+        wsprintfA(why, "FUN_005bed92 gave place %d%s", slot, slot < 0 || slot >= NATIVE_LOOP_LIST60 ? "" : ", which holds another routine");
+        return why;
+    }
+    task = (short *)(ADDR_WATCH_TASK_DATA + slot * 0x20);
+    for (i = 1; i < 16; i++)            /* FUN_005bed92 sets word 0 only */
+        task[i] = 0;
+    task[2] = (short)++native_loop_serial;
+    native_loop_task_on = 1;
+    if (native_loop_say())
+        log_line("native effects: the loops' task started in place %d of the list of 60 (%d in it now, %d were free)", slot,
+                 (int)*(const short *)ADDR_LOOP_LIST60_COUNT, free_places);
+    return NULL;
+}
+
+/* The cast in native_play has ended at its length and its effect has a loop: the loop starts (or one line says why not;
+   the cast played as always). What the cast's targets were is held now: a loop draws them where they stood. */
+static void native_loop_begin(void)
+{
+    int e = native_play.effect, i, t, b, n = 0, h = 0, every = 0;
+    const struct nfx_loop_keys *k = &effect_copies[e].loop;
+    struct native_loop *l;
+    char why[192], intro[48];
+    short c[4] = { 0, 0, 0, 0 };
+
+    why[0] = 0;
+    for (i = 0; i < NATIVE_LOOPS_MAX && native_loops[i].on; i++)
+        ;
+    if (i == NATIVE_LOOPS_MAX)
+        wsprintfA(why, "%d loops run already", NATIVE_LOOPS_MAX);
+    else if (!native_group_now(e))
+        lstrcpyA(why, "its files are no longer loaded");
+    else
+        native_loop_task_start(why);
+    if (why[0]) {
+        if (native_loop_say())
+            log_line("native effect %04lx: loop not started: %s; the cast played as always", native_play.number, why);
+        return;
+    }
+    l = &native_loops[i];
+    {
+        BYTE *z = (BYTE *)l;
+        unsigned j;
+
+        for (j = 0; j < sizeof *l; j++)
+            z[j] = 0;
+    }
+    l->effect = e;
+    l->number = native_play.number;
+    l->generation = native_generation;
+    nfx_loop_clock_start(k, &l->clock);
+    l->fade = NFX_LOOP_ONE;
+    l->play.actor = native_play.actor;
+    l->play.mask = native_play.mask;
+    l->play.number = native_play.number;
+    l->play.effect = e;
+    l->play.generation = native_generation;
+    l->play.length = native_play.length;
+    l->play.serial = native_play.serial;
+    l->play.limit_hit = NATIVE_HIT_NONE;
+    l->play.loop = l;
+    for (b = 0; b < NFX_ITEMS_MAX; b++)
+        for (t = 0; t < 10; t++)
+            l->play.bones[b][t] = -1;
+    for (t = 0; t < 10; t++) {
+        DWORD base = (DWORD)t * ACTOR_EFFECT_STRIDE;
+        int bones;
+
+        if (*(const DWORD *)(ADDR_NATIVE_MODEL + base))
+            every |= 1 << t;
+        if (!(native_play.mask >> t & 1) || !*(const DWORD *)(ADDR_NATIVE_MODEL + base) || (bones = *(const short *)(ADDR_NATIVE_BONES + base)) < 1)
+            continue;
+        l->models |= 1 << t;
+        l->bones[t] = (short)bones;
+        l->height[t] = *(const short *)(ADDR_NATIVE_HEIGHT + base);
+        l->floor[t][0] = *(const short *)(ADDR_NATIVE_PLACE_X + base);
+        l->floor[t][1] = *(const short *)(ADDR_NATIVE_PLACE_Z + base);
+        for (b = 0; b < bones && b <= NFX_BONE_MAX; b++)
+            ((void (__cdecl *)(int, int, short *))FN_NATIVE_BONE_PLACE)(t, b, l->held[t][b]);
+        n++;
+        h += l->height[t];
+    }
+    if (n) {
+        /* the targets' centre, as at=centre takes it in a cast (FUN_005bfec9), or the mean of their floor places when that
+           routine is not as expected (said once) */
+        if (native_centre_routine_ok(l->number))
+            ((short *(__cdecl *)(unsigned, short *))FN_NATIVE_CENTRE)((unsigned)l->models, c);
+        else {
+            int sx = 0, sz = 0;
+
+            for (t = 0; t < 10; t++)
+                if (l->models >> t & 1)
+                    sx += l->floor[t][0], sz += l->floor[t][1];
+            c[0] = (short)nfx_mean(sx, n), c[2] = (short)nfx_mean(sz, n);
+        }
+        l->centre_held = 1;
+        l->centre[0] = c[0], l->centre[1] = c[2];
+        l->centre_height = (short)nfx_mean(h, n);
+        for (b = 0; b <= NFX_BONE_MAX; b++) {
+            int y = 0;
+
+            for (t = 0; t < 10; t++)
+                if (l->models >> t & 1) {
+                    int held = b < l->bones[t] ? b : l->bones[t] - 1;   /* (the bone past a model's last: its last, as native_place) */
+
+                    y += l->held[t][held > NFX_BONE_MAX ? NFX_BONE_MAX : held][1];
+                }
+            l->centre_y[b] = (short)nfx_mean(y, n);
+        }
+    }
+    c[0] = c[1] = c[2] = 0;
+    if (k->at == NFX_LOOP_AT_ACTORS && every && native_centre_routine_ok(l->number))
+        ((short *(__cdecl *)(unsigned, short *))FN_NATIVE_CENTRE)((unsigned)every, c);
+    if (k->at == NFX_LOOP_AT_HELD) {
+        l->anchor[0] = l->centre[0], l->anchor[1] = l->centre[1];
+    } else {
+        int x = c[0] + k->x, z = c[2] + k->z;
+
+        l->anchor[0] = (short)(x < -NFX_LOOP_PLACE_MAX ? -NFX_LOOP_PLACE_MAX : x > NFX_LOOP_PLACE_MAX ? NFX_LOOP_PLACE_MAX : x);
+        l->anchor[1] = (short)(z < -NFX_LOOP_PLACE_MAX ? -NFX_LOOP_PLACE_MAX : z > NFX_LOOP_PLACE_MAX ? NFX_LOOP_PLACE_MAX : z);
+    }
+    l->now[0] = l->centre_held ? l->centre[0] : l->anchor[0];
+    l->now[1] = l->centre_held ? l->centre[1] : l->anchor[1];
+    l->on = 1;
+    if (k->intro_a >= 0)
+        wsprintfA(intro, "intro %d-%d once, then ", k->intro_a, k->intro_b);
+    else
+        intro[0] = 0;
+    if (native_loop_say())
+        log_line("native effect %04lx: loop handed over by actor %d's cast (targets %04x, %d of them held): %s%d-%d again and again; at=centre from (%d, %d)%s to (%d, %d) over %d frame(s) (loop_at %s); ends: battle%s%s%s; hidden for%s%s%s; wall %d-%d, fade %d%s",
+                 l->number, l->play.actor, l->play.mask, n, intro, k->a, k->b, l->now[0], l->now[1], l->centre_held ? "" : " (no target had a model)", l->anchor[0], l->anchor[1],
+                 k->at == NFX_LOOP_AT_HELD ? 0 : k->glide, k->at == NFX_LOOP_AT_HELD ? "held" : k->at == NFX_LOOP_AT_ARENA ? "arena" : "actors",
+                 (k->ends & NFX_LOOP_ENDS_KO) ? " ko" : "", (k->ends & NFX_LOOP_ENDS_FROG) ? " frog" : "",
+                 k->frames ? " loop_for" : "", (k->hide & NFX_LOOP_HIDE_SUMMON) ? " summons" : "",
+                 (k->hide & NFX_LOOP_HIDE_LIMIT) ? " limits" : "", k->hide ? "" : " nothing", k->wall1, k->wall2, k->fade,
+                 k->outside ? ", not drawn outside it" : "");
+}
+
+/* Loop l ends (one line); its group stays loaded to the battle's end (see above). */
+static void native_loop_end(struct native_loop *l, const char *why)
+{
+    if (native_loop_say())
+        log_line("native effect %04lx: loop ENDED: %s (at frame %d; %d frame(s) played, %d pass(es); drawn on %d update(s), hidden on %d)",
+                 l->number, why, l->clock.frame, l->clock.played, l->clock.passes, l->play.drawn, l->hidden_frames);
+    l->on = 0;
+}
+
+/* Effect c's loop ends (a cast of it starts). */
+static void native_loop_end_effect(int c, const char *why)
+{
+    int i;
+
+    for (i = 0; i < NATIVE_LOOPS_MAX; i++)
+        if (native_loops[i].on && native_loops[i].effect == c)
+            native_loop_end(&native_loops[i], why);
+}
+
+/* A battle starts (native_battle_start): the lists were emptied, the groups freed: every loop has ended. */
+static void native_loops_battle_start(void)
+{
+    int i;
+
+    InterlockedExchange(&native_loop_logs, 0);
+    for (i = 0; i < NATIVE_LOOPS_MAX; i++)
+        if (native_loops[i].on)
+            native_loop_end(&native_loops[i], "the battle's end");
+    native_loop_task_on = 0;
+    native_loop_summon_shown = 0;
+}
+
+/* The loop's sound lines of frame f (an advancing call), as native_events plays a cast's, when nfx_loop_sounds_due says. */
+static void native_loop_events(const struct native_loop *l, int f)
+{
+    const struct nfx_script *s = &nfx_scripts[l->effect];
+    const struct nfx_item *items = nfx_pool + s->first;
+    int i, n, k, pans[10];
+
+    if (!nfx_loop_sounds_due(&effect_copies[l->effect].loop, &l->clock, f, s->length))
+        return;
+    for (i = 0; i < s->count; i++)
+        for (n = nfx_sound_masks(&items[i], f, l->play.mask, l->play.actor, pans), k = 0; k < n; k++) {
+            int route = nfx_sound_route(&items[i]), pan = ((int (__cdecl *)(int))FN_NATIVE_PAN)(pans[k]);
+
+            if (route == NFX_PLAY_HANDLE)
+                sound_handle_play(items[i].sound, pan);
+            else if (route == NFX_PLAY_GAME)
+                ((void (__cdecl *)(int, int, int))FN_NATIVE_SOUND)(items[i].sound_kind, pan, items[i].sound);
+        }
+}
+
+/* One call for loop l: its ends, its hiding, its place and fade, its draw, its clock. */
+static void native_loop_step(struct native_loop *l, int paused, int summon, int limit, const short *eye)
+{
+    const struct nfx_loop_keys *k = &effect_copies[l->effect].loop;
+    DWORD group = native_group_now(l->effect), status = 0;
+    int actor = l->play.actor, hide, glide, page, drawn = l->play.drawn;
+    const char *why;
+
+    if (actor >= 0 && actor < 10)
+        status = *(const DWORD *)(ADDR_LOOP_SHOWN_STATUS + (DWORD)actor * 0x74) | *(const DWORD *)(ADDR_LOOP_TICK_STATUS + (DWORD)actor * 0x10);
+    why = l->generation != native_generation ? "the scripts were read again (Re-init)"
+        : !group ? "its files were freed (the battle's end)"
+        : nfx_loop_end_reason(k->ends, status);
+    if (why) {
+        native_loop_end(l, why);
+        return;
+    }
+    hide = nfx_loop_hidden(k->hide, summon, limit);
+    if (hide != l->hidden) {
+        if (l->said < NATIVE_LOOP_HIDE_LINES && native_loop_say())
+            log_line(hide ? "native effect %04lx: loop hidden at frame %d: %s is shown" : "native effect %04lx: loop shown again at frame %d (%s is over)",
+                     l->number, l->clock.frame, (k->hide & NFX_LOOP_HIDE_SUMMON) && (hide ? summon : !summon) ? "a summon" : "a limit");
+        l->said++;
+        l->hidden = hide;
+    }
+    glide = k->at == NFX_LOOP_AT_HELD ? 0 : k->glide;
+    l->now[0] = (short)nfx_loop_glide(l->centre_held ? l->centre[0] : l->anchor[0], l->anchor[0], l->clock.played, glide);
+    l->now[1] = (short)nfx_loop_glide(l->centre_held ? l->centre[1] : l->anchor[1], l->anchor[1], l->clock.played, glide);
+    l->fade = nfx_loop_fade(nfx_loop_distance(eye[0] - l->now[0], eye[2] - l->now[1]), k);
+    page = l->clock.frame;
+    if (hide) {
+        if (!paused)
+            l->hidden_frames++;
+    } else if (l->fade > 0) {
+        native_now = &l->play;
+        native_draw(group, page);
+        native_now = &native_play;
+        if (!drawn && l->play.drawn && native_loop_say())
+            log_line("native effect %04lx: loop first drawn at frame %d (%d frame(s) after the hand-over): at=centre at (%d, %d), the camera's eye at (%d, %d, %d), fade %d/4096; %d task(s) in the list of 60",
+                     l->number, page, l->clock.played, l->now[0], l->now[1], eye[0], eye[1], eye[2], l->fade,
+                     (int)*(const short *)ADDR_LOOP_LIST60_COUNT);
+    }
+    if (paused)
+        return;                         /* (FFNx's frames between at 30 / 60 fps: drawn, not advanced) */
+    if (!hide)
+        native_loop_events(l, page);
+    if (nfx_loop_advance(k, &l->clock))
+        native_loop_end(l, "loop_for's frames were played");
+}
+
+/* The loops' task, in the list of 60 (see "Native effects, the loop"). */
+static void __cdecl native_loop_task(void)
+{
+    int index = *(const short *)ADDR_HIT_LIST60_INDEX, i, live = 0, found = 0, summon, limit, actor;
+    const DWORD *fns100 = (const DWORD *)ADDR_NATIVE_TASK_FNS, *fns60 = (const DWORD *)ADDR_HIT_LIST60_FNS;
+    short *task;
+
+    if (index < 0 || index >= NATIVE_LOOP_LIST60)
+        return;
+    task = (short *)(ADDR_WATCH_TASK_DATA + index * 0x20);
+    if (!native_loop_task_on || (WORD)task[2] != native_loop_serial) {
+        *task = -1;                     /* an older task: the loops have a newer one, or a battle started */
+        return;
+    }
+    if (!*(const DWORD *)ADDR_NATIVE_3D)
+        return;                         /* the battle is over and its 3D data freed (FUN_00428f59): nothing to read or draw */
+    for (i = 0; i < 100 && !found; i++)
+        found = fns100[i] == FN_LOOP_GAME_SUMMON || fns100[i] == (DWORD)summon_intro_task;
+    for (i = 0; i < NATIVE_LOOP_LIST60 && !found; i++)
+        found = fns60[i] == FN_SUMMON_END_WATCHER;
+    summon = native_loop_summon_shown = nfx_loop_summon(native_loop_summon_shown, found, *(const BYTE *)ADDR_SUMMON_ACTIVE != 0);
+    actor = *(const signed char *)ADDR_EFFECT_ACTOR;
+    limit = actor >= 0 && actor < 10 && *(const BYTE *)(ADDR_ACTOR_COMMAND_TYPE + (DWORD)actor * ACTOR_EFFECT_STRIDE) == 0x14 &&
+            *(const short *)ADDR_LOOP_LIST100_COUNT > 0;
+    for (i = 0; i < NATIVE_LOOPS_MAX; i++)
+        if (native_loops[i].on) {
+            native_loop_step(&native_loops[i], *(const BYTE *)ADDR_NATIVE_PAUSED != 0, summon, limit, (const short *)ADDR_LOOP_EYE);
+            live += native_loops[i].on;
+        }
+    if (!live) {
+        if (native_loop_say())
+            log_line("native effects: the loops' task ends: no loop runs");
+        native_loop_task_on = 0;
+        *task = -1;
+    }
+}
+/* (persistent effect) end of "Native effects, the loop" */
 
 /* ---- Native effect scripts: reading them (load_effect_copies) and finding their files ---- */
 static const char *native_script_name;  /* for native_script_say */
@@ -19013,7 +20389,9 @@ static void native_script_read(int i)
     }
     text = read_whole_file(file, &size);
     if (text) {
-        nfx_pool_used = nfx_parse(text, size, s, nfx_pool, nfx_pool_used, nfx_pool_capacity, native_script_say);
+        /* (persistent effect) with the section's loop keys, if it has any (none: nfx_parse as always) */
+        nfx_pool_used = nfx_parse_loop(text, size, s, nfx_pool, nfx_pool_used, nfx_pool_capacity, native_script_say,
+                                       c->loop.given ? &c->loop : NULL);
         VirtualFree(text, 0, MEM_RELEASE);
     } else if (effect_same_name(c->play_name, "stage0_test")) {
         /* stage 0's timeline, built in (nfx_parse only reads the text) */
@@ -19045,6 +20423,15 @@ static void native_script_read(int i)
     log_line("native effect %04lx: plays effects\\%s.txt%s: %d file(s), %d frames, %d timeline line(s), %d note(s); the record holds effect %02x",
              c->number, c->play_name, built_in ? " (not found: the built-in stage-0 timeline)" : "", s->file_count, s->length, s->count,
              s->notes, c->play_base);
+    if (c->loop.given && built_in)
+        c->loop.on = 0;                 /* (persistent effect) the built-in timeline has no loop part */
+    if (c->loop.given)
+        log_line(c->loop.on ? "native effect %04lx: and then LOOPS (list of 60): intro %d-%d, loop %d-%d; ends: battle%s%s, loop_for %d; hidden for summons %d, limits %d; sounds every pass %d; loop_at %d (%d, %d), glide %d; wall %d-%d, fade %d, outside %s"
+                            : "native effect %04lx: its loop is OFF (the lines above say why): it plays as a cast only",
+                 c->number, c->loop.intro_a, c->loop.intro_b, c->loop.a, c->loop.b, (c->loop.ends & NFX_LOOP_ENDS_KO) ? " ko" : "",
+                 (c->loop.ends & NFX_LOOP_ENDS_FROG) ? " frog" : "", c->loop.frames, (c->loop.hide & NFX_LOOP_HIDE_SUMMON) != 0,
+                 (c->loop.hide & NFX_LOOP_HIDE_LIMIT) != 0, c->loop.sound, c->loop.at, c->loop.x, c->loop.z, c->loop.glide, c->loop.wall1,
+                 c->loop.wall2, c->loop.fade, c->loop.outside ? "hide" : "show");
     if (s->stage && !stage_fx_site_ok())    /* (stage fx 1) "stage lines: on / OFF", said once a run */
         log_line("native effect %04lx: its %d stage line(s) will not be played (the rest of it plays)", c->number, s->stage);
     if (s->fill && !stage_fill_site_ok())   /* (stage fx 2) "fill lines: on / OFF", likewise */
@@ -20236,6 +21623,24 @@ static const BYTE sheet_first_weapon[9] = { 0, 32, 16, 62, 48, 87, 101, 114, 73 
 #define EQUIP_LIKE_NONE         (-2)        /* `equip_like = none`: no original character's own gear (equip_like_allows) */
 #define EQUIP_ALL_NINE          0x01ffu     /* the mask bits of the nine (0 to 8): a piece every one of them can equip */
 
+/* STANCE PURE BEGIN  (the types; the functions follow FORM PURE: tested natively, the weapon stance stage's test)
+   A weapon's stance (`stance = NAME`, weapon file) and a character's `stance_scripts = NAME SS:II ...` (character file):
+   while the character's equipped weapon has stance NAME, slot SS of its model's script table plays entry II of its own
+   script file, the whole battle. See "Weapon stances" after FORM PURE. */
+#define STANCE_MAX              12      /* stance names the weapon file may give: model digits 0xf down to 0x4 */
+#define STANCE_DIGIT_TOP        0x0f    /* the high digit of the model byte the first name gets; the next 0xe ... */
+#define STANCE_NAME_MAX         15      /* letters, digits or _ (FORM_NAME_MAX, the same rule: form_name) */
+#define CHARACTER_STANCE_MAX    4       /* stance_scripts lines of one character */
+#define STANCE_SLOTS            0x2e    /* the game slots a stance may give: 00-2d (the ones the game's own pickers play) */
+
+struct stance_map {
+    char name[STANCE_NAME_MAX + 1];     /* lower case; "" = none */
+    WORD entry[STANCE_SLOTS];           /* the script file's entry + 1 each slot plays; 0 = the slot's own */
+    BYTE pairs;                         /* how many slots the line gives */
+    WORD line;                          /* its line of the character file */
+};
+/* STANCE PURE END */
+
 struct new_character {
     int defined, base, party_slot;      /* base: one of the nine; party_slot: 1-3 or 0 */
     int join_on_load;                   /* testing: exists in every loaded save; otherwise joins by field script */
@@ -20349,6 +21754,10 @@ struct new_character {
        struct, as the outfit keys. Not copied by copy_of. */
     int seat_when_flag;                 /* the bit; FORGET_FLAG_NONE = no key */
     int seat_when_seat;                 /* the seat's character ID, 13 to 15; 0 = no key (or refused after the file was read) */
+    /* (stances) `stance_scripts = NAME SS:II ...` (STANCE PURE): the slots its model plays from its own script file while
+       the equipped weapon has stance NAME. Last in the struct, as the outfit keys. Copied by copy_of. */
+    int stance_count;                   /* lines read; 0 = none (as before: nothing is looked at) */
+    struct stance_map stance[CHARACTER_STANCE_MAX];
 };
 
 /* ---- Seats and the roster ------------------------------------------------------
@@ -21446,6 +22855,450 @@ static void form_files_said(const struct form_def *f, char *out, int out_size)
 }
 /* FORM PURE END */
 
+/* ---- Weapon stances ------------------------------------------------------------------------------------------------
+
+   A weapon file section's `stance = NAME` and a character's `stance_scripts = NAME SS:II [SS:II ...]`: while that
+   character's equipped weapon has stance NAME, slot SS (00-2d) of its model's script table plays entry II of its own
+   script file, for the whole battle.
+
+   The script file's entries from 0x4a up are past the 74 the game relocates (FUN_0042ae73 in battle mode 2, through
+   FUN_0042a6bf; the a2 case at 00424181: both loop to 0x4a), and the game never plays one (it plays a slot's number, and
+   none of those is 0x4a or more). So they are read only here, when the model has just been loaded: in
+   load_party_model_hook once FUN_0042a441 has returned (the load is synchronous: FUN_0042a330 -> FUN_005e1ad2), and in
+   form_model_load_hook after a load of the character's own model; both BEFORE the game's relocation. The raw file offset
+   of entry II is written into slot SS, and the game then relocates it as one of its own. Nothing is lent per action and
+   nothing is put back (the model is freed with the battle); every lender of this DLL (a state's idle and attack
+   scripts, script_NN, script_bytes, a limit's script, the follow-ups) keeps the slot as it finds it and puts that back.
+
+   The weapon carries its stance in the HIGH digit of its model byte (record byte 9; battle record + 0x411 for every worn
+   weapon, a wide one's lent slot too: gear_slot_fill copies its whole record). The game reads that digit only in
+   FUN_005be20b (characters 1 and 7: their model variant, digits 1-3; any other digit gives their first) and at 00423fa1
+   (`ac 0a`, the way back of character 7's transformations: digits 1 and 2 give forms 5 and 6, any other form 4, as 0
+   does); every other reader masks the low digit (004235a7, 0042c1d6, 0043045b, 005e1b51). The weapon
+   file's names get digits 0xf, 0xe ... down to 0x4, in the order the file first gives them: the kernel's weapons have
+   digits 0-3 only (the game's kernel and New Threat's: 110 x 0, 8 x 1, 9 x 2, 1 x 3), so a weapon based on one of them
+   without `stance` never reads as a stance.
+
+   Before anything is written the files are checked, and with one problem nothing is (one log line; the model plays its
+   own scripts): every entry named is inside the table (before the first script) and points at a script that ends within
+   255 bytes (FUN_0041fba4 reads a script at a byte position, 00be11b4) on each way through it (a b3's skip to after the
+   next b2 too), in fe c0 or with a c1 only in a standing slot, in 9e only in a turn of the 2x-Cut or 4x-Cut but the
+   last, with no animation of a limit pack (2c-33: a party actor's go to the pack); and every animation they play is in the
+   model's table with its weapon track (n + 0x34, drawn by FUN_004303cc with no test but the count), both loaded, and is a
+   body (animation 00's bones). So a script file, skeleton or animation file installed without the others is refused. */
+/* STANCE PURE BEGIN  (the functions: no Win32 call inside) */
+#define STANCE_TABLE_END        (FORM_SCRIPT_TABLE + FORM_SCRIPT_SLOTS * 4)    /* 0x190: the 74 offsets the game relocates end here */
+#define STANCE_SCRIPT_MAX       255     /* FUN_0041fba4 reads a script at a byte position (00be11b4) */
+#define STANCE_FILE_SPAN        0x10000 /* the bytes of a script file looked at, at most */
+#define STANCE_TRACK            0x34    /* a party model's body n has its weapon track at n + 0x34 (FUN_004303cc) */
+#define STANCE_ANIM_FINE        0
+#define STANCE_ANIM_COUNT       1       /* it or its weapon track is past the model's table */
+#define STANCE_ANIM_UNLOADED    2       /* it or its weapon track is not loaded */
+#define STANCE_ANIM_NOT_BODY    3       /* its bones are not animation 00's (a weapon track, or not read) */
+
+/* The high digit of the model byte stance names[index] gives; and the index digit `digit` is of `count` names (-1: none). */
+static int stance_digit(int index)
+{
+    return STANCE_DIGIT_TOP - index;
+}
+
+static int stance_index(int digit, int count)
+{
+    int i = STANCE_DIGIT_TOP - digit;
+
+    return i >= 0 && i < count && i < STANCE_MAX ? i : -1;
+}
+
+static BOOL stance_same(const char *a, const char *b)
+{
+    int i;
+
+    for (i = 0; i <= STANCE_NAME_MAX; i++) {
+        if (a[i] != b[i])
+            return FALSE;
+        if (!a[i])
+            return TRUE;
+    }
+    return TRUE;
+}
+
+/* A weapon's `stance = NAME` or `none`: *digit is the high digit its model byte gets (0 for none); a new name is added to
+   names[] (*count of them). NULL, or the problem (nothing is changed). */
+static const char *stance_weapon_key(char names[][STANCE_NAME_MAX + 1], int *count, const char *value, const char *end,
+                                     int *digit)
+{
+    char name[STANCE_NAME_MAX + 1];
+    int i, k;
+
+    if (word_is(value, end, "none")) {
+        *digit = 0;
+        return NULL;
+    }
+    if (!form_name(name, value, end))
+        return "stance is a name of 1 to 15 letters, digits or _ (a character's stance_scripts line names it), or none";
+    for (i = 0; i < *count && !stance_same(names[i], name); i++)
+        ;
+    if (i == *count) {
+        if (*count >= STANCE_MAX)
+            return "the weapon file may name 12 stances: this is a 13th. The line is not read";
+        for (k = 0; k <= STANCE_NAME_MAX; k++)
+            names[i][k] = name[k];
+        (*count)++;
+    }
+    *digit = stance_digit(i);
+    return NULL;
+}
+
+/* The model byte with a stance's digit laid over its high digit (`digit` < 0: no stance key, the byte as it is). */
+static BYTE stance_model_byte(BYTE model, int digit)
+{
+    return digit < 0 ? model : (BYTE)((model & 0x0f) | (digit << 4));
+}
+
+/* SS:II, one or two hex digits each. */
+static BOOL stance_pair(const char *p, const char *end, int *slot, int *entry)
+{
+    int v[2] = { 0, 0 }, part = 0, digits = 0, d;
+
+    for (; p < end; p++) {
+        if (*p == ':' && part == 0 && digits) {
+            part = 1;
+            digits = 0;
+            continue;
+        }
+        if ((d = hex_digit(*p)) < 0 || ++digits > 2)
+            return FALSE;
+        v[part] = v[part] * 16 + d;
+    }
+    if (part != 1 || !digits)
+        return FALSE;
+    *slot = v[0];
+    *entry = v[1];
+    return TRUE;
+}
+
+/* Why slot `slot` (00-ff) cannot be given a stance's script, or NULL. */
+static const char *stance_slot_refusal(int slot)
+{
+    if (slot >= 0 && slot < STANCE_SLOTS)
+        return NULL;
+    if (form_slot_from_exe(slot))
+        return "slots 2e-32 and 34-3b are taken from the exe for every model (FUN_0041fba4): the file's are never played";
+    if (slot == 0x33)
+        return "slot 33 is the game's \"no reaction\": it is never played";
+    if (slot >= 0x3c && slot < FORM_SCRIPT_SLOTS)
+        return "slots 3c-49 are the limits (3c-42), the game's follow-ups (43, 44) and this DLL's follow-up chain (45-49): a limit's script is given in the limits file";
+    return "the game plays slots 00-49 only, and a stance gives 00-2d";
+}
+
+/* The slots the game's tick plays as an actor's standing script (0 and 1 the idles; state_lend_standing's): the only
+   ones whose script may end in fe c0 (back to the idle, never finished: the battle would wait on an action's). */
+static BOOL stance_slot_standing(int slot)
+{
+    return slot >= 0 && (slot <= 0x02 || slot == 0x0c || slot == 0x0d || slot == 0x0e || slot == 0x13);
+}
+
+/* The 2x-Cut's and 4x-Cut's turns but the last (16; 18, 19, 1a): the only slots whose script may end in 9e, which marks
+   the actor finished and does not change its script (FUN_0041fba4 case 0x10). The game's own end so, each followed in
+   the file by its next turn's script (17; 19, 1a, 1b), which the next record plays. */
+static BOOL stance_slot_turn(int slot)
+{
+    return slot == 0x16 || slot == 0x18 || slot == 0x19 || slot == 0x1a;
+}
+
+/* A character's `stance_scripts = NAME SS:II [SS:II ...]`: into maps[*count], and *count one more. NULL, or the problem
+   (the line is not kept). SS is a slot 00-2d and II an entry of the model's script file 00-ff, both in hex. */
+static const char *stance_scripts_key(struct stance_map *maps, int *count, char *value, char *end, int line)
+{
+    struct stance_map *m;
+    char *p = value, *word_end;
+    int i, slot = 0, entry = 0;
+
+    if (*count < 0 || *count >= CHARACTER_STANCE_MAX)
+        return "a character has 4 stance_scripts lines at most: this one is not read";
+    m = &maps[*count];
+    for (i = 0; i < (int)sizeof *m; i++)
+        ((BYTE *)m)[i] = 0;
+    if ((word_end = next_word(&p, end)) == NULL || !form_name(m->name, p, word_end)) {
+        m->name[0] = 0;
+        return "stance_scripts is a stance's name (a weapon's stance = NAME), then SS:II pairs in hex: slot SS of the model plays entry II of its script file (00:4a 14:4f ...)";
+    }
+    for (i = 0; i < *count; i++)
+        if (stance_same(maps[i].name, m->name)) {
+            m->name[0] = 0;
+            return "this character has a stance_scripts line for that stance already: this one is not read";
+        }
+    for (p = word_end; (word_end = next_word(&p, end)) != NULL; p = word_end) {
+        const char *why = NULL;
+
+        if (!stance_pair(p, word_end, &slot, &entry))
+            why = "each pair is SS:II, a slot and an entry of the script file in hex (one or two digits each), like 14:4f";
+        else if ((why = stance_slot_refusal(slot)) != NULL)
+            ;
+        else if (form_slot_from_exe(entry))
+            why = "entries 2e-32 and 34-3b are the places of the exe's scripts: the game never plays the file's";
+        else if (m->entry[slot])
+            why = "the line gives one slot twice";
+        if (why) {
+            m->name[0] = 0;
+            return why;
+        }
+        m->entry[slot] = (WORD)(entry + 1);
+        m->pairs++;
+    }
+    if (!m->pairs) {
+        m->name[0] = 0;
+        return "stance_scripts needs at least one SS:II pair after the stance's name";
+    }
+    m->line = (WORD)line;
+    (*count)++;
+    return NULL;
+}
+
+/* The first script of a script file (`size` bytes of it can be read): the smallest of the 74 offsets the game relocates
+   that points past their table and into what can be read (party files have unused slots pointing into the header); 0
+   if there is none. The file's table of entries ends there. */
+static DWORD stance_first_script(const BYTE *file, DWORD size)
+{
+    DWORD first = 0, at;
+    int slot;
+
+    if (!file || size < STANCE_TABLE_END)
+        return 0;
+    for (slot = 0; slot < FORM_SCRIPT_SLOTS; slot++) {
+        at = form_dword(file + FORM_SCRIPT_TABLE + slot * 4);
+        if (at >= STANCE_TABLE_END && at < size && (!first || at < first))
+            first = at;
+    }
+    return first;
+}
+
+/* Whether byte `op` (0x8e up) plays as an animation: the interpreter's jump table (004248c2) gives it the default case. */
+static BOOL stance_animation_byte(BYTE op)
+{
+    return op == 0xbb || op == 0xc0 || op == 0xcd || op == 0xd2 || op == 0xd3 || op == 0xd9 || op == 0xef;
+}
+
+/* Walks the script at file + at (`size` bytes of the file can be read) command by command (form_operands) on every way
+   the interpreter may take through it, each to an end: ee, ff, f1, fe c0 (a standing slot's only) or 9e (a turn slot's
+   only, stance_slot_turn), within STANCE_SCRIPT_MAX bytes of its start. b3 goes on to the next command and, while the
+   actor is small (00bf23c0 bit 0x1000), to just after the next BYTE b2 (FUN_0041fba4 case 0x25 reads byte by byte,
+   operands too); c1 (case 0x33: back to just after the first c9, for ever) only in a standing slot. c1, and ca (case
+   0x3c, while an effect loads), go back to just after the script's first BYTE c9 (mark + 1), searched from its start
+   with no end if there is none: that c9 must come before them and the byte after it be a start some way gets to (the
+   jump lands on a way walked). Only an animation ends the tick (the default case, a7, a9, b6 clear the read loop's
+   flag); ee / ff and fe c0 restart the idle at 0 and read on (0x00422e07, 0x0041fde2). So no way may go round with
+   none: in a standing slot (any of them may be the idle) no way from the start reaches ee, ff or fe c0 with no animation
+   (quiet[]); no way from mark + 1 reaches c1 with none (loop[]); and not both a c1 from the start and an ee, ff or fe c0
+   from mark + 1 with none (0 -> c1 -> mark + 1 -> ee -> 0). ca's own loop is not refused: it jumps only while 00bf2a30
+   is set, which beside FFNx never is. fe restarts only while f3's count (00be11b5) is 0: f4 NN (NN > 0, 0x0042232d)
+   and c5 (0x00422380) set it, f3 waits while it is set and counts it down (0x004222c1); with it set fe does nothing
+   (0x0041fdf6), c0 plays as an animation and the read goes on past the script. So no way may reach fe c0 with the count
+   set and no f3 since (pend[]), and not both a c1 with it set and an fe c0 from mark + 1 with no f3 (nof3[]: the count
+   goes back with c1's jump). No other way goes back, so the bytes are taken in order and each command once
+   (reach[]: the starts some way gets to). The animations played on any way (a byte below 8e or one the interpreter
+   plays as one, a7 / b6's operand, a9's second) are set in played[] (bits). NULL, or the problem. */
+static const char *stance_walk(const BYTE *file, DWORD size, DWORD at, BOOL standing, BOOL turn, BYTE *played)
+{
+    static const char no_end[] = "a script it names has no end (ee, ff, f1, fe c0, or 9e in a turn) within 255 bytes on each way through it (b3 may skip to after the next b2), or runs past the file";
+    static const char spin[] = "a script it names, in a standing slot (00, 01, 02, 0c, 0d, 0e, 13), can reach ee, ff or fe c0 with no animation before it (c1's jump back included): as the idle it would start again inside one frame, for ever";
+    static const char held[] = "a script it names can reach fe c0 with f3's count still set (f4 NN or c5 with no f3 after it, c1's jump back included): fe then does nothing and the game reads on past the script's end";
+    BYTE reach[(STANCE_SCRIPT_MAX + 7) / 8], quiet[(STANCE_SCRIPT_MAX + 7) / 8], loop[(STANCE_SCRIPT_MAX + 7) / 8];
+    BYTE pend[(STANCE_SCRIPT_MAX + 7) / 8], nof3[(STANCE_SCRIPT_MAX + 7) / 8];
+    DWORD start = at, i, k, mark;
+    BOOL c1_quiet = FALSE, end_loop = FALSE;    /* a c1 from the start, an ee / ff / fe c0 from mark + 1, with no animation */
+    BOOL c1_pend = FALSE, fe_nof3 = FALSE;      /* a c1 with the count set, an fe c0 from mark + 1 with no f3 */
+
+    for (i = 0; i < sizeof reach; i++)
+        reach[i] = quiet[i] = loop[i] = pend[i] = nof3[i] = 0;
+    reach[0] = quiet[0] = 1;                    /* quiet: a way gets here with no animation since the script's start */
+    for (mark = 0; mark < STANCE_SCRIPT_MAX && start + mark < size && file[start + mark] != 0xc9; mark++)
+        ;                                       /* the first byte c9: c1 and ca go back to mark + 1 */
+    for (i = 0; i < STANCE_SCRIPT_MAX; i++) {
+        BYTE op;
+        int a = -1, n;
+        BOOL q, l, p, f;
+
+        if (!(reach[i >> 3] & (1u << (i & 7))))
+            continue;
+        if (i == mark + 1) {
+            loop[i >> 3] |= (BYTE)(1u << (i & 7));  /* loop: a way gets here from mark + 1 with no animation */
+            nof3[i >> 3] |= (BYTE)(1u << (i & 7));  /* nof3: a way gets here from mark + 1 with no f3 */
+        }
+        q = (quiet[i >> 3] >> (i & 7)) & 1;
+        l = (loop[i >> 3] >> (i & 7)) & 1;
+        p = (pend[i >> 3] >> (i & 7)) & 1;     /* pend: a way gets here with f3's count (00be11b5) set and no f3 since */
+        f = (nof3[i >> 3] >> (i & 7)) & 1;
+        at = start + i;
+        if (at >= size)
+            return no_end;
+        op = file[at];
+        if ((op == 0xee || op == 0xff) && standing && q)
+            return spin;                        /* ee / fe c0 restart the idle and the loop reads on (0x00422e07, 0x0041fde2) */
+        if ((op == 0xee || op == 0xff) && l)
+            end_loop = TRUE;
+        if (op == 0xee || op == 0xff || op == 0xf1)
+            continue;                           /* an end: this way stops */
+        if (op == 0x9e) {
+            if (!turn)
+                return "a script it names has 9e (the actor finished without going back to its idle) in a slot that is not a first turn of the 2x-Cut or 4x-Cut (16, 18, 19, 1a, each followed by its next turn's): only those may end so";
+            continue;
+        }
+        if (op == 0xfe && at + 1 < size && file[at + 1] == 0xc0) {
+            if (i + 1 >= STANCE_SCRIPT_MAX)
+                return no_end;
+            if (!standing)
+                return "a script it names ends in fe c0 (back to the idle, never finished) in a slot that is not a standing one (00, 01, 02, 0c, 0d, 0e, 13): the battle would wait on it";
+            if (q)
+                return spin;
+            if (p)
+                return held;                    /* fe with a count does nothing (0x0041fdf6): c0 plays, the read goes on */
+            if (l)
+                end_loop = TRUE;
+            if (f)
+                fe_nof3 = TRUE;
+            continue;
+        }
+        if (op == 0xc1 && !standing)
+            return "a script it names has c1 (back to just after the first c9, for ever) in a slot that is not a standing one (00, 01, 02, 0c, 0d, 0e, 13): the battle would wait on it";
+        if (op == 0xc1 || op == 0xca) {
+            /* c1, and ca while an effect loads: back to just after the FIRST byte c9 of the script, searched byte by byte
+               from position 0 (0x00422867, 0x004228c6; with none the search never ends) */
+            if (mark >= i || !(reach[(mark + 1) >> 3] & (1u << ((mark + 1) & 7))))
+                return "a script it names has c1 or ca with no c9 before it that starts a command (the game goes back to just after the first byte c9 of the script: with none it searches for ever, or skips ahead)";
+            if (op == 0xc1 && l)
+                return "a script it names has c1 with no animation between the script's first c9 and it: the game would loop inside one frame for ever";
+            if (op == 0xc1 && q)
+                c1_quiet = TRUE;
+            if (op == 0xc1 && p)
+                c1_pend = TRUE;                 /* the count goes back with c1's jump */
+        }
+        n = op < 0x8e ? 1 : 1 + form_operands[op - 0x8e];
+        if (at + n > size)
+            return no_end;
+        if (op < 0x8e || stance_animation_byte(op))
+            a = op;
+        else if (op == 0xa7 || op == 0xb6)
+            a = file[at + 1];
+        else if (op == 0xa9)
+            a = file[at + 2];
+        if (a >= FORM_MODEL_ANIMATIONS && a < STANCE_TRACK)
+            return "a script it names plays an animation 2c-33: a party actor's go to its limit's pack";
+        if (a >= 0) {
+            played[a >> 3] |= (BYTE)(1u << (a & 7));
+            q = l = FALSE;                      /* an animation ends the tick (the default case, a7, a9, b6) */
+        }
+        if (op == 0xf3)
+            p = f = FALSE;                      /* f3 waits while the count is set: after it the count is 0 (0x004222c1) */
+        else if ((op == 0xf4 && file[at + 1]) || op == 0xc5)
+            p = TRUE;                           /* f4 NN sets the count (0x0042232d), c5 sets it from 00bfd0f0 */
+        if (op == 0xb3) {
+            for (k = i + 1; k < STANCE_SCRIPT_MAX && start + k < size && file[start + k] != 0xb2; k++)
+                ;
+            if (start + k >= size || k + 1 >= STANCE_SCRIPT_MAX)
+                return no_end;                  /* no b2, or the skip's way starts past 255 bytes */
+            reach[(k + 1) >> 3] |= (BYTE)(1u << ((k + 1) & 7));
+            quiet[(k + 1) >> 3] |= (BYTE)(q << ((k + 1) & 7));
+            loop[(k + 1) >> 3] |= (BYTE)(l << ((k + 1) & 7));
+            pend[(k + 1) >> 3] |= (BYTE)(p << ((k + 1) & 7));
+            nof3[(k + 1) >> 3] |= (BYTE)(f << ((k + 1) & 7));
+        }
+        if (i + n >= STANCE_SCRIPT_MAX)
+            return no_end;
+        reach[(i + n) >> 3] |= (BYTE)(1u << ((i + n) & 7));
+        quiet[(i + n) >> 3] |= (BYTE)(q << ((i + n) & 7));
+        loop[(i + n) >> 3] |= (BYTE)(l << ((i + n) & 7));
+        pend[(i + n) >> 3] |= (BYTE)(p << ((i + n) & 7));
+        nof3[(i + n) >> 3] |= (BYTE)(f << ((i + n) & 7));
+    }
+    if (c1_quiet && end_loop)
+        return spin;                            /* 0 -> c1 -> mark + 1 -> ee / fe c0 -> 0, with no animation */
+    if (c1_pend && fe_nof3)
+        return held;                            /* f4 NN -> c1 -> mark + 1 -> fe c0, with no f3 */
+    return NULL;
+}
+
+/* Whether stance `m` can be used with this script file (`size` bytes of it can be read, as loaded: its offsets not yet
+   relocated). NULL, with offsets[slot] the raw offset each slot it gives gets (0 for the others) and played[] (32 bytes)
+   the bits of the animations those scripts play; or the problem, with *bad_slot the slot it is in (-1: the file). */
+static const char *stance_plan(const BYTE *file, DWORD size, const struct stance_map *m, DWORD *offsets, BYTE *played,
+                               int *bad_slot)
+{
+    DWORD first = stance_first_script(file, size), at;
+    int slot, entry;
+    const char *why;
+
+    *bad_slot = -1;
+    for (slot = 0; slot < 32; slot++)
+        played[slot] = 0;
+    for (slot = 0; slot < STANCE_SLOTS; slot++)
+        offsets[slot] = 0;
+    if (!first)
+        return "its script file cannot be read, or has no script after its table of 74";
+    for (slot = 0; slot < STANCE_SLOTS; slot++) {
+        if ((entry = (int)m->entry[slot] - 1) < 0)
+            continue;
+        *bad_slot = slot;
+        if ((DWORD)(FORM_SCRIPT_TABLE + entry * 4 + 4) > first)
+            return "the entry it gives the slot is not in the script file (its table of entries ends where its first script begins)";
+        at = form_dword(file + FORM_SCRIPT_TABLE + entry * 4);
+        if (at < first || at >= size)
+            return "the entry it gives the slot points into the file's table or past the file";
+        if ((why = stance_walk(file, size, at, stance_slot_standing(slot), stance_slot_turn(slot), played)) != NULL)
+            return why;
+        offsets[slot] = at;
+    }
+    *bad_slot = -1;
+    return NULL;
+}
+
+/* Animation `a`, which a stance's script plays, of a model with `count` animations: `body` and `track` whether the
+   entries of a and a + 0x34 (its weapon track) are loaded, `bones` a's bones and `bones0` animation 00's (-1: not
+   read). STANCE_ANIM_*. */
+static int stance_animation_problem(int a, int count, BOOL body, BOOL track, int bones, int bones0)
+{
+    if (a < 0 || a + STANCE_TRACK >= count)
+        return STANCE_ANIM_COUNT;
+    if (!body || !track)
+        return STANCE_ANIM_UNLOADED;
+    if (bones < 0 || bones0 < 0 || bones != bones0)
+        return STANCE_ANIM_NOT_BODY;
+    return STANCE_ANIM_FINE;
+}
+
+/* "00:4a 01:4b ..." of the slots a stance gives, into out (`size` bytes; " ..." where the rest does not fit). */
+static void stance_pairs_text(const struct stance_map *m, char *out, int size)
+{
+    static const char digits[] = "0123456789abcdef";
+    int slot, n = 0;
+
+    if (size <= 0)
+        return;
+    out[0] = 0;
+    for (slot = 0; slot < STANCE_SLOTS; slot++) {
+        int entry = (int)m->entry[slot] - 1;
+
+        if (entry < 0)
+            continue;
+        if (n + 6 + 4 + 1 > size) {
+            if (n + 4 + 1 <= size) {
+                out[n++] = ' ', out[n++] = '.', out[n++] = '.', out[n++] = '.';
+                out[n] = 0;
+            }
+            return;
+        }
+        if (n)
+            out[n++] = ' ';
+        out[n++] = digits[slot >> 4], out[n++] = digits[slot & 15], out[n++] = ':';
+        out[n++] = digits[entry >> 4 & 15], out[n++] = digits[entry & 15];
+        out[n] = 0;
+    }
+}
+/* STANCE PURE END */
+
+static char stance_names[STANCE_MAX][STANCE_NAME_MAX + 1];  /* the weapon file's stance names: index i is model digit 0xf - i */
+static int stance_name_count;                               /* how many it gave, as last read */
+
 static struct form_def forms[FORM_MAX];
 static int form_count;                  /* sections read, bad ones included (their numbers stay taken) */
 static int form_hooks_state;            /* 0 not tried, 1 both a2 calls hooked, -1 refused (form keys off) */
@@ -21517,9 +23370,12 @@ static void battle_letters_choose(struct new_character *c)
     }
 }
 
+static void stance_model_loaded(int slot, const struct stance_map *maps, int count, int id);   /* (stances) after state_own_table */
+
 static int __cdecl load_party_model_hook(int zero, int slot, const char *name)
 {
     struct new_character *c = slot >= 0 && slot < 3 ? new_character(((const BYTE *)ADDR_PARTY)[slot]) : NULL;
+    int r;
 
     if (c && c->battle_prefix[0] && override_on) {
         int i;
@@ -21538,7 +23394,10 @@ static int __cdecl load_party_model_hook(int zero, int slot, const char *name)
         party_model_file[slot][i] = slot_own_model[slot][i] = 0;
         form_in_slot[slot] = NULL;      /* (forms) the slot holds its own model again */
     }
-    return ((int (__cdecl *)(int, int, const char *))FN_LOAD_PARTY_MODEL)(zero, slot, name);
+    r = ((int (__cdecl *)(int, int, const char *))FN_LOAD_PARTY_MODEL)(zero, slot, name);
+    if (c && c->stance_count)
+        stance_model_loaded(slot, c->stance, c->stance_count, character_file_id(c));  /* (stances) before the game relocates the table */
+    return r;
 }
 
 /* `body_blend = yes`. The game loads a party model's body with the load context's blend mode at 4 (set by
@@ -21926,6 +23785,8 @@ static int __cdecl form_model_load_hook(int zero, int flag, int slot, const char
                      slot, back);
         }
         r = load_model_slot(0, 0, slot, back);
+        if (r && c && own && c->stance_count)
+            stance_model_loaded(slot, c->stance, c->stance_count, character_file_id(c));  /* (stances) its own model: before the a2 case relocates */
         form_note_slot(slot, NULL, back);
         if (!f)
             wsprintfA(number, "number 0x%02x", n & 0xff);
@@ -21936,6 +23797,8 @@ static int __cdecl form_model_load_hook(int zero, int flag, int slot, const char
         /* the way back (`ac 0a`, or 4-6) on a slot a new character holds, or one in a form of this DLL's
            (whoever it is: the game's table is right only for its own character): the slot's own model */
         r = load_model_slot(zero, flag, slot, own);
+        if (r && c && c->stance_count)
+            stance_model_loaded(slot, c->stance, c->stance_count, character_file_id(c));  /* (stances) its own model: before the a2 case relocates */
         if (InterlockedIncrement(&logged) <= FORM_LOG_MAX)
             log_line("revert: slot %d loads %s (character %d's own model; the game's table says %s)%s", slot, own,
                      c ? character_file_id(c) : (int)((const BYTE *)ADDR_PARTY)[slot], name ? name : "(none)",
@@ -23071,6 +24934,7 @@ static int load_characters(void)
                 current->field_when_model[0] = current->battle_when_prefix[0] = current->battle_letters_now[0] = 0;
                 current->field_when_found = 0;
                 current->body_blend = 0;
+                current->stance_count = 0;      /* (stances) none until the section says */
                 current->ai_like = 0;
                 current->ai_file[0] = 0;
                 current->ai_keys_here = 0;
@@ -23149,6 +25013,9 @@ static int load_characters(void)
                     ;   /* one of the definition keys; `problem` is NULL or what was wrong */
                 } else if (word_is(start, key_end, "portrait")) {
                     problem = character_portrait_key(current, value, stop);    /* a file or one of the game's own portraits */
+                } else if (word_is(start, key_end, "stance_scripts")) {
+                    /* NAME SS:II ...: while the worn weapon has stance NAME, slot SS plays entry II of the model's script file (STANCE PURE) */
+                    problem = stance_scripts_key(current->stance, &current->stance_count, value, stop, line_number);
                 } else if (word_is(start, key_end, "field_model")) {
                     /* the four characters of a field skeleton's name (YUAA for YUAA.HRC), or none */
                     int length = (int)(stop - value), k;
@@ -23982,6 +25849,314 @@ static void build_character_ai(void)
     }
 }
 
+/* ==== FIELD LIMITS BEGIN (part 1: the site table, the pure engine, the DLL's tables; Breaking Limits, `field_limits`;
+   tools/work/field_models/build/BUILD_PLAN.md, from the designs DESIGN.md and entities/DESIGN_ENTITIES.md) ====
+
+   A field holds at most 16 models and 48 entities in the plain game: not because its file says so (one byte counts the
+   entities, a word the models) but because the engine keeps a model's and an entity's state in small tables of 16, 18,
+   20 or 48 entries, each packed against other data. With `field_limits = on` (and `breaking_limits = on`) the DLL
+   gives each of those tables 256 entries of its own (32 for the KAWAI work buffers) and rewrites the operands that name
+   them, so a field may hold up to 32 models (FFNx keeps 32 per field: the ceiling) and 255 entities (0-254).
+     - The 16 model records (0x88 each at 00cc1670) do NOT move: they grow in place over the 0x390 bytes behind them
+       (the field's name, its 32 LINE records and three scalars), which move into the DLL as one block; records 22-31 lie
+       on the old field info table's first records, dead once that table is moved (by the field registry, or here).
+     - The talk detector (FUN_00636284) keeps a 16-word array on its stack: its frame grows by 0x28 (36 words) and its
+       22 other locals move down with it. Five loop bounds (16, 18, 18, 20, 20) become 32. Six reads of a LINE's owner
+       read it signed (movsx): they read it unsigned (movzx), so entities 128-254 own lines.
+     - Every operand is rewritten from a GENERATED table (field_limits_sites.inc, gen/gen_field_limits.py) that holds each
+       instruction as the exe has it: every byte of each is checked before anything is written, all or nothing.
+   Two moments. FFNx takes the addresses of eight of these tables out of the game's code once, when the game creates
+   its window (before the driver entry); those eight groups move from DllMain (field_limits_dllmain), as the weapon and
+   armour operands do, so FFNx reads the DLL's. The rest moves at the first kernel load (field_limits_kernel_load),
+   checked against the code as FFNx left it. Off (the default) = no byte of the game is changed. Nothing here names a
+   character. */
+
+/* ---- FIELD LIMITS PURE begin (no game memory, no Windows: build/test compiles this block alone, with the .inc) ---- */
+#define FLIM_DLLMAIN            1       /* a group's moment: from DllMain, before FFNx copies its address */
+#define FLIM_KERNEL             2       /* at the first kernel load */
+#define FLIM_DISP32             1       /* a row's kind: the dword at `off` names the group's table */
+#define FLIM_LINE               2       /* the same, and byte +2 is movsx (be) that becomes movzx (b6) */
+#define FLIM_DISP8              3       /* the talk detector: a local's disp8 at `off`, 0x50 lower */
+#define FLIM_FRAME              4       /* the talk detector's sub esp, imm8 at `off`: 0x50 -> 0x78 */
+#define FLIM_IMM8               5       /* a loop bound's imm8 at `off` -> FLIM_BOUND_NEW */
+#define FLIM_FILL_COPY          1       /* a new table: the old one's bytes, the rest 0 */
+#define FLIM_FILL_ONES18        2       /* ... and dwords 18 to 255 are 1 (draw enable: else a 19th model is never drawn) */
+#define FLIM_FILL_INFO          3       /* the info table: a copy the DLL allocates, only when the registry has not moved it */
+#define FLIM_FILL_NONE          4
+#define FLIM_TALK_SHIFT         0x50
+#define FLIM_TALK_FRAME_NEW     0x78
+#define FLIM_MOVSX              0xbe
+#define FLIM_MOVZX              0xb6
+
+struct flim_group { DWORD old_base, old_span, new_offset, new_bytes; BYTE moment, fill, hashed; const char *what; };
+struct flim_row { DWORD at, stock; BYTE length, off, kind, group; BYTE code[12]; };
+
+#include "field_limits_sites.inc"
+
+/* FNV-1a, for the talk detector's bytes and the old tables' tripwire. */
+static DWORD flim_hash(const BYTE *p, DWORD n)
+{
+    DWORD h = 0x811c9dc5u;
+
+    while (n--)
+        h = (h ^ *p++) * 0x01000193u;
+    return h;
+}
+
+/* Is the row one of this moment's? The info rows only when `info` (the registry has not moved that table). */
+static int flim_row_in(const struct flim_row *row, int moment, int info)
+{
+    return flim_groups[row->group].moment == moment && (row->group != FLIM_G_INFO || info);
+}
+
+/* The edited field's bytes: 4 for an operand, 1 for the rest. */
+static int flim_width(const struct flim_row *row)
+{
+    return row->kind == FLIM_DISP32 || row->kind == FLIM_LINE ? 4 : 1;
+}
+
+/* The value the row's field takes when moved, from the group's new base. */
+static DWORD flim_value(const struct flim_row *row, const DWORD *new_base)
+{
+    switch (row->kind) {
+    case FLIM_DISP32:
+    case FLIM_LINE:
+        return row->stock - flim_groups[row->group].old_base + new_base[row->group];
+    case FLIM_DISP8:
+        return (row->stock - FLIM_TALK_SHIFT) & 0xff;
+    case FLIM_FRAME:
+        return FLIM_TALK_FRAME_NEW;
+    default:
+        return FLIM_BOUND_NEW;
+    }
+}
+
+/* Where the row's instruction is in `image` (which holds the exe's image from address `base`, `size` bytes), or NULL. */
+static BYTE *flim_place(BYTE *image, DWORD base, DWORD size, const struct flim_row *row)
+{
+    if (row->at < base || row->at - base > size || size - (row->at - base) < row->length)
+        return NULL;
+    return image + (row->at - base);
+}
+
+static DWORD flim_field(const BYTE *p, const struct flim_row *row)
+{
+    if (flim_width(row) == 4)
+        return p[row->off] | (DWORD)p[row->off + 1] << 8 | (DWORD)p[row->off + 2] << 16 | (DWORD)p[row->off + 3] << 24;
+    return p[row->off];
+}
+
+/* Every row of the moment (and the info rows when `info`): each byte outside the edited field as the exe has it, the
+   field the stock value, or (`planned`) the value flim_value gives and a LINE row's byte +2 movzx. Returns how many
+   rows were checked, or -1 with *bad the index of the first that is not so. Writes nothing. */
+static int flim_check(BYTE *image, DWORD base, DWORD size, int moment, int info, int planned, const DWORD *new_base, int *bad)
+{
+    int i, k, n = 0;
+
+    for (i = 0; i < FLIM_ROW_COUNT; i++) {
+        const struct flim_row *row = &flim_rows[i];
+        const BYTE *p;
+
+        if (!flim_row_in(row, moment, info))
+            continue;
+        *bad = i;
+        if ((p = flim_place(image, base, size, row)) == NULL)
+            return -1;
+        for (k = 0; k < row->length; k++) {
+            if (k >= row->off && k < row->off + flim_width(row))
+                continue;
+            if (row->kind == FLIM_LINE && k == 2) {
+                if (p[k] != (planned ? FLIM_MOVZX : FLIM_MOVSX))
+                    return -1;
+            } else if (p[k] != row->code[k])
+                return -1;
+        }
+        if (flim_field(p, row) != (planned ? flim_value(row, new_base) : row->stock))
+            return -1;
+        n++;
+    }
+    *bad = -1;
+    return n;
+}
+
+static void flim_put(BYTE *p, const struct flim_row *row, DWORD value)
+{
+    int k;
+
+    for (k = 0; k < flim_width(row); k++)
+        p[row->off + k] = (BYTE)(value >> 8 * k);
+}
+
+/* Writes every row of the moment as planned; the caller checked them (flim_check) and made the code writable. */
+static int flim_apply(BYTE *image, DWORD base, DWORD size, int moment, int info, const DWORD *new_base)
+{
+    int i, n = 0;
+
+    for (i = 0; i < FLIM_ROW_COUNT; i++) {
+        const struct flim_row *row = &flim_rows[i];
+        BYTE *p;
+
+        if (!flim_row_in(row, moment, info) || (p = flim_place(image, base, size, row)) == NULL)
+            continue;
+        flim_put(p, row, flim_value(row, new_base));
+        if (row->kind == FLIM_LINE)
+            p[2] = FLIM_MOVZX;
+        n++;
+    }
+    return n;
+}
+
+/* Puts the edited bytes of every row of the moment back as the exe has them. */
+static int flim_undo(BYTE *image, DWORD base, DWORD size, int moment, int info)
+{
+    int i, n = 0;
+
+    for (i = 0; i < FLIM_ROW_COUNT; i++) {
+        const struct flim_row *row = &flim_rows[i];
+        BYTE *p;
+
+        if (!flim_row_in(row, moment, info) || (p = flim_place(image, base, size, row)) == NULL)
+            continue;
+        flim_put(p, row, row->stock);
+        if (row->kind == FLIM_LINE)
+            p[2] = FLIM_MOVSX;
+        n++;
+    }
+    return n;
+}
+
+/* The talk detector as a whole as the exe has it (its 0x267 bytes; graft 2): 1, else 0. */
+static int flim_talk_ok(BYTE *image, DWORD base, DWORD size)
+{
+    if (FLIM_TALK_AT < base || FLIM_TALK_AT - base > size || size - (FLIM_TALK_AT - base) < FLIM_TALK_BYTES)
+        return 0;
+    return flim_hash(image + (FLIM_TALK_AT - base), FLIM_TALK_BYTES) == FLIM_TALK_HASH;
+}
+
+/* Each function that holds a kernel row still begins push ebp / mov ebp,esp (not replaced by a driver). -1, or the
+   index of the first that does not. */
+static int flim_functions_ok(BYTE *image, DWORD base, DWORD size)
+{
+    int i;
+
+    for (i = 0; i < FLIM_FUNCTION_COUNT; i++) {
+        DWORD at = flim_functions[i];
+        const BYTE *p;
+
+        if (at < base || at - base > size || size - (at - base) < 3)
+            return i;
+        p = image + (at - base);
+        if (p[0] != 0x55 || p[1] != 0x8b || p[2] != 0xec)
+            return i;
+    }
+    return -1;
+}
+
+/* The field reader's push (68 + the field name's address): the game's 00cc1ef0, or the DLL's moved name. */
+static int flim_reader_push_ok(const BYTE *code, DWORD moved_name)
+{
+    DWORD value = code[1] | (DWORD)code[2] << 8 | (DWORD)code[3] << 16 | (DWORD)code[4] << 24;
+
+    return code[0] == 0x68 && (value == 0x00cc1ef0u || value == moved_name);
+}
+
+/* An operand a check of the DLL expects: the game's table, or the same table moved. */
+static int flim_operand_ok(DWORD value, DWORD game, DWORD moved)
+{
+    return value == game || value == moved;
+}
+
+/* The game file read as load_game_settings reads it (the same line rules: a comment starts at ; or # at a line's start
+   or after a space, `[` lines and empty lines are skipped, key = value trimmed, the last line wins), for two keys only:
+   breaking_limits and field_limits; on/yes is 1, anything else 0. Read from DllMain, before the full reading. */
+static void flim_peek(char *text, DWORD size, int *breaking, int *limits)
+{
+    char *line, *end, *file_end = text + size;
+
+    *breaking = *limits = 0;
+    for (line = text; line < file_end; line = end + 1) {
+        char *start = line, *stop, *equals, *key_end, *value;
+        int *target;
+
+        for (end = line; end < file_end && *end != '\n'; end++)
+            ;
+        for (stop = start; stop < end; stop++)
+            if ((*stop == ';' || *stop == '#') && (stop == start || is_space(stop[-1])))
+                break;
+        trim(&start, &stop);
+        if (start == stop || *start == '[')
+            continue;
+        for (equals = start; equals < stop && *equals != '='; equals++)
+            ;
+        key_end = equals;
+        value = equals < stop ? equals + 1 : stop;
+        trim(&start, &key_end);
+        trim(&value, &stop);
+        target = word_is(start, key_end, "breaking_limits") ? breaking : word_is(start, key_end, "field_limits") ? limits : NULL;
+        if (target)
+            *target = word_is(value, stop, "on") || word_is(value, stop, "yes");
+    }
+}
+
+struct flim_counts { DWORD entities, h3, n2; };
+
+/* A field file as the reader left it (u16 0, u32 9, nine offsets checked as field_merge.inc checks them; section 1 +2
+   entities, +3 models; section 3 +2 the loader's models), never read past `room`. 1, or 0 when it is not such a file. */
+static int flim_counts(const BYTE *file, DWORD room, struct flim_counts *c)
+{
+    DWORD off[9];
+    int i;
+
+    if (!file || room < 42 || file[0] || file[1] || (file[2] | file[3] << 8 | (DWORD)file[4] << 16 | (DWORD)file[5] << 24) != 9)
+        return 0;
+    for (i = 0; i < 9; i++) {
+        const BYTE *p = file + 6 + i * 4;
+
+        off[i] = p[0] | (DWORD)p[1] << 8 | (DWORD)p[2] << 16 | (DWORD)p[3] << 24;
+        if (off[i] < 42 || off[i] > room || room - off[i] < 4 || (i && (off[i] <= off[i - 1] || off[i] - off[i - 1] < 4)))
+            return 0;
+    }
+    if (off[1] - off[0] < 8 || off[3] - off[2] < 8)
+        return 0;
+    c->entities = file[off[0] + 4 + 2];
+    c->h3 = file[off[0] + 4 + 3];
+    c->n2 = file[off[2] + 4 + 2] | (DWORD)file[off[2] + 4 + 3] << 8;
+    return 1;
+}
+
+/* The bytes of the model records, from record 0 (00cc1670), that a field of `models` models leaves unused up to the
+   32nd: [max(16, models), 32) records; empty above 32. Records below 16 are the game's to leave as they are. */
+static void flim_trip_range(DWORD models, DWORD *from, DWORD *to)
+{
+    *from = (models < 16 ? 16 : models > 32 ? 32 : models) * 0x88;
+    *to = 32 * 0x88;
+}
+/* ---- FIELD LIMITS PURE end ---- */
+
+/* The DLL's tables, all of them (the KAWAI work buffers are most of it), zero at start as the game's are. */
+static BYTE flim_space[FLIM_SPACE_BYTES] __attribute__((aligned(16)));
+
+/* Where the DLL's own code finds four of the tables: the game's addresses until their group moves. */
+static DWORD flim_script_pos = 0x00cc0cf8u;     /* word per entity: its command's offset in the script section */
+static DWORD flim_models = 0x00cbfb70u;         /* byte per entity: its model, ff none */
+static DWORD flim_join_state = 0x00cc0830u;     /* byte per entity: where it is in a JOIN or a SPLIT */
+static DWORD flim_field_name = 0x00cc1ef0u;     /* the field's name as the reader is given it */
+
+/* The address a group's old base has in the DLL's space (whether moved or not). */
+static DWORD flim_moved(int group)
+{
+    return (DWORD)flim_space + flim_groups[group].new_offset;
+}
+
+/* The field reader's push as a check of this DLL expects it: the game's name, or the moved one. */
+static BOOL flim_push_ok(const BYTE *code)
+{
+    return flim_reader_push_ok(code, flim_moved(FLIM_G_NAME) + 4);
+}
+
+static void flim_field_read(const char *name, int result, BOOL resumed);
+/* ==== FIELD LIMITS END (part 1; part 2 follows fields_start) ==== */
+
 /* The field keeps, for each character ID, which of the field's entities is that character (a byte
    each at 00cc0998, ff = none; the PC script command sets it), and clears the first NINE as a field
    loads. A seat's entry was therefore never ff: it read 0, entity 0 of whatever field, which the
@@ -24043,7 +26218,7 @@ static int __cdecl field_pxyzi_hook(void)
 {
     const BYTE *party = (const BYTE *)0x00dc09e5u;      /* the field's copy of the party */
     const BYTE *entity_of = (const BYTE *)0x00cc0998u;  /* per character ID, ff = none */
-    WORD *pointer = (WORD *)(0x00cc0cf8u + *(const BYTE *)0x00cc0964u * 2);
+    WORD *pointer = (WORD *)(flim_script_pos + *(const BYTE *)0x00cc0964u * 2);     /* (field limits) the table moved or not */
     BYTE slot = *(*(const BYTE **)0x00cbf5e8u + *pointer + 3), id;
 
     if (slot < 3 && (id = party[slot]) >= 9 && id < 16 && entity_of[id] == 0xff) {
@@ -24145,10 +26320,10 @@ static int __cdecl field_split_hook(void)
         return ((int (__cdecl *)(void))field_split_next)();
     for (i = 1; i < 3; i++)
         if (party[i] != 0xff && entity_of[party[i]] != 0xff)
-            *(BYTE *)(0x00cc0830u + entity_of[party[i]]) = 0;
+            *(BYTE *)(flim_join_state + entity_of[party[i]]) = 0;    /* (field limits) the table moved or not */
     *(BYTE *)(*(DWORD *)0x00cbf9d8u + 0x32) = *(const BYTE *)0x00cc040cu;
     *(BYTE *)0x00cc08ecu = 0xff;
-    *(WORD *)(0x00cc0cf8u + *(const BYTE *)0x00cc0964u * 2) += FIELD_SPLIT_LENGTH;
+    *(WORD *)(flim_script_pos + *(const BYTE *)0x00cc0964u * 2) += FIELD_SPLIT_LENGTH;
     if (InterlockedIncrement(&told) <= 8)
         log_line("field command SPLIT skipped: the party's leader (character %d) has no entity in this field, and the command would wait for ever",
                  leader);
@@ -24256,8 +26431,8 @@ static int __cdecl field_join_hook(void)
 {
     const BYTE *party = (const BYTE *)0x00dc09e5u;      /* the field's copy of the party */
     const BYTE *entity_of = (const BYTE *)0x00cc0998u;  /* per character ID, ff = none */
-    const BYTE *model_of = (const BYTE *)0x00cbfb70u;   /* per entity, ff = none */
-    BYTE *state = (BYTE *)0x00cc0830u;                  /* per entity: where it is in a JOIN or a SPLIT */
+    const BYTE *model_of = (const BYTE *)flim_models;   /* per entity, ff = none (field limits: the table moved or not) */
+    BYTE *state = (BYTE *)flim_join_state;              /* per entity: where it is in a JOIN or a SPLIT */
     const BYTE *models = *(const BYTE *const *)0x00cc0b60u;
     BYTE marked[2] = { 0xff, 0xff };
     static DWORD told_of[2];
@@ -24284,8 +26459,8 @@ static int __cdecl field_join_hook(void)
         }
     for (i = 0; i < 2; i++)     /* one line for a JOIN, not one a frame: by the entity and where the command is */
         if (marked[i] != 0xff) {
-            DWORD what = 0x80000000u | (DWORD)marked[i] << 16 | *(const WORD *)(0x00cc0cf8u + *(const BYTE *)0x00cc0964u * 2);
-            const char *name = (const char *)0x00cc1ef0u;
+            DWORD what = 0x80000000u | (DWORD)marked[i] << 16 | *(const WORD *)(flim_script_pos + *(const BYTE *)0x00cc0964u * 2);
+            const char *name = (const char *)flim_field_name;
             int k, other = 0;
 
             for (k = 0; k < 31 && name[k]; k++)     /* another field than the last one spoken of: four lines again */
@@ -24302,7 +26477,7 @@ static int __cdecl field_join_hook(void)
             if (what != told_of[i] && told < 4) {
                 told++;
                 log_line("field command JOIN in %.31s: the companion with character ID %d was never placed by a script (hidden at the map's origin): taken as joined, not walked in (the command would wait for ever)",
-                         (const char *)0x00cc1ef0u, party[i + 1]);
+                         (const char *)flim_field_name, party[i + 1]);
             }
             told_of[i] = what;
         }
@@ -24343,7 +26518,8 @@ static BOOL guard_field_join(void)
         }
     }
     for (i = 0; i < (int)sizeof state_read; i++)
-        if (((const BYTE *)SITE_JOIN_STATE)[i] != state_read[i]) {
+        if (i < 2 || i >= 6 ? ((const BYTE *)SITE_JOIN_STATE)[i] != state_read[i]      /* (field limits) the table's address: */
+                            : !flim_operand_ok(*(const DWORD *)(SITE_JOIN_STATE + 2), 0x00cc0830u, flim_moved(FLIM_G_E_JOIN))) {     /* the game's or the moved */
             log_line("field command JOIN: not guarded: the code at %08lx is not the game's", SITE_JOIN_STATE + (DWORD)i);
             return FALSE;
         }
@@ -26013,6 +28189,8 @@ static void field_add_seats(const char *name)
     struct field_extra extra[FM_MAX_EXTRAS];
     char model_names[FM_MAX_EXTRAS][16], why[160], list[64];
     unsigned added = 0, present = 0, length, last, in_length, scratch_room;
+    unsigned k_added = 0;
+    struct flim_counts counts = { 0, 0, 0 };
     int count = 0, i, k, id, n;
 
     /* who: the party first and its leader before all (if the field has room for one only) */
@@ -26079,9 +28257,23 @@ static void field_add_seats(const char *name)
     n = 0;
     list[0] = 0;
     for (i = 0; i < count; i++)
-        if (added >> i & 1)
+        if (added >> i & 1) {
             n += wsprintfA(list + n, " %d (%.4s)", extra[i].seat, extra[i].hrc);
-    if (length)
+            k_added++;
+        }
+    /* models no CHAR reaches (a mod's section 3 longer than its scripts) were kept past the header: the new
+       models went in before them, not last; anywhere else the line is as it always was */
+    if (length && k_added && flim_counts(file, length, &counts) && counts.n2 > counts.h3 && counts.h3 >= k_added) {
+        char where[48];
+
+        if (k_added == 1)
+            wsprintfA(where, "its model put in at %lu", counts.h3 - k_added);
+        else
+            wsprintfA(where, "their models put in at %lu to %lu", counts.h3 - k_added, counts.h3 - 1);
+        log_line("field %.40s: entity added, last, for character%s; %s, before the %lu model%s the field's scripts never give out; %lu bytes of %lu used%s%s",
+                 name, list, where, counts.n2 - counts.h3, counts.n2 - counts.h3 == 1 ? "" : "s",
+                 (DWORD)length, room, why[0] ? "; " : "", why);
+    } else if (length)
         log_line("field %.40s: entity and model added, last, for character%s; %lu bytes of %lu used%s%s", name, list,
                  (DWORD)length, room, why[0] ? "; " : "", why);
     else {
@@ -26104,6 +28296,11 @@ static void field_add_seats(const char *name)
 
 static LONG battle_menu_owed;           /* (battle menu) a test battle's party or loss flag is still to be put back */
 static void battle_menu_field_read(void);       /* (battle menu) the field is read: back from the test battle? */
+static LONG warp_active;                /* (warp menu) the field reader's hook has something to do: a warp is awaited, or a table is read */
+static void warp_field_read(const char *name, int result, BOOL resumed);   /* (warp menu) the arrival check; the table's checksums */
+static void warp_menu_keys_begin(void);         /* (warp menu) warp_menu: its default */
+static int warp_menu_key_line(char *start, char *key_end, char *value, char *stop, const char **fault);
+static void warp_menu_keys_settle(void);
 
 static int __cdecl field_read_hook(const char *name)
 {
@@ -26112,8 +28309,11 @@ static int __cdecl field_read_hook(const char *name)
 
     if (battle_menu_owed)
         battle_menu_field_read();   /* (battle menu, stage 3) back from a test battle: its party put back before the field runs */
-    if (!resumed && fields_before_read(name))       /* (field capacity) an id nobody registered: not read */
+    if (!resumed && fields_before_read(name)) {     /* (field capacity) an id nobody registered: not read */
+        if (warp_active)
+            warp_field_read(name, 0, resumed);      /* (warp menu) a warp waiting is said to be lost */
         return 0;
+    }
     result = ((int (__cdecl *)(const char *))field_read_next)(name);
     if (!resumed)
         fields_after_read(name, result);            /* (field capacity) a registered field's line; nothing with the feature off */
@@ -26126,6 +28326,9 @@ static int __cdecl field_read_hook(const char *name)
         if (field_entities_hooked && field_entities_mode)
             field_add_seats(name ? name : "?");
     }
+    flim_field_read(name, result, resumed);         /* (field limits) after the merge: counts, tripwires; nothing unless on */
+    if (warp_active)
+        warp_field_read(name, result, resumed);     /* (warp menu) before the game places the player: the entrance checked against the walkmesh; the table's checksums */
     return result;
 }
 
@@ -26493,7 +28696,7 @@ static const BYTE *text_more_target(const BYTE *source)
 
     if (!table || !script)
         return NULL;
-    place = *(const WORD *)(ADDR_SCRIPT_PLACE + 2 * (DWORD)*(const BYTE *)ADDR_SCRIPT_ENTITY);
+    place = *(const WORD *)(flim_script_pos + 2 * (DWORD)*(const BYTE *)ADDR_SCRIPT_ENTITY);    /* (field limits) ADDR_SCRIPT_PLACE, moved or not */
     command = script + place;
     if (command[0] == 0x40)             /* MESSAGE window, text */
         shown = command[2];
@@ -26686,7 +28889,9 @@ static void install_text_more(void)
     }
     for (i = 0; i < (int)(sizeof code / sizeof code[0]); i++)
         for (n = 0; n < code[i].count; n++)
-            if (((const BYTE *)code[i].address)[n] != code[i].bytes[n]) {
+            if (i < 2 && n >= 13 + i && n < 17 + i ? !flim_operand_ok(*(const DWORD *)(code[i].address + 13 + (DWORD)i), 0x00cc0cf8u,
+                                                                       flim_moved(FLIM_G_E_SCRIPT_POS))     /* (field limits) MESSAGE's, ASK's script position: moved or not */
+                                                   : ((const BYTE *)code[i].address)[n] != code[i].bytes[n]) {
                 log_line("more than 256 texts in a field: NOT on: the game's code at %08lx is not as expected (a line kept past text 255 will show an empty window)",
                          code[i].address + (DWORD)n);
                 return;
@@ -26697,7 +28902,6 @@ static void install_text_more(void)
 
 static void install_field_entities(void)
 {
-    static const BYTE before[5] = { 0x68, 0xf0, 0x1e, 0xcc, 0x00 };     /* push 00cc1ef0: the field's name */
     static const BYTE after[5] = { 0x83, 0xc4, 0x04, 0x85, 0xc0 };      /* add esp, 4 / test eax, eax */
     const BYTE *code = (const BYTE *)(SITE_FIELD_READ - 5);     /* the push, the call, what follows it */
     int i;
@@ -26705,7 +28909,7 @@ static void install_field_entities(void)
     if (field_entities_hooked)      /* (field capacity: the call may go to the hook for the field capacity alone) */
         return;
     for (i = 0; i < 5; i++)
-        if (code[i] != before[i] || code[i + 10] != after[i]) {
+        if (!flim_push_ok(code) || code[i + 10] != after[i]) {     /* push of the field's name (field limits: moved or not) */
             log_line("field entities for the seats: NOT on: the code around the field reader's call at %08lx is not the game's",
                      SITE_FIELD_READ);
             return;
@@ -26730,7 +28934,6 @@ static void install_field_entities(void)
    the DLL's, the field reader's call (the same site and checks as the seats' entities: chained). */
 static void fields_start(void)
 {
-    static const BYTE before[5] = { 0x68, 0xf0, 0x1e, 0xcc, 0x00 };     /* push 00cc1ef0: the field's name */
     static const BYTE after[5] = { 0x83, 0xc4, 0x04, 0x85, 0xc0 };      /* add esp, 4 / test eax, eax */
     const BYTE *code = (const BYTE *)(SITE_FIELD_READ - 5);
     static BOOL said;
@@ -26742,7 +28945,7 @@ static void fields_start(void)
     said = TRUE;
     if (code[5] == 0xe8 && SITE_FIELD_READ + 5 + *(const DWORD *)(code + 6) == (DWORD)field_read_hook)
         hooked = TRUE;
-    else if (!fields_bytes_are(SITE_FIELD_READ - 5, before, 5) || !fields_bytes_are(SITE_FIELD_READ + 5, after, 5))
+    else if (!flim_push_ok(code) || !fields_bytes_are(SITE_FIELD_READ + 5, after, 5))     /* push 00cc1ef0 (field limits: or the moved name) */
         hooked = FALSE;
     else
         hooked = patch_call_chained(SITE_FIELD_READ, FN_FIELD_READ, field_read_hook, &field_read_next);
@@ -26751,6 +28954,388 @@ static void fields_start(void)
                     : "is NOT the game's (push 00cc1ef0 / call / add esp,4 / test eax,eax): not hooked; the tables are the DLL's all the same, an id nobody registered then reaches the reader with the name sx_none");
     fields_open_install();          /* (stage 2) the three callers of field_open_file: a field id the game cannot read goes to fields_fallback */
 }
+
+/* ==== FIELD LIMITS BEGIN (part 2: the key, the two moments, the field read; part 1 is before the field hooks) ==== */
+#define FLIM_GAME_FILE          "FF7_SpellExt_Game.ini"     /* GAME_FILE_NAME, defined further down */
+#define FLIM_IMAGE              0x00400000u                 /* the exe's image base */
+#define FLIM_RECORDS            0x00cc1670u                 /* the model records, 0x88 each: they do not move */
+#define FLIM_RECORD_BYTES       0x88
+#define FLIM_ZERO_LOW           0x00cc1ef0u                 /* records 16-31: the old name/LINE block and info records 0-6 */
+#define FLIM_ZERO_HIGH          (FLIM_RECORDS + 32 * FLIM_RECORD_BYTES)
+#define FLIM_MODELS_GAME        16
+#define FLIM_MODELS_MOST        32                          /* FFNx's MAX_FIELD_MODELS: its per-model arrays are 32 long */
+#define FLIM_ENTITIES_GAME      48
+#define FLIM_ENTITIES_MOST      255                         /* the file's one-byte count; entity ff means none */
+#define FLIM_INFO_RECORDS       1200
+#define FLIM_PAGE               0x1000u
+#define FLIM_PAGES_MOST         128
+#define FLIM_LINES_MOST         64
+
+#define FLIM_STATE_OFF          0       /* not asked (or given back) */
+#define FLIM_STATE_HALF         1       /* the DllMain groups moved */
+#define FLIM_STATE_REFUSED      2       /* asked, and the DllMain half refused: nothing moved */
+#define FLIM_STATE_ON           3       /* both halves: 32 models, 255 entities */
+
+static int flim_state;
+static LONG flim_asked, flim_given;     /* this reading of the game file */
+static LONG flim_settled;
+static BOOL flim_taken;                 /* the first reading asked for it (with breaking_limits on) */
+static DWORD flim_new_base[FLIM_GROUP_COUNT];
+static DWORD flim_old_hash[FLIM_GROUP_COUNT];
+static BYTE flim_hash_taken[FLIM_GROUP_COUNT], flim_hash_told[FLIM_GROUP_COUNT];
+static BYTE *flim_infos;                /* the info table's copy, when this feature moved it (the registry had not) */
+static DWORD flim_prev_models = FLIM_MODELS_GAME;   /* max(16, the models of the last field read): records from it on are zero */
+
+/* ---- the game file's key (Breaking Limits) ---- */
+static void flim_keys_begin(void)
+{
+    flim_asked = 0;
+    flim_given = 0;
+}
+
+/* 0: not this key; 1: read; -1: a mistake (*fault says what; off is used). */
+static int flim_key_line(char *start, char *key_end, char *value, char *stop, const char **fault)
+{
+    if (!word_is(start, key_end, "field_limits"))
+        return 0;
+    flim_given = 1;
+    if (word_is(value, stop, "on") || word_is(value, stop, "yes"))
+        flim_asked = 1;
+    else if (word_is(value, stop, "off") || word_is(value, stop, "no"))
+        flim_asked = 0;
+    else {
+        flim_asked = 0;
+        *fault = "field_limits must be on or off: off is used";
+        return -1;
+    }
+    return 1;
+}
+
+/* After each reading of the game file, behind bl_keys_settle: taken at the first reading (the move itself is at the
+   kernel load, field_limits_kernel_load); a later change is said, not taken. `master` is breaking_limits. */
+static void flim_keys_settle(LONG master)
+{
+    BOOL wanted = master && flim_asked;
+
+    if (InterlockedExchange(&flim_settled, 1)) {
+        if (wanted != flim_taken)
+            log_line("breaking limits: the game file now asks for field_limits %s; it is %s for this run (taken at start-up): restart the game for the change",
+                     wanted ? "on" : "off", flim_state == FLIM_STATE_ON ? "on" : "off");
+        return;
+    }
+    flim_taken = wanted;
+    if (!flim_given)
+        return;
+    if (!master)
+        log_line("breaking limits: off (breaking_limits is not on): field_limits is not taken; fields keep 16 models and 48 entities");
+    else if (!flim_asked)
+        log_line("breaking limits: on; field_limits off: fields keep 16 models and 48 entities");
+}
+
+/* ---- the moments ---- */
+static DWORD flim_image_size(void)
+{
+    const BYTE *base = (const BYTE *)FLIM_IMAGE;
+    const IMAGE_NT_HEADERS *nt = (const IMAGE_NT_HEADERS *)(base + ((const IMAGE_DOS_HEADER *)base)->e_lfanew);
+
+    return nt->OptionalHeader.SizeOfImage;
+}
+
+static void flim_set_bases(void)
+{
+    int g;
+
+    for (g = 0; g < FLIM_GROUP_COUNT; g++)
+        flim_new_base[g] = flim_groups[g].fill == FLIM_FILL_INFO ? (DWORD)flim_infos : flim_moved(g);
+}
+
+/* Makes the code pages of [low, high) writable, one page at a time (each keeps its own protection in saved[]); FALSE
+   (and every page as it was) if one cannot be. */
+static BOOL flim_unprotect(DWORD low, DWORD high, DWORD *saved)
+{
+    DWORD page, first = low & ~(FLIM_PAGE - 1), n = 0, k;
+
+    if ((high - first + FLIM_PAGE - 1) / FLIM_PAGE > FLIM_PAGES_MOST)
+        return FALSE;
+    for (page = first; page < high; page += FLIM_PAGE, n++)
+        if (!VirtualProtect((void *)page, FLIM_PAGE, PAGE_EXECUTE_READWRITE, &saved[n])) {
+            log_line("field limits: the code page at %08lx could not be made writable (error %lu)", page, GetLastError());
+            for (k = 0; k < n; k++)
+                VirtualProtect((void *)(first + k * FLIM_PAGE), FLIM_PAGE, saved[k], &saved[k]);
+            return FALSE;
+        }
+    return TRUE;
+}
+
+static void flim_reprotect(DWORD low, DWORD high, DWORD *saved)
+{
+    DWORD page, first = low & ~(FLIM_PAGE - 1), n = 0, old;
+
+    FlushInstructionCache(GetCurrentProcess(), (void *)first, high - first);
+    for (page = first; page < high; page += FLIM_PAGE, n++)
+        VirtualProtect((void *)page, FLIM_PAGE, saved[n], &old);
+}
+
+/* The new tables of a moment: a copy of each old table, the rest 0; draw enable 1 from slot 18 on. */
+static void flim_fill(int moment)
+{
+    int g;
+    DWORD i;
+
+    for (g = 0; g < FLIM_GROUP_COUNT; g++) {
+        const struct flim_group *group = &flim_groups[g];
+
+        if (group->moment != moment || (group->fill != FLIM_FILL_COPY && group->fill != FLIM_FILL_ONES18))
+            continue;
+        copy_bytes((BYTE *)flim_new_base[g], (const BYTE *)group->old_base, (int)group->old_span);
+        if (group->fill == FLIM_FILL_ONES18)
+            for (i = 18; i < group->new_bytes / 4; i++)
+                ((DWORD *)flim_new_base[g])[i] = 1;
+    }
+}
+
+/* The old tables' hashes (the record space excluded): a write to one after its move is a place not moved. */
+static void flim_take_hashes(int moment)
+{
+    int g;
+
+    for (g = 0; g < FLIM_GROUP_COUNT; g++)
+        if (flim_groups[g].moment == moment && flim_groups[g].hashed) {
+            flim_old_hash[g] = flim_hash((const BYTE *)flim_groups[g].old_base, flim_groups[g].old_span);
+            flim_hash_taken[g] = 1;
+        }
+}
+
+static const char *flim_row_what(int bad)
+{
+    return bad >= 0 && bad < FLIM_ROW_COUNT ? flim_groups[flim_rows[bad].group].what : "?";
+}
+
+/* From DllMain, after open_log: when the game file says breaking_limits = on and field_limits = on, the eight groups
+   whose addresses FFNx takes from the game's code when the game creates its window are moved now, before it does.
+   Nothing at all (no line) when the file does not ask. */
+static void field_limits_dllmain(void)
+{
+    char *text;
+    DWORD size = 0, image_size, saved[FLIM_PAGES_MOST];
+    int breaking, limits, bad = -1;
+    BYTE *image = (BYTE *)FLIM_IMAGE;
+
+    text = read_whole_file(FLIM_GAME_FILE, &size);
+    if (!text)
+        return;
+    flim_peek(text, size, &breaking, &limits);
+    VirtualFree(text, 0, MEM_RELEASE);
+    if (!breaking || !limits)
+        return;
+    image_size = flim_image_size();
+    flim_set_bases();
+    if (flim_check(image, FLIM_IMAGE, image_size, FLIM_DLLMAIN, 0, 0, flim_new_base, &bad) < 0) {
+        flim_state = FLIM_STATE_REFUSED;
+        log_line("field limits: NOT on: the game's code at %08lx (%s) is not as the exe has it (another mod's patch?): nothing moved; fields keep 16 models and 48 entities",
+                 bad >= 0 ? flim_rows[bad].at : 0, flim_row_what(bad));
+        return;
+    }
+    if (!flim_unprotect(FLIM_DLLMAIN_LOW, FLIM_DLLMAIN_HIGH, saved)) {
+        flim_state = FLIM_STATE_REFUSED;
+        log_line("field limits: NOT on: the game's code could not be made writable: nothing moved; fields keep 16 models and 48 entities");
+        return;
+    }
+    flim_fill(FLIM_DLLMAIN);
+    ((BYTE *)flim_new_base[FLIM_G_E_MODELS])[255] = 0;  /* entity ff (an empty seat's) reads model 0, as it nearly always did */
+    flim_apply(image, FLIM_IMAGE, image_size, FLIM_DLLMAIN, 0, flim_new_base);
+    flim_reprotect(FLIM_DLLMAIN_LOW, FLIM_DLLMAIN_HIGH, saved);
+    flim_script_pos = flim_new_base[FLIM_G_E_SCRIPT_POS];
+    flim_models = flim_new_base[FLIM_G_E_MODELS];
+    flim_field_name = flim_new_base[FLIM_G_NAME] + 4;
+    flim_take_hashes(FLIM_DLLMAIN);
+    flim_state = FLIM_STATE_HALF;
+    log_line("field limits: start-up half: %d operands of the tables the driver takes from the game's code (entity script positions, models, priorities, WAIT counters, script numbers; the field name, model animation types, model lights) now name the DLL's tables (%08lx-%08lx); the rest at the first kernel load",
+             FLIM_DLLMAIN_OPERANDS, (DWORD)flim_space, (DWORD)flim_space + FLIM_SPACE_BYTES);
+}
+
+/* DllMain, when the DLL goes inactive (no driver entry): the start-up half put back before the driver has seen it. */
+static __attribute__((unused)) void field_limits_give_back(void)
+{
+    DWORD image_size, saved[FLIM_PAGES_MOST];
+    int bad = -1;
+
+    if (flim_state != FLIM_STATE_HALF)
+        return;
+    image_size = flim_image_size();
+    if (flim_check((BYTE *)FLIM_IMAGE, FLIM_IMAGE, image_size, FLIM_DLLMAIN, 0, 1, flim_new_base, &bad) < 0 ||
+        !flim_unprotect(FLIM_DLLMAIN_LOW, FLIM_DLLMAIN_HIGH, saved)) {
+        log_line("field limits: the start-up half could NOT be given back (the code at %08lx is not as this DLL left it)",
+                 bad >= 0 ? flim_rows[bad].at : 0);
+        return;
+    }
+    flim_undo((BYTE *)FLIM_IMAGE, FLIM_IMAGE, image_size, FLIM_DLLMAIN, 0);
+    flim_reprotect(FLIM_DLLMAIN_LOW, FLIM_DLLMAIN_HIGH, saved);
+    flim_script_pos = 0x00cc0cf8u;
+    flim_models = 0x00cbfb70u;
+    flim_field_name = 0x00cc1ef0u;
+    flim_state = FLIM_STATE_OFF;
+    log_line("field limits: the start-up half is given back: the game's code is as it was");
+}
+
+/* `at` 0: no address to name. */
+static void flim_kernel_refused(const char *why, DWORD at)
+{
+    char where[16];
+
+    where[0] = 0;
+    if (at)
+        wsprintfA(where, " at %08lx", at);
+    log_line("breaking limits: field_limits NOT on: %s%s: fields keep 16 models and 48 entities%s", why, where,
+             flim_state == FLIM_STATE_HALF ? "; the start-up half stays (the tables the driver reads are the DLL's)" : "");
+}
+
+/* At the first kernel load, after fields_start (the registry has moved the info table, or not): the rest, checked
+   against the code as the driver left it. All or nothing; 32 models and 255 entities only when both halves landed. */
+static void field_limits_kernel_load(void)
+{
+    static LONG done;
+    static const BYTE after[5] = { 0x83, 0xc4, 0x04, 0x85, 0xc0 };      /* add esp, 4 / test eax, eax */
+    BYTE *image = (BYTE *)FLIM_IMAGE;
+    const BYTE *code = (const BYTE *)(SITE_FIELD_READ - 5);
+    DWORD image_size, saved[FLIM_PAGES_MOST], k;
+    int bad = -1, info = !fields_live, hooked;
+    char tables[2][900];
+
+    if (InterlockedExchange(&done, 1))
+        return;
+    if (!flim_taken && flim_state != FLIM_STATE_HALF)
+        return;                                 /* not asked: the settle said so, or nothing is to be said */
+    if (!flim_taken) {
+        flim_kernel_refused("the game file's full reading does not ask for it (breaking_limits and field_limits on); the start-up peek did", 0);
+        return;
+    }
+    if (flim_state == FLIM_STATE_REFUSED) {
+        flim_kernel_refused("the start-up half was refused (the line at start-up)", 0);
+        return;
+    }
+    if (flim_state != FLIM_STATE_HALF) {
+        flim_kernel_refused("the start-up peek of the game file did not find breaking_limits = on and field_limits = on", 0);
+        return;
+    }
+    image_size = flim_image_size();
+    if (flim_check(image, FLIM_IMAGE, image_size, FLIM_DLLMAIN, 0, 1, flim_new_base, &bad) < 0) {
+        flim_kernel_refused("a start-up operand no longer names the DLL's table (the driver rewrote it?)", flim_rows[bad].at);
+        return;
+    }
+    if (flim_check(image, FLIM_IMAGE, image_size, FLIM_KERNEL, info, 0, flim_new_base, &bad) < 0) {
+        log_line("breaking limits: field_limits: the game's code at %08lx (%s) is not as the exe has it (another mod's patch?)",
+                 flim_rows[bad].at, flim_row_what(bad));
+        flim_kernel_refused("the game's code is not as the exe has it", flim_rows[bad].at);
+        return;
+    }
+    if (!flim_talk_ok(image, FLIM_IMAGE, image_size)) {
+        flim_kernel_refused("the talk detector is not as the exe has it", FLIM_TALK_AT);
+        return;
+    }
+    if ((bad = flim_functions_ok(image, FLIM_IMAGE, image_size)) >= 0) {
+        flim_kernel_refused("a function that holds a site does not begin as the exe's (replaced by a driver?)", flim_functions[bad]);
+        return;
+    }
+    if (info) {
+        flim_infos = VirtualAlloc(NULL, FLIM_INFO_RECORDS * 0xd0, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (!flim_infos) {
+            flim_kernel_refused("no memory for the field info table's copy", 0);
+            return;
+        }
+        copy_bytes(flim_infos, (const BYTE *)flim_groups[FLIM_G_INFO].old_base, (int)flim_groups[FLIM_G_INFO].old_span);
+        flim_set_bases();
+    }
+    if (!flim_unprotect(FLIM_KERNEL_LOW, FLIM_KERNEL_HIGH, saved)) {
+        if (flim_infos)
+            VirtualFree(flim_infos, 0, MEM_RELEASE);
+        flim_infos = NULL;
+        flim_set_bases();
+        flim_kernel_refused("the game's code could not be made writable", FLIM_KERNEL_LOW);
+        return;
+    }
+    flim_fill(FLIM_KERNEL);
+    flim_apply(image, FLIM_IMAGE, image_size, FLIM_KERNEL, info, flim_new_base);
+    flim_reprotect(FLIM_KERNEL_LOW, FLIM_KERNEL_HIGH, saved);
+    for (k = FLIM_ZERO_LOW; k < FLIM_ZERO_HIGH; k++)
+        *(BYTE *)k = 0;
+    flim_join_state = flim_new_base[FLIM_G_E_JOIN];
+    fm_room_models = FLIM_MODELS_MOST;
+    fm_room_entities = FLIM_ENTITIES_MOST;
+    flim_take_hashes(FLIM_KERNEL);
+    flim_state = FLIM_STATE_ON;
+    if (code[5] == 0xe8 && SITE_FIELD_READ + 5 + *(const DWORD *)(code + 6) == (DWORD)field_read_hook)
+        hooked = 1;
+    else if (!flim_push_ok(code) || !bytes_are(SITE_FIELD_READ + 5, after, 5))
+        hooked = 0;
+    else
+        hooked = patch_call_chained(SITE_FIELD_READ, FN_FIELD_READ, field_read_hook, &field_read_next);
+    log_line("breaking limits: field_limits on: a field holds up to 32 models (the game: 16; 32 is the most FFNx keeps) and 255 entities, numbers 0-254 (the game: 48): %d operands, the 6 LINE owner reads, the talk detector's frame (36 words) and 5 loop bounds changed; the info room %s",
+             FLIM_ALL_OPERANDS, info ? "is this feature's copy of the 1,200 records" : "is the field registry's table");
+    wsprintfA(tables[0], "name %08lx, LINE %08lx, scalars %08lx, default animation %08lx, animation type %08lx, speed %08lx, divided speed %08lx, walk speed %08lx, KAWAI 0xD %08lx / %08lx, KAWAI slots %08lx, on/off %08lx, draw list %08lx, Z %08lx, Y %08lx, KAWAI==1 %08lx, draw enable %08lx, buffers %08lx, buffer flag %08lx, lights %08lx",
+              flim_new_base[FLIM_G_NAME] + 4, flim_new_base[FLIM_G_LINE], flim_new_base[FLIM_G_SCALARS], flim_new_base[FLIM_G_DFANM],
+              flim_new_base[FLIM_G_ANIMTYPE], flim_new_base[FLIM_G_SPEED], flim_new_base[FLIM_G_DIVSPEED], flim_new_base[FLIM_G_WALKSPEED],
+              flim_new_base[FLIM_G_KAWAISTATE], flim_new_base[FLIM_G_KAWAID], flim_new_base[FLIM_G_KAWAISLOT], flim_new_base[FLIM_G_KAWAIONOFF],
+              flim_new_base[FLIM_G_DRAWLIST], flim_new_base[FLIM_G_ZOFF], flim_new_base[FLIM_G_YOFF], flim_new_base[FLIM_G_KAWAI1],
+              flim_new_base[FLIM_G_DRAWENABLE], flim_new_base[FLIM_G_KAWAIBUF], flim_new_base[FLIM_G_KAWAIFLAG], flim_new_base[FLIM_G_LIGHTS]);
+    wsprintfA(tables[1], "line owned %08lx, saved positions %08lx, script numbers %08lx, models %08lx, JOIN state %08lx, WAIT %08lx, callers %08lx, priority %08lx, request state %08lx, script position %08lx; info %08lx",
+              flim_new_base[FLIM_G_E_LINE_OF], flim_new_base[FLIM_G_E_SAVED_POS], flim_new_base[FLIM_G_E_SCRIPT_ID], flim_new_base[FLIM_G_E_MODELS],
+              flim_new_base[FLIM_G_E_JOIN], flim_new_base[FLIM_G_E_WAIT], flim_new_base[FLIM_G_E_CALLERS], flim_new_base[FLIM_G_E_PRIORITY],
+              flim_new_base[FLIM_G_E_REQ_STATE], flim_new_base[FLIM_G_E_SCRIPT_POS], info ? (DWORD)flim_infos : 0);
+    log_line("field limits: the DLL's model tables: %s", tables[0]);
+    log_line("field limits: the DLL's entity tables: %s; the model records grow in place from %08lx", tables[1], FLIM_RECORDS);
+    log_line("field limits: the field reader's call at %08lx %s", SITE_FIELD_READ,
+             hooked ? "goes through this DLL (chained): a field above the game's limits is named as it is read, and the tripwires are looked at"
+                    : "is NOT the game's (push of the field name / call / add esp,4 / test eax,eax): not hooked; no per-field line and no tripwire");
+}
+
+/* A field read afresh (not a return from a battle or a menu), after the reader and the merge: its counts named when they
+   are above the game's, the tripwires looked at, and the records it leaves unused cleared. Nothing with the feature
+   not on. */
+static void flim_field_read(const char *name, int result, BOOL resumed)
+{
+    static LONG lines, loud, told_records;
+    const BYTE *file = *(const BYTE *const *)ADDR_FIELD_FILE;
+    DWORD room = *(const DWORD *)ADDR_FIELD_FILE_ROOM, from, to, k, models;
+    struct flim_counts c = { 0, 0, 0 };
+    int g, counted;
+
+    if (flim_state != FLIM_STATE_ON || resumed || !result)
+        return;
+    counted = file && !IsBadReadPtr(file, room) && flim_counts(file, room, &c);
+    if (counted)
+        models = c.h3 > c.n2 ? c.h3 : c.n2;
+    else
+        models = FLIM_MODELS_MOST;              /* not counted: no record is taken as unused, the next field checks none */
+    flim_trip_range(flim_prev_models, &from, &to);
+    for (k = from; k < to; k++)
+        if (((const BYTE *)FLIM_RECORDS)[k]) {
+            if (!InterlockedExchange(&told_records, 1))
+                log_line("*** field limits: model record bytes past the previous field's models were written (record %lu, offset %lx): a place that writes the old name/LINE block or info room was not moved ***",
+                         k / FLIM_RECORD_BYTES, k % FLIM_RECORD_BYTES);
+            break;
+        }
+    for (g = 0; g < FLIM_GROUP_COUNT; g++)
+        if (flim_hash_taken[g] && !flim_hash_told[g] &&
+            flim_hash((const BYTE *)flim_groups[g].old_base, flim_groups[g].old_span) != flim_old_hash[g]) {
+            flim_hash_told[g] = 1;
+            log_line("*** field limits: the game's old %s at %08lx changed after it was moved: a place that writes it was not moved ***",
+                     flim_groups[g].what, flim_groups[g].old_base);
+        }
+    if (counted && (c.h3 > FLIM_MODELS_GAME || c.n2 > FLIM_MODELS_GAME || c.entities > FLIM_ENTITIES_GAME) &&
+        InterlockedIncrement(&lines) <= FLIM_LINES_MOST)
+        log_line("field %.40s: %lu models (script %lu), %lu entities: above the game's 16 / 48; this run holds 32 and 255",
+                 name ? name : "?", c.n2, c.h3, c.entities);
+    if (counted && models > FLIM_MODELS_MOST && InterlockedIncrement(&loud) <= FLIM_LINES_MOST)
+        log_line("*** field %.40s: %lu models (script %lu); this run holds 32: models past 32 overrun FFNx's tables and the talk detector (FFNx.log then says \"KAWAI: invalid model id\", \"field_blink_eye_sub: Invalid model ID\" or \"subcode[EYETX]: Invalid model ID\"); it is loaded as the game would ***",
+                 name ? name : "?", c.n2, c.h3);
+    flim_trip_range(models, &from, &to);
+    for (k = from; k < to; k++)
+        ((BYTE *)FLIM_RECORDS)[k] = 0;
+    flim_prev_models = models < FLIM_MODELS_GAME ? FLIM_MODELS_GAME : models > FLIM_MODELS_MOST ? FLIM_MODELS_MOST : models;
+}
+
+/* ==== FIELD LIMITS END (part 2) ==== */
 
 /* ---- New characters in a shop ----
 
@@ -28207,6 +30792,17 @@ static struct prop_slot *prop_slot_for(const char *rsd)
     return NULL;
 }
 
+/* PROP FRAMES PURE BEGIN  (no Win32 call inside: tested natively, fps60/variants/build/dll/test) */
+/* Whether file frame `frame` of the prop's animation is outside `prop_frames` [from, to] (to PROP_TO_END: to its end;
+   from 0: from its start). The range counts the original frames: with a battle frame factor F the frame is
+   floor(frame / F) (battle_frame_original), so the prop is shown on F*from .. F*to + F - 1. F 1: the frame itself. */
+static BOOL prop_frames_outside(int frame, WORD from, WORD to, int factor)
+{
+    frame = battle_frame_original(frame, factor);
+    return (from && frame < (int)from) || (to != PROP_TO_END && frame > (int)to);
+}
+/* PROP FRAMES PURE END */
+
 /* For a state's prop at the same bone (the hand-over, see "A state, stage C"): is a limit's prop of
    this actor at bone entry `n`, and will its task still be there after its call of THIS frame? The
    limit's task is in the list of 100, which runs after the list of 60 in the same frame
@@ -28240,7 +30836,7 @@ static BOOL prop_run_holds(int actor, int n)
 static void __cdecl prop_task(void)
 {
     short *task = (short *)(0x00bfb718u + *(const short *)ADDR_EFFECT_TASK_INDEX * 0x20);
-    int actor = task[2], paused = *(const BYTE *)ADDR_EFFECTS_PAUSED != 0, pack, own, frame, n = 0, count;
+    int actor = task[2], paused = *(const BYTE *)ADDR_EFFECTS_PAUSED != 0, pack, own, frame, n = 0, count, factor;
     DWORD base = (DWORD)actor * ACTOR_EFFECT_STRIDE;
     struct prop_slot *p;
     const struct prop_place *s;
@@ -28317,15 +30913,21 @@ static void __cdecl prop_task(void)
     }
     if (prop_run[actor].phase != PROP_IN_HAND)
         return;
-    if ((s->from && frame < (int)s->from) || (s->to != PROP_TO_END && frame > (int)s->to)) {
+    factor = battle_frame_factor;
+    if (prop_frames_outside(frame, s->from, s->to, factor)) {
         /* its animation, but not one of the frames of `prop_frames`: not in the hand yet, or put
-           away again. Nothing is drawn; the task stays for the frames to come */
+           away again. Nothing is drawn; the task stays for the frames to come. (With a battle frame
+           factor above 1 the range counts the original frames: battle_frame_original.) */
         if (!prop_run[actor].outside++) {
             char text[192];
 
             prop_describe(text, s);
-            log_line("prop %s actor %d: animation frame %d is outside prop_frames: not shown on such frames (%s)", name, actor,
-                     frame, text);
+            if (factor > 1)
+                log_line("prop %s actor %d: animation frame %d (file frame %d, the battle animations x%d) is outside prop_frames: not shown on such frames (%s)",
+                         name, actor, battle_frame_original(frame, factor), frame, factor, text);
+            else
+                log_line("prop %s actor %d: animation frame %d is outside prop_frames: not shown on such frames (%s)", name, actor,
+                         frame, text);
         }
         return;
     }
@@ -32007,6 +34609,114 @@ static DWORD *state_own_table(int actor)
     return holder && *holder ? (DWORD *)((BYTE *)*holder + 0x68) : NULL;
 }
 
+/* ---- (stances) A stance's scripts into the model's own table: see "Weapon stances", after FORM PURE ---- */
+/* STANCE LOAD BEGIN  (IsBadReadPtr, InterlockedIncrement, wsprintfA and log_line: the native runtime test stubs them) */
+#define STANCE_LOG_MAX          32      /* "stance:" lines per run of the game */
+#define STANCE_ANIMATIONS_MAX   0x2000  /* a model's animation count above this is not taken for one */
+static LONG stance_logged;
+
+/* How many bytes from `p` can be read, up to `most` (looked at page by page). */
+static DWORD stance_readable(const BYTE *p, DWORD most)
+{
+    DWORD got = 0;
+
+    while (got < most && !IsBadReadPtr(p + got, 1))
+        got += 0x1000 - ((DWORD)(p + got) & 0xfff);
+    return got < most ? got : most;
+}
+
+/* Slot `slot`'s model has just been loaded for the character of file ID `id` (its stance_scripts lines: `maps`, `count`
+   of them), and its script table still holds the file's own offsets: the slots of the stance its weapon's model digit
+   names, if the character has a line for it and the model's files have everything the line needs; otherwise nothing
+   is written, and one line says why. A digit that names no stance of the weapon file: nothing is looked at. */
+static void stance_model_loaded(int slot, const struct stance_map *maps, int count, int id)
+{
+    const struct stance_map *m = NULL;
+    const DWORD *record = NULL, *animations = NULL, *r;
+    DWORD offsets[STANCE_SLOTS], size, *table;
+    BYTE played[32], *file = NULL;
+    const char *why = NULL, *name;
+    char text[320], pairs[STANCE_SLOTS * 6 + 8];
+    int digit, i, k, bad = -1, animation_count = 0, bones0 = -1, given = 0;
+
+    if (slot < 0 || slot > 2 || count <= 0)
+        return;
+    digit = *(const BYTE *)(ADDR_WEAPON_MODEL + (DWORD)slot * 0x440) >> 4;
+    if ((i = stance_index(digit, stance_name_count)) < 0)
+        return;                                 /* no stance: as before */
+    name = stance_names[i];
+    for (k = 0; k < count && k < CHARACTER_STANCE_MAX && !m; k++)
+        if (maps[k].name[0] && stance_same(maps[k].name, name))
+            m = &maps[k];
+    if (!m) {
+        if (InterlockedIncrement(&stance_logged) <= STANCE_LOG_MAX)
+            log_line("stance: character %d in slot %d wears a weapon of stance %s (its model digit %x) and has no stance_scripts line for it: its own scripts play",
+                     id, slot, name, digit);
+        return;
+    }
+    record = *(const DWORD *const *)(ADDR_MODEL_POINTERS + (DWORD)slot * 4);
+    if (!record || IsBadReadPtr(record, 0x10) || !record[0]) {
+        why = "its model cannot be read";
+    } else {
+        file = (BYTE *)record[0];
+        size = stance_readable(file, STANCE_FILE_SPAN);
+        if ((why = stance_plan(file, size, m, offsets, played, &bad)) != NULL && bad >= 0) {
+            wsprintfA(text, "slot %02x (entry %02x): %s", bad, (int)m->entry[bad] - 1, why);
+            why = text;
+        }
+    }
+    if (!why) {
+        animation_count = (int)record[2];
+        animations = (const DWORD *)record[3];
+        if (animation_count <= 0 || animation_count > STANCE_ANIMATIONS_MAX || !animations ||
+            IsBadReadPtr(animations, (UINT_PTR)animation_count * 4))
+            why = "its model's animation table cannot be read";
+        else if ((r = (const DWORD *)animations[0]) != NULL && !IsBadReadPtr(r, 0xc))
+            bones0 = (int)r[2];
+    }
+    for (k = 0; !why && k < 256; k++) {
+        BOOL body, track;
+        int bones = -1, problem;
+
+        if (!(played[k >> 3] & (1u << (k & 7))))
+            continue;
+        body = k < animation_count && animations[k];
+        track = k + STANCE_TRACK < animation_count && animations[k + STANCE_TRACK];
+        if (body && !IsBadReadPtr((const void *)animations[k], 0xc))
+            bones = (int)((const DWORD *)animations[k])[2];
+        problem = stance_animation_problem(k, animation_count, body, track, bones, bones0);
+        if (problem == STANCE_ANIM_COUNT)
+            wsprintfA(text, "its scripts play animation %02x, whose weapon track %02x is past the model's %d animations (its skeleton file's count)",
+                      k, k + STANCE_TRACK, animation_count);
+        else if (problem == STANCE_ANIM_UNLOADED && !body)
+            wsprintfA(text, "its scripts play animation %02x, which its animation file does not hold", k);
+        else if (problem == STANCE_ANIM_UNLOADED)
+            wsprintfA(text, "its scripts play animation %02x, whose weapon track %02x its animation file does not hold", k, k + STANCE_TRACK);
+        else if (problem == STANCE_ANIM_NOT_BODY)
+            wsprintfA(text, "its scripts play animation %02x, which is no body animation (%d bones; animation 00 has %d)", k, bones, bones0);
+        if (problem != STANCE_ANIM_FINE)
+            why = text;
+    }
+    if (why) {
+        if (InterlockedIncrement(&stance_logged) <= STANCE_LOG_MAX)
+            log_line("stance: character %d in slot %d: stance %s (character file line %d) is NOT used: %s. Its own scripts play",
+                     id, slot, name, (int)m->line, why);
+        return;
+    }
+    table = (DWORD *)(file + FORM_SCRIPT_TABLE);
+    for (k = 0; k < STANCE_SLOTS; k++)
+        if (m->entry[k]) {
+            table[k] = offsets[k];
+            given++;
+        }
+    if (InterlockedIncrement(&stance_logged) <= STANCE_LOG_MAX) {
+        stance_pairs_text(m, pairs, (int)sizeof pairs);
+        log_line("stance: character %d in slot %d: stance %s (its weapon's model digit %x; character file line %d): %d script slots play entries of its script file (%s)",
+                 id, slot, name, digit, (int)m->line, given, pairs);
+    }
+}
+/* STANCE LOAD END */
+
 /* ---- A spell's caster script ------------------------------------------------------------------------
    `script = N` on an extended spell: the model script a party member plays to cast it, in place of the
    command's own (the game's 007b7510: Magic 0x1d, Summon 0x1f). The game does the same itself in handler
@@ -33772,6 +36482,55 @@ static void move_limit_tables(void)
     repoint_operand(0x00428030u, ADDR_LIMIT_EFFECT_SETUP, limit_effect_setup, "limit effect set-up table");
     repoint_operand(0x0042838du, ADDR_LIMIT_EFFECT_INDEX, limit_effect_index, "limit effect table");
 }
+
+/* LIMIT EFFECT STEP BEGIN */
+/* ---- A game limit's effect at a spell's effect step (limit effects; tools/work/lucky_girl/RESEARCH.md section 5) ----
+   An [effect N] of the effects file with `limit = L` (read in "Effect copies: the part that reads only what it is given"):
+   a spell naming it (`animation = N`) holds its `base` in the record (a file-less magic effect: the spell's `e8` loads and
+   frees nothing), and at its effect step (`ec`: summon_effect_hook -> start_effect_copy) the game's limit effect L runs
+   in place of FUN_00427c22, as 00427c22's limit case runs it (0042802d-00428051): the routine of the set-up table that
+   0042802d reads (this DLL's copy once move_limit_tables has moved it), called (movsx word 00bfd0f8, movsx byte 00be1170),
+   cdecl, after 00427c22's own preamble (00427c2b-00427c42: FUN_00429322 when 007c10d8 is 0, then byte 00bf23bc = 0). Not
+   done: the limit case's animation pack (the caster's, for a limit's own scripts), its return value into the script's
+   argument word (a magic routine's is not kept either) and FUN_0042819b (empty). The routine loads its own files and shows
+   each target's result itself, as a magic routine does; the battle waits for its tasks (the list of 100). What it relies on
+   is read before each step (effect_limit_why); when anything is not as the game has it, one line and the record's own
+   effect (the base) plays through FUN_00427c22. Nothing is patched. */
+#define LIMIT_EFFECT_LOGS       40           /* lines of the limit effects at work, per run of the game */
+static LONG limit_effect_logs;
+
+/* TRUE if the actor's action plays a game limit's effect and its routine was called; FALSE and FUN_00427c22 runs. */
+static BOOL limit_effect_step(int actor_arg)
+{
+    int actor = (BYTE)actor_arg, c;
+    unsigned shown;
+    DWORD routine;
+    const char *why;
+
+    if (!effect_limits_usable || actor >= 10 || *(const BYTE *)(ADDR_ACTOR_COMMAND_TYPE + actor * ACTOR_EFFECT_STRIDE) != 2)
+        return FALSE;
+    shown = *(const WORD *)ADDR_EFFECT_TARGETS;
+    /* one target or several from the record's results, as for a copy or a native effect */
+    c = effect_limit_choice(effect_copy_cast[actor].single, effect_copy_cast[actor].several, (shown & (shown - 1)) != 0,
+                            *(const BYTE *)(ADDR_ACTOR_NUMBER + actor * ACTOR_EFFECT_STRIDE), effect_copies, effect_copy_count);
+    if (c < 0)
+        return FALSE;
+    if ((why = effect_limit_why(effect_copies[c].limit, effect_code_at, limit_effect_read, (DWORD)limit_effect_setup, &routine)) != NULL) {
+        if (InterlockedIncrement(&limit_effect_logs) <= LIMIT_EFFECT_LOGS)
+            log_line("limit effects: effect %04lx (the game's limit effect %02x) not played for actor %d: %s: the record's effect %02x plays",
+                     effect_copies[c].number, effect_copies[c].limit, actor, why, effect_copies[c].play_base);
+        return FALSE;
+    }
+    if (!*(const DWORD *)ADDR_PRELOAD_ON)
+        ((void (__cdecl *)(void))EFFECT_LIMIT_DESTROY)();
+    *(BYTE *)ADDR_NATIVE_STEP_FLAG = 0;
+    ((int (__cdecl *)(int, int))routine)((int)*(const short *)ADDR_EFFECT_TARGETS, (int)*(const signed char *)ADDR_EFFECT_ACTOR);
+    if (InterlockedIncrement(&limit_effect_logs) <= LIMIT_EFFECT_LOGS)
+        log_line("limit effects: effect %04lx: the game's limit effect %02x (%08lx) started for actor %d on targets %04x",
+                 effect_copies[c].number, effect_copies[c].limit, routine, actor, shown);
+    return TRUE;
+}
+/* LIMIT EFFECT STEP END */
 
 /* ---- Limits file ---- */
 
@@ -45045,6 +47804,7 @@ struct weapon_draft {
     BYTE value[WEAPON_RECORD_SIZE], is_set[WEAPON_RECORD_SIZE];
     BYTE name[32], description[96];
     char icon_file[CI_FILE_ROOM];           /* (custom icons) icon = file:NAME; "" none */
+    int stance;                             /* (stances) `stance`: the model byte's high digit it gets (0 = none); -1 not given */
 };
 
 static const struct flag_name equip_flags[] = {
@@ -45337,10 +48097,27 @@ static const char *apply_weapon_key(struct weapon_draft *draft, char *key, char 
         if (!parse_number(&p, end, &n) || p != end || n > (size == 1 ? 0xffu : 0xffffu))
             return "the value does not fit";
         set_weapon_bytes(draft, offset, size, n);
+    } else if (word_is(key, key_end, "stance")) {
+        /* (stances) NAME or none: the high digit of the model byte, laid over it when the section is finished (after
+           `model` and byte_09, in whatever order they come) */
+        return stance_weapon_key(stance_names, &stance_name_count, value, end, &draft->stance);
     } else {
         return "unknown key";
     }
     return NULL;
+}
+
+/* (stances) A finished section's record: its `stance` digit over the model byte's high digit (no key: nothing), and one
+   line when characters 1 or 7 may wear it (the game picks their model variant by that digit, FUN_005be20b: with a stance
+   they are shown with their first). */
+static void weapon_stance_lay(const struct weapon_draft *draft, BYTE *record)
+{
+    if (draft->stance < 0)
+        return;
+    record[WEAPON_MODEL_BYTE] = stance_model_byte(record[WEAPON_MODEL_BYTE], draft->stance);
+    if (draft->stance && (*(const WORD *)(record + WEAPON_EQUIP_MASK) & 0x0082))
+        log_line("weapon file line %d: weapon %d: its stance is the high digit of its model byte, which characters 1 and 7 of the game also read (FUN_005be20b: their model variant): worn by them it shows their first model",
+                 draft->line, draft->id);
 }
 
 static void start_weapon_draft(struct weapon_draft *draft, int id, int line)
@@ -45357,6 +48134,7 @@ static void start_weapon_draft(struct weapon_draft *draft, int id, int line)
         draft->value[i] = draft->is_set[i] = 0;
     draft->name[0] = draft->description[0] = 0xff;
     draft->icon_file[0] = 0;                /* (custom icons) */
+    draft->stance = -1;                     /* (stances) */
 }
 
 /* ---- (kernel overrides) the kernel's prices and throw tables, kept ---- */
@@ -45416,6 +48194,7 @@ static int finish_kernel_weapon(struct weapon_draft *draft)
     for (i = 0; i < WEAPON_RECORD_SIZE; i++)
         if (draft->is_set[i])
             record[i] = draft->value[i];
+    weapon_stance_lay(draft, record);       /* (stances) */
     restrictions = *(WORD *)(record + WEAPON_RESTRICTIONS);
     if (draft->sell >= 0)
         restrictions = (WORD)(draft->sell ? restrictions & ~1 : restrictions | 1);
@@ -45461,6 +48240,7 @@ static int finish_wide_weapon(struct weapon_draft *draft)
     for (i = 0; i < WEAPON_RECORD_SIZE; i++)
         if (draft->is_set[i])
             g->record[i] = draft->value[i];
+    weapon_stance_lay(draft, g->record);    /* (stances) */
     restrictions = *(WORD *)(g->record + WEAPON_RESTRICTIONS);
     if (draft->sell >= 0)
         restrictions = (WORD)(draft->sell ? restrictions & ~1 : restrictions | 1);
@@ -45506,6 +48286,7 @@ static int finish_weapon(struct weapon_draft *draft)
     for (i = 0; i < WEAPON_RECORD_SIZE; i++)
         if (draft->is_set[i])
             record[i] = draft->value[i];
+    weapon_stance_lay(draft, record);       /* (stances) */
     /* Restriction bits are stored inverted: a clear bit 0 allows selling, a clear bit 3 throwing. */
     restrictions = *(WORD *)(record + WEAPON_RESTRICTIONS);
     if (draft->sell >= 0)
@@ -45638,6 +48419,7 @@ static void load_weapons(void)
 
     kernel_prices_restore(ITEM_ID_WEAPON_BASE, WEAPON_COUNT_ORIGINAL);     /* (kernel overrides) the game weapons' prices and throw effects: the kernel's again */
     kernel_throw_restore();
+    stance_name_count = 0;      /* (stances) the names as this reading gives them: digits from 0xf again */
     for (i = 0; i < NEW_WEAPON_COUNT; i++) {
         price_table[NEW_WEAPON_FIRST_ITEM + i] = 0;
         throw_effects[NEW_WEAPON_FIRST + i] = 0;
@@ -45763,6 +48545,7 @@ struct gear_draft {
     long price;                             /* or -1 */
     int sell, give, battle;                 /* 1, 0, or -1 for "as the base" */
     long menu_hp, menu_mp;                  /* items: restored from the Item menu; -1 = not given */
+    long battle_mp;                         /* items: (battle_mp) MP each landed hit restores in battle; -1 = not given */
     DWORD roster_equip;                     /* the file's characters its `equip` list names: see parse_equip */
     BYTE value[GEAR_RECORD_MAX], is_set[GEAR_RECORD_MAX];
     BYTE name[32], description[96];
@@ -45971,6 +48754,13 @@ static const char *apply_gear_key(struct gear_draft *draft, char *key, char *key
         else if (!parse_number(&p, end, &n) || p != end || n > 10000)
             return "expected an amount from 0 to 9999, or all";
         *(word_is(key, key_end, "menu_hp") ? &draft->menu_hp : &draft->menu_mp) = (long)n;
+    } else if (kind == GEAR_ITEM && word_is(key, key_end, "battle_mp")) {
+        /* (battle_mp) MP each landed hit restores in battle, besides the record's formula ("Item battle MP"); no "all":
+           the hit's MP goes through the game's pending MP, held to max MP there; at most 9 characters, so that no
+           number wraps round 32 bits into the range */
+        if (end - value > 9 || !parse_number(&p, end, &n) || p != end || n > ITEM_BATTLE_MP_MOST)
+            return "battle_mp: expected an amount from 0 to 9999";
+        draft->battle_mp = (long)n;
     } else if (word_is(key, key_end, "icon")) {
         return ci_file_problem(value, end, draft->icon);       /* (custom icons) icon = file:NAME.png | file:NAME.tex (armour, accessory and item files) */
     } else if (key_end - key > 5 && (word_is(key, key + 5, "byte_") || word_is(key, key + 5, "word_"))) {
@@ -46066,6 +48856,7 @@ static int finish_wide_item(struct gear_draft *draft)
     *(WORD *)(w->record + ITEM_RESTRICTIONS) = restrictions;
     w->menu_hp = (short)(draft->menu_hp > 0 ? draft->menu_hp : 0);
     w->menu_mp = (short)(draft->menu_mp > 0 ? draft->menu_mp : 0);
+    w->battle_mp = (short)(draft->battle_mp > 0 ? draft->battle_mp : 0);     /* (battle_mp) */
     w->given = draft->give == 1;
     w->price = draft->price >= 0 ? (DWORD)draft->price : price_table[draft->base];
     copy_bytes(w->name, draft->name, sizeof w->name);
@@ -46149,6 +48940,7 @@ static int finish_gear(struct gear_draft *draft)
         restrictions = (WORD)(draft->menu_hp > 0 || draft->menu_mp > 0 ? restrictions & ~4 : restrictions | 4);
         item_menu_hp[n] = (short)(draft->menu_hp > 0 ? draft->menu_hp : 0);
         item_menu_mp[n] = (short)(draft->menu_mp > 0 ? draft->menu_mp : 0);
+        item_battle_mp[n] = (short)(draft->battle_mp > 0 ? draft->battle_mp : 0);     /* (battle_mp) */
         item_defined[n] = 1;
     }
     custom_icon_of_id[draft->id] = ci_take(draft->icon, gear_kinds[kind].what, draft->line);      /* (custom icons) 105-127, 448-511 (items), 384-415, 416-447 here */
@@ -46234,6 +49026,7 @@ static void load_gear_file(int kind)
                     draft.line = line_number;
                     draft.base = -1;
                     draft.price = draft.menu_hp = draft.menu_mp = -1;
+                    draft.battle_mp = -1;      /* (battle_mp) */
                     draft.sell = draft.give = draft.battle = -1;
                     draft.roster_equip = 0;
                     for (i = 0; i < GEAR_RECORD_MAX; i++)
@@ -46252,6 +49045,7 @@ static void load_gear_file(int kind)
                     draft.line = line_number;
                     draft.base = -1;
                     draft.price = draft.menu_hp = draft.menu_mp = -1;
+                    draft.battle_mp = -1;      /* (battle_mp) */
                     draft.sell = draft.give = draft.battle = -1;
                     draft.roster_equip = 0;
                     for (i = 0; i < GEAR_RECORD_MAX; i++)
@@ -46270,6 +49064,7 @@ static void load_gear_file(int kind)
                     draft.line = line_number;
                     draft.base = -1;
                     draft.price = draft.menu_hp = draft.menu_mp = -1;
+                    draft.battle_mp = -1;      /* (battle_mp) */
                     draft.sell = draft.give = draft.battle = -1;
                     draft.roster_equip = 0;
                     for (i = 0; i < GEAR_RECORD_MAX; i++)
@@ -46297,6 +49092,7 @@ static void load_gear_file(int kind)
                 draft.line = line_number;
                 draft.base = -1;
                 draft.price = draft.menu_hp = draft.menu_mp = -1;
+                draft.battle_mp = -1;      /* (battle_mp) */
                 draft.sell = draft.give = draft.battle = -1;
                 draft.roster_equip = 0;
                 for (i = 0; i < GEAR_RECORD_MAX; i++)
@@ -46335,6 +49131,8 @@ static void load_gear_file(int kind)
     log_line("%s file: %d loaded, %d line(s) with problems", what, loaded, errors);
     if (kind != GEAR_ITEM)
         kernel_overrides_report(kind + 1, what, kernel_sections, kernel_problems);
+    if (kind == GEAR_ITEM)
+        item_battle_mp_report();        /* (battle_mp) the items with the key: one line */
     if (kind == GEAR_ITEM && wide_item_count > wide_before)
         log_line("item file: %d of them are WIDE ITEMS (sections [%d] to [%d]; the first defined: %d \"%s\"): whether they can enter the item list in this run is said in the \"wide items:\" line",
                  wide_item_count - wide_before, WIDE_ITEM_FIRST, WIDE_ITEM_LAST, wide_items[wide_before].number, wide_item_log_name(wide_items[wide_before].number));
@@ -47108,6 +49906,20 @@ static void load_materia(void)
 #define COMMAND_MAGIC_WINDOW    6            /* the Magic list (set-up 006d9ad5, input 006d9b98, draw 006df9ba) */
 #define ADDR_ENTRY0_KEPT        0x009aead0u  /* + party slot * 6: menu entry 0 as FUN_00437370 kept it at battle start */
 #define COMMAND_ENTRY0_KEPT_STRIDE 6
+/* (mix) */
+#define ADDR_MIX_MENU_STATE     0x0091ef9cu  /* short: the battle menu's state (5 the Item list, 0 the target cursor: FUN_006db0ee) */
+#define ADDR_MIX_MENU_RETURN    0x0091ef98u  /* short: the state a return to the list goes to (the Item list's OK writes 5) */
+#define ADDR_MIX_MENU_REDRAW    0x00dc38e0u  /* word: set 1 by every return to the list (006db361, 006db546) */
+#define ADDR_MIX_MENU_LATCH     0x00dc35acu  /* dword: the input latch, 1 after an OK or a cancel */
+#define ADDR_MIX_MENU_ITEM      0x00dc3c78u  /* word: the item the Item list's OK picked (the confirm issues it) */
+#define ADDR_MIX_PANEL_BYTE     0x00dc2088u  /* short: the picked item's conditions byte (record +0x10; -1 none): window 0x15 */
+#define COMMAND_MIX_PANEL_WINDOW 0x15        /* the conditions panel (the Item list's OK opens it when the byte is not -1) */
+#define COMMAND_MIX_LIST_STATE  5            /* the Item list's menu state (006d98e3 acts only in it) */
+#define COMMAND_MIX_REFUSED_SOUND 3          /* FUN_0074580a: the buzzer (the game's for a dimmed row) */
+#define FN_MENU_WINDOW_OPEN     0x006d0af9u  /* FUN_006d0af9(x, y, window), cdecl: window state 1 (opening) */
+#define FN_MENU_WINDOW_CLOSE    0x006d0be1u  /* FUN_006d0be1(window), cdecl: window state 3 (closing); one write */
+#define FN_MIX_DROP             0x0043305cu  /* FUN_0043305c(actor, item), cdecl: one reserved pair dropped (handler 0x02's own drop) */
+#define SITE_ITEM_LIST_OK_STATE 0x006d9a3cu  /* in 006d98e3, the OK: 66 c7 05 9c ef 91 00 00 00 / 66 c7 05 98 ef 91 00 05 00 */
 
 /* ---- NEW COMMANDS PURE begin (no game memory, no Windows: tools/work/new_command_materia/stage1/test compiles this
    block with the file's parse helpers) ---- */
@@ -47229,6 +50041,34 @@ static void load_materia(void)
 #define COMMAND_REQUEST_PARTY   0xff         /* (stage 9b) a field request's character byte: the three in the party */
 #define COMMAND_REQUEST_IDS     16           /* the game's IDs a field request may name: 0-15 */
 #define COMMAND_LEARN_ENEMY_FLAG 0x40        /* (stage 9b) 009a88a6: no Enemy Skill is learned while this bit is set (005db812) */
+#define COMMAND_HP_COST_MOST    99           /* (hp_cost) `hp_cost = N%`: 1-99 per cent of the user's HP, once an action */
+#define COMMAND_HP_COST_DIGITS  4            /* (hp_cost) the longest N as written ("0x63") */
+#define COMMAND_HP_FROM_MAX     0            /* (hp_cost) `hp_cost_from = max` (the default): of the user's max HP */
+#define COMMAND_HP_FROM_CURRENT 1            /* `hp_cost_from = current`: of its HP when the action is set up */
+#define COMMAND_ACT_QUADRA_TIMES 0x2b        /* (hp_cost) action[0x2b]: the hit loop's repeats left (Quadra Magic; 0 for one) */
+#define COMMAND_DISPLAY_RECORDS_MOST 0x40    /* (hp_cost) an action's display records: FUN_00436c66 stops counting at 0x40 */
+enum { COMMAND_HP_IDLE, COMMAND_HP_ARMED, COMMAND_HP_TAKEN };   /* (hp_cost) command_hp_cost_run's states */
+enum { COMMAND_HP_NOTHING, COMMAND_HP_TAKE, COMMAND_HP_LOWERED, COMMAND_HP_STALE, COMMAND_HP_FULL };  /* (hp_cost) command_hp_cost_hit's answers */
+#define COMMAND_MIX_LINES_MOST  1024         /* (mix) the file's mix lines and mix_other entries (the pool command_mix.line) */
+#define COMMAND_MIX_GROUPS_MOST 64           /* (mix) the file's groups (a group named by a mix line before its group line counts) */
+#define COMMAND_MIX_NAME_MOST   15           /* (mix) a group's name: a letter, then letters, digits or _ */
+#define COMMAND_MIX_TOKEN_FIRST COMMAND_ITEM_NUMBERS     /* (mix) word 4 of a spell result: 10000 + its entry (items are below 10000) */
+#define COMMAND_MIX_PRIORITY_MENU 6          /* (mix) a menu issue's queue priority (00432aa2: 6 for any command but 0x14) */
+#define COMMAND_MIX_SILENCE     0x80         /* (mix) action[0x32], the actor's status at the build: Silence (FUN_005dbe6f) */
+#define COMMAND_MIX_FROG        0x800        /* Frog: only Toad (0x0a) of the spells is cast */
+#define COMMAND_MIX_TOAD        0x0a
+#define COMMAND_ACT_STATUS      0x32         /* (mix) action[0x32]: the actor's status dword, copied by the builder (00435fd7) */
+#define COMMAND_MIX_ITEM_REDO   0xff         /* (mix) the game's 009ac111 after a take, as its own take 00434a80 writes it: the item list made afresh */
+enum { COMMAND_MIX_SIDE_ITEM, COMMAND_MIX_SIDE_GROUP, COMMAND_MIX_SIDE_ANY };   /* (mix) a side of a mix line */
+enum { COMMAND_MIX_RESULT_ITEM, COMMAND_MIX_RESULT_SPELL };                     /* (mix) its result */
+enum { COMMAND_MIX_NOT, COMMAND_MIX_FIRST, COMMAND_MIX_SECOND, COMMAND_MIX_NO_RESULT };     /* (mix) command_mix_pick's answers */
+enum {  /* (mix) command_mix_enqueue_step's answers */
+    COMMAND_MIX_Q_NOT, COMMAND_MIX_Q_OK, COMMAND_MIX_Q_NO_TARGETS, COMMAND_MIX_Q_NO_PICK, COMMAND_MIX_Q_NO_FIRST
+};
+enum {  /* (mix) the set-ups' answers: > 0 set up (1: the two items used, 2: a Mime or AI action, free), 0: not a mix action, < 0 refused */
+    COMMAND_MIX_SET_ENEMY = -1, COMMAND_MIX_SET_NOT_RESULT = -2, COMMAND_MIX_SET_NO_QUEUE = -3, COMMAND_MIX_SET_SILENCE = -4,
+    COMMAND_MIX_SET_FROG = -5, COMMAND_MIX_SET_NONE = 0, COMMAND_MIX_SET_USED = 1, COMMAND_MIX_SET_FREE = 2
+};
 enum {  /* (stage 7) why command_attack_rule reads an attribute as Attack (0: kept) */
     COMMAND_ATTACK_KEPT, COMMAND_ATTACK_NOT_COMMAND, COMMAND_ATTACK_NOT_LIVE, COMMAND_ATTACK_ITEM, COMMAND_ATTACK_NO_HOOKS,
     COMMAND_ATTACK_LIST             /* (stage 8) */
@@ -47301,6 +50141,64 @@ struct new_command {
     /* stage 9b (learned entries): after stage 9a's, so that stages 1-9a's fields keep their places; 0 with no line */
     short learned_text_line;            /* the `learned_text` line (0 = not given: the default) */
     char learned_text[COMMAND_LEARNED_TEXT_MOST + 1];   /* as written */
+    /* hp_cost: after stage 9b's, so that stages 1-9b's fields keep their places; all 0 with no line */
+    short hp_cost_line, hp_cost_from_line;  /* the `hp_cost` and `hp_cost_from` lines (0 = not given) */
+    BYTE hp_cost;                       /* N of `hp_cost = N%`: 1-99 per cent of the user's HP (taken only with hp_cost_line) */
+    BYTE hp_cost_from;                  /* COMMAND_HP_FROM_MAX (the default) or COMMAND_HP_FROM_CURRENT */
+    /* (mix) kind = mix: after hp_cost's, so that the earlier fields keep their places; all 0 in any other section */
+    BYTE mix;                           /* kind = mix: an item command (kind COMMAND_KIND_ITEM) whose two picks make one result */
+    BYTE mix_spells;                    /* at resolve: a line left in has a spell result (Magic's handlers are needed too) */
+    short mix_line;                     /* the first mix, mix_other or group line (0 = none) */
+    short mix_other_line;               /* the mix_other line (0 = not given) */
+    WORD mix_other_at;                  /* its entry in command_mix.line + 1 (0 = none) */
+    WORD mix_count;                     /* at resolve: its mix lines left in (mix_other not counted) */
+};
+/* (mix) The file's mix lines and groups, in file order (command_file_read empties them; one section's are together). */
+struct command_mix_line {
+    BYTE command;                       /* the section's number */
+    BYTE side_kind[2];                  /* COMMAND_MIX_SIDE_*; a mix_other entry has none (other) */
+    BYTE result_kind;                   /* COMMAND_MIX_RESULT_* */
+    BYTE on;                            /* 1: in use; 0: left out at resolve or turned off after the items file (never matches) */
+    BYTE other;                         /* the section's mix_other entry */
+    BYTE target;                        /* (a spell result) the spell's record target byte, at resolve */
+    WORD side[2];                       /* an item number, or a group's index in command_mix.group */
+    WORD result;                        /* an item number, or a spell: kernel magic 0x00-0x35, the spell file's 3000 and up */
+    short line;
+};
+struct command_mix_group {
+    BYTE command;
+    BYTE defined;                       /* its group line was read (0: only named by a mix line so far) */
+    char name[COMMAND_MIX_NAME_MOST + 1];   /* lower case */
+    WORD count;                         /* numbers in it */
+    short line;                         /* its group line, or the first mix line naming it */
+    BYTE bits[COMMAND_ITEM_NUMBERS / 8];
+};
+struct command_mix_pool {
+    int lines, groups;
+    BYTE lines_full_said, groups_full_said;
+    struct command_mix_line line[COMMAND_MIX_LINES_MOST];
+    struct command_mix_group group[COMMAND_MIX_GROUPS_MOST];
+};
+static struct command_mix_pool command_mix;
+/* (mix) A pick in the Item list (per party slot) and a queued pair (per party actor 0-2). */
+struct command_mix_pick {
+    BYTE on, command, second;           /* second: B picked too (b, word, entry are its) */
+    WORD a, b, word;                    /* the first item, the second, the result's word 4 (an item number or a token) */
+    short entry;                        /* the result's entry in command_mix.line */
+    DWORD reading;                      /* command_reading when the first item was picked */
+};
+struct command_mix_run {
+    BYTE on, command;
+    WORD a, b, word;
+    DWORD reading;
+};
+/* (hp_cost) One action's HP cost: armed at its set-up, taken at its first hit (command_hp_cost_arm, _hit). */
+struct command_hp_cost_run {
+    BYTE state;                         /* COMMAND_HP_IDLE, _ARMED (set up, no hit yet), _TAKEN (in the user's pending HP) */
+    BYTE actor, command;                /* the action's (ARMED, TAKEN) */
+    DWORD want;                         /* the cost worked out at the set-up, before the floor */
+    DWORD ours;                         /* TAKEN: what it put into the user's pending HP (lowered, never raised) */
+    int display, turns, quadra;         /* TAKEN: the pass it was taken in (display records written, action[0x2d], [0x2b]) */
 };
 /* (stage 9b) The [learning] section of the commands file (command_file_read). */
 struct command_learning {
@@ -47503,6 +50401,7 @@ static int command_physical_key(struct new_command *c, char *key, char *key_end,
         c->script_all = (BYTE)n;
     else if (word_is(key, key_end, "kind")) {
         k = COMMAND_KEY_KIND;
+        c->mix = 0;                         /* (mix) only the last kind line counts */
         if (word_is(value, stop, "spell"))
             c->kind = COMMAND_KIND_SPELL;
         else if (word_is(value, stop, "physical"))
@@ -47511,8 +50410,11 @@ static int command_physical_key(struct new_command *c, char *key, char *key_end,
             c->kind = COMMAND_KIND_ITEM;    /* (stage 5) */
         else if (word_is(value, stop, "list"))
             c->kind = COMMAND_KIND_LIST;    /* (stage 8) */
-        else
-            bad = "kind is spell (the row casts a spell, the default), physical (a weapon attack made like one of the game's weapon commands), item (the battle's Item list under the command's own name) or list (its own list of spells, in the Magic list's window)";
+        else if (word_is(value, stop, "mix")) {
+            c->kind = COMMAND_KIND_ITEM;    /* (mix) an item command whose two picks make one result */
+            c->mix = 1;
+        } else
+            bad = "kind is spell (the row casts a spell, the default), physical (a weapon attack made like one of the game's weapon commands), mix (two items from the Item list make one result), item (the battle's Item list under the command's own name) or list (its own list of spells, in the Magic list's window)";
     } else if (word_is(key, key_end, "like")) {
         k = COMMAND_KEY_LIKE;
         c->like = (BYTE)command_like_number(value, stop);
@@ -47575,6 +50477,43 @@ static int command_physical_key(struct new_command *c, char *key, char *key_end,
 static int command_item_run(DWORD n)
 {
     return n < 128 ? 1 : n >= 448 && n < 512 ? 2 : n >= 1024 && n < COMMAND_ITEM_NUMBERS ? 3 : 0;
+}
+
+/* (hp_cost) An `hp_cost = N%` line (`from` FALSE): N 1 to 99, decimal or 0x hex, with its % (spaces before it allowed;
+   a bare number is refused: it could be read as HP), or an `hp_cost_from = max | current` line (`from` TRUE), either
+   kind of command. A bad value: one line, the command is not used (a later good line does not undo that). */
+static void command_hp_cost_key(struct new_command *c, BOOL from, char *value, char *stop, int line, command_problem_fn problem)
+{
+    char *p = value, *end = stop;
+    DWORD n = 0;
+
+    if (from) {
+        if (word_is(value, stop, "max"))
+            c->hp_cost_from = COMMAND_HP_FROM_MAX;
+        else if (word_is(value, stop, "current"))
+            c->hp_cost_from = COMMAND_HP_FROM_CURRENT;
+        else {
+            problem(line, "hp_cost_from is max (the user's max HP, the default) or current (its HP when the action is set up): the command is not used");
+            c->usable = 0;
+        }
+        c->hp_cost_from_line = (short)line;
+        return;
+    }
+    if (end > value && end[-1] == '%') {
+        end--;
+        while (end > value && is_space(end[-1]))
+            end--;
+    } else {
+        end = value;            /* no %: refused below */
+    }
+    if (end == value || end - value > COMMAND_HP_COST_DIGITS || !parse_number(&p, end, &n) || p != end || n < 1 ||
+        n > COMMAND_HP_COST_MOST) {
+        problem(line, "hp_cost is a per cent of the user's HP, 1% to 99%, written with its % (hp_cost = 10%): the command is not used");
+        c->usable = 0;
+        return;
+    }
+    c->hp_cost = (BYTE)n;
+    c->hp_cost_line = (short)line;
 }
 
 /* (stage 5) An `items` line: item numbers and ranges a-b (no space inside a range), decimal or 0x hex, at most six
@@ -47871,6 +50810,279 @@ static void command_learning_key(struct command_learning *l, const char *key, co
         problem(line, "unknown key in [learning] (it takes request and test_lesson)");
 }
 
+/* (mix) The pool of mix lines and groups emptied (command_file_read, before a reading). */
+static void command_mix_empty(void)
+{
+    command_mix.lines = command_mix.groups = 0;
+    command_mix.lines_full_said = command_mix.groups_full_said = 0;
+}
+
+/* (mix) Is [s, e) a group name: a letter, then letters, digits or _, at most 15, not `any`? */
+static BOOL command_mix_name_ok(const char *s, const char *e)
+{
+    const char *p;
+
+    if (e - s < 1 || e - s > COMMAND_MIX_NAME_MOST || !((*s >= 'a' && *s <= 'z') || (*s >= 'A' && *s <= 'Z')) ||
+        word_is(s, e, "any"))
+        return FALSE;
+    for (p = s; p < e; p++)
+        if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') || (*p >= '0' && *p <= '9') || *p == '_'))
+            return FALSE;
+    return TRUE;
+}
+
+/* (mix) Command `command`'s group named [s, e) (case not counted): its index, or -1. With `make`, a group not found yet
+   is made (not defined: only named so far) when the pool has room; -2 when it is full. */
+static int command_mix_group_at(int command, const char *s, const char *e, BOOL make, int line)
+{
+    struct command_mix_group *g;
+    int i, k;
+
+    for (i = 0; i < command_mix.groups; i++) {
+        g = &command_mix.group[i];
+        if (g->command != command)
+            continue;
+        for (k = 0; s + k < e && g->name[k]; k++)
+            if ((s[k] >= 'A' && s[k] <= 'Z' ? s[k] - 'A' + 'a' : s[k]) != g->name[k])
+                break;
+        if (s + k == e && !g->name[k])
+            return i;
+    }
+    if (!make)
+        return -1;
+    if (command_mix.groups >= COMMAND_MIX_GROUPS_MOST)
+        return -2;
+    g = &command_mix.group[command_mix.groups];
+    for (k = 0; k < (int)sizeof *g; k++)
+        ((BYTE *)g)[k] = 0;
+    g->command = (BYTE)command;
+    for (k = 0; s + k < e && k < COMMAND_MIX_NAME_MOST; k++)
+        g->name[k] = (char)(s[k] >= 'A' && s[k] <= 'Z' ? s[k] - 'A' + 'a' : s[k]);
+    g->name[k] = 0;
+    g->line = (short)line;
+    return command_mix.groups++;
+}
+
+/* (mix) A group line's items: numbers and ranges as the `items` key (command_items_key: no space inside a range, at most
+   six characters a number, commas or spaces between), added to the group's set. A bad word: one line, left out. */
+static void command_mix_numbers(struct command_mix_group *g, char *p, char *stop, int line, command_problem_fn problem)
+{
+    while (p < stop) {
+        char *word, *end, *q, *second;
+        DWORD a = 0, b = 0;
+        int ok;
+
+        while (p < stop && (*p == ',' || is_space(*p)))
+            p++;
+        if (p == stop)
+            break;
+        for (word = p; p < stop && *p != ',' && !is_space(*p); p++)
+            ;
+        end = p;
+        q = word;
+        ok = parse_number(&q, end, &a) && q - word <= 6;
+        b = a;
+        if (ok && q < end) {
+            ok = *q == '-';
+            second = ++q;
+            ok = ok && parse_number(&q, end, &b) && q == end && q - second <= 6;
+        }
+        if (!ok) {
+            problem(line, "group: a word that is not an item number or a range of them (0x00-0x02: no space inside; at most six characters a number): that word is left out, the rest is kept");
+            continue;
+        }
+        if (a > b || !command_item_run(a) || command_item_run(a) != command_item_run(b)) {
+            problem(line, "group: a weapon, armour or accessory number (128-447), a number that is no item (512-1023, 10000 and up), a range reaching one, or a range backwards: only items 0-127, 448-511 and 1024-9999 are grouped: that word is left out, the rest is kept");
+            continue;
+        }
+        for (; a <= b; a++)
+            if (!(g->bits[a >> 3] & (1u << (a & 7)))) {
+                g->bits[a >> 3] |= (BYTE)(1u << (a & 7));
+                g->count++;
+            }
+    }
+}
+
+/* (mix) One side of a mix line, [s, e) trimmed: an item number (as `items` allows one), `any`, or a group name of the
+   section (found, or made as named only). 1 read, 0 not a side, -1 the group pool is full. */
+static int command_mix_side(int command, const char *s, const char *e, int line, BYTE *kind, WORD *value)
+{
+    char *p = (char *)s;
+    DWORD n = 0;
+    int g;
+
+    if (s == e)
+        return 0;
+    if (word_is(s, e, "any")) {
+        *kind = COMMAND_MIX_SIDE_ANY;
+        *value = 0;
+        return 1;
+    }
+    if (*s >= '0' && *s <= '9') {
+        if (!parse_number(&p, e, &n) || p != e || e - s > 6 || n >= COMMAND_ITEM_NUMBERS || !command_item_run(n))
+            return 0;
+        *kind = COMMAND_MIX_SIDE_ITEM;
+        *value = (WORD)n;
+        return 1;
+    }
+    if (!command_mix_name_ok(s, e))
+        return 0;
+    g = command_mix_group_at(command, s, e, TRUE, line);
+    if (g < 0)
+        return -1;
+    *kind = COMMAND_MIX_SIDE_GROUP;
+    *value = (WORD)g;
+    return 1;
+}
+
+/* (mix) A RESULT, [s, e) trimmed: `item N` (an item `items` allows: 0-127, 448-511, 1024-9999) or `spell N` (0 to
+   65534; whether a spell has it is settled at resolve). TRUE if read. */
+static BOOL command_mix_result(char *s, char *e, BYTE *kind, WORD *value)
+{
+    char *word = s, *word_end, *p;
+    DWORD n = 0;
+    BOOL spell;
+
+    for (word_end = word; word_end < e && !is_space(*word_end); word_end++)
+        ;
+    if (word_is(word, word_end, "item"))
+        spell = FALSE;
+    else if (word_is(word, word_end, "spell"))
+        spell = TRUE;
+    else
+        return FALSE;
+    p = word_end;
+    trim(&p, &e);
+    if (p == e || e - p > 6)
+        return FALSE;
+    word = p;
+    if (!parse_number(&p, e, &n) || p != e)
+        return FALSE;
+    if (spell ? n > 0xfffe : n >= COMMAND_ITEM_NUMBERS || !command_item_run(n))
+        return FALSE;
+    *kind = (BYTE)(spell ? COMMAND_MIX_RESULT_SPELL : COMMAND_MIX_RESULT_ITEM);
+    *value = (WORD)n;
+    return TRUE;
+}
+
+/* (mix) A `mix` (which 0), `mix_other` (1) or `group` (2) line of command `command`'s section (any kind: resolve refuses
+   them outside kind = mix). A line that does not read is left out with one line, the rest kept; a bad mix_other line
+   makes the command unusable (every pair needs a result). */
+static void command_mix_key(struct new_command *c, int command, int which, char *value, char *stop, int line,
+                            command_problem_fn problem)
+{
+    struct command_mix_line *l;
+    char *arrow, *plus, *a_end, *b_start, *r_start, *t;
+    int i, got;
+
+    if (!c->mix_line)
+        c->mix_line = (short)line;
+    if (which == 2) {
+        char *colon, *name_end, *items;
+        int g;
+
+        for (colon = value; colon < stop && *colon != ':'; colon++)
+            ;
+        name_end = colon;
+        t = value;
+        trim(&t, &name_end);
+        if (colon == stop || !command_mix_name_ok(t, name_end)) {
+            problem(line, "group is NAME: items (NAME a letter, then letters, digits or _, at most 15, not any; the items as the items key takes them): that line is left out, and the mix lines naming it");
+            return;
+        }
+        g = command_mix_group_at(command, t, name_end, TRUE, line);
+        if (g == -2) {
+            if (!command_mix.groups_full_said)
+                problem(line, "group: the file's 64 groups are used: this group and the further ones are left out, and the mix lines naming them");
+            command_mix.groups_full_said = 1;
+            return;
+        }
+        if (command_mix.group[g].defined) {
+            problem(line, "group: this name is already a group of this section: this line is left out (the first is kept)");
+            return;
+        }
+        command_mix.group[g].defined = 1;
+        command_mix.group[g].line = (short)line;
+        items = colon + 1;
+        trim(&items, &stop);
+        command_mix_numbers(&command_mix.group[g], items, stop, line, problem);
+        return;
+    }
+    if (command_mix.lines >= COMMAND_MIX_LINES_MOST) {
+        if (!command_mix.lines_full_said)
+            problem(line, "mix: the file's 1,024 mix and mix_other lines are used: this line and the further ones are left out");
+        command_mix.lines_full_said = 1;
+        if (which == 1) {
+            problem(line, "mix_other: the file's 1,024 mix and mix_other lines are used, none is left for it: the command is not used");
+            c->usable = 0;
+        }
+        return;
+    }
+    l = &command_mix.line[command_mix.lines];
+    for (i = 0; i < (int)sizeof *l; i++)
+        ((BYTE *)l)[i] = 0;
+    l->command = (BYTE)command;
+    l->line = (short)line;
+    if (which == 1) {
+        if (c->mix_other_line) {
+            problem(line, "mix_other: a second line: it is left out, the first is kept");
+            return;
+        }
+        c->mix_other_line = (short)line;
+        if (!command_mix_result(value, stop, &l->result_kind, &l->result)) {
+            problem(line, "mix_other is item N or spell N (what any pair with no mix line gives: an item 0-127, 448-511 or 1024-9999, or kernel magic 0x00-0x35 or a spell of the spell file, 3000 and up; a bare number is refused, as items and spells share numbers): the command is not used");
+            c->usable = 0;
+            return;
+        }
+        l->other = l->on = 1;
+        c->mix_other_at = (WORD)(command_mix.lines + 1);
+        command_mix.lines++;
+        return;
+    }
+    for (arrow = value; arrow + 1 < stop && !(arrow[0] == '-' && arrow[1] == '>'); arrow++)
+        ;
+    for (plus = value; plus < arrow && *plus != '+'; plus++)
+        ;
+    if (arrow + 1 >= stop || plus == arrow) {
+        problem(line, "mix is SIDE + SIDE -> RESULT (each SIDE an item number, a group of this section or any; RESULT item N or spell N): that line is left out, the rest is kept");
+        return;
+    }
+    a_end = plus;
+    t = value;
+    trim(&t, &a_end);
+    b_start = plus + 1;
+    r_start = arrow + 2;
+    trim(&b_start, &arrow);
+    trim(&r_start, &stop);
+    got = command_mix_side(command, t, a_end, line, &l->side_kind[0], &l->side[0]);
+    if (got > 0)
+        got = command_mix_side(command, b_start, arrow, line, &l->side_kind[1], &l->side[1]);
+    if (got < 0) {
+        problem(line, "mix: the file's 64 groups are used and this line names a further one: that line is left out, the rest is kept");
+        return;
+    }
+    if (!got) {
+        problem(line, "mix: a side is an item number (0-127, 448-511 or 1024-9999, decimal or 0x hex), a group name of this section or any; a range goes in a group: that line is left out, the rest is kept");
+        return;
+    }
+    if (!command_mix_result(r_start, stop, &l->result_kind, &l->result)) {
+        problem(line, "mix: the result is item N (an item 0-127, 448-511 or 1024-9999) or spell N (kernel magic 0x00-0x35 or a spell of the spell file, 3000 and up); a bare number is refused, as items and spells share numbers: that line is left out, the rest is kept");
+        return;
+    }
+    if (l->side_kind[0] == COMMAND_MIX_SIDE_ITEM && l->side_kind[1] == COMMAND_MIX_SIDE_ITEM)
+        for (i = 0; i < command_mix.lines; i++) {
+            const struct command_mix_line *o = &command_mix.line[i];
+
+            if (o->command == command && !o->other && o->side_kind[0] == COMMAND_MIX_SIDE_ITEM && o->side_kind[1] == COMMAND_MIX_SIDE_ITEM &&
+                ((o->side[0] == l->side[0] && o->side[1] == l->side[1]) || (o->side[0] == l->side[1] && o->side[1] == l->side[0]))) {
+                problem(line, "mix: the same two items as an earlier mix line (either order): it could never match: that line is left out, the rest is kept");
+                return;
+            }
+        }
+    l->on = 1;
+    command_mix.lines++;
+}
+
 /* (stage 9a and before) The commands file without a [learning] section of its own (stages 1-9a's reader, kept for their
    tests; the DLL reads with command_file_read): a [learning] line is refused as any section that is not a number. */
 static int command_file_read(char *text, DWORD size, struct new_command *commands, struct command_learning *learning,
@@ -47903,6 +51115,7 @@ static int command_file_read(char *text, DWORD size, struct new_command *command
             b[k] = 0;
         commands[i].name[0] = commands[i].description[0] = 0xff;
     }
+    command_mix_empty();                /* (mix) the pool of mix lines and groups */
     for (line = text; line < file_end; line = end + 1) {
         char *start = line, *stop, *equals, *key_end, *value, *p;
         DWORD n = 0;
@@ -48073,8 +51286,14 @@ static int command_file_read(char *text, DWORD size, struct new_command *command
                 c->learned_text[i] = 0;
                 c->learned_text_line = (short)line_number;
             }
+        } else if (word_is(start, key_end, "hp_cost") || word_is(start, key_end, "hp_cost_from")) {
+            command_hp_cost_key(c, word_is(start, key_end, "hp_cost_from"), value, stop, line_number, problem);    /* (hp_cost) any kind */
+        } else if (word_is(start, key_end, "mix") || word_is(start, key_end, "mix_other") || word_is(start, key_end, "group")) {
+            /* (mix) kept for resolve, which refuses them outside kind = mix */
+            command_mix_key(c, (int)(c - commands) + COMMAND_FIRST, word_is(start, key_end, "mix") ? 0 : word_is(start, key_end, "mix_other") ? 1 : 2,
+                            value, stop, line_number, problem);
         } else if (!command_physical_key(c, start, key_end, value, stop, line_number, problem)) {
-            problem(line_number, "unknown key (a command takes name, description, menu, spell, spell_all, target and support; any kind also w_form; with kind = physical: like, script, script_all, turns, power, damage_formula, accuracy, element, status, status_mode, status_chance, special, flags, impact_effect, impact_sound, camera_single, camera_multi; with kind = item: items, potency; with kind = list: spells)");
+            problem(line_number, "unknown key (a command takes name, description, menu, spell, spell_all, target and support; any kind also w_form; with kind = physical: like, script, script_all, turns, power, damage_formula, accuracy, element, status, status_mode, status_chance, special, flags, impact_effect, impact_sound, camera_single, camera_multi; with kind = mix: mix, mix_other, group, items, potency; with kind = item: items, potency; with kind = list: spells)");
             c->usable = 0;
         }
     }
@@ -48272,6 +51491,84 @@ static void command_resolve_support(struct new_command *c, command_problem_fn pr
     c->support_off = (BYTE)(applies & ~c->support_named);
 }
 
+/* (mix) A spell result's record target byte (spell_target), or -1 with *why: a summon, no spell, a target byte ff. */
+static int command_mix_spell_ok(int spell, command_spell_fn spell_target, const char **why)
+{
+    int target = spell_target(spell);
+
+    if (target == COMMAND_SPELL_SUMMON)
+        *why = "is an extended summon (list = summon), which is not cast as magic";
+    else if (target < 0)
+        *why = "is neither a kernel magic ID 0x00-0x35 nor a spell of the spell file (3000 and up)";
+    else if (target == 0xff)
+        *why = "has the target byte 0xff (it would aim at every living actor)";
+    else
+        return target;
+    return -1;
+}
+
+/* (mix) A mix section after the file is read, before command_resolve_item: no w_form; its groups resolved (one with no
+   number left is left out); each mix line naming a group the section does not define, or a spell result that is not a
+   spell a command can cast, left out (one line each); mix_other given and good (else the command is not used). The
+   spell results' target bytes noted, mix_spells and mix_count set. TRUE if usable. */
+static BOOL command_mix_resolve(struct new_command *c, int command, command_spell_fn spell_target, command_problem_fn problem)
+{
+    const char *why = NULL;
+    int i, k, target;
+
+    if (c->w_form_line) {
+        problem(c->w_form_line, "w_form: a mix command already takes two picks (OK on two items makes one action): w_form is not a mix command's key: the command is not used");
+        return FALSE;
+    }
+    for (i = 0; i < command_mix.groups; i++) {
+        struct command_mix_group *g = &command_mix.group[i];
+
+        if (g->command == command && g->defined && !g->count) {
+            problem(g->line, "group: no item number is left (the line is empty, or every word was left out): the group is left out, and the mix lines naming it");
+            g->defined = 0;
+        }
+    }
+    c->mix_spells = 0;
+    c->mix_count = 0;
+    for (i = 0; i < command_mix.lines; i++) {
+        struct command_mix_line *l = &command_mix.line[i];
+
+        if (l->command != command || !l->on)
+            continue;
+        for (k = 0; k < 2 && !l->other; k++)
+            if (l->side_kind[k] == COMMAND_MIX_SIDE_GROUP && !command_mix.group[l->side[k]].defined)
+                break;
+        if (k < 2 && !l->other) {
+            problem(l->line, "mix: a group this section does not define (group = NAME: items), or one left out above: that line is left out, the rest is kept");
+            l->on = 0;
+            continue;
+        }
+        if (l->result_kind == COMMAND_MIX_RESULT_SPELL) {
+            target = command_mix_spell_ok(l->result, spell_target, &why);
+            if (target < 0) {
+                if (l->other) {
+                    problem(l->line, "mix_other: its spell is not one a command can cast (an extended summon, no such spell, or the target byte 0xff): the command is not used");
+                    l->on = 0;
+                    return FALSE;
+                }
+                problem(l->line, "mix: the result spell is not one a command can cast (an extended summon, no kernel magic 0x00-0x35 or spell of the spell file, or the target byte 0xff): that line is left out, the rest is kept");
+                l->on = 0;
+                continue;
+            }
+            l->target = (BYTE)target;
+            c->mix_spells = 1;
+        }
+        if (!l->other)
+            c->mix_count++;
+    }
+    (void)why;
+    if (!c->mix_other_at || !command_mix.line[c->mix_other_at - 1].on) {
+        problem(c->line, "kind = mix needs mix_other = item N or spell N (what any pair with no mix line gives): the command is not used");
+        return FALSE;
+    }
+    return TRUE;
+}
+
 /* After the file is read and the spells are known: each usable section has a name. A spell section's spells
    exist and are not summons, its target byte (the spell's own record byte unless `target` is given) is not ff,
    and it has no physical key; a physical section as command_resolve_physical; (stage 5) an item section as
@@ -48302,6 +51599,16 @@ static int command_resolve(struct new_command *commands, command_spell_fn spell_
             c->usable = 0;
             continue;
         }
+        if (!c->mix && c->mix_line) {
+            problem(c->mix_line, "mix, mix_other and group are a mix command's keys (kind = mix): the command is not used");    /* (mix) */
+            c->usable = 0;
+            continue;
+        }
+        if (c->hp_cost_from_line && !c->hp_cost_line) {
+            problem(c->hp_cost_from_line, "hp_cost_from goes with an hp_cost line (hp_cost = 10%): the command is not used");     /* (hp_cost) */
+            c->usable = 0;
+            continue;
+        }
         command_resolve_support(c, problem);    /* (stage 6) a line only: never makes a section unusable */
         if (c->kind == COMMAND_KIND_LIST) {
             if (command_resolve_list(c, spell_target, problem))     /* (stage 8) */
@@ -48311,8 +51618,8 @@ static int command_resolve(struct new_command *commands, command_spell_fn spell_
             continue;
         }
         if (c->kind == COMMAND_KIND_ITEM) {
-            if (command_resolve_item(c, problem))
-                usable++;
+            if ((!c->mix || command_mix_resolve(c, COMMAND_FIRST + i, spell_target, problem)) && command_resolve_item(c, problem))
+                usable++;       /* (mix) a mix section is an item section with recipes */
             else
                 c->usable = 0;
             continue;
@@ -48887,8 +52194,10 @@ static int command_item_reserve_decide(const BYTE *entry, const struct new_comma
 {
     int actor = (signed char)entry[2];
 
-    if (!command_item_of(commands, entry[3]) || actor < 0 || actor > 2)
-        return -1;
+    const struct new_command *c = command_item_of(commands, entry[3]);
+
+    if (!c || c->mix || actor < 0 || actor > 2)
+        return -1;              /* (mix: command_mix_enqueue_step reserves) */
     *item = entry[4] | entry[5] << 8;
     return actor;
 }
@@ -48902,12 +52211,13 @@ static BOOL command_item_as_item(const int *action, const struct new_command *co
 
 /* (stage 5) The item command whose list the menu opens or shows: the menu's command byte (00dc3c70) is a live item
    command with an items line, and the cursor action (00dc3c74) is its record's: the Item list's 3, or (stage 7, w_form)
-   W-Item's 0x0a. Else NULL. */
+   W-Item's 0x0a. Else NULL. (mix) A mix command also without an items line (its first item is dimmed at the second pick
+   when only one is left: command_filter_apply_with). */
 static const struct new_command *command_filter_want(const struct new_command *commands, int menu_command, int cursor)
 {
     const struct new_command *c = command_item_of(commands, menu_command);
 
-    return c && c->items_line && cursor == c->cursor ? c : NULL;
+    return c && (c->items_line || c->mix) && cursor == c->cursor ? c : NULL;
 }
 
 /* (stage 5) The filter's notes: notes[r] is 0, or 1 + the number row r held when the filter set its bit 0x02 (only
@@ -48935,8 +52245,9 @@ static int command_filter_undo(BYTE *rows, WORD *notes, int count)
 /* (stage 5) Apply command c's set: every row with an item (not ffff) that c does not allow and whose bit 0x02 is
    clear gets it set and noted (a row the game dims already, gear or a Tent, is left and never noted: the filter only
    adds dimming); a noted row whose bit was cleared since (a gain of the same item rewrites the use bits) is dimmed
-   again; a note whose row changed is dropped first (its bits are the game's). Returns the rows the filter dims. */
-static int command_filter_apply(BYTE *rows, WORD *notes, int count, const struct new_command *c)
+   again; a note whose row changed is dropped first (its bits are the game's). Returns the rows the filter dims.
+   (mix) command_filter_apply_with: also the rows holding `dim` (0-9999; -1 none) are dimmed as not allowed. */
+static int command_filter_apply_with(BYTE *rows, WORD *notes, int count, const struct new_command *c, int dim)
 {
     int r, dimmed = 0;
 
@@ -48948,7 +52259,7 @@ static int command_filter_apply(BYTE *rows, WORD *notes, int count, const struct
             notes[r] = 0;
         if (number == COMMAND_ITEM_ROW_EMPTY)
             continue;
-        if (command_item_allowed(c, number)) {
+        if (command_item_allowed(c, number) && number != dim) {
             if (notes[r]) {             /* (never with one set: the caller undoes for another command or reading) */
                 row[COMMAND_ITEM_ROW_USE] &= (BYTE)~COMMAND_ITEM_NOT_IN_BATTLE;
                 notes[r] = 0;
@@ -48964,13 +52275,19 @@ static int command_filter_apply(BYTE *rows, WORD *notes, int count, const struct
     return dimmed;
 }
 
+/* (mix) command_filter_apply is command_filter_apply_with with nothing more dimmed (-1): stage 5's, kept for its tests. */
+static __attribute__((unused)) int command_filter_apply(BYTE *rows, WORD *notes, int count, const struct new_command *c)
+{
+    return command_filter_apply_with(rows, notes, count, c, -1);
+}
+
 /* (stage 5) One sync of the filter (command_filter_sync: each opening of the Item list and every frame it is open).
    `menu`, `cursor`: the menu's command byte and cursor action; *owner, *owner_reading: whose notes they are (-1:
    none) and of which reading; `reading`: this one. The notes are undone when they are another command's or an older
    reading's, or the list is not an item command's (Item, W-Item, Throw, Coin); then the menu's command's set is
    applied when it is one at cursor 3. Returns the rows the filter dims, or -1 when it applies no set. */
-static int command_filter_step(BYTE *rows, WORD *notes, int count, const struct new_command *commands, int menu,
-                               int cursor, int *owner, DWORD *owner_reading, DWORD reading)
+static int command_filter_step_with(BYTE *rows, WORD *notes, int count, const struct new_command *commands, int menu,
+                                    int cursor, int *owner, DWORD *owner_reading, DWORD reading, int dim)
 {
     const struct new_command *c = command_filter_want(commands, menu, cursor);
 
@@ -48982,7 +52299,14 @@ static int command_filter_step(BYTE *rows, WORD *notes, int count, const struct 
         return -1;
     *owner = menu;
     *owner_reading = reading;
-    return command_filter_apply(rows, notes, count, c);
+    return command_filter_apply_with(rows, notes, count, c, dim);
+}
+
+/* (mix) command_filter_step is command_filter_step_with with nothing more dimmed (-1): stage 5's, kept for its tests. */
+static __attribute__((unused)) int command_filter_step(BYTE *rows, WORD *notes, int count, const struct new_command *commands, int menu,
+                               int cursor, int *owner, DWORD *owner_reading, DWORD reading)
+{
+    return command_filter_step_with(rows, notes, count, commands, menu, cursor, owner, owner_reading, reading, -1);
 }
 
 /* (stage 5) A hit's amount with an item command's potency (fixed_damage_hook, after FUN_005da5da's clamp): for an
@@ -49996,6 +53320,434 @@ static int command_learned_message(BYTE *out, int capacity, const char *template
     out[n] = 0xff;
     return n;
 }
+
+/* (hp_cost) The cost of one action of `c`, before the floor: hp_cost per cent of `max_hp` (hp_cost_from = current: of
+   `hp`), rounded down, at least 1; 0 for a command with no hp_cost line. Exact for any 32-bit HP (no overflow). */
+static DWORD command_hp_cost_amount(const struct new_command *c, DWORD hp, DWORD max_hp)
+{
+    DWORD base = c->hp_cost_from == COMMAND_HP_FROM_CURRENT ? hp : max_hp, cost;
+
+    if (!c->hp_cost_line)
+        return 0;
+    cost = base / 100 * c->hp_cost + base % 100 * c->hp_cost / 100;
+    return cost ? cost : 1;
+}
+
+/* (hp_cost) What the cost may put into the user's pending HP (the total FUN_005df30b keeps per actor at 009a8b3c, which
+   the hit loop takes off its HP at the end of each pass: 005d9e9b, FUN_005da380 -> FUN_005da3f5): `want`, held so that
+   `hp` less the whole pending total stays 1 or more. `others`: what the rest of the action has put there (a drain, HP
+   Absorb); a heal (negative) is not counted on, so it never makes the cost larger. 0 when `hp` is 1 or less. */
+static DWORD command_hp_cost_cap(DWORD hp, int others, DWORD want)
+{
+    DWORD held = others > 0 ? (DWORD)others : 0, room;
+
+    if (hp <= 1 || held >= hp - 1)
+        return 0;
+    room = hp - 1 - held;
+    return want < room ? want : room;
+}
+
+/* (hp_cost) At the set-up of an action of a new command (`way`: the set-up's answer, > 0 set up as the command, else
+   refused or an enemy's): armed with the cost of `c` when it is live with an hp_cost line, the actor is a party member
+   and the action is not a Mime repeat (`flags` with 0x400000, which the builder sets for Mime's replay: the game takes
+   no MP then, FUN_005c94d3). Any other set-up leaves the run idle. Returns the cost armed (0: none). */
+static DWORD command_hp_cost_arm(struct command_hp_cost_run *r, const struct new_command *c, int way, int actor, int command,
+                                 DWORD flags, DWORD hp, DWORD max_hp)
+{
+    r->state = COMMAND_HP_IDLE;
+    r->want = r->ours = 0;
+    if (way <= 0 || !c || !c->live || !c->hp_cost_line || actor < 0 || actor > 2 || (flags & COMMAND_FLAG_REPEAT))
+        return 0;
+    r->state = COMMAND_HP_ARMED;
+    r->actor = (BYTE)actor;
+    r->command = (BYTE)command;
+    r->want = command_hp_cost_amount(c, hp, max_hp);
+    return r->want;
+}
+
+/* (hp_cost) After each hit of the hit loop (hit_target_hook, after the game's FUN_005da5da). `actor`, `command`: the
+   action's [0] and [3]; `display`: the display records written (009aea9c); `turns`, `quadra`: action[0x2d], [0x2b];
+   `hp`: the armed actor's HP now; `*pending`: its pending HP total. ARMED and a hit of the same action (actor and
+   command): the cost goes into *pending, held to the floor: COMMAND_HP_TAKE (it may be 0: HP 1). TAKEN, the same action
+   and still the same pass (no display record opened since: the take-off opens one; the same turn and repeat): held to
+   the floor again (a later hit of the pass may have hurt the user itself), COMMAND_HP_LOWERED when lowered. ARMED with
+   the display records at their stop (FUN_00436c66 then writes the last one again, so the end of the pass could not be
+   told from a later group): nothing is taken, COMMAND_HP_FULL. A hit of another action while ARMED: the armed action had
+   no hit (refused, no target, a frog's end): COMMAND_HP_STALE, nothing taken. Anything else (the pass is over: the game
+   took the pending HP off at its end): idle, COMMAND_HP_NOTHING. */
+static int command_hp_cost_hit(struct command_hp_cost_run *r, int actor, int command, int display, int turns, int quadra,
+                               DWORD hp, int *pending)
+{
+    DWORD ours;
+
+    if (r->state == COMMAND_HP_IDLE)
+        return COMMAND_HP_NOTHING;
+    if (actor != r->actor || command != r->command) {
+        ours = r->state == COMMAND_HP_ARMED;
+        r->state = COMMAND_HP_IDLE;
+        return ours ? COMMAND_HP_STALE : COMMAND_HP_NOTHING;
+    }
+    if (r->state == COMMAND_HP_ARMED && display >= COMMAND_DISPLAY_RECORDS_MOST) {
+        r->state = COMMAND_HP_IDLE;
+        return COMMAND_HP_FULL;
+    }
+    if (r->state == COMMAND_HP_ARMED) {
+        r->ours = command_hp_cost_cap(hp, *pending, r->want);
+        *pending += (int)r->ours;
+        r->state = COMMAND_HP_TAKEN;
+        r->display = display;
+        r->turns = turns;
+        r->quadra = quadra;
+        return COMMAND_HP_TAKE;
+    }
+    if (display != r->display || turns != r->turns || quadra != r->quadra) {
+        r->state = COMMAND_HP_IDLE;
+        return COMMAND_HP_NOTHING;
+    }
+    ours = command_hp_cost_cap(hp, *pending - (int)r->ours, r->ours);
+    if (ours >= r->ours)
+        return COMMAND_HP_NOTHING;
+    *pending -= (int)(r->ours - ours);
+    r->ours = ours;
+    return COMMAND_HP_LOWERED;
+}
+/* (mix) The live mix command numbered n, or NULL. */
+static const struct new_command *command_mix_of(const struct new_command *commands, int n)
+{
+    const struct new_command *c = command_item_of(commands, n);
+
+    return c && c->mix ? c : NULL;
+}
+
+/* (mix) Does side k of line l take `item`? */
+static BOOL command_mix_side_takes(const struct command_mix_line *l, int k, int item)
+{
+    if (item < 0 || item >= COMMAND_ITEM_NUMBERS)
+        return FALSE;
+    if (l->side_kind[k] == COMMAND_MIX_SIDE_ANY)
+        return TRUE;
+    if (l->side_kind[k] == COMMAND_MIX_SIDE_ITEM)
+        return l->side[k] == item;
+    return command_mix.group[l->side[k]].defined && (command_mix.group[l->side[k]].bits[item >> 3] >> (item & 7) & 1);
+}
+
+/* (mix) The entry of command n that items a and b make: the first mix line in use (file order) whose sides take them in
+   either order, else its mix_other entry when it is in use; -1 none. */
+static int command_mix_find(int command, int a, int b)
+{
+    int i, other = -1;
+
+    for (i = 0; i < command_mix.lines; i++) {
+        const struct command_mix_line *l = &command_mix.line[i];
+
+        if (l->command != command || !l->on)
+            continue;
+        if (l->other) {
+            other = i;
+            continue;
+        }
+        if ((command_mix_side_takes(l, 0, a) && command_mix_side_takes(l, 1, b)) ||
+            (command_mix_side_takes(l, 0, b) && command_mix_side_takes(l, 1, a)))
+            return i;
+    }
+    return other;
+}
+
+/* (mix) Word 4 of the action entry i makes: an item result's number, or (a spell) the token 10000 + i. */
+static int command_mix_word(int i)
+{
+    const struct command_mix_line *l = &command_mix.line[i];
+
+    return l->result_kind == COMMAND_MIX_RESULT_ITEM ? l->result : COMMAND_MIX_TOKEN_FIRST + i;
+}
+
+/* (mix) The spell entry of command n that word 4 names (a token), or -1. */
+static int command_mix_token_entry(int command, int word)
+{
+    int i = word - COMMAND_MIX_TOKEN_FIRST;
+    const struct command_mix_line *l;
+
+    if (i < 0 || i >= command_mix.lines)
+        return -1;
+    l = &command_mix.line[i];
+    return l->command == command && l->on && l->result_kind == COMMAND_MIX_RESULT_SPELL ? i : -1;
+}
+
+/* (mix) Is `item` an item result of an entry in use of command n? */
+static BOOL command_mix_item_result(int command, int item)
+{
+    int i;
+
+    for (i = 0; i < command_mix.lines; i++) {
+        const struct command_mix_line *l = &command_mix.line[i];
+
+        if (l->command == command && l->on && l->result_kind == COMMAND_MIX_RESULT_ITEM && l->result == item)
+            return TRUE;
+    }
+    return FALSE;
+}
+
+/* (mix) The target flags of the second pick's cursor (00dc3c84) for entry i: an item result's record byte +0x0c
+   (`item_target`: what every writer of a battle row's +3 copies, so the game's own OK would show the same), a spell's
+   record byte with the rule of a Magic row without All: toggle (8) -> without multiple and toggle (& 0xf3). */
+static int command_mix_cursor(int i, int item_target)
+{
+    const struct command_mix_line *l = &command_mix.line[i];
+
+    if (l->result_kind == COMMAND_MIX_RESULT_ITEM)
+        return item_target & 0xff;
+    return l->target & COMMAND_TOGGLE ? l->target & COMMAND_ONE_TARGET : l->target;
+}
+
+/* (mix) How many of `item` the battle's list holds (every row of it: a number may be in two rows). */
+static int command_mix_held(const BYTE *rows, int count, int item)
+{
+    int r, held = 0;
+
+    for (r = 0; r < count; r++)
+        if ((WORD)(rows[r * COMMAND_ITEM_ROW_SIZE] | rows[r * COMMAND_ITEM_ROW_SIZE + 1] << 8) == (WORD)item)
+            held += rows[r * COMMAND_ITEM_ROW_SIZE + 2];
+    return held;
+}
+
+/* (mix) One of `item` taken out of the battle's list as the game's target confirm takes one (006db0ee: the quantity
+   less one, the number ffff when it reaches 0), from the first row holding it with a quantity of 1 or more. The row, or
+   -1 (none left: nothing changed). */
+static int command_mix_take(BYTE *rows, int count, int item)
+{
+    int r;
+
+    if (item < 0 || item >= COMMAND_ITEM_ROW_EMPTY)
+        return -1;
+    for (r = 0; r < count; r++) {
+        BYTE *row = rows + r * COMMAND_ITEM_ROW_SIZE;
+
+        if ((WORD)(row[0] | row[1] << 8) != (WORD)item || !row[2])
+            continue;
+        if (!--row[2])
+            row[0] = row[1] = 0xff;
+        return r;
+    }
+    return -1;
+}
+
+/* (mix) command_mix_take, and after a take the byte `redo` (the game's 009ac111) = ff, as the game's own take 00434a80
+   writes it (CF 34143-34153): the inventory changed, so an open item target cursor goes back to the list. Nothing taken:
+   `redo` untouched. */
+static int command_mix_take_marked(BYTE *rows, int count, int item, BYTE *redo)
+{
+    int r = command_mix_take(rows, count, item);
+
+    if (r >= 0)
+        *redo = COMMAND_MIX_ITEM_REDO;
+    return r;
+}
+
+/* (mix) The item the filter dims at the second pick (its rows hold fewer than two: the same item twice needs two), or
+   -1. `p`: the menu's party slot's pick; `menu`: the menu's command byte. */
+static int command_mix_dim(const struct command_mix_pick *p, int menu, DWORD reading, const BYTE *rows, int count)
+{
+    if (!p->on || p->command != menu || p->reading != reading)
+        return -1;
+    return command_mix_held(rows, count, p->a) < 2 ? p->a : -1;
+}
+
+/* (mix) An OK in the Item list (the game's input routine has just accepted one: its state went from 5 to 0) for the
+   menu's command `menu` at cursor action `cursor` on item `item`, party slot pick `p`. Not a live mix command at its
+   own cursor: COMMAND_MIX_NOT. No first item noted (or another command's, an older reading's): `item` is noted as the
+   first, COMMAND_MIX_FIRST (the caller goes back to the list: no target step, nothing taken). Else the second:
+   *entry = the entry the pair makes, the pick holds B and the result's word, COMMAND_MIX_SECOND; no entry (mix_other
+   turned off after the items file): COMMAND_MIX_NO_RESULT, the first item kept. */
+static int command_mix_pick(struct command_mix_pick *p, const struct new_command *commands, int menu, int cursor, int item,
+                            DWORD reading, int *entry)
+{
+    const struct new_command *c = command_mix_of(commands, menu);
+    int i;
+
+    if (!c || cursor != c->cursor)
+        return COMMAND_MIX_NOT;
+    if (!p->on || p->command != menu || p->reading != reading) {
+        p->on = 1;
+        p->command = (BYTE)menu;
+        p->second = 0;
+        p->a = (WORD)item;
+        p->b = p->word = 0;
+        p->entry = -1;
+        p->reading = reading;
+        return COMMAND_MIX_FIRST;
+    }
+    i = command_mix_find(menu, p->a, item);
+    if (i < 0) {
+        p->second = 0;
+        return COMMAND_MIX_NO_RESULT;
+    }
+    p->second = 1;
+    p->b = (WORD)item;
+    p->word = (WORD)command_mix_word(i);
+    p->entry = (short)i;
+    *entry = i;
+    return COMMAND_MIX_SECOND;
+}
+
+typedef BOOL (*command_take_fn)(int item);              /* (mix) one of `item` out of the battle's list; FALSE: none left */
+typedef void (*command_pair_fn)(int actor, int item);   /* (mix) 004330c0 (reserve) or 0043305c (drop) */
+
+/* (mix) enqueue_hook, before the game's queue takes the entry (the queue's call 00432878: the menu's issues, and the
+   automatic issue of an actor whose menu entry 0 is chosen for it, with targets 0). For an entry of a live mix command by
+   a party member (byte 2: 0-2) with targets: B (word 4) reserved, always (the game's confirm took it from the bag); then,
+   when the actor's pick holds the first and this B of this command and reading, A taken from the bag and reserved too,
+   word 4 made the result's and the pair noted in runs[actor] (both are the game's to give back from here); else
+   (COMMAND_MIX_Q_NO_PICK, COMMAND_MIX_Q_NO_FIRST) nothing else, the set-up refuses the action and the game gives B back.
+   An entry with targets 0 is no menu issue: nothing reserved (COMMAND_MIX_Q_NO_TARGETS; refused at the set-up). The
+   pick is spent in every case. */
+static int command_mix_enqueue_step(BYTE *entry, const struct new_command *commands, struct command_mix_pick *picks,
+                                    struct command_mix_run *runs, DWORD reading, command_take_fn take, command_pair_fn reserve)
+{
+    int actor = (signed char)entry[2], n = entry[3], b = entry[4] | entry[5] << 8, targets = entry[6] | entry[7] << 8;
+    struct command_mix_pick *p;
+    struct command_mix_run *r;
+
+    if (!command_mix_of(commands, n) || actor < 0 || actor > 2)
+        return COMMAND_MIX_Q_NOT;
+    p = &picks[actor];
+    r = &runs[actor];
+    r->on = 0;
+    if (!targets) {
+        p->on = 0;
+        return COMMAND_MIX_Q_NO_TARGETS;
+    }
+    reserve(actor, b);
+    if (!p->on || !p->second || p->command != n || p->b != b || p->reading != reading) {
+        p->on = 0;
+        return COMMAND_MIX_Q_NO_PICK;
+    }
+    p->on = 0;
+    if (!take(p->a))
+        return COMMAND_MIX_Q_NO_FIRST;
+    reserve(actor, p->a);
+    entry[4] = (BYTE)p->word;
+    entry[5] = (BYTE)(p->word >> 8);
+    r->on = 1;
+    r->command = (BYTE)n;
+    r->a = p->a;
+    r->b = (WORD)b;
+    r->word = p->word;
+    r->reading = reading;
+    return COMMAND_MIX_Q_OK;
+}
+
+/* (mix) A set-up's use of the queued pair: a menu issue (priority 6) must be the actor's noted pair (then both items are
+   dropped from the reservations: used, COMMAND_MIX_SET_USED), else COMMAND_MIX_SET_NO_QUEUE (refused: what the queue
+   reserved stays reserved and the game gives it back); a Mime or AI action (another priority) uses nothing,
+   COMMAND_MIX_SET_FREE. */
+static int command_mix_use(int actor, int command, int word, int priority, struct command_mix_run *runs, DWORD reading,
+                           command_pair_fn drop)
+{
+    struct command_mix_run *r = &runs[actor];
+
+    if (priority != COMMAND_MIX_PRIORITY_MENU)
+        return COMMAND_MIX_SET_FREE;
+    if (!r->on || r->command != command || r->word != word || r->reading != reading)
+        return COMMAND_MIX_SET_NO_QUEUE;
+    r->on = 0;
+    drop(actor, r->a);
+    drop(actor, r->b);
+    return COMMAND_MIX_SET_USED;
+}
+
+/* (mix) Handler 0x02's step (item_setup_hook), before the game's 005c8fdf, for an action of a live mix command on Item's
+   list. A party member's action whose word 4 is an item result of the command: command_mix_use, then type 4 (Item's), > 0:
+   the game's routine follows (it copies [4] into [0xb] and [9], drops (actor, [4]) and picks the script). For the two
+   items used (COMMAND_MIX_SET_USED) the pair (actor, R) is reserved first (`reserve`, 004330c0), so that the game's drop
+   takes that pair and never a leftover (actor, R) of an earlier action (one Berserk rewrote or a set-up refused, no other
+   party member's action built since): that one stays the game's to give back. A Mime or AI action reserves nothing (as
+   Mime of Item). Not an item result (a token on this list, a stale word): attack ID 0, script -1, COMMAND_MIX_SET_NOT_RESULT;
+   a menu issue without its pair: the same, COMMAND_MIX_SET_NO_QUEUE; the game's routine is NOT run, so what was reserved
+   stays reserved and is given back. Anyone else's: queued and attack ID 0, script -1, COMMAND_MIX_SET_ENEMY. 0: not a
+   live mix command. */
+static int command_mix_item_setup(int *action, const struct new_command *commands, struct command_mix_run *runs, int priority,
+                                  DWORD reading, command_pair_fn drop, command_pair_fn reserve)
+{
+    int n = action[ACT_COMMAND], word = action[ACT_QUEUED_ID] & 0xffff, way;
+
+    if (!command_mix_of(commands, n))
+        return COMMAND_MIX_SET_NONE;
+    if (action[ACT_ACTOR] < 0 || action[ACT_ACTOR] > 2) {
+        action[ACT_QUEUED_ID] = action[ACT_ATTACK_ID] = 0;
+        action[ACT_SCRIPT] = -1;
+        return COMMAND_MIX_SET_ENEMY;
+    }
+    way = word >= COMMAND_MIX_TOKEN_FIRST || !command_mix_item_result(n, word) ? COMMAND_MIX_SET_NOT_RESULT
+        : command_mix_use(action[ACT_ACTOR], n, word, priority, runs, reading, drop);
+    if (way < 0) {
+        action[ACT_ATTACK_ID] = 0;
+        action[ACT_SCRIPT] = -1;
+        return way;
+    }
+    action[ACT_COMMAND_TYPE] = COMMAND_ITEM;
+    if (way == COMMAND_MIX_SET_USED)
+        reserve(action[ACT_ACTOR], word);   /* the game's 005c8fdf drops (actor, [4]) next (CF 233843): net nothing */
+    return way;
+}
+
+/* (mix) Handler 0x0c's first step (command_action_setup) for an action of a live mix command on Magic's list (00 0c 09:
+   handler 0x00 has copied [4] into [0xb]). A party member's action whose word 4 is a token of a spell entry of the
+   command: refused (script -1) under Silence (status 0x80 of [0x32], as FUN_005dbe6f reads it) and for a frog (0x800)
+   but Toad, COMMAND_MIX_SET_SILENCE / _FROG, before its pair is used (the game gives both items back); then
+   command_mix_use (a menu issue without its pair: refused, COMMAND_MIX_SET_NO_QUEUE); then the spell's cast as Magic
+   makes it: attack ID and banner ID the spell, [4] kept (the token: Mime's store copies it), the record's target byte in
+   [0x14], type 2, script 0x1d, > 0 (action_setup_hook sets no MP after the game's set-up). Not a token of the command:
+   script -1, COMMAND_MIX_SET_NOT_RESULT. Anyone else's: script -1, COMMAND_MIX_SET_ENEMY (no set-up). 0: not a live mix
+   command. */
+static int command_mix_spell_setup(int *action, const struct new_command *commands, struct command_mix_run *runs, int priority,
+                                   DWORD reading, command_pair_fn drop)
+{
+    int n = action[ACT_COMMAND], word = action[ACT_QUEUED_ID] & 0xffff, i, way;
+    const struct command_mix_line *l;
+    DWORD status = (DWORD)action[COMMAND_ACT_STATUS];
+
+    if (!command_mix_of(commands, n))
+        return COMMAND_MIX_SET_NONE;
+    action[ACT_SCRIPT] = -1;
+    if (action[ACT_ACTOR] < 0 || action[ACT_ACTOR] > 2)
+        return COMMAND_MIX_SET_ENEMY;
+    i = command_mix_token_entry(n, word);
+    if (i < 0)
+        return COMMAND_MIX_SET_NOT_RESULT;
+    l = &command_mix.line[i];
+    if (status & COMMAND_MIX_SILENCE)
+        return COMMAND_MIX_SET_SILENCE;
+    if ((status & COMMAND_MIX_FROG) && l->result != COMMAND_MIX_TOAD)
+        return COMMAND_MIX_SET_FROG;
+    way = command_mix_use(action[ACT_ACTOR], n, word, priority, runs, reading, drop);
+    if (way < 0)
+        return way;
+    action[ACT_ATTACK_ID] = action[ACT_DISPLAY_ID] = l->result;
+    action[ACT_TARGET_FLAGS] = l->target;
+    action[ACT_COMMAND_TYPE] = COMMAND_MAGIC;
+    action[ACT_SCRIPT] = SCRIPT_CAST_MAGIC;
+    return way;
+}
+
+/* (mix) The handler list an action of a live mix command is to run (slot_match_hook, before the builder reads the
+   offset): Magic's (`magic`) for a token when the command has spell results and Magic's list may be lent (`spells_ok`),
+   else Item's (`item`); -1 not a live mix command's action. */
+static long command_mix_list_offset(const int *action, const struct new_command *commands, DWORD magic, DWORD item, BOOL spells_ok)
+{
+    const struct new_command *c = command_mix_of(commands, action[ACT_COMMAND]);
+
+    if (!c)
+        return -1;
+    return (long)((action[ACT_QUEUED_ID] & 0xffff) >= COMMAND_MIX_TOKEN_FIRST && c->mix_spells && spells_ok ? magic : item);
+}
+
+/* (mix) Is the action a mix command's spell result as command_mix_spell_setup made it (type 2)? Its MP is 0 after the
+   game's set-up. */
+static BOOL command_mix_spell_action(const int *action, const struct new_command *commands)
+{
+    return command_mix_of(commands, action[ACT_COMMAND]) && action[ACT_COMMAND_TYPE] == COMMAND_MAGIC;
+}
+
 /* ---- NEW COMMANDS PURE end ---- */
 
 static struct new_command new_commands[COMMAND_COUNT];
@@ -50090,13 +53842,88 @@ static const BYTE *command_text_answer(int section, int index)
 
 static void command_quadra_use(int *action);   /* (stage 6) "Support materia", below */
 
+/* ---- hp_cost (a new command that costs the user a per cent of its HP, once an action) ----
+   Armed at the action's set-up (a spell or list command's in command_action_setup, handler 0x0c; a physical one's in
+   command_weapon_after, handler 0x0e; an item one's in item_setup_hook, handler 0x02): FUN_00435d81 runs these when the
+   action is BUILT, which is when it is carried out (one action built and shown before the next), never when it is
+   queued; an action that never runs is never set up. Taken at the action's first hit (hit_target_hook, after the
+   game's FUN_005da5da), not at the set-up: the set-up also runs for an action the hit loop then ends with no hit (a
+   frog's end, no MP, no target: FUN_005dbe6f, FUN_005dbd40), and only a hit is sure to be followed by the end of its
+   pass. Taken as the game takes a drain from or gives HP Absorb to the attacker: added to the user's pending HP
+   (009a8b3c + actor * 0x44, FUN_005df30b's flag 2 total; 009a8b40 beside it is the MP one), which the hit loop takes
+   off at the end of the pass (005d9e9b: FUN_005da380(actor, 0) -> FUN_005da3f5, which = 0: action[0x88] without bit 4,
+   so HP: its own display record, script 0x2e, a result and the damage number on the
+   user, FUN_005df0f0 on its HP). Never below 1 HP: held to HP - 1 when taken and after each later hit of the same pass.
+   No code of the game is patched: the hit hook is the DLL's existing one; two game words are read, one written. */
+#define ADDR_COMMAND_HP         0x009ab108u  /* (hp_cost) dword + actor * 0x68: HP (FUN_005df0f0 takes a hit's amount from it) */
+#define ADDR_COMMAND_MAX_HP     0x009ab10cu  /* dword + actor * 0x68: max HP */
+#define ADDR_COMMAND_PENDING_HP 0x009a8b3cu  /* (hp_cost) int + actor * 0x44: the pending HP change (positive: taken off); 009a8b40 beside it is the MP one */
+#define COMMAND_HP_FLUSH_SITE   0x005d9e9bu  /* (for the log) in FUN_005d9940: e8 e0 04 00 00, call 005da380 (actor, 0): the pending HP */
+static struct command_hp_cost_run command_hp_run;
+
+/* (hp_cost) A set-up of an action of a new command (`way` its answer): armed or left idle, with a line for a cost. */
+static void command_hp_cost_setup(const int *action, int way)
+{
+    int command = action[ACT_COMMAND], actor = action[ACT_ACTOR];
+    const struct new_command *c = command_of(new_commands, command);
+    BOOL party = actor >= 0 && actor <= 2;
+    DWORD hp = party ? *(const DWORD *)(ADDR_COMMAND_HP + (DWORD)actor * 0x68) : 0;
+    DWORD max_hp = party ? *(const DWORD *)(ADDR_COMMAND_MAX_HP + (DWORD)actor * 0x68) : 0;
+    DWORD cost = command_hp_cost_arm(&command_hp_run, c, way, actor, command, (DWORD)action[ACT_FLAGS], hp, max_hp);
+
+    if (!c || !c->live || !c->hp_cost_line || way <= 0 || !party || !command_may_log())
+        return;
+    if (cost)
+        log_line("new command %02x (%s): actor %d: HP cost %lu (%d%% of its %s %lu), taken once at the action's first hit (HP %lu)",
+                 command, c->label, actor, cost, c->hp_cost, c->hp_cost_from == COMMAND_HP_FROM_CURRENT ? "HP" : "max HP",
+                 c->hp_cost_from == COMMAND_HP_FROM_CURRENT ? hp : max_hp, hp);
+    else
+        log_line("new command %02x (%s): actor %d: a Mime repeat: no HP cost (as Mime takes no MP)", command, c->label, actor);
+}
+
+/* (hp_cost) hit_target_hook, after the game's FUN_005da5da: an armed cost taken at the action's first hit, held to the
+   floor after the pass's later hits; a line when something happens. */
+static void command_hp_cost_after_hit(const int *action)
+{
+    struct command_hp_cost_run *r = &command_hp_run;
+    const struct new_command *c;
+    int actor = r->actor, *pending, way;
+    DWORD hp, was = r->ours;
+
+    if (r->state == COMMAND_HP_IDLE)
+        return;
+    pending = (int *)(ADDR_COMMAND_PENDING_HP + (DWORD)actor * 0x44);
+    hp = *(const DWORD *)(ADDR_COMMAND_HP + (DWORD)actor * 0x68);
+    c = command_of(new_commands, r->command);
+    way = command_hp_cost_hit(r, action[ACT_ACTOR], action[ACT_COMMAND], *(const int *)ADDR_DISPLAY_COUNT, action[ACT_TURNS],
+                              action[COMMAND_ACT_QUADRA_TIMES], hp, pending);
+    if (way == COMMAND_HP_NOTHING || !c || !command_may_log())
+        return;
+    if (way == COMMAND_HP_TAKE)
+        log_line("new command %02x (%s): actor %d pays %lu HP (cost %lu%s; HP %lu, pending %d): shown on it at the end of the hit's pass, as the game shows a drain",
+                 r->command, c->label, actor, r->ours, r->want, r->ours < r->want ? ", held to leave 1 HP" : "", hp, *pending);
+    else if (way == COMMAND_HP_LOWERED)
+        log_line("new command %02x (%s): actor %d's HP cost lowered %lu -> %lu (a later hit of the pass hurt it: HP %lu; never below 1)",
+                 r->command, c->label, actor, was, r->ours, hp);
+    else if (way == COMMAND_HP_FULL)
+        log_line("new command %02x (%s): actor %d: no HP cost taken (the armed %lu): the action's display records are full (%d), so the end of the pass could not be told",
+                 r->command, c->label, actor, r->want, COMMAND_DISPLAY_RECORDS_MOST);
+    else
+        log_line("new command %02x (%s): actor %d's action had no hit: no HP cost taken (the armed %lu)", r->command, c->label, actor, r->want);
+}
+
 /* action_setup_hook's first step. Returns 1 (a party member's cast set up), -1 (an enemy's: script -1, no set-up)
    or 0 (not a new command). (stage 6) A party member's cast: Quadra Magic, when linked. */
+static int command_mix_action_setup(int *action);   /* (mix) "Kind = mix", below */
 static int command_action_setup(int *action)
 {
     int command = action[ACT_COMMAND], queued = action[ACT_QUEUED_ID] & 0xffff;
-    int way = command_setup(action, new_commands);
+    int way = command_mix_action_setup(action);    /* (mix) a mix command's spell result: its own path */
     BOOL list = command_list_of(new_commands, command) != NULL;     /* (stage 8) */
+
+    if (way)
+        return way;
+    way = command_setup(action, new_commands);
 
     if (way > 0 && command_may_log())
         log_line("new command %02x (%s): actor %d casts spell %d%s (queued ID %04x; targets %04x): command type 2, script %02x",
@@ -50110,6 +53937,8 @@ static int command_action_setup(int *action)
                  command, new_commands[command - COMMAND_FIRST].label, action[ACT_ACTOR]);
     if (way > 0)
         command_quadra_use(action);     /* (stage 6) before the game's set-up, which does not touch [0x2b] / [0x3e] */
+    if (way)
+        command_hp_cost_setup(action, way);     /* (hp_cost) */
     return way;
 }
 
@@ -50154,6 +53983,8 @@ static void command_weapon_after(const BYTE *saved, int lent)
     else if (way < 0 && command_may_log())
         log_line("new command %02x (%s): actor %d is not a party member: refused (script -1, the hit loop does nothing; a command is party-only)",
                  command, new_commands[command - COMMAND_FIRST].label, actor);
+    if (way)
+        command_hp_cost_setup(action, way);     /* (hp_cost) */
 }
 
 /* ---- The build-list guard (stage 2) ----
@@ -50275,7 +54106,16 @@ static void commands_write_records(const char *when)
             continue;               /* (not usable: said by command_resolve) */
         if (decision == 1)
             copy_bytes(record, want, COMMAND_RECORD_SIZE);
-        if (decision > 0 && c->kind == COMMAND_KIND_ITEM) {
+        if (decision > 0 && c->kind == COMMAND_KIND_ITEM && c->mix) {
+            c->live = 1;                /* (mix) */
+            log_line("new command %02x (%s): kernel record %08lx %s (%s): %02x %02x %02x %02x %02x %02x %02x %02x (OK: the Item list, two items make one result; the target flags are the result's); mix: %u line(s) and mix_other, %s, %s %u, potency %u%%",
+                     COMMAND_FIRST + i, c->label, (DWORD)record, decision == 1 ? "written over ff x8" : "already holds it", when,
+                     want[0], want[1], want[2], want[3], want[4], want[5], want[6], want[7], (unsigned)c->mix_count,
+                     c->mix_spells ? "with spell results (Magic's handlers for those)" : "item results only",
+                     c->items_line ? "item numbers that may be picked (the other rows dimmed):" : "every item may be picked: numbers allowed",
+                     c->items_line ? (unsigned)c->items_count : (unsigned)COMMAND_ITEM_NUMBERS,
+                     c->potency_line ? (unsigned)c->potency : (unsigned)COMMAND_POTENCY_DEFAULT);
+        } else if (decision > 0 && c->kind == COMMAND_KIND_ITEM) {
             c->live = 1;
             log_line("new command %02x (%s): kernel record %08lx %s (%s): %02x %02x %02x %02x %02x %02x %02x %02x (OK: %s; the target flags and cameras are the chosen item's); item: Item's handlers, %s %u, potency %u%%",
                      COMMAND_FIRST + i, c->label, (DWORD)record, decision == 1 ? "written over ff x8" : "already holds it", when,
@@ -50590,16 +54430,314 @@ static int command_filter_owner = -1;   /* the command the notes are of, or -1: 
 static DWORD command_filter_reading;
 static BOOL command_filter_said[COMMAND_COUNT];     /* this reading: the first opening's line said */
 
+/* ---- Kind = mix (two items from the Item list make one result) ----
+   A mix command is an item command (cursor 3, Item's list and set-up) whose recipes decide the action. The picks
+   (item_list_input_hook, after the game's 006d98e3): the first OK notes item A for the menu's party slot and does the
+   game's own return to the list (no target step; nothing taken); the second OK on B works out the result R and gives
+   the target cursor R's flags (006e5c52 again). The game's confirm takes one B and issues (Mix, B, targets). The queue
+   (enqueue_hook): B reserved, then A taken from the bag and reserved, word 4 made R's (an item number, or a spell's
+   token); from there both are the game's reservation pairs (given back on a KO, a lost turn, the battle's end). The
+   turn: slot_match_hook gives the action Item's list (02 0d 09) or Magic's (00 0c 09, a token); the set-up drops both
+   pairs (used) and makes R's action (item_setup_hook, command_action_setup; a spell costs no MP). Mime repeats R free. */
+static struct command_mix_pick command_mix_picks[3];    /* per party slot (the menu's 00dc3c7c) */
+static struct command_mix_run command_mix_runs[3];      /* per party actor 0-2 (the queue entry's byte 2) */
+static BOOL command_mix_lent[COMMAND_COUNT];            /* this battle: its handler list was lent at the start */
+static DWORD command_mix_magic_list, command_mix_item_list;     /* this battle's offsets of Magic's and Item's lists */
+static BOOL command_mix_spells_ok;                      /* this battle: Magic's list may be lent (00 0c 09, handler 0x0c ours) */
+static BOOL command_mix_menu_ok;                        /* the game's code the picks rely on is as expected (command_item_ready) */
+static BOOL command_mix_other_said[COMMAND_COUNT];      /* this reading: "no result" said */
+
+static int command_mix_rows(void)
+{
+    int count = battle_rows();
+
+    return count > WIDE_ROWS_MAX + WIDE_GUARD_ROWS ? WIDE_ROWS_MAX + WIDE_GUARD_ROWS : count;
+}
+
+/* An item record's byte `at` (+0x0c target flags, +0x10 conditions) of an item result, through the item table the game's
+   handlers read (item_record: the DLL's for every number while it is live); 0xff for a number past the game's table
+   while it is not (never so for a result the settle check kept). */
+static BYTE command_mix_item_byte(int item, int at)
+{
+    if (item < 0 || item >= ITEM_TABLE_RECORDS || (item >= ITEM_COUNT_ORIGINAL && !item_table_live))
+        return 0xff;
+    return item_record(item)[at];
+}
+
+/* A spell result's record byte `at` (kernel magic or the spell file's). */
+static BYTE command_mix_spell_byte(int spell, int at)
+{
+    int index = ext_index(spell);
+
+    if (index >= 0)
+        return spells[index].record[at];
+    return spell >= 0 && spell <= COMMAND_KERNEL_SPELL_LAST ? kernel_record(spell)[at] : 0xff;
+}
+
+/* The game's own return to the list (its target cancel and its W-1 confirm, 006db353-006db37f): the state the OK wrote
+   to 0091ef98 (5), 00dc38e0 = 1, the latch, the conditions panel closed when it is not closed. */
+static void command_mix_back_to_list(void)
+{
+    *(short *)ADDR_MIX_MENU_STATE = *(const short *)ADDR_MIX_MENU_RETURN;
+    *(WORD *)ADDR_MIX_MENU_REDRAW = 1;
+    *(DWORD *)ADDR_MIX_MENU_LATCH = 1;
+    if (*(const BYTE *)(ADDR_MENU_WINDOW_STATES + COMMAND_MIX_PANEL_WINDOW))
+        ((void (__cdecl *)(int))FN_MENU_WINDOW_CLOSE)(COMMAND_MIX_PANEL_WINDOW);
+}
+
+/* item_list_input_hook, after the game's 006d98e3: `before` the menu's state before it. Acts only when that routine has
+   just accepted an OK (5 -> 0) for a live mix command at its own cursor (3). */
+static void command_mix_pick_step(int before)
+{
+    int menu = *(const BYTE *)ADDR_MENU_COMMAND, k = *(const BYTE *)ADDR_BATTLE_MENU_ACTOR, item = *(const WORD *)ADDR_MIX_MENU_ITEM;
+    int way, i = -1, flags;
+    BYTE panel;
+    const struct new_command *c = command_mix_of(new_commands, menu);
+    const struct command_mix_line *l;
+
+    if (!c || !command_mix_menu_ok || k > 2 || before != COMMAND_MIX_LIST_STATE || *(const short *)ADDR_MIX_MENU_STATE != 0)
+        return;
+    way = command_mix_pick(&command_mix_picks[k], new_commands, menu, *(const BYTE *)ADDR_MENU_CURSOR_ACTION, item, command_reading, &i);
+    if (way == COMMAND_MIX_NOT)
+        return;
+    if (way != COMMAND_MIX_SECOND) {
+        if (way == COMMAND_MIX_NO_RESULT)
+            ((void (__cdecl *)(int))FN_PLAY_SOUND)(COMMAND_MIX_REFUSED_SOUND);
+        command_mix_back_to_list();
+        if (way == COMMAND_MIX_FIRST && command_may_log())
+            log_line("new command %02x (%s): party slot %d's first item %d noted (no target step; nothing taken yet)", menu, c->label, k, item);
+        else if (way == COMMAND_MIX_NO_RESULT && !command_mix_other_said[menu - COMMAND_FIRST] && command_may_log()) {
+            command_mix_other_said[menu - COMMAND_FIRST] = TRUE;
+            log_line("new command %02x (%s): party slot %d: item %d + item %d has no result (no mix line, and mix_other is turned off): refused (the buzzer; the first item stays noted); said once a reading",
+                     menu, c->label, k, command_mix_picks[k].a, item);
+        }
+        return;
+    }
+    l = &command_mix.line[i];
+    flags = command_mix_cursor(i, l->result_kind == COMMAND_MIX_RESULT_ITEM ? command_mix_item_byte(l->result, 0x0c) : 0);
+    *(WORD *)ADDR_MENU_TARGET_FLAGS = (WORD)flags;
+    ((void (__cdecl *)(void))FN_MENU_TARGET_SETUP)();
+    panel = l->result_kind == COMMAND_MIX_RESULT_ITEM ? command_mix_item_byte(l->result, REC_FIELD_10) : command_mix_spell_byte(l->result, REC_FIELD_10);
+    *(short *)ADDR_MIX_PANEL_BYTE = panel == 0xff ? -1 : panel;     /* as 004193c2 answers: the byte, or -1 for ff */
+    if (*(const short *)ADDR_MIX_PANEL_BYTE != -1 && !*(const BYTE *)(ADDR_MENU_WINDOW_STATES + COMMAND_MIX_PANEL_WINDOW))
+        ((void (__cdecl *)(int, int, int))FN_MENU_WINDOW_OPEN)(-1, -1, COMMAND_MIX_PANEL_WINDOW);
+    else if (*(const short *)ADDR_MIX_PANEL_BYTE == -1 && *(const BYTE *)(ADDR_MENU_WINDOW_STATES + COMMAND_MIX_PANEL_WINDOW))
+        ((void (__cdecl *)(int))FN_MENU_WINDOW_CLOSE)(COMMAND_MIX_PANEL_WINDOW);
+    if (command_may_log())
+        log_line("new command %02x (%s): party slot %d: item %d + item %d -> %s %d (%s line %d), cursor flags %02x%s",
+                 menu, c->label, k, command_mix_picks[k].a, item, l->result_kind == COMMAND_MIX_RESULT_ITEM ? "item" : "spell", l->result,
+                 l->other ? "mix_other," : "mix", l->line, flags,
+                 l->result_kind == COMMAND_MIX_RESULT_SPELL && (l->target & COMMAND_TOGGLE) ? " (the spell's toggle: one target)" : "");
+}
+
+/* command_mix_enqueue_step's take: one of `item` out of the battle's list, and 009ac111 = ff after it (as the game's own
+   take 00434a80). */
+static BOOL command_mix_take_one(int item)
+{
+    return command_mix_take_marked(wide_battle_at, command_mix_rows(), item, (BYTE *)ADDR_BATTLE_ITEM_REDO) >= 0;
+}
+
+static void command_mix_reserve(int actor, int item)
+{
+    ((void (__cdecl *)(int, int))FN_ITEM_RESERVE)(actor, item);
+}
+
+static void command_mix_drop(int actor, int item)
+{
+    ((void (__cdecl *)(int, int))FN_MIX_DROP)(actor, item);
+}
+
+/* enqueue_hook, before command_item_reserve and the game's 0043258a: a mix command's entry (command_mix_enqueue_step). */
+static void command_mix_enqueue(BYTE *entry)
+{
+    int n = entry[3], actor = (signed char)entry[2], b = entry[4] | entry[5] << 8, way, a;
+    const struct new_command *c = command_mix_of(new_commands, n);
+
+    if (!c)
+        return;
+    a = actor >= 0 && actor <= 2 ? command_mix_picks[actor].a : -1;
+    way = command_mix_enqueue_step(entry, new_commands, command_mix_picks, command_mix_runs, command_reading, command_mix_take_one,
+                                   command_mix_reserve);
+    if (way == COMMAND_MIX_Q_NOT || !command_may_log())
+        return;
+    if (way == COMMAND_MIX_Q_OK)
+        log_line("new command %02x (%s): actor %d's items %d and %d reserved at the queue (%d taken from the bag now); the action carries word %d (given back if it never runs)",
+                 n, c->label, actor, a, b, a, entry[4] | entry[5] << 8);
+    else if (way == COMMAND_MIX_Q_NO_FIRST)
+        log_line("new command %02x (%s): actor %d: item %d is no longer in the bag at the queue: refused; item %d given back when another party member's action is built or the battle ends",
+                 n, c->label, actor, a, b);
+    else if (way == COMMAND_MIX_Q_NO_PICK)
+        log_line("new command %02x (%s): actor %d: no first item noted for item %d: refused; item %d given back when another party member's action is built or the battle ends",
+                 n, c->label, actor, b, b);
+    else
+        log_line("new command %02x (%s): actor %d: an issue with no targets (not the menu's): nothing reserved; refused at its set-up",
+                 n, c->label, actor);
+}
+
+/* slot_match_hook, after command_all_use (the builder reads the list offset right after: 0043655b): the handler list of
+   a mix command's action, Item's or Magic's, when its list was lent at this battle's start. The tables moved and a number
+   below 0x26: the game's 009ae9c8 too (as commands_battle_start mirrors it). */
+static void command_mix_list(const int *action)
+{
+    long offset = command_mix_list_offset(action, new_commands, command_mix_magic_list, command_mix_item_list, command_mix_spells_ok);
+    int n = action[ACT_COMMAND];
+
+    if (offset < 0 || !command_mix_lent[n - COMMAND_FIRST])
+        return;
+    command_offsets_at[n] = (DWORD)offset;
+    if (command_tables_moved && n < COMMAND_GAME_NUMBERS)
+        ((DWORD *)ADDR_COMMAND_LIST_AT)[n] = (DWORD)offset;
+}
+
+/* item_setup_hook's first step: an action of a live mix command (command_mix_item_setup; the game's 005c8fdf unless
+   refused). FALSE: not a mix command's action (the item command's own path follows). */
+static BOOL command_mix_item_hook(int *action)
+{
+    int n = action[ACT_COMMAND], actor = action[ACT_ACTOR], word = action[ACT_QUEUED_ID] & 0xffff;
+    int way = command_mix_item_setup(action, new_commands, command_mix_runs, *(const BYTE *)ADDR_COMMAND_QUEUE_ENTRY, command_reading,
+                                     command_mix_drop, command_mix_reserve);
+    const struct command_mix_run *r = actor >= 0 && actor <= 2 ? &command_mix_runs[actor] : NULL;
+
+    if (way == COMMAND_MIX_SET_NONE)
+        return FALSE;
+    if (way > 0)
+        ((void (__cdecl *)(void))FN_ITEM_SETUP)();
+    command_hp_cost_setup(action, way);     /* (hp_cost) */
+    if (!command_may_log())
+        return TRUE;
+    if (way == COMMAND_MIX_SET_USED)
+        log_line("new command %02x (%s): actor %d uses item %d (items %d and %d used; targets %04x): command type 4, Item's handlers (script %02x)",
+                 n, new_commands[n - COMMAND_FIRST].label, actor, word, r->a, r->b, action[ACT_TARGETS] & 0xffff, action[ACT_SCRIPT]);
+    else if (way == COMMAND_MIX_SET_FREE)
+        log_line("new command %02x (%s): actor %d: a Mime or AI action of result item %d: used free, no item taken (as Mime of Item)",
+                 n, new_commands[n - COMMAND_FIRST].label, actor, word);
+    else if (way == COMMAND_MIX_SET_ENEMY)
+        log_line("new command %02x (%s): actor %d is not a party member: refused (script -1; a command is party-only)",
+                 n, new_commands[n - COMMAND_FIRST].label, actor);
+    else if (way == COMMAND_MIX_SET_NO_QUEUE)
+        log_line("new command %02x (%s): actor %d: word %d is not the pair the queue noted: refused (script -1); what was reserved is given back when another party member's action is built or the battle ends",
+                 n, new_commands[n - COMMAND_FIRST].label, actor, word);
+    else
+        log_line("new command %02x (%s): actor %d: word %d is not an item result of this command: refused (script -1); what was reserved is given back when another party member's action is built or the battle ends",
+                 n, new_commands[n - COMMAND_FIRST].label, actor, word);
+    return TRUE;
+}
+
+/* command_action_setup's first step: an action of a live mix command on Magic's list (command_mix_spell_setup). Returns
+   > 0 set up (the cast), < 0 refused (script -1, no set-up), 0 not a mix command's action. */
+static int command_mix_action_setup(int *action)
+{
+    int n = action[ACT_COMMAND], actor = action[ACT_ACTOR], word = action[ACT_QUEUED_ID] & 0xffff;
+    int way = command_mix_spell_setup(action, new_commands, command_mix_runs, *(const BYTE *)ADDR_COMMAND_QUEUE_ENTRY, command_reading,
+                                      command_mix_drop);
+    const char *label;
+
+    if (way == COMMAND_MIX_SET_NONE)
+        return 0;
+    command_hp_cost_setup(action, way);     /* (hp_cost) */
+    label = new_commands[n - COMMAND_FIRST].label;
+    if (command_may_log()) {
+        if (way > 0)
+            log_line("new command %02x (%s): actor %d casts spell %d (token %d; targets %04x): command type 2, script %02x, no MP%s",
+                     n, label, actor, action[ACT_ATTACK_ID], word, action[ACT_TARGETS] & 0xffff, SCRIPT_CAST_MAGIC,
+                     way == COMMAND_MIX_SET_FREE ? " (a Mime or AI action: no item taken)" : " (its two items used)");
+        else if (way == COMMAND_MIX_SET_SILENCE || way == COMMAND_MIX_SET_FROG)
+            log_line("new command %02x (%s): actor %d is %s: the spell result of token %d is refused (script -1); its two items are given back when another party member's action is built or the battle ends",
+                     n, label, actor, way == COMMAND_MIX_SET_SILENCE ? "silenced" : "a frog (only Toad is cast)", word);
+        else if (way == COMMAND_MIX_SET_ENEMY)
+            log_line("new command %02x (%s): actor %d is not a party member: refused (script -1; a command is party-only)", n, label, actor);
+        else
+            log_line("new command %02x (%s): actor %d: word %d is not a spell result of this command%s: refused (script -1); what was reserved is given back when another party member's action is built or the battle ends",
+                     n, label, actor, word, way == COMMAND_MIX_SET_NO_QUEUE ? " that the queue noted" : "");
+    }
+    return way > 0 ? 1 : -1;
+}
+
+/* action_setup_hook, after the game's 005c94d3 (both paths): a mix command's spell result costs no MP ([0xe] = 0:
+   FUN_005dbe6f then neither checks nor takes any). */
+static void command_mix_no_mp(int *action)
+{
+    if (command_mix_spell_action(action, new_commands))
+        action[COMMAND_ACT_MP_COST] = 0;
+}
+
+/* Is an item result usable: an item of the battle the Item list may use? NULL, or why not. After the items file (the
+   settle): a game item, an item of the items file (105-127, 448-511, with the item table the DLL's), a wide item while
+   wide items are admitted (its record and name are only served then); not a limit item or a teaching item; record
+   +0x0a without bit 0x02 (the battle's "not in battle"). */
+static const char *command_mix_item_problem(int item)
+{
+    if (item < 0 || item >= COMMAND_ITEM_NUMBERS || !command_item_run((DWORD)item))
+        return "is not an item number";
+    if (item >= WIDE_ITEM_FIRST ? !wide_item(item) || !wide_items_ready() || !item_table_live
+                                : item >= NEW_ITEM_FIRST && !is_new_item(item))
+        return item >= WIDE_ITEM_FIRST ? "is not a wide item the items file defines while wide items are admitted" : "is not an item the items file defines";
+    if (is_limit_item(item))
+        return "is a new character's limit item";
+    if (command_teaches_item(item))
+        return "is a teaching item (a list entry is learned from it)";
+    if (command_mix_item_byte(item, ITEM_RESTRICTIONS) & COMMAND_ITEM_NOT_IN_BATTLE)
+        return "cannot be used in battle (its record's restriction bit 0x02)";
+    return NULL;
+}
+
+/* After the commands file and the items file are both read (with commands_learn_settle): each live mix command's item
+   results checked (command_mix_item_problem); a line whose result fails is turned off (never matches), one line each;
+   a mix_other that fails is turned off too: a pair no mix line names is then refused at the second pick (the buzzer). */
+static void commands_mix_settle(const char *when)
+{
+    int i, j, spells, items;
+
+    for (i = 0; i < COMMAND_COUNT; i++) {
+        const struct new_command *c = &new_commands[i];
+        const char *why;
+
+        command_mix_other_said[i] = FALSE;
+        if (!c->live || !c->mix)
+            continue;
+        spells = items = 0;
+        for (j = 0; j < command_mix.lines; j++) {
+            struct command_mix_line *l = &command_mix.line[j];
+
+            if (l->command != COMMAND_FIRST + i || !l->on)
+                continue;
+            if (l->result_kind == COMMAND_MIX_RESULT_ITEM && (why = command_mix_item_problem(l->result)) != NULL) {
+                l->on = 0;
+                if (l->other)
+                    log_line("new command %02x (%s): *** commands file line %d: mix_other: item %d %s (%s): it is turned off: a pair no mix line names is REFUSED at the second pick (the buzzer) ***",
+                             COMMAND_FIRST + i, c->label, l->line, l->result, why, when);
+                else
+                    log_line("commands file line %d: mix: item %d %s (%s): that line is turned off (never matches), the rest is kept",
+                             l->line, l->result, why, when);
+                continue;
+            }
+            if (l->result_kind == COMMAND_MIX_RESULT_ITEM)
+                items++;
+            else
+                spells++;
+        }
+        log_line("new command %02x (%s): mix: %d line(s) in use with mix_other (%d item result(s), %d spell result(s)); mix_other %s (%s)",
+                 COMMAND_FIRST + i, c->label, items + spells, items, spells, c->mix_other_at && command_mix.line[c->mix_other_at - 1].on ? "in use" : "OFF", when);
+    }
+}
+
+
 /* (stage 5) Handler 0x02's entry 008fee50 (Item's and W-Item's first step): for an action of a live item command,
    command_item_setup first; the game's 005c8fdf unless refused. Every other action: the game's routine alone. */
 static void __cdecl item_setup_hook(void)
 {
     int *action = current_action();
     int command = action[ACT_COMMAND], actor = action[ACT_ACTOR], item = action[ACT_QUEUED_ID] & 0xffff;
-    int way = command_item_setup(action, new_commands);
+    int way;
+
+    if (command_mix_item_hook(action))
+        return;                 /* (mix) a mix command's action: its own path */
+    way = command_item_setup(action, new_commands);
 
     if (way >= 0)
         ((void (__cdecl *)(void))FN_ITEM_SETUP)();
+    if (way)
+        command_hp_cost_setup(action, way);     /* (hp_cost) */
     if (!way || !command_may_log())
         return;
     if (way > 0)
@@ -50682,16 +54820,18 @@ static void command_potency_hit(int *action, int target)
 /* (stage 5) The filter at each opening of the Item list and every frame it is open: the notes undone when they are
    another command's or an older reading's, or the list is not an item command's (Item, W-Item, Throw, Coin); the set
    of the menu's command applied when it is one at cursor 3. The battle's list as the DLL walks it (wide_battle_at,
-   battle_rows()). */
+   battle_rows()). (mix) A mix command's first item also, at the second pick, when its rows hold fewer than two. */
 static void command_filter_sync(void)
 {
-    int menu = *(const BYTE *)ADDR_MENU_COMMAND, count = battle_rows(), dimmed;
+    int menu = *(const BYTE *)ADDR_MENU_COMMAND, count = battle_rows(), dimmed, dim = -1, k = *(const BYTE *)ADDR_BATTLE_MENU_ACTOR;
 
     if (count > WIDE_ROWS_MAX + WIDE_GUARD_ROWS)
         count = WIDE_ROWS_MAX + WIDE_GUARD_ROWS;
-    dimmed = command_filter_step(wide_battle_at, command_filter_notes, count, new_commands, menu, *(const BYTE *)ADDR_MENU_CURSOR_ACTION,
-                                 &command_filter_owner, &command_filter_reading, command_reading);
-    if (dimmed >= 0 && !command_filter_said[menu - COMMAND_FIRST] && command_may_log()) {
+    if (command_mix_of(new_commands, menu) && k <= 2)
+        dim = command_mix_dim(&command_mix_picks[k], menu, command_reading, wide_battle_at, count);     /* (mix) */
+    dimmed = command_filter_step_with(wide_battle_at, command_filter_notes, count, new_commands, menu, *(const BYTE *)ADDR_MENU_CURSOR_ACTION,
+                                      &command_filter_owner, &command_filter_reading, command_reading, dim);     /* (mix) the first item, one left */
+    if (dimmed >= 0 && !command_filter_said[menu - COMMAND_FIRST] && new_commands[menu - COMMAND_FIRST].items_line && command_may_log()) {
         command_filter_said[menu - COMMAND_FIRST] = TRUE;
         log_line("new command %02x (%s): the Item list: %d row(s) dimmed (not among its %u items); the others as the game shows them; said once a reading",
                  menu, new_commands[menu - COMMAND_FIRST].label, dimmed, (unsigned)new_commands[menu - COMMAND_FIRST].items_count);
@@ -50700,14 +54840,53 @@ static void command_filter_sync(void)
 
 static void __cdecl item_list_setup_hook(void)
 {
+    int k = *(const BYTE *)ADDR_BATTLE_MENU_ACTOR;
+
+    if (k <= 2)
+        command_mix_picks[k].on = 0;    /* (mix) each opening of the list starts at the first pick */
     command_filter_sync();
     ((void (__cdecl *)(void))FN_ITEM_LIST_SETUP)();
 }
 
 static void __cdecl item_list_input_hook(void)
 {
+    int before = *(const short *)ADDR_MIX_MENU_STATE;
+
     command_filter_sync();
     ((void (__cdecl *)(void))FN_ITEM_LIST_INPUT)();
+    command_mix_pick_step(before);      /* (mix) an OK the game's input has just accepted: the first pick or the second */
+}
+
+/* (mix) What a mix command needs besides an item command's (command_item_ready): the game's routines the picks and the
+   set-ups call are the game's (006e5c52 the cursor, 006d0af9 / 006d0be1 a window opened / closed, 0043305c the drop) and
+   the Item list's OK writes the states the picks read (006d9a3c: state 0, return state 5); with a spell result also
+   handler 0x0c's entry (action_setup_hook: the cast, no MP) and the slot-match call 00436266 (slot_match_hook: the
+   action's handler list) this DLL's. One line and FALSE when not. */
+static BOOL command_mix_ready(const struct new_command *c)
+{
+    static const BYTE cursor_code[] = { 0x55, 0x8b, 0xec, 0x83, 0xec, 0x08, 0x6a, 0x01 };     /* 006e5c52 */
+    static const BYTE open_code[] = { 0x55, 0x8b, 0xec, 0x0f, 0xbf, 0x45, 0x10, 0xc6, 0x80, 0x68, 0x20, 0xdc, 0x00, 0x01 };  /* 006d0af9 */
+    static const BYTE close_code[] = { 0x55, 0x8b, 0xec, 0x0f, 0xbf, 0x45, 0x08, 0xc6, 0x80, 0x68, 0x20, 0xdc, 0x00, 0x03, 0x5d, 0xc3 };   /* 006d0be1 */
+    static const BYTE drop_code[] = { 0x55, 0x8b, 0xec, 0x51, 0xc7, 0x45, 0xfc, 0x00, 0x00, 0x00, 0x00 };  /* 0043305c */
+    static const BYTE ok_code[] = { 0x66, 0xc7, 0x05, 0x9c, 0xef, 0x91, 0x00, 0x00, 0x00, 0x66, 0xc7, 0x05, 0x98, 0xef, 0x91, 0x00, 0x05, 0x00 };  /* 006d9a3c */
+
+    command_mix_menu_ok = bytes_are(FN_MENU_TARGET_SETUP, cursor_code, sizeof cursor_code) && bytes_are(FN_MENU_WINDOW_OPEN, open_code, sizeof open_code) &&
+                          bytes_are(FN_MENU_WINDOW_CLOSE, close_code, sizeof close_code) && bytes_are(FN_MIX_DROP, drop_code, sizeof drop_code) &&
+                          bytes_are(SITE_ITEM_LIST_OK_STATE, ok_code, sizeof ok_code);
+    if (!command_mix_menu_ok) {
+        log_line("new command %02x (%s): NOT used: the game's code a mix relies on is not as expected (006e5c52 %02x %02x %02x, 006d0af9 %02x, 006d0be1 %02x, 0043305c %02x, the Item list's OK at %08lx %02x %02x %02x)",
+                 (int)(c - new_commands) + COMMAND_FIRST, c->label, ((const BYTE *)FN_MENU_TARGET_SETUP)[0], ((const BYTE *)FN_MENU_TARGET_SETUP)[1],
+                 ((const BYTE *)FN_MENU_TARGET_SETUP)[2], ((const BYTE *)FN_MENU_WINDOW_OPEN)[0], ((const BYTE *)FN_MENU_WINDOW_CLOSE)[0],
+                 ((const BYTE *)FN_MIX_DROP)[0], SITE_ITEM_LIST_OK_STATE, ((const BYTE *)SITE_ITEM_LIST_OK_STATE)[0],
+                 ((const BYTE *)SITE_ITEM_LIST_OK_STATE)[1], ((const BYTE *)SITE_ITEM_LIST_OK_STATE)[2]);
+        return FALSE;
+    }
+    if (c->mix_spells && (*(const DWORD *)ADDR_ACTION_SETUP_ENTRY != (DWORD)action_setup_hook || !command_call_goes_to(SITE_SLOT_MATCH, slot_match_hook))) {
+        log_line("new command %02x (%s): NOT used: it has spell results, which need handler 0x0c's entry %08lx (holds %08lx) and the slot-match call %08lx to be this DLL's",
+                 (int)(c - new_commands) + COMMAND_FIRST, c->label, ADDR_ACTION_SETUP_ENTRY, *(const DWORD *)ADDR_ACTION_SETUP_ENTRY, SITE_SLOT_MATCH);
+        return FALSE;
+    }
+    return TRUE;
 }
 
 /* (stage 5) What an item command needs, put in once (never taken out: each hook passes every other action, list
@@ -50734,7 +54913,7 @@ static BOOL command_item_ready(const struct new_command *c)
                  (int)(c - new_commands) + COMMAND_FIRST, c->label, ADDR_ITEM_SETUP_ENTRY, *(const DWORD *)ADDR_ITEM_SETUP_ENTRY);
         return FALSE;
     }
-    if (c->items_line && !command_item_list_live) {
+    if ((c->items_line || c->mix) && !command_item_list_live) {     /* (mix) a mix command's picks need both entries */
         if (*(const DWORD *)ADDR_ITEM_LIST_SETUP_ENTRY == FN_ITEM_LIST_SETUP && *(const DWORD *)ADDR_ITEM_LIST_INPUT_ENTRY == FN_ITEM_LIST_INPUT &&
             patch_pointer(ADDR_ITEM_LIST_SETUP_ENTRY, FN_ITEM_LIST_SETUP, item_list_setup_hook)) {
             command_item_list_live = patch_pointer(ADDR_ITEM_LIST_INPUT_ENTRY, FN_ITEM_LIST_INPUT, item_list_input_hook);
@@ -50745,13 +54924,16 @@ static BOOL command_item_ready(const struct new_command *c)
             log_line("new commands: the Item list's window entries (%08lx -> %08lx, %08lx -> %08lx) are followed for the item filter",
                      ADDR_ITEM_LIST_SETUP_ENTRY, FN_ITEM_LIST_SETUP, ADDR_ITEM_LIST_INPUT_ENTRY, FN_ITEM_LIST_INPUT);
     }
-    if (c->items_line && (!command_item_list_live || *(const DWORD *)ADDR_ITEM_LIST_SETUP_ENTRY != (DWORD)item_list_setup_hook ||
-                          *(const DWORD *)ADDR_ITEM_LIST_INPUT_ENTRY != (DWORD)item_list_input_hook)) {
-        log_line("new command %02x (%s): NOT used: the Item list's window entries (%08lx holds %08lx, %08lx holds %08lx; the game's: %08lx, %08lx) are not this DLL's: a command with an items line would show every item",
+    if ((c->items_line || c->mix) && (!command_item_list_live || *(const DWORD *)ADDR_ITEM_LIST_SETUP_ENTRY != (DWORD)item_list_setup_hook ||
+                                      *(const DWORD *)ADDR_ITEM_LIST_INPUT_ENTRY != (DWORD)item_list_input_hook)) {
+        log_line("new command %02x (%s): NOT used: the Item list's window entries (%08lx holds %08lx, %08lx holds %08lx; the game's: %08lx, %08lx) are not this DLL's: %s",
                  (int)(c - new_commands) + COMMAND_FIRST, c->label, ADDR_ITEM_LIST_SETUP_ENTRY, *(const DWORD *)ADDR_ITEM_LIST_SETUP_ENTRY,
-                 ADDR_ITEM_LIST_INPUT_ENTRY, *(const DWORD *)ADDR_ITEM_LIST_INPUT_ENTRY, FN_ITEM_LIST_SETUP, FN_ITEM_LIST_INPUT);
+                 ADDR_ITEM_LIST_INPUT_ENTRY, *(const DWORD *)ADDR_ITEM_LIST_INPUT_ENTRY, FN_ITEM_LIST_SETUP, FN_ITEM_LIST_INPUT,
+                 c->mix ? "a mix command's two picks could not be told apart" : "a command with an items line would show every item");
         return FALSE;
     }
+    if (c->mix && !command_mix_ready(c))
+        return FALSE;                   /* (mix) one line said why */
     if (c->potency_line && c->potency != COMMAND_POTENCY_DEFAULT && !command_call_goes_to(SITE_HIT_IMMUNE_CHECK, fixed_damage_hook)) {
         log_line("new command %02x (%s): NOT used: the hit's call %08lx is not this DLL's (fixed_damage_hook): its potency could not be applied",
                  (int)(c - new_commands) + COMMAND_FIRST, c->label, SITE_HIT_IMMUNE_CHECK);
@@ -51999,6 +56181,19 @@ static void commands_learn_settle(const char *when)
              command_learning.request < 0 ? "none" : "set", command_learning.test_lesson ? "on (a testing aid)" : "none");
 }
 
+/* (hp_cost) A usable command with an hp_cost line needs the hit call 005d9e12 to be this DLL's (the cost is taken
+   there): otherwise it would be free; one line, not used. */
+static BOOL command_hp_cost_ready(const struct new_command *c)
+{
+    const BYTE *p = (const BYTE *)SITE_HIT_TARGET;
+
+    if (command_call_goes_to(SITE_HIT_TARGET, (const void *)hit_target_hook))
+        return TRUE;
+    log_line("new command %02x (%s): NOT used: hp_cost needs the hit call %08lx (the game's: e8 to %08lx) to be this DLL's; it holds %02x %02x %02x %02x %02x: the cost could not be taken",
+             (int)(c - new_commands) + COMMAND_FIRST, c->label, SITE_HIT_TARGET, FN_HIT_TARGET, p[0], p[1], p[2], p[3], p[4]);
+    return FALSE;
+}
+
 static void load_commands(const char *when)
 {
     static const BYTE status_fields[] = { 0x55, 0x8b, 0xec, 0x83, 0xec, 0x08, 0x8b, 0x45, 0x08, 0xc1, 0xe8, 0x06 };
@@ -52018,6 +56213,9 @@ static void load_commands(const char *when)
         command_list_told[i] = 0;       /* (stage 8) */
     }
     command_w_state.on = 0;             /* (stage 7) a stored W- first pick is not carried over a reading */
+    command_hp_run.state = COMMAND_HP_IDLE;     /* (hp_cost) nor an armed cost */
+    for (i = 0; i < 3; i++)
+        command_mix_picks[i].on = command_mix_runs[i].on = 0;   /* (mix) nor a pick or a queued pair (their reading is stale too) */
     for (i = 0; i < 4; i++)
         for (k = 0; k < 32; k++)
             command_guard_said[i][k] = 0;
@@ -52077,6 +56275,8 @@ static void load_commands(const char *when)
             c->usable = 0;              /* (stage 7) one line said why; (stage 8) a list command's W- form is W-Magic's own (cursor 8) */
         if (c->usable && c->kind == COMMAND_KIND_LIST && !command_list_ready(c))
             c->usable = 0;              /* (stage 8) one line said why */
+        if (c->usable && c->hp_cost_line && !command_hp_cost_ready(c))
+            c->usable = 0;              /* (hp_cost) one line said why */
     }
     if (weapon_hook_live && !weapon_was)
         log_line("new commands: the weapon set-up (handler 0x0e, table entry %08lx -> %08lx) is followed for the physical commands",
@@ -52109,8 +56309,15 @@ static void load_commands(const char *when)
     commands_records_sync();            /* (stage 4) nothing unless the tables are moved */
     commands_write_records(when);
     commands_records_mirror();
-    for (usable = 0, i = 0; i < COMMAND_COUNT; i++)
-        usable += new_commands[i].live;
+    for (usable = 0, i = 0; i < COMMAND_COUNT; i++) {
+        const struct new_command *c = &new_commands[i];
+
+        usable += c->live;
+        if (c->live && c->hp_cost_line)     /* (hp_cost) */
+            log_line("new command %02x (%s): hp_cost %d%% of the user's %s: taken once an action, at its first hit, never below 1 HP (a party member's, not a Mime repeat's); shown on the user as the game shows a drain (pending HP %08lx, taken off at %08lx)",
+                     COMMAND_FIRST + i, c->label, c->hp_cost, c->hp_cost_from == COMMAND_HP_FROM_CURRENT ? "HP when the action is set up" : "max HP",
+                     ADDR_COMMAND_PENDING_HP, COMMAND_HP_FLUSH_SITE);
+    }
     log_line("commands file: %d command(s) defined, %d in use, %d line(s) with problems", read, usable, command_file_problems);
     command_support_install();          /* (stage 6) once, with a live command */
     commands_check_materia();
@@ -52143,6 +56350,11 @@ static void commands_battle_start(void)
         command_filter_notes[i] = 0;    /* (stage 5) the build at 00437f02, right after, writes every row afresh */
     command_filter_owner = -1;
     command_w_state.on = 0;             /* (stage 7) no W- first pick carried into a battle */
+    for (i = 0; i < 3; i++)
+        command_mix_picks[i].on = command_mix_runs[i].on = 0;   /* (mix) no pick or queued pair carried into a battle */
+    for (i = 0; i < COMMAND_COUNT; i++)
+        command_mix_lent[i] = FALSE;
+    command_mix_spells_ok = FALSE;
     for (i = 0; i < (int)(sizeof command_views.list_grid / sizeof command_views.list_grid[0][0][0]); i++)
         (&command_views.list_grid[0][0][0])[i] = 0;     /* (stage 8) each list's cursor positions start afresh */
     if (command_tables_moved)
@@ -52160,6 +56372,9 @@ static void commands_battle_start(void)
     weapon_ok = *(const DWORD *)ADDR_WEAPON_SETUP_ENTRY == (DWORD)weapon_setup_hook;
     item_ok = item <= COMMAND_LISTS_SIZE - sizeof item_list && bytes_are(ADDR_COMMAND_LISTS + item, item_list, sizeof item_list) &&
               *(const DWORD *)ADDR_ITEM_SETUP_ENTRY == (DWORD)item_setup_hook;     /* (stage 5) */
+    command_mix_magic_list = magic;     /* (mix) a spell result's list, chosen per action (command_mix_list) */
+    command_mix_item_list = item;
+    command_mix_spells_ok = base_ok && spell_ok;
     for (i = 0; i < COMMAND_COUNT; i++) {
         const struct new_command *c = &new_commands[i];
         DWORD own, wanted;
@@ -52171,8 +56386,8 @@ static void commands_battle_start(void)
         wanted = physical ? offsets[c->like] : is_item ? item : magic;
         ok = base_ok && (physical ? weapon_ok && wanted < COMMAND_LISTS_SIZE &&
                                     command_list_is_weapon(lists, COMMAND_LISTS_SIZE, (int)wanted)
-                                  : is_item ? item_ok : spell_ok);
-        if (!ok || (own != wanted && (own >= COMMAND_LISTS_SIZE || lists[own] != 0x1f))) {
+                                  : is_item ? item_ok && (!c->mix_spells || spell_ok) : spell_ok);     /* (mix) with spell results Magic's too */
+        if (!ok || (own != wanted && !(c->mix && own == magic) && (own >= COMMAND_LISTS_SIZE || lists[own] != 0x1f))) {
             if (!command_lists_refused_said) {
                 command_lists_refused_said = TRUE;
                 log_line("new command %02x: NOT given %s handlers in this battle (reader %02x %02x %02x, the list to lend at %lx, its own %lx -> %02x, handler 0x0c %08lx, 0x0e %08lx, 0x02 %08lx): its row spends the turn and does nothing",
@@ -52184,11 +56399,16 @@ static void commands_battle_start(void)
             continue;
         }
         offsets[COMMAND_FIRST + i] = wanted;
+        command_mix_lent[i] = c->mix;   /* (mix) slot_match_hook may now choose Item's or Magic's per action */
         if (!command_lists_said[i]) {
             command_lists_said[i] = TRUE;
             if (physical)
                 log_line("new command %02x (%s): battle start: its handler list is %s's (009ae9c8[%02x] = %lx); said once a reading",
                          COMMAND_FIRST + i, c->label, state_command_name(c->like), COMMAND_FIRST + i, wanted);
+            else if (is_item && c->mix)
+                log_line("new command %02x (%s): battle start: its handler list is Item's (009ae9c8[%02x] = %lx: 02 0d 09)%s; said once a reading",
+                         COMMAND_FIRST + i, c->label, COMMAND_FIRST + i, item,
+                         c->mix_spells ? ", Magic's (00 0c 09) for an action with a spell result (slot_match_hook)" : "");
             else if (is_item)
                 log_line("new command %02x (%s): battle start: its handler list is Item's (009ae9c8[%02x] = %lx: 02 0d 09); said once a reading",
                          COMMAND_FIRST + i, c->label, COMMAND_FIRST + i, item);
@@ -52201,6 +56421,336 @@ static void commands_battle_start(void)
         command_offsets_mirror((DWORD *)ADDR_COMMAND_LIST_AT, offsets);     /* (stage 4) exactly the game's 38 */
 }
 /* ==== NEW COMMANDS END ==== */
+
+/* ==== ITEM BATTLE MP (battle_mp: an item key, MP at each landed hit besides the record's formula) BEGIN ====
+   One item record restores HP or MP by its formula, never both by amounts (special flag bit 0 picks which). An item of
+   the items file with `battle_mp = N` (1-9999; a narrow [105]-[127], [448]-[511] or a wide [1024]-[9999] alike) also
+   restores N MP to the target of each of its hits that lands: base = 1 (Hi-Potion), strength = 25, battle_mp = 75 is
+   500 HP and 75 MP. For any action of command type 4 (COMMAND_ITEM: Item, W-Item, an item command or a mix command's
+   item result of the commands file, Mime's repeat of any of them): its item is action[0xb], which Item's handler
+   005c8fdf copies from the queued [4] (CF 233830: a wide number too; a mix result's R likewise). Taken at the hit, in
+   hit_target_hook after the game's FUN_005da5da, the way the game gives MP Absorb's MP: the amount goes into the
+   target's pending MP (009a8b40 + target * 0x44, the word FUN_005df30b's flag 1 writes; negative = restored), which the
+   hit loop takes at the end of the pass (005d9ea9-005d9eb8: FUN_005da380(target, 1) -> FUN_005da3f5 with which 1:
+   action[0x88] = 4 (MP) | 1 when negative (restore), its own display record (script 0x2e), a result and the number on
+   the target; FUN_005df0f0 -> FUN_005c8126 on the MP word, held to max MP). The target is the hit's (action[0x82],
+   after cover). Nothing on a miss (action[0x86] bit 0) or on a target KO'd after the hit (FUN_005da380 skips a KO'd
+   actor and leaves its word, which a later pass would show); TAKEN instead of restored when the hit hurt (action[0x88]
+   bit 0 clear: a restorative on a target healing harms; an item that is not restorative); scaled by an item command's
+   potency (command_potency_amount, held to the target's MP limit, as command_potency_hit does for the hit's amount);
+   nothing when the action's display records are at their stop (0x40: the flush opens one, as for hp_cost). No code of
+   the game is patched: the hit hook is the DLL's existing one; game words read: the action, the target's status, the
+   display count, the MP limits; one written: the target's pending MP. An item without the key: nothing is written. */
+#define ADDR_ITEM_PENDING_MP    0x009a8b40u  /* (battle_mp) int + actor * 0x44: the pending MP change (negative: restored); 009a8b3c beside it is the HP one */
+#define ITEM_MP_FLUSH_SITE      0x005d9eb8u  /* (for the log) in FUN_005d9940: e8 c3 04 00 00, call 005da380 (actor, 1): the pending MP */
+#define ITEM_MP_LINES_MAX       64           /* (battle_mp) the hit lines of one reading of the items file */
+
+/* ---- ITEM BATTLE MP PURE begin (no game memory, no Windows: tools/work/mixed_potion/build/test compiles this block, after the NEW COMMANDS PURE one, alone) ---- */
+#define ITEM_MP_DISPLAY_MOST    0x40         /* an action's display records: FUN_00436c66 stops counting at 0x40 */
+#define ITEM_ACT_HIT_TARGET     0x82         /* the hit's target, after cover (FUN_005da5da) */
+enum { ITEM_MP_NOTHING, ITEM_MP_GIVEN, ITEM_MP_TAKEN, ITEM_MP_FULL };  /* item_battle_mp_hit's answers */
+
+/* (battle_mp) One hit, after the game's FUN_005da5da. `mp`: the action's item's battle_mp (0: none); `limit`: the
+   target's MP limit (the potency's hold); `status`: the target's status dword now; `display`: the display records
+   written (009aea9c); `*pending`: the target's pending MP. A landed hit of an item action (type 4) on a target not KO'd,
+   with mp > 0: *amount = mp with the command's potency; ITEM_MP_GIVEN (*pending lowered by it: restored) when the hit
+   restored (action[0x88] bit 0), ITEM_MP_TAKEN (*pending raised by it) when it hurt; ITEM_MP_FULL with the display
+   records at their stop (nothing changed). Anything else: ITEM_MP_NOTHING, nothing changed, *amount 0. */
+static int item_battle_mp_hit(const int *action, const struct new_command *commands, int mp, DWORD limit, DWORD status,
+                              int display, int *pending, int *amount)
+{
+    *amount = 0;
+    if (mp <= 0 || action[ACT_COMMAND_TYPE] != COMMAND_ITEM || (action[COMMAND_ACT_HIT_MISS] & 1) || (status & 1))
+        return ITEM_MP_NOTHING;
+    if (display >= ITEM_MP_DISPLAY_MOST)
+        return ITEM_MP_FULL;
+    *amount = command_potency_amount(action, commands, mp, limit);
+    if (action[COMMAND_ACT_HIT_RESULT] & 1) {
+        *pending -= *amount;
+        return ITEM_MP_GIVEN;
+    }
+    *pending += *amount;
+    return ITEM_MP_TAKEN;
+}
+/* ---- ITEM BATTLE MP PURE end ---- */
+
+static int item_mp_lines;
+
+/* (battle_mp) The battle_mp of an item number: a wide item's, a defined new item's of the file, else 0 (the game's
+   items 0-104, a number nothing defines, anything else). */
+static int item_battle_mp_of(int item)
+{
+    const struct wide_item *w = wide_item(item);
+    int n = new_item_slot(item);
+
+    if (w)
+        return w->battle_mp;
+    return n >= 0 && item_defined[n] ? item_battle_mp[n] : 0;
+}
+
+/* (battle_mp) load_gear_file, after the items file: one line when an item has the key (and the hit lines' budget anew). */
+static void item_battle_mp_report(void)
+{
+    int i, count = 0, first = -1, first_mp = 0;
+
+    item_mp_lines = 0;
+    for (i = 0; i < NEW_ITEM_COUNT; i++)
+        if (item_defined[i] && item_battle_mp[i] > 0 && count++ == 0) {
+            first = i < NEW_ITEM_LOW_COUNT ? NEW_ITEM_FIRST + i : NEW_ITEM_HIGH_FIRST + i - NEW_ITEM_LOW_COUNT;
+            first_mp = item_battle_mp[i];
+        }
+    for (i = 0; wide_items && i < wide_item_count; i++)
+        if (wide_items[i].battle_mp > 0 && count++ == 0) {
+            first = wide_items[i].number;
+            first_mp = wide_items[i].battle_mp;
+        }
+    if (count)
+        log_line("item file: %d item(s) with battle_mp (the first: item %d, %d MP): in battle each landed hit of the item also gives that MP to its target, through the game's pending MP (shown at the end of the hit's pass, %08x)",
+                 count, first, first_mp, ITEM_MP_FLUSH_SITE);
+}
+
+/* (battle_mp) hit_target_hook, after the game's FUN_005da5da: an item's battle_mp into its target's pending MP; a line
+   when something happens (ITEM_MP_LINES_MAX a reading). An action that is not an item one, or whose item has no
+   battle_mp: nothing is read past the action, nothing written. */
+static void item_battle_mp_after_hit(const int *action)
+{
+    int target = action[ITEM_ACT_HIT_TARGET], item = action[ACT_ATTACK_ID], mp, way, amount, *pending;
+    DWORD limit;
+
+    if (action[ACT_COMMAND_TYPE] != COMMAND_ITEM || target < 0 || target >= 10)
+        return;
+    mp = item_battle_mp_of(item);
+    if (mp <= 0)
+        return;
+    limit = target < 3 ? *(const WORD *)(ADDR_PARTY_MP_LIMIT + (DWORD)target * 0x34) : command_enemy_limit(TRUE);
+    pending = (int *)(ADDR_ITEM_PENDING_MP + (DWORD)target * 0x44);
+    way = item_battle_mp_hit(action, new_commands, mp, limit, *(const DWORD *)(ADDR_ACTOR_STATE + (DWORD)target * 0x68),
+                             *(const int *)ADDR_DISPLAY_COUNT, pending, &amount);
+    if (way == ITEM_MP_NOTHING || item_mp_lines > ITEM_MP_LINES_MAX)
+        return;
+    if (item_mp_lines++ == ITEM_MP_LINES_MAX) {
+        log_line("item battle_mp: %d lines in this reading of the items file; further hits are not logged", ITEM_MP_LINES_MAX);
+        return;
+    }
+    if (way == ITEM_MP_GIVEN || way == ITEM_MP_TAKEN)
+        log_line("item %d (battle_mp %d): actor %d's hit on actor %d: %d MP %s (pending MP %d), shown at the end of the hit's pass",
+                 item, mp, action[ACT_ACTOR], target, amount, way == ITEM_MP_GIVEN ? "restored" : "taken (the hit hurt)", *pending);
+    else
+        log_line("item %d (battle_mp %d): actor %d's hit on actor %d: no MP: the action's display records are full (%d)",
+                 item, mp, action[ACT_ACTOR], target, ITEM_MP_DISPLAY_MOST);
+}
+/* ==== ITEM BATTLE MP END ==== */
+
+/* ==== SPELL BATTLE MP (battle_mp: a spell file key, MP at each landed hit besides the record's formula) BEGIN ====
+   The items file's battle_mp ("Item battle MP", above) for the spells of the spell file: `battle_mp = N` (1-9999) in a
+   spell's section gives N MP to the target of each hit of that spell that lands. Taken at the hit, in hit_target_hook
+   after the game's FUN_005da5da, through the game's pending MP (009a8b40 + target * 0x44), as the item's: shown as a
+   second number at the end of the hit's pass and held to max MP (the flush: see "Item battle MP").
+   Which actions: command type 2 or 3 after the set-up (action_setup_hook carries an extended summon out as magic, type 2)
+   whose attack ID (action[0xb]) is a spell of the file. So the spell cast by Magic, Summon (list = summon), W-Magic and
+   W-Summon (each of the two), a counter (Magic Counter, Sneak Attack, Final Attack: counter_pick_hook queues it as
+   magic), Mime's repeat, a new command (spell, list, a mix command's spell result: command_mix_spell_setup writes the
+   line's spell into [0xb], the token 10000 + i stays in [4]) and an enemy casting it as magic; each cast of Quadra Magic
+   (a pass of the hit loop, action[0x2b]) and each target of a cast on several. Not: the game's magic and summons (the
+   spell file holds 3000-65534 only), a limit (type 0x14, its own record; the limits file refuses the key), an enemy's
+   own attack (type 0x20: its ID, 0100-7fff, may equal a spell's, but action_setup_hook does not load the spell for it),
+   an item (type 4: a wide item 1024-9999 may be numbered like a spell; the items file has its own key), Throw.
+   The hit: nothing on a miss (action[0x86] bit 0; a status-only spell whose status does not take is one) or on a target
+   KO'd after it (the flush skips a KO'd actor and leaves its word). Nothing on a target Reflect bounced the hit off:
+   FUN_005da5da (005da763-005da9f8) then marks the hit's own result (flag 2), sets action[0x86] bit 1, zeroes the
+   amount and the statuses, and sends the hit on to another actor in the next pass, through 005d9e12 again, where the
+   MP goes. A hit that hurt (an amount, action[0x86] bit 1 clear, that did not restore, action[0x88] bit 0 clear: a
+   damage spell, a restorative on a target healing harms) TAKES the MP, as the item's; any other landed hit gives it
+   (a restore; a hit with no amount: a spell that only changes statuses). The amount is N: MP Turbo (FUN_005ca9d0's
+   percent, action[0x3a], which the damage formula adds), elements and criticals act in the formula only, and potency
+   is an item command's (type 4). The bounce is read only for a hit with no amount, from the hit's result entry
+   (009acb98 + n * 0x0c, n the count 009aeaa0 just before the call: FUN_005da5da's first act is FUN_00436cb5, which
+   takes entry n), checked by its target and attacker bytes, and only while the three places that rests on have their
+   bytes (checked at the reading); else such a hit gives nothing, with a line. No code of the game is patched: the hit
+   hook is the DLL's existing one. Game words read: the action, the result count and the hit's result, the target's
+   status, the display count; one written: the target's pending MP. With no spell carrying the key nothing is read past
+   the spell table. */
+#define ADDR_RESULT_COUNT       0x009aeaa0u  /* int: the action's results written; FUN_00436cb5 takes entry count, adds 1 below 0x80 */
+#define SPELL_MP_RESULT_SIZE    0x0c         /* a result entry (ADDR_ACTION_RESULTS): +0 target, +1 attacker, +4 flags word */
+#define SPELL_MP_RESULTS_MOST   0x80         /* the count stops there (FUN_00436cb5 then takes entry 0x80 again) */
+#define SITE_HIT_NEW_RESULT     0x005da5dau  /* FUN_005da5da's head: 55 8b ec 83 ec 34, e8 d0 c6 e5 ff (call 00436cb5), 89 45 f4 (kept at [ebp-0xc]) */
+#define FN_NEW_RESULT           0x00436cb5u  /* 55 8b ec 51, a1 a0 ea 9a 00, 6b c0 0c, 05 98 cb 9a 00: entry 009acb98 + count * 0x0c */
+#define SITE_HIT_BOUNCE_FLAG    0x005da9ebu  /* in FUN_005da5da's bounce: 8b 4d f4 66 8b 51 04 80 ca 02 8b 45 f4 66 89 50 04 (flag 2 on that entry) */
+#define SPELL_MP_LINES_MAX      64           /* (battle_mp) the hit lines of one reading of the spell file */
+
+/* ---- SPELL BATTLE MP PURE begin (no game memory, no Windows: tools/work/mixed_potion/spells/build/test compiles this block, after the action enum, the parse helpers and COMMAND_MAGIC, alone) ---- */
+#define SPELL_BATTLE_MP_MOST    9999         /* (battle_mp) the key's bound: the items file's */
+#define SPELL_MP_DISPLAY_MOST   0x40         /* an action's display records: FUN_00436c66 stops counting at 0x40 */
+#define SPELL_MP_HIT_TARGET     0x82         /* action[0x82]: the hit's target, after cover (FUN_005da5da) */
+#define SPELL_MP_HIT_MISS       0x86         /* action[0x86]: bit 0 missed, bit 1 no amount (power 0, or bounced by Reflect) */
+#define SPELL_MP_HIT_RESULT     0x88         /* action[0x88]: bit 0 restored */
+#define SPELL_MP_TYPE_SUMMON    3            /* command type 3, Summon (COMMAND_MAGIC is 2) */
+#define SPELL_MP_BOUNCED_FLAG   2            /* a result's flags word (+4), bit 1: Reflect bounced the hit off its target (005da9ee-005da9f8) */
+enum { SPELL_MP_NOTHING, SPELL_MP_GIVEN, SPELL_MP_TAKEN, SPELL_MP_FULL, SPELL_MP_BOUNCED, SPELL_MP_UNSURE };   /* spell_battle_mp_hit's answers */
+
+/* (battle_mp) The key's value: 0 to 9999 (decimal or 0x), at most 9 characters, so that no number wraps round 32 bits
+   into the range. NULL, or what is wrong. */
+static const char *spell_battle_mp_value(char *value, char *end, DWORD *out)
+{
+    char *p = value;
+
+    if (end - value > 9 || !parse_number(&p, end, out) || p != end || *out > SPELL_BATTLE_MP_MOST)
+        return "battle_mp must be a number from 0 to 9999";
+    return NULL;
+}
+
+/* (battle_mp) The attack ID that names the spell an action casts at its hits: action[0xb] for command type 2 (Magic, and
+   all that is carried out as magic) or 3 (Summon); -1 for any other type (an item, a limit, an enemy's own attack,
+   Attack and the weapon commands), whose [0xb] is no spell of the file even when its number is one's. */
+static int spell_mp_attack_id(const int *action)
+{
+    int type = action[ACT_COMMAND_TYPE];
+
+    return type == COMMAND_MAGIC || type == SPELL_MP_TYPE_SUMMON ? action[ACT_ATTACK_ID] : -1;
+}
+
+/* (battle_mp) Did Reflect bounce the hit off its target? From the hit's own result entry (`entry`; NULL when it could
+   not be placed): 1 bounced (flags bit 1), 0 not, -1 unknown (no entry, or one whose target and attacker bytes are not
+   the hit's: then it is not this hit's). */
+static int spell_mp_bounced(const BYTE *entry, int target, int attacker)
+{
+    if (!entry || entry[0] != (BYTE)target || entry[1] != (BYTE)attacker)
+        return -1;
+    return (entry[4] & SPELL_MP_BOUNCED_FLAG) ? 1 : 0;
+}
+
+/* (battle_mp) One hit of a spell action, after the game's FUN_005da5da. `mp`: the action's spell's battle_mp (0: none);
+   `status`: the target's status dword now; `display`: the display records written (009aea9c); `bounced`:
+   spell_mp_bounced's answer, asked only for a hit with no amount (else 0); `*pending`: the target's pending MP. A landed
+   hit on a target not KO'd, with mp > 0: *amount = mp, and SPELL_MP_TAKEN (*pending raised by it) when the hit hurt (an
+   amount that did not restore), else SPELL_MP_GIVEN (*pending lowered: restored); SPELL_MP_FULL with the display records
+   at their stop. A hit with no amount that Reflect bounced off the target: SPELL_MP_BOUNCED; one whose bounce is
+   unknown: SPELL_MP_UNSURE (the MP could go to a reflector). Anything else: SPELL_MP_NOTHING. Only GIVEN and TAKEN change
+   *pending; *amount is 0 for the others. */
+static int spell_battle_mp_hit(const int *action, int mp, DWORD status, int display, int bounced, int *pending,
+                               int *amount)
+{
+    BOOL no_amount = (action[SPELL_MP_HIT_MISS] & 2) != 0;
+
+    *amount = 0;
+    if (mp <= 0 || (action[SPELL_MP_HIT_MISS] & 1) || (status & 1))
+        return SPELL_MP_NOTHING;
+    if (no_amount && bounced > 0)
+        return SPELL_MP_BOUNCED;
+    if (no_amount && bounced < 0)
+        return SPELL_MP_UNSURE;
+    if (display >= SPELL_MP_DISPLAY_MOST)
+        return SPELL_MP_FULL;
+    *amount = mp;
+    if (!no_amount && !(action[SPELL_MP_HIT_RESULT] & 1)) {
+        *pending += mp;
+        return SPELL_MP_TAKEN;
+    }
+    *pending -= mp;
+    return SPELL_MP_GIVEN;
+}
+/* ---- SPELL BATTLE MP PURE end ---- */
+
+static int spell_mp_lines, spell_mp_spells;     /* the hit lines of this reading of the spell file; its spells with the key */
+static int spell_mp_result_ok;                  /* the three places a hit with no amount rests on: 1 as known, -1 not, 0 not checked */
+
+/* (battle_mp) The battle_mp of the spell an action casts at its hits (spell_mp_attack_id), or 0. */
+static int spell_battle_mp_of(const int *action)
+{
+    int spell = ext_index(spell_mp_attack_id(action));
+
+    return spell < 0 ? 0 : spells[spell].battle_mp;
+}
+
+/* (battle_mp) load_spells, at its end: one line when a spell has the key, the hit lines' budget anew, and (once, with a
+   spell that has it) the bytes of the three places a hit with no amount rests on. */
+static void spell_battle_mp_report(void)
+{
+    static const BYTE hit_head[] = { 0x55, 0x8b, 0xec, 0x83, 0xec, 0x34, 0xe8, 0xd0, 0xc6, 0xe5, 0xff, 0x89, 0x45, 0xf4 };
+    static const BYTE new_result[] = { 0x55, 0x8b, 0xec, 0x51, 0xa1, 0xa0, 0xea, 0x9a, 0x00, 0x6b, 0xc0, 0x0c, 0x05, 0x98,
+                                       0xcb, 0x9a, 0x00 };
+    static const BYTE bounce_flag[] = { 0x8b, 0x4d, 0xf4, 0x66, 0x8b, 0x51, 0x04, 0x80, 0xca, 0x02, 0x8b, 0x45, 0xf4, 0x66,
+                                        0x89, 0x50, 0x04 };
+    int i, first = 0;
+
+    spell_mp_lines = spell_mp_spells = 0;
+    for (i = 0; spells && i < spell_count; i++)
+        if (spells[i].battle_mp > 0 && spell_mp_spells++ == 0)
+            first = i;
+    if (!spell_mp_spells)
+        return;
+    if (!spell_mp_result_ok)
+        spell_mp_result_ok = bytes_are(SITE_HIT_NEW_RESULT, hit_head, sizeof hit_head) &&
+                             bytes_are(FN_NEW_RESULT, new_result, sizeof new_result) &&
+                             bytes_are(SITE_HIT_BOUNCE_FLAG, bounce_flag, sizeof bounce_flag) ? 1 : -1;
+    log_line("spell file: %d spell(s) with battle_mp (the first: spell %d, %d MP): in battle each landed hit of the spell also gives that MP to its target (takes it when the hit hurt), through the game's pending MP (shown at the end of the hit's pass, %08x)%s",
+             spell_mp_spells, spells[first].id, spells[first].battle_mp, ITEM_MP_FLUSH_SITE,
+             spell_mp_result_ok > 0 ? "" : "; the game's hit routine is not as this DLL knows it (bytes at 005da5da, 00436cb5 or 005da9eb): a hit with no amount (a spell that only changes statuses, or one Reflect bounces) gives no MP");
+}
+
+/* (battle_mp) hit_target_hook, before the game's FUN_005da5da. For an action whose spell has battle_mp: the place of
+   the result entry the hit is about to take (the count 009aeaa0, 0 to 0x80), or -2 when it cannot be told (the count
+   out of range, or the bytes not as known). -1 for any other action: no step after the hit. */
+static int spell_battle_mp_before(void)
+{
+    const int *action;
+    int n;
+
+    if (!spell_mp_spells || !spells)
+        return -1;
+    action = *(const int **)ADDR_ACTION_PTR;
+    if (!action || spell_battle_mp_of(action) <= 0)
+        return -1;
+    n = *(const int *)ADDR_RESULT_COUNT;
+    return spell_mp_result_ok > 0 && n >= 0 && n <= SPELL_MP_RESULTS_MOST ? n : -2;
+}
+
+/* (battle_mp) hit_target_hook, after the game's FUN_005da5da (and the item's step): a spell's battle_mp into its target's
+   pending MP; a line when something happens (SPELL_MP_LINES_MAX a reading). `attacker`: the hit's (the reflector, for a
+   hit Reflect sent on); `results`: spell_battle_mp_before's answer (-1: nothing is read past it). */
+static void spell_battle_mp_after_hit(const int *action, int attacker, int results)
+{
+    int target, mp, bounced = 0, way, amount, *pending;
+    char from[40];
+
+    if (results == -1)
+        return;
+    target = action[SPELL_MP_HIT_TARGET];
+    mp = spell_battle_mp_of(action);
+    if (mp <= 0 || target < 0 || target >= 10)
+        return;
+    if (action[SPELL_MP_HIT_MISS] & 2)      /* no amount: a status-only hit, or one Reflect bounced off this target */
+        bounced = spell_mp_bounced(results >= 0 ? (const BYTE *)(ADDR_ACTION_RESULTS + (DWORD)results * SPELL_MP_RESULT_SIZE) : NULL,
+                                   target, attacker);
+    pending = (int *)(ADDR_ITEM_PENDING_MP + (DWORD)target * 0x44);    /* (the item's define: the game's pending MP word) */
+    way = spell_battle_mp_hit(action, mp, *(const DWORD *)(ADDR_ACTOR_STATE + (DWORD)target * 0x68),
+                              *(const int *)ADDR_DISPLAY_COUNT, bounced, pending, &amount);
+    if (way == SPELL_MP_NOTHING || spell_mp_lines > SPELL_MP_LINES_MAX)
+        return;
+    if (spell_mp_lines++ == SPELL_MP_LINES_MAX) {
+        log_line("spell battle_mp: %d lines in this reading of the spell file; further hits are not logged", SPELL_MP_LINES_MAX);
+        return;
+    }
+    from[0] = 0;
+    if (attacker != action[ACT_ACTOR])
+        wsprintfA(from, " (sent on by actor %d's Reflect)", attacker);
+    if (way == SPELL_MP_GIVEN || way == SPELL_MP_TAKEN)
+        log_line("spell %d (battle_mp %d): actor %d's hit%s on actor %d: %d MP %s (pending MP %d), shown at the end of the hit's pass",
+                 action[ACT_ATTACK_ID], mp, action[ACT_ACTOR], from, target, amount,
+                 way == SPELL_MP_GIVEN ? "restored" : "taken (the hit hurt)", *pending);
+    else if (way == SPELL_MP_BOUNCED)
+        log_line("spell %d (battle_mp %d): actor %d's hit%s on actor %d: no MP there: Reflect bounced the hit off it (the MP goes where it lands)",
+                 action[ACT_ATTACK_ID], mp, action[ACT_ACTOR], from, target);
+    else if (way == SPELL_MP_UNSURE)
+        log_line("spell %d (battle_mp %d): actor %d's hit%s on actor %d: no MP: a hit with no amount whose result could not be read (%s): it may have bounced off the target",
+                 action[ACT_ATTACK_ID], mp, action[ACT_ACTOR], from, target,
+                 spell_mp_result_ok <= 0 ? "the game's hit routine is not as known" : results < 0 ? "the result count was out of range"
+                 : "the result entry is not this hit's");
+    else
+        log_line("spell %d (battle_mp %d): actor %d's hit%s on actor %d: no MP: the action's display records are full (%d)",
+                 action[ACT_ATTACK_ID], mp, action[ACT_ACTOR], from, target, SPELL_MP_DISPLAY_MOST);
+}
+/* ==== SPELL BATTLE MP END ==== */
 
 /* ---- Names that are too wide are drawn narrower ----------------------------
    The menus were laid out for the game's own names. A name supplied by the DLL (a renamed kernel
@@ -54220,6 +58770,134 @@ static void bl_keys_settle(void)
 }
 /* ==== BREAKING LIMITS END ==== */
 
+/* ==== SFX PAN BEGIN ==== (tested natively: tools/work/sfx_pan_fix/tests)
+   The battle's sound pan. Two routines of the game make a sound's pan from a fighter's screen x (the short
+   at 00bf2e20 + actor*8): pan = (x / 5 * 2) & 0x7f. FUN_00430d32 plays the model scripts' sounds (and the
+   effects' through it); FUN_005bbb9c is sound operation 0x2a. Written for the PlayStation's 320-wide screen:
+   on PC the x is 640 wide, so the pan WRAPS at the screen's centre (x 315-319: 126, hard right; x 320-324: 0,
+   hard left). sfx_pan_fix = on (the default) makes the divisor 10 at both: pan 0-126 across x 0-639, no wrap
+   inside the screen (x of 640 and more, or -10 and less, still wraps as the game's code does past its own
+   edges). Both sites or neither; patched once, at the first reading of the game file; FFNx calls
+   FUN_00430d32 but does not replace or patch it. (The effects' own pan, FUN_005c00c5, holds x to 0-319 of
+   a projection of its own: not touched.) */
+#define SFX_PAN_SITE_SCRIPT     0x00430d4bu  /* in FUN_00430d32: movsx eax,[edx*8+00bf2e20] / cdq / mov ecx,5 / idiv ecx / shl eax,1 / and eax,7f / mov [ebp-4],al */
+#define SFX_PAN_SITE_OPERATION  0x005bbbbcu  /* in FUN_005bbb9c: the same five, then push eax / push 2a (call sound_operation 00740d80) */
+#define SFX_PAN_WINDOW          24           /* the bytes compared at each site */
+#define SFX_PAN_DIVISOR_AT      10           /* the low byte of mov ecx,imm32: 00430d55 and 005bbbc6 */
+#define SFX_PAN_DIVISOR_GAME    0x05
+#define SFX_PAN_DIVISOR_FIXED   0x0a
+
+static const BYTE sfx_pan_code[2][SFX_PAN_WINDOW] = {
+    { 0x0f, 0xbf, 0x04, 0xd5, 0x20, 0x2e, 0xbf, 0x00, 0x99, 0xb9, 0x05, 0x00, 0x00, 0x00, 0xf7, 0xf9, 0xd1, 0xe0, 0x83, 0xe0, 0x7f,
+      0x88, 0x45, 0xfc },
+    { 0x0f, 0xbf, 0x04, 0xd5, 0x20, 0x2e, 0xbf, 0x00, 0x99, 0xb9, 0x05, 0x00, 0x00, 0x00, 0xf7, 0xf9, 0xd1, 0xe0, 0x83, 0xe0, 0x7f,
+      0x50, 0x6a, 0x2a },
+};
+static int sfx_pan_asked = 1;       /* the key: 1 on (its default), 0 off */
+static int sfx_pan_taken = -1;      /* what this run took at the first reading (-1: not yet) */
+static LONG sfx_pan_settled;
+
+/* The pan the game's code gives screen x with this divisor (idiv truncates toward 0, as C's / does). */
+static int sfx_pan_of(int x, int divisor)
+{
+    return (int)(((unsigned)((short)x / divisor) << 1) & 0x7f);
+}
+
+/* The code at site k (0 the script sounds', 1 operation 0x2a's): 0 the game's (divisor 5), 1 divisor 10, -1 neither. */
+static int sfx_pan_site_state(const BYTE *code, int k)
+{
+    int i;
+
+    for (i = 0; i < SFX_PAN_WINDOW; i++)
+        if (i != SFX_PAN_DIVISOR_AT && code[i] != sfx_pan_code[k][i])
+            return -1;
+    return code[SFX_PAN_DIVISOR_AT] == SFX_PAN_DIVISOR_GAME ? 0 : code[SFX_PAN_DIVISOR_AT] == SFX_PAN_DIVISOR_FIXED ? 1 : -1;
+}
+
+/* Both divisors made `divisor`, or neither: FALSE (nothing written) when a protection could not be changed. */
+static BOOL sfx_pan_write(BYTE divisor)
+{
+    BYTE *at[2];
+    DWORD old_protect[2];
+    int k;
+
+    at[0] = (BYTE *)SFX_PAN_SITE_SCRIPT + SFX_PAN_DIVISOR_AT;
+    at[1] = (BYTE *)SFX_PAN_SITE_OPERATION + SFX_PAN_DIVISOR_AT;
+    for (k = 0; k < 2; k++)
+        if (!VirtualProtect(at[k], 1, PAGE_EXECUTE_READWRITE, &old_protect[k])) {
+            log_line("sfx pan: NOT fixed: the code at %08lx could not be written (VirtualProtect error %lu): nothing written, the game's pan",
+                     (DWORD)at[k], GetLastError());
+            if (k)
+                VirtualProtect(at[0], 1, old_protect[0], &old_protect[0]);
+            return FALSE;
+        }
+    for (k = 0; k < 2; k++)
+        at[k][0] = divisor;
+    for (k = 0; k < 2; k++) {
+        VirtualProtect(at[k], 1, old_protect[k], &old_protect[k]);
+        FlushInstructionCache(GetCurrentProcess(), at[k], 1);
+    }
+    return TRUE;
+}
+
+static void sfx_pan_keys_begin(void)
+{
+    sfx_pan_asked = 1;
+}
+
+/* 0: not this key; 1: read; -1: a mistake (*fault says what; on is used). */
+static int sfx_pan_key_line(char *start, char *key_end, char *value, char *stop, const char **fault)
+{
+    if (!word_is(start, key_end, "sfx_pan_fix"))
+        return 0;
+    if (word_is(value, stop, "on") || word_is(value, stop, "yes"))
+        sfx_pan_asked = 1;
+    else if (word_is(value, stop, "off") || word_is(value, stop, "no"))
+        sfx_pan_asked = 0;
+    else {
+        sfx_pan_asked = 1;
+        *fault = "sfx_pan_fix must be on or off: on is used";
+        return -1;
+    }
+    return 1;
+}
+
+/* After each reading of the game file: the sites are patched at the first reading only; a later change waits for the next start. */
+static void sfx_pan_keys_settle(void)
+{
+    static const char *const said[] = { "the game's", "divisor 10", "neither" };
+    int state[2];
+
+    if (InterlockedExchange(&sfx_pan_settled, 1)) {
+        if (sfx_pan_asked != sfx_pan_taken)
+            log_line("sfx pan: the game file now says sfx_pan_fix = %s; it is %s for this run (taken at start-up): restart the game for the change",
+                     sfx_pan_asked ? "on" : "off", sfx_pan_taken ? "on" : "off");
+        return;
+    }
+    sfx_pan_taken = sfx_pan_asked;
+    if (!sfx_pan_asked) {
+        log_line("sfx pan: off (sfx_pan_fix = off): nothing written; the battle's sound pan is the game's (it wraps at the screen's centre)");
+        return;
+    }
+    state[0] = sfx_pan_site_state((const BYTE *)SFX_PAN_SITE_SCRIPT, 0);
+    state[1] = sfx_pan_site_state((const BYTE *)SFX_PAN_SITE_OPERATION, 1);
+    if (state[0] == 1 && state[1] == 1) {
+        log_line("sfx pan: on: %08lx and %08lx already hold divisor 10 (written before the DLL looked): nothing written",
+                 SFX_PAN_SITE_SCRIPT + SFX_PAN_DIVISOR_AT, SFX_PAN_SITE_OPERATION + SFX_PAN_DIVISOR_AT);
+        return;
+    }
+    if (state[0] != 0 || state[1] != 0) {
+        log_line("sfx pan: NOT fixed: the code at %08lx is %s, at %08lx %s (both must be the game's: movsx / cdq / mov ecx,5 / idiv / shl / and 7f): nothing written",
+                 SFX_PAN_SITE_SCRIPT, said[state[0] < 0 ? 2 : state[0]], SFX_PAN_SITE_OPERATION, said[state[1] < 0 ? 2 : state[1]]);
+        return;
+    }
+    if (sfx_pan_write(SFX_PAN_DIVISOR_FIXED))
+        log_line("sfx pan: fixed: the battle's sound pan divisor 5 -> 10 at %08lx (model script sounds) and %08lx (sound operation 0x2a): pan 0-126 across the 640-wide screen (x 319: %d, x 320: %d; were %d and %d)",
+                 SFX_PAN_SITE_SCRIPT + SFX_PAN_DIVISOR_AT, SFX_PAN_SITE_OPERATION + SFX_PAN_DIVISOR_AT, sfx_pan_of(319, SFX_PAN_DIVISOR_FIXED),
+                 sfx_pan_of(320, SFX_PAN_DIVISOR_FIXED), sfx_pan_of(319, SFX_PAN_DIVISOR_GAME), sfx_pan_of(320, SFX_PAN_DIVISOR_GAME));
+}
+/* ==== SFX PAN END ==== */
+
 /* ---- Game settings: test_battle (a testing aid) -----------------------------------------
    Every battle the game starts becomes the one named, until the line is removed. FUN_00408243,
    called only from the swirl's mode (0x17) in the main loop when the swirl hands over to the
@@ -54432,6 +59110,8 @@ static void enemies_keys_settle(void)
 #define EN_KEYS_MAX             1024
 #define EN_SECTION_KEYS_MAX     48
 #define EN_NAME_MAX             31
+#define EN_STAGE_NAME_MAX       15          /* (stage model) a stage's or a section's folder name */
+#define EN_STAGE_SECTIONS_MAX   16          /* (stage section) the sections a stage.ini may name, 1-16 */
 #define EN_PROBLEM_MAX          1024        /* wvsprintfA writes at most 1024 bytes */
 #define EN_ITEM_NAMES           128         /* items 0-127 by name (the compiler's kernel2 section) */
 #define EN_TABLE_MAX            (3 * EN_SECTIONS_MAX)
@@ -54495,6 +59175,11 @@ struct en_result {
     struct en_fx { WORD id, effect, effect_all, camera_multi; } fx[3][16];  /* effect 0 / camera_multi ffff: none */
     BYTE surrounded[4];         /* (surrounded, stage 1) the formation's kind is `surrounded`: its image says kind 0 (normal) */
     short party_radius[4], party_front[4];  /* (surrounded) its keys, or their defaults */
+    int far_plane[4];           /* (far plane) the formation's `far_plane`, EN_FAR_MIN-EN_FAR_MAX; 0: not given (the game's own) */
+    char stage_model[4][EN_STAGE_NAME_MAX + 1];     /* (stage model) the formation's `stage_model` NAME, lower case; "": not given */
+    char stage_section[4][EN_STAGE_NAME_MAX + 1];   /* (stage model) its SECTION, lower case; "": none (NAME\ holds every file) */
+    BYTE camera_records[4];     /* (camera records) 1: the image's camera block of the formation is its `camera_records` */
+    BYTE stage_anchor[4];       /* (stage section) the formation's `stage_section`, 1-EN_STAGE_SECTIONS_MAX; 0: not given */
     BYTE image[EN_IMAGE_SIZE];
 };
 
@@ -54535,8 +59220,9 @@ static const char *const en_scene_attack_keys[18] = {
     "mp", "formula", "effect", "impact", "sound", "effect_all", "camera_multi",
 };
 static const char *const en_kernel_attack_keys[6] = { "id", "script", "camera", "effect", "effect_all", "camera_multi" };
-static const char *const en_formation_keys[9] = { "stage", "camera", "rows", "kind", "escape_counter", "flags", "next",
-                                                   "party_radius", "party_front" };
+static const char *const en_formation_keys[13] = { "stage", "camera", "rows", "kind", "escape_counter", "flags", "next",
+                                                    "party_radius", "party_front", "far_plane", "stage_model", "camera_records",
+                                                    "stage_section" };
 #define EN_JOINED_ELEMENTS      "fire ice bolt earth poison gravity water wind holy restorative cut hit punch shoot shout hidden"
 #define EN_JOINED_STATUSES      "death near_death sleep poison sadness fury confusion silence haste slow stop frog small slow_numb petrify regen barrier mbarrier reflect dual shield death_sentence manipulate berserk peerless paralysis darkness dual_drain death_force resist lucky_girl imprisoned"
 #define EN_JOINED_RATES         "death double weak half nullify immune absorb fullcure"
@@ -54546,7 +59232,23 @@ static const char *const en_formation_keys[9] = { "stage", "camera", "rows", "ki
 #define EN_SORTED_KERNEL_KEYS   "camera camera_multi effect effect_all id script"
 #define EN_NATIVE_BASE          0x94        /* stage 6a: a scene attack's effect byte under a SpellExt effect: the game's enemy
                                                effect 94, magic effect 02's routine 005d4788 (no file; it shows the hit) */
-#define EN_SORTED_FORMATION_KEYS "camera escape_counter flags kind next party_front party_radius rows stage"
+#define EN_SORTED_FORMATION_KEYS "camera camera_records escape_counter far_plane flags kind next party_front party_radius rows stage stage_model stage_section"
+/* (far plane) a formation's `far_plane`: the distance from the eye past which the battle draws nothing. The game's
+   battle_enter (0041b3a1) writes 64000; the key raises it for that battle (far_apply). Not in the scene image (no
+   scene.bin byte), like party_radius. */
+#define EN_FAR_MIN              64000
+#define EN_FAR_MAX              400000
+/* (stage model) a formation's `stage_model = NAME[:SECTION]`: the battle's stage is the files of SpellExtConfig\stages\NAME
+   (and NAME\SECTION\, whose files win), served by the DLL under the formation's `stage` (the CARRIER location) for that
+   battle only (STAGE RUN). Each name 1 to EN_STAGE_NAME_MAX letters, digits, _ or -. The carrier must be an ordinary
+   location: the game has code of its own for 37 (the Battle Square), 57 (a draw flag on every actor), 58 (the Midgar
+   rain) and 78 (camera and script cases), read from the location number whatever files are drawn. Not in the scene
+   image (no scene.bin byte), like far_plane. A folder without aa is a note, not a refusal: the carrier's own stage plays. */
+/* (camera records) a formation's `camera_records = ex ey ez fx fy fz [| ... [| ...]]`: its camera block (0x30 bytes: three
+   records of eye x y z and focus x y z as shorts, then 12 bytes ff), which the load copies to 009a8764, is these 1 to 3
+   records instead of the stand-in's (`camera` still gives the set-up's camera words and the opening sweep, +0x13). A
+   record not given is record 0's copy. The battle rests on record [00bfcb28] (0 at the set-up). In the image. */
+#define EN_CAMERA_RECORDS_MAX   3
 
 /* ---- Surrounded (stage 1): the triangle's geometry (the compiler's refusal and the placement share it) ----
    A formation of `kind = surrounded` is a NORMAL battle to the game (kind byte 0: no script of kind 0 rewrites a home
@@ -54864,6 +59566,100 @@ static BOOL en_words_none(const char *v)
 
     return en_split(v, TRUE, start, length, 2) == 1 && length[0] == 4 && start[0][0] == 'n' && start[0][1] == 'o' &&
            start[0][2] == 'n' && start[0][3] == 'e';
+}
+
+/* (stage model) `stage_model = NAME[:SECTION]` (white space round it): each part 1 to EN_STAGE_NAME_MAX letters, digits,
+   _ or -, into name and section (EN_STAGE_NAME_MAX + 1 each), lower case; section "" without one. FALSE: refused. */
+static BOOL en_stage_model(const char *v, const char *where, char *name, char *section)
+{
+    const char *c = v, *e = v + en_len(v), *colon = NULL, *p;
+    char *out;
+    int part, length, colons = 0;
+
+    name[0] = section[0] = 0;
+    while (c < e && en_space(*c))
+        c++;
+    while (e > c && en_space(e[-1]))
+        e--;
+    for (p = c; p < e; p++)
+        if (*p == ':' && !colons++)
+            colon = p;
+    if (colons > 1)
+        goto bad;
+    for (part = 0; part < (colon ? 2 : 1); part++) {
+        const char *start = part ? colon + 1 : c, *stop = part ? e : (colon ? colon : e);
+
+        out = part ? section : name;
+        length = (int)(stop - start);
+        if (length < 1 || length > EN_STAGE_NAME_MAX)
+            goto bad;
+        for (p = start; p < stop; p++)
+            if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') || (*p >= '0' && *p <= '9') || *p == '_' || *p == '-'))
+                goto bad;
+        for (p = start; p < stop; p++)
+            *out++ = en_lower(*p);
+        *out = 0;
+    }
+    return TRUE;
+bad:
+    name[0] = section[0] = 0;
+    return en_fail("%.320s: stage_model is NAME or NAME:SECTION, each 1 to %d letters, digits, _ or - (a folder of SpellExtConfig\\stages, like mystage:s1)",
+                   where, EN_STAGE_NAME_MAX);
+}
+
+/* (camera records) `camera_records`: 1 to EN_CAMERA_RECORDS_MAX records split at |, each six numbers (white space or
+   commas between) -32768..32767, eye x y z then focus x y z, the eye not the focus; written into `block` (0x30 bytes:
+   the records as shorts, a record not given record 0's copy, then 12 bytes ff). FALSE: refused, block untouched. */
+static BOOL en_camera_records(const char *v, const char *where, BYTE *block)
+{
+    short record[EN_CAMERA_RECORDS_MAX][6];
+    const char *c = v;
+    int count = 0, i, j;
+
+    for (;;) {
+        const char *e = c, *start[7];
+        int length[7], words;
+
+        while (*e && *e != '|')
+            e++;
+        if (count == EN_CAMERA_RECORDS_MAX)
+            return en_fail("%.320s: camera_records is 1 to %d records split by |, each eye x y z focus x y z", where, EN_CAMERA_RECORDS_MAX);
+        {
+            char piece[256];
+
+            if (e - c >= (int)sizeof piece)
+                return en_fail("%.320s: camera record %d is too long", where, count);
+            en_copy(piece, sizeof piece, c, (int)(e - c));
+            words = en_split(piece, TRUE, start, length, 7);
+            if (words != 6)
+                return en_fail("%.320s: camera record %d has %d numbers: a record is six, eye x y z focus x y z", where, count, words);
+            for (i = 0; i < 6; i++) {
+                char number[64];
+                long long n;
+
+                en_copy(number, sizeof number, start[i], length[i]);
+                if (!en_number(number, where, -32768, 32767, &n))
+                    return FALSE;
+                record[count][i] = (short)n;
+            }
+        }
+        if (record[count][0] == record[count][3] && record[count][1] == record[count][4] && record[count][2] == record[count][5])
+            return en_fail("%.320s: camera record %d's eye is its focus (it looks nowhere)", where, count);
+        count++;
+        if (!*e)
+            break;
+        c = e + 1;
+    }
+    for (i = 0; i < EN_CAMERA_RECORDS_MAX; i++)
+        for (j = 0; j < 6; j++) {
+            short n = record[i < count ? i : 0][j];
+
+            block[12 * i + 2 * j] = (BYTE)n;
+            block[12 * i + 2 * j + 1] = (BYTE)((WORD)n >> 8);
+        }
+    for (i = 12 * EN_CAMERA_RECORDS_MAX; i < 0x30; i++)
+        block[i] = 0xff;
+    return TRUE;
 }
 
 /* ---- the text files (s0_common.read_ini and overlay) ---- */
@@ -55957,7 +60753,7 @@ static BOOL en_build(const struct en_env *env, const char *name, int want, DWORD
         list_count[f] = c;
     }
     for (f = 0; f < 4; f++) {
-        struct en_key *keyed[9];
+        struct en_key *keyed[13];
         BYTE *setup = img + EN_O_SETUP + 0x14 * f, *camera_out = img + EN_O_CAMERA + 0x30 * f, *row;
         BYTE stand_setup[0x14], stand_camera[0x30];
         long long part[3];
@@ -55966,13 +60762,13 @@ static BOOL en_build(const struct en_env *env, const char *name, int want, DWORD
         int row_length[8];
         short row_x[6], row_z[6];       /* (surrounded) the rows' places, for the count in front of each party place */
 
-        for (i = 0; i < 9; i++)
+        for (i = 0; i < 13; i++)
             keyed[i] = NULL;
         for (i = 0; i < list_count[f]; i++) {
             k = list[f][i];
-            for (j = 0; j < 9 && en_cmp(k->key, en_formation_keys[j]); j++)
+            for (j = 0; j < 13 && en_cmp(k->key, en_formation_keys[j]); j++)
                 ;
-            if (j == 9)
+            if (j == 13)
                 return en_fail("%.320s: unknown key \"%.320s\" (keys: %.320s)", en_at(k), k->key, EN_SORTED_FORMATION_KEYS);
             keyed[j] = k;
         }
@@ -56022,6 +60818,9 @@ static BOOL en_build(const struct en_env *env, const char *name, int want, DWORD
         r->party_radius[f] = (short)n;
         if (keyed[8]) { if (!en_number(keyed[8]->value, en_at(keyed[8]), 0, 359, &n)) return FALSE; } else n = 0;
         r->party_front[f] = (short)n;
+        /* (far plane) beside the image too: 0 when not given (nothing is written: the game's own far plane) */
+        if (keyed[9]) { if (!en_number(keyed[9]->value, en_at(keyed[9]), EN_FAR_MIN, EN_FAR_MAX, &n)) return FALSE; } else n = 0;
+        r->far_plane[f] = (int)n;
         if (!keyed[6] || en_lower_is(keyed[6]->value, "none"))
             n = 0xffff;
         else if (!en_number(keyed[6]->value, en_at(keyed[6]), 0, 0xfffe, &n))
@@ -56049,6 +60848,47 @@ static BOOL en_build(const struct en_env *env, const char *name, int want, DWORD
             if (f == r->formation)
                 r->stand_bytes = 1;
         }                               /* (else ff: the game's own load of the stand-in gives them) */
+        /* (camera records) the block is the key's, over the stand-in's (enemies_overwrite gives it to the battle) */
+        r->camera_records[f] = 0;
+        if (keyed[11]) {
+            if (!en_camera_records(keyed[11]->value, en_at(keyed[11]), camera_out))
+                return FALSE;
+            r->camera_records[f] = 1;
+        }
+        /* (stage model) beside the image: the folder the DLL serves the carrier's files from, for this battle */
+        r->stage_model[f][0] = r->stage_section[f][0] = 0;
+        if (keyed[10]) {
+            int carrier = setup[0] | setup[1] << 8;
+            char relative[64];
+
+            if (!en_stage_model(keyed[10]->value, en_at(keyed[10]), r->stage_model[f], r->stage_section[f]))
+                return FALSE;
+            if (carrier == 37 || carrier == 57 || carrier == 58 || carrier == 78)
+                return en_fail("%.320s: stage_model needs an ordinary carrier location, and stage %d is not one (the game has code of its own for 37, 57, 58 and 78)",
+                               en_at(keyed[10]), carrier);
+            wsprintfA(relative, "stages\\%s\\aa", r->stage_model[f]);
+            if (f == r->formation && !env->exists(relative)) {
+                char line[400];
+
+                wsprintfA(relative, "stages\\%s\\%s\\aa", r->stage_model[f], r->stage_section[f]);
+                if (!r->stage_section[f][0] || !env->exists(relative)) {
+                    wsprintfA(line, "enemies: scene %.31s [formation %d]: stage_model %s%s%s: SpellExtConfig\\stages\\%s\\ has no aa: location %d's own stage plays",
+                              name, f, r->stage_model[f], r->stage_section[f][0] ? ":" : "", r->stage_section[f],
+                              r->stage_model[f], carrier);
+                    env->note(line);
+                }
+            }
+        }
+        /* (stage section) beside the image: the anchor of the served folder's stage.ini the battle starts at (the
+           DLL reads stage.ini at the battle; a section it does not name serves nothing then) */
+        r->stage_anchor[f] = 0;
+        if (keyed[12]) {
+            if (!keyed[10])
+                return en_fail("%.320s: stage_section needs stage_model (the folder whose stage.ini names the sections)", en_at(keyed[12]));
+            if (!en_number(keyed[12]->value, en_at(keyed[12]), 1, EN_STAGE_SECTIONS_MAX, &n))
+                return FALSE;
+            r->stage_anchor[f] = (BYTE)n;
+        }
         rows = en_split(keyed[2]->value, FALSE, row_start, row_length, 8);
         if (rows < 1 || rows > 6)
             return en_fail("%.320s: 1 to 6 rows", en_at(keyed[2]));
@@ -57459,6 +62299,8 @@ static void enemies_game_scene(void)
 {
     if (*(const DWORD *)ADDR_LOADER_STATE == 0 && enemies_battle_assigned)
         enemies_battle_release("a battle of the game's own loads");
+    if (*(const DWORD *)ADDR_LOADER_STATE == 0)
+        far_apply(0, "a battle of the game's own loads");  /* (far plane) a `next` into it: a raised far plane put back */
 }
 
 /* ---- the hand-over (battle_number_hook) ---- */
@@ -57912,7 +62754,6 @@ static BYTE *battle_menu_record_of(int id)
    checks as the field capacity's. Once; FALSE: the party is not put back after a test battle. */
 static BOOL battle_menu_field_hook(void)
 {
-    static const BYTE before[5] = { 0x68, 0xf0, 0x1e, 0xcc, 0x00 };     /* push 00cc1ef0: the field's name */
     static const BYTE after[5] = { 0x83, 0xc4, 0x04, 0x85, 0xc0 };      /* add esp, 4 / test eax, eax */
     const BYTE *code = (const BYTE *)(SITE_FIELD_READ - 5);
 
@@ -57924,7 +62765,7 @@ static BOOL battle_menu_field_hook(void)
                  SITE_FIELD_READ);
         return TRUE;
     }
-    if (!fields_bytes_are(SITE_FIELD_READ - 5, before, 5) || !fields_bytes_are(SITE_FIELD_READ + 5, after, 5))
+    if (!flim_push_ok(code) || !fields_bytes_are(SITE_FIELD_READ + 5, after, 5))     /* push 00cc1ef0 (field limits: or the moved name) */
         bm_field_hook = -1;
     else
         bm_field_hook = patch_call_chained(SITE_FIELD_READ, FN_FIELD_READ, field_read_hook, &field_read_next) ? 1 : -1;
@@ -58019,7 +62860,7 @@ static void battle_menu_start(LONG battle, BOOL locked)
     *(BYTE *)ADDR_FIELD_RANDOM_MARK = 1;
     InterlockedExchange(&battle_menu_pending, battle);
     log_line("battle menu: START battle %ld (DLL scene %ld '%s', formation %ld) asked from field %u (%.15s; its random battles %s): 00cc0d89 = 2, 00cc0d8a = %ld, 00cc1658 = 1 and the menu closed (00dc12f4 = 1); test mode: rewards %s, a loss %s, the party %s%s",
-             battle, battle >> 2, name, battle & 3, *(const WORD *)ADDR_FIELD_MODULE_ID, (const char *)ADDR_FIELD_NAME,
+             battle, battle >> 2, name, battle & 3, *(const WORD *)ADDR_FIELD_MODULE_ID, (const char *)flim_field_name,
              locked ? "off" : "on", battle, bm_request_rewards ? "given" : "off", bm_request_lose ? "returns to the field" : "is a game over",
              bm_request_restore ? "put back" : battle_menu_restores() ? "NOT put back (the field reader is not hooked)" : "as the battle leaves it",
              bm_request_fast ? "; no fanfare, no victory pose" : "");
@@ -58291,6 +63132,7 @@ static void __cdecl sur_party_place_hook(void)
 static void __cdecl sur_next_enemies_hook(void)
 {
     ((void (__cdecl *)(void))FN_SUR_ENEMY_PLACE)();
+    stage_move_placed();                /* (stage section) the next formation's enemies are placed: a cut may fade back */
     if (sur.armed)
         sur_apply("a next formation");
     else if (sur.placed) {
@@ -58909,6 +63751,1456 @@ static void install_surrounded_rules(int *ok, int *total)
              sur_back_live > 0 ? "on" : "NOT on", ADDR_HIT_STEP_PHYSICAL);
 }
 
+/* ---- The far plane: a DLL scene's formation's `far_plane` ----
+   The battle's far plane is the float at game + 0x9a4 (the game object *00db2bb8, FUN_00676578's): nothing farther
+   from the eye is drawn. The battle mode's enter battle_enter_0041b300 writes 64000.0 there (0041b3a1) and hands it
+   to the projection engine_sub_0067ccde (0041b3fb; cdecl, 8 arguments: fov +0x99c, near +0x9a0, far +0x9a4, the two
+   words +0x9a8 / +0x9ac, the viewport's width +0x850 and height +0x854 as floats, the game object). The routine
+   builds the projection, gives it to the driver (00660be3(2, ..); FFNx 1.24.3's common_setmatrix copies it), stores
+   the five words back (the far at 0067cd86) and refreshes game + 0x890 / + 0x8d0 (the cursors', the damage
+   numbers'). Every battle frame the game calls it again with the word as it stands (FUN_0066067a from the battle's
+   main loop, FUN_00661a1c from 0042d929, which turns the battle's H into the fov); nothing in a battle writes the
+   word after 0041b3a1 (every store of +0x9a4 in the exe: 0040a3a8, 00676511, 0041b3a1, the field's 0060e150 /
+   0060e33d / 0060ee30, the world map's 0074bcec, the condor's 005f4814 / 005f4be9, the chocobo race's 0076d5db /
+   0076dd65, the coaster's 005e8b12, the submarine's 00799075, and 0067cd86 for what the routine is given: the
+   highway's 40000 at 0065a531, the snowboard's 16384 at 00722f4f, the submarine's 65536 at 0077d078).
+   A formation with `far_plane = N` (EN_FAR_MIN-EN_FAR_MAX): at its overwrite (enemies_overwrite, inside the scene's
+   load in the logic set-up: after battle_enter, before any frame of the visual set-up; a `next` formation's too)
+   the word becomes N and the routine is called as battle_enter calls it (far_set); the per-frame calls keep it. A
+   formation without the key, a scene of the game's (a `next` into one), a DLL scene that cannot be built (the
+   stand-in battle 0 plays) and the battle's end put back the word found before the raise (battle_enter's 64000),
+   only while the word is still the one this DLL wrote: a word changed since by someone else is left as it is (one
+   line). The battle's end is the battle module's exit FUN_0041b87d (mode 2's, run at every switch out of the battle:
+   a win, an escape, a loss, a game over; FFNx's ff7_engine_exit_game_mode calls it too, before the next mode's
+   enter): its call of battle_end_free_00428f59 at 0041b8a6 is chained, the game's routine first. So a raised
+   battle leaves the game object as a vanilla battle leaves it (the field writes its own 32000 on both its entry
+   paths whatever it finds, but the world map writes its 40000 only on one: 0074bcec, under DAT_00e045ec == 0).
+   No other mode's far plane is touched, nothing runs per frame, no task. All or nothing at start-up (install_far):
+   every byte this reads or calls checked first; refused, a formation's key is logged and not applied. */
+#define SITE_FAR_BATTLE_WRITE   0x0041b3a1u  /* in battle_enter_0041b300: c7 80 a4 09 00 00 00 00 7a 47 (game + 0x9a4 = 64000.0) */
+#define SITE_FAR_BATTLE_READ    0x0041b3e0u  /* 8b 82 a4 09 00 00: the projection's far argument, read from the word */
+#define SITE_FAR_BATTLE_CALL    0x0041b3fbu  /* e8 de 18 26 00 (call 0067ccde), then 83 c4 20 (cdecl, 8 arguments) */
+#define FN_FAR_PROJECTION       0x0067ccdeu  /* engine_sub_0067ccde(fov, near, far, x, y, width, height, game): 55 8b ec 83 ec 48 */
+#define SITE_FAR_STORE          0x0067cd86u  /* in it: 89 88 a4 09 00 00 (the far it is given, stored back) */
+#define SITE_FAR_GAME_OBJECT    0x0067657bu  /* in FUN_00676578: a1 b8 2b db 00 (it returns *ADDR_GAME_OBJECT) */
+#define SITE_FAR_BATTLE_EXIT    0x0041b8a6u  /* in FUN_0041b87d (the battle mode's exit): e8 07 35 2b 00 [e8 ae d6 00 00] 6a 00 6a 00 */
+#define FN_FAR_BATTLE_END       0x00428f59u  /* battle_end_free_00428f59(): the task lists emptied, the battle's 3D data freed */
+#define FAR_GAME_FOV            0x99cu       /* the game object's floats: fov (battle_enter: 90.0) */
+#define FAR_GAME_NEAR           0x9a0u       /* near (250.0) */
+#define FAR_GAME_FAR            0x9a4u       /* far (64000.0) */
+#define FAR_GAME_X              0x9a8u       /* the two words after it (0 in a battle; the field's world place in the field) */
+#define FAR_GAME_Y              0x9acu
+#define FAR_GAME_WIDTH          0x850u       /* ints: the viewport's width and height (FUN_0066067a) */
+#define FAR_GAME_HEIGHT         0x854u
+#define FAR_GAME_READ           0x9b0u       /* the game object's bytes read */
+#define FAR_LOG_MAX             200
+
+/* FAR PURE BEGIN  (no Win32 call inside: tested natively, junon_cannon_stage/stage2a/dll/test) */
+struct far_state {
+    int raised;                 /* the word at game + 0x9a4 is the one this DLL wrote (`wrote`) */
+    DWORD found, wrote;         /* the word found before the raise (put back), and the word written */
+};
+#define FAR_KEEP                0   /* nothing to write */
+#define FAR_RAISE               1   /* write *word (the formation's far plane) */
+#define FAR_PUT_BACK            2   /* write *word (the word found before the raise) */
+#define FAR_LEFT                3   /* the word is not the one this DLL wrote: changed by someone else since; left as it is */
+
+/* A whole distance as the float word the game keeps (exact: EN_FAR_MAX is far below 2^24). */
+static DWORD far_word_of(int distance)
+{
+    union { float f; DWORD d; } u;
+
+    u.f = (float)distance;
+    return u.d;
+}
+
+/* The float word as a whole distance, for the log (0 when it is none). */
+static int far_distance_of(DWORD word)
+{
+    union { float f; DWORD d; } u;
+
+    u.d = word;
+    if (!(u.f > -2.0e9f && u.f < 2.0e9f))
+        return 0;
+    return (int)u.f;
+}
+
+/* The battle being set up wants far plane `want` (0: the game's own); the word now at game + 0x9a4 is `now`. What to
+   write (into *word) and the state after it. A raise keeps the word it found (the first raise of a `next` chain's);
+   a put-back only while the word is still this DLL's. */
+static int far_decide(struct far_state *s, int want, DWORD now, DWORD *word)
+{
+    if (want <= 0) {
+        if (!s->raised)
+            return FAR_KEEP;
+        s->raised = 0;
+        if (now != s->wrote)
+            return FAR_LEFT;
+        *word = s->found;
+        return FAR_PUT_BACK;
+    }
+    *word = far_word_of(want);
+    if (s->raised && now == s->wrote) {
+        if (now == *word)
+            return FAR_KEEP;            /* (a `next` formation with the same far plane) */
+    } else
+        s->found = now;                 /* (not raised; or changed since by someone else: then what is there now is put back) */
+    s->raised = 1;
+    s->wrote = *word;
+    return FAR_RAISE;
+}
+/* FAR PURE END */
+
+/* FAR RUN BEGIN  (IsBadReadPtr, InterlockedIncrement, wsprintfA, log_line, bytes_are and patch_call: the native test
+   stubs or extracts them, with the game object, the projection and the battle's end at addresses of its own) */
+static LONG far_on;             /* 1: on (the battle's exit chained); -1: refused at start-up; 0: enemies off (never tried) */
+static LONG far_logged;
+static struct far_state far_now;
+
+/* The far word becomes `word` and the projection is built again from it, as battle_enter builds it (its eight
+   arguments, the far the word written). FALSE, nothing written, without a readable game object. */
+static BOOL far_set(DWORD word)
+{
+    DWORD game = *(const DWORD *)ADDR_GAME_OBJECT;
+
+    if (!game || IsBadReadPtr((const void *)game, FAR_GAME_READ))
+        return FALSE;
+    *(DWORD *)(game + FAR_GAME_FAR) = word;
+    ((void (__cdecl *)(DWORD, DWORD, DWORD, DWORD, DWORD, float, float, DWORD))FN_FAR_PROJECTION)(
+        *(const DWORD *)(game + FAR_GAME_FOV), *(const DWORD *)(game + FAR_GAME_NEAR), word,
+        *(const DWORD *)(game + FAR_GAME_X), *(const DWORD *)(game + FAR_GAME_Y),
+        (float)*(const int *)(game + FAR_GAME_WIDTH), (float)*(const int *)(game + FAR_GAME_HEIGHT), game);
+    return TRUE;
+}
+
+/* The battle being set up (`where`, for the log) wants far plane `want` (0: the game's own). Main thread: the scene
+   load (load_scene_hook) and the battle module's exit. */
+static void far_apply(int want, const char *where)
+{
+    DWORD game = *(const DWORD *)ADDR_GAME_OBJECT, now, word = 0;
+    struct far_state before = far_now;
+    int action;
+
+    if (far_on <= 0) {
+        if (want > 0 && InterlockedIncrement(&far_logged) <= FAR_LOG_MAX)
+            log_line("far_plane: %s asks for far plane %d, but the far plane is NOT on (start-up line \"far_plane:\"): the game's own is kept",
+                     where, want);
+        return;
+    }
+    if (!game || IsBadReadPtr((const void *)game, FAR_GAME_READ)) {
+        if ((want > 0 || far_now.raised) && InterlockedIncrement(&far_logged) <= FAR_LOG_MAX)
+            log_line("far_plane: %s: no game object (*%08lx = %08lx): nothing is written", where, ADDR_GAME_OBJECT, game);
+        return;
+    }
+    now = *(const DWORD *)(game + FAR_GAME_FAR);
+    action = far_decide(&far_now, want, now, &word);
+    if (action == FAR_KEEP) {
+        if (want > 0 && InterlockedIncrement(&far_logged) <= FAR_LOG_MAX)
+            log_line("far_plane: %s: the far plane stays %d", where, want);
+        return;
+    }
+    if (action == FAR_LEFT) {
+        if (InterlockedIncrement(&far_logged) <= FAR_LOG_MAX)
+            log_line("far_plane: %s: the far plane is %d, not the %d this DLL wrote (someone else changed it): left as it is",
+                     where, far_distance_of(now), far_distance_of(before.wrote));
+        return;
+    }
+    if (!far_set(word)) {
+        far_now = before;               /* (not reached: the game object was read above) */
+        return;
+    }
+    if (InterlockedIncrement(&far_logged) <= FAR_LOG_MAX) {
+        if (action == FAR_RAISE)
+            log_line("far_plane: %s: the far plane is %d (it was %d)", where, want, far_distance_of(now));
+        else
+            log_line("far_plane: %s: the far plane %d is put back (the key had raised it to %d)", where,
+                     far_distance_of(word), far_distance_of(before.wrote));
+    }
+}
+
+/* The battle module's exit, at its call of battle_end_free_00428f59: the game's routine, then a raised far plane
+   put back (nothing else when the battle did not raise it). */
+static void __cdecl far_exit_hook(void)
+{
+    ((void (__cdecl *)(void))FN_FAR_BATTLE_END)();
+    far_apply(0, "the battle is over");
+    stage_release("the battle is over");    /* (stage model) a served stage given back */
+    stage_move_release("the battle is over");   /* (stage section) */
+}
+
+/* enemies_start: every byte read and called checked, then the battle's exit chained; all or nothing. */
+static void install_far(int *ok, int *total)
+{
+    static const BYTE battle_write[] = { 0xc7, 0x80, 0xa4, 0x09, 0x00, 0x00, 0x00, 0x00, 0x7a, 0x47 };
+    static const BYTE battle_read[] = { 0x8b, 0x82, 0xa4, 0x09, 0x00, 0x00 };
+    static const BYTE battle_call[] = { 0xe8, 0xde, 0x18, 0x26, 0x00, 0x83, 0xc4, 0x20 };
+    static const BYTE projection_start[] = { 0x55, 0x8b, 0xec, 0x83, 0xec, 0x48 };
+    static const BYTE projection_store[] = { 0x89, 0x88, 0xa4, 0x09, 0x00, 0x00 };
+    static const BYTE game_object[] = { 0xa1, 0xb8, 0x2b, 0xdb, 0x00 };
+    static const BYTE exit_before[] = { 0xe8, 0x07, 0x35, 0x2b, 0x00 };    /* call 006cedad */
+    static const BYTE exit_after[] = { 0x6a, 0x00, 0x6a, 0x00 };           /* push 0; push 0 (FUN_00661b23's) */
+    static const struct { DWORD at; const BYTE *bytes; int count; } checks[] = {
+        { SITE_FAR_BATTLE_WRITE, battle_write, sizeof battle_write },
+        { SITE_FAR_BATTLE_READ, battle_read, sizeof battle_read },
+        { SITE_FAR_BATTLE_CALL, battle_call, sizeof battle_call },
+        { FN_FAR_PROJECTION, projection_start, sizeof projection_start },
+        { SITE_FAR_STORE, projection_store, sizeof projection_store },
+        { SITE_FAR_GAME_OBJECT, game_object, sizeof game_object },
+        { SITE_FAR_BATTLE_EXIT - 5, exit_before, sizeof exit_before },
+        { SITE_FAR_BATTLE_EXIT + 5, exit_after, sizeof exit_after },
+    };
+    char differ[sizeof checks / sizeof checks[0] * 9 + 1];
+    unsigned i;
+    int n = 0;
+
+    (*total)++;
+    differ[0] = 0;
+    for (i = 0; i < sizeof checks / sizeof checks[0]; i++)
+        if (!bytes_are(checks[i].at, checks[i].bytes, checks[i].count))
+            n += wsprintfA(differ + n, " %08lx", checks[i].at);
+    if (n) {
+        far_on = -1;
+        log_line("far_plane: NOT on: the bytes at%s are not as the exe has them: a formation's far_plane is not applied (the game's 64000 is kept)", differ);
+        return;
+    }
+    if (!patch_call(SITE_FAR_BATTLE_EXIT, FN_FAR_BATTLE_END, far_exit_hook)) {
+        far_on = -1;
+        log_line("far_plane: NOT on: the battle's exit call at %08lx could not be chained (the line above): a formation's far_plane is not applied (the game's 64000 is kept)",
+                 SITE_FAR_BATTLE_EXIT);
+        return;
+    }
+    (*ok)++;
+    far_on = 1;
+    log_line("far_plane: on (the far at game + 0x%x; battle_enter's 64000 at %08lx; the projection %08lx called as at %08lx; the battle's exit %08lx -> %08lx chained: a raised far plane is put back): a DLL scene's formation with far_plane = N (%d to %d) draws to N",
+             FAR_GAME_FAR, SITE_FAR_BATTLE_WRITE, FN_FAR_PROJECTION, SITE_FAR_BATTLE_CALL, SITE_FAR_BATTLE_EXIT, FN_FAR_BATTLE_END,
+             EN_FAR_MIN, EN_FAR_MAX);
+}
+/* FAR RUN END */
+
+/* ---- The stage model: a DLL scene's formation's `stage_model` (served stages) ----
+   How the game loads a battle's stage (READ FROM CODE, junon_cannon_stage/stage3b/PLAN.md 1.1): the visual set-up
+   battle_setup_00429ac0 makes the battle's 3D data (009adfd8), then battle_load_camera_data_0042a0e7 calls
+   load_battle_stage_00428df7(0, location, ..) through FFNx's achievements wrapper at 0042a15f; it names the stage
+   "STAGE%02d.DAT" (00428eda) and load_battle_stage_pc_005e1bc6 (00428f48, which FFNx derives) reads STAGEnn.D (the
+   header: word 0 = 1, the bones at +0x0c = 0, the parts at +0x14, the textures at +0x18), .B (8 bytes: the draw mode
+   and split), every .Pkk (k < parts) and every .Tmm (m < textures). The archive's name of each is the location's battle
+   model, 370 + nn, as two letters (005e2460: location 60 is qo..) and a suffix: aa the header, ab the descriptor, ac+m
+   the textures, am+k the parts. Under FFNx every open goes through its open_file / lgp_open_file, which fopens
+   <game>\direct\battle\<four letters> first: an open through the driver's CreateFileA/W imports, which this DLL already
+   answers for a DLL battle's pool models (driver_create_file_a/w; seen working in the game).
+   A formation with `stage_model = NAME[:SECTION]`: at its overwrite (enemies_overwrite, the battle's first load: its 3D
+   data not made yet) every file the header lists is found (SpellExtConfig\stages\NAME\SECTION\ first, then
+   SpellExtConfig\stages\NAME\, each by its two letters) and checked, all before anything is served: the header and the
+   descriptor as the vanilla 90 have them, each texture's version 1 and its whole size from its header, each part's
+   version 1 and EXACTLY the size its counts give (FFNx's load_p_file reads that list; the vanilla 1,194 parts and 586
+   textures all match). Only then is the table filled and armed, and the driver's two slots taken (stage_battle_holds,
+   one more reason of driver_opens_settle): the driver's opens of direct\battle\<the carrier's letters><suffix> are
+   given the stage's files while the battle loads. Any check failing: nothing is served (one line), the carrier's own
+   files load (all or nothing: a half-served stage is never handed to the loader). Given back (stage_release) at the
+   battle's end (far_exit_hook, the battle module's exit, when far_plane is on), at every new scene load
+   (load_scene_hook, before its overwrite), and from the driver's opens once the battle's 3D data, seen made, is gone
+   (stage_watch, as the pool models'). A `next` formation loads no stage (the game keeps the loaded one): its key is
+   logged. The carrier is an ordinary location (the build refuses 37 57 58 78): every rule the game keys on the
+   location number is that location's; the stage's own draw rules (mode, split, mask bits) come from its files. FFNx
+   names the stage's textures by the game's data name, STAGEnn (HD files battle\STAGEnn_Tmm_00, the lighting list): the
+   carrier's (PLAN 1.2). No site of the game or of FFNx is patched for it: only the driver's import slots, as before.
+   Needs the driver's slots (FFNx): with the stock driver or none found, it is not on (one line at start-up). */
+/* STAGE PURE BEGIN  (no Win32 call inside but wsprintfA: tested natively, junon_cannon_stage/stage3b/dll/test) */
+#define STAGE_FOLDER_NAME       "stages"
+#define STAGE_SUFFIXES          112         /* aa ab, ac..al (textures 0-9), am.. (parts 0-99): suffix n = letters n / 26, n % 26 */
+#define STAGE_SUFFIX_TEXTURE    2
+#define STAGE_SUFFIX_PART       12
+#define STAGE_PARTS_MAX         100
+#define STAGE_TEXTURES_MAX      10
+#define STAGE_MODEL_FIRST       370         /* STAGEnn is battle model 370 + nn (005e2460's table) */
+#define STAGE_HEADER_BYTES      0x34        /* the .D: 13 words (FFNx's battle_hrc_header) */
+#define STAGE_DESCRIPTOR_BYTES  8           /* the .B: mode, split, 6 zero bytes */
+#define STAGE_MODE_MAX          5
+#define STAGE_P_HEAD            0x80        /* a .P's header (FFNx's polygon_data) */
+#define STAGE_TEX_HEAD          0xec        /* a TEX's header (FFNx's ff7_tex_header) */
+#define STAGE_HEAD_MAX          0xec
+#define STAGE_DIR_MAX           (MAX_PATH + 64)
+#define STAGE_FAULT_MAX         640
+
+/* What the check asks of the world (the DLL: stage_win_head; the native test: its own files). head reads at most `want`
+   bytes of the file at `path` into buffer and its whole size into *size: the bytes read, -1 when there is no such file,
+   -2 when it is there but cannot be read. */
+struct stage_io {
+    int (*head)(void *context, const char *path, BYTE *buffer, int want, DWORD *size);
+    void *context;
+};
+
+/* A stage made ready: where each of its files is (the table the driver's opens are answered from). */
+struct stage_table {
+    char dir[2][STAGE_DIR_MAX];         /* NAME\ and NAME\SECTION\ (each ends in a separator; [1] "" without a section) */
+    char label[2][48];                  /* the same relative to the config folder, for the log (stages\NAME\ ..) */
+    BYTE where[STAGE_SUFFIXES];         /* 0: not the stage's file; 1: in dir[0]; 2: in dir[1] */
+    char carrier[3];                    /* the carrier location's two letters (lower case) */
+    int location, parts, textures, files;
+    int mode;                           /* (stage section) the descriptor's draw mode (0-5); -1 before it is read */
+};
+
+/* The suffix index of two letters (any case), or -1 past the table. */
+static int stage_suffix_of(char a, char b)
+{
+    int x = a >= 'A' && a <= 'Z' ? a - 'A' : a >= 'a' && a <= 'z' ? a - 'a' : -1;
+    int y = b >= 'A' && b <= 'Z' ? b - 'A' : b >= 'a' && b <= 'z' ? b - 'a' : -1;
+
+    if (x < 0 || y < 0 || x * 26 + y >= STAGE_SUFFIXES)
+        return -1;
+    return x * 26 + y;
+}
+
+/* If `bare` is four letters whose first two are the table's carrier's and whose suffix is one of the stage's files: the
+   suffix index; else -1. */
+static int stage_bare_index(const struct stage_table *t, const char *bare)
+{
+    int n, i;
+
+    for (i = 0; i < 4; i++)
+        if (!((bare[i] >= 'a' && bare[i] <= 'z') || (bare[i] >= 'A' && bare[i] <= 'Z')))
+            return -1;
+    if (bare[4] || (bare[0] | 0x20) != t->carrier[0] || (bare[1] | 0x20) != t->carrier[1])
+        return -1;
+    n = stage_suffix_of(bare[2], bare[3]);
+    return n >= 0 && t->where[n] ? n : -1;
+}
+
+static DWORD stage_u32(const BYTE *b, int at)
+{
+    return (DWORD)b[at] | (DWORD)b[at + 1] << 8 | (DWORD)b[at + 2] << 16 | (DWORD)b[at + 3] << 24;
+}
+
+/* The checks of one file: NULL when it is fine, else what is wrong (`got` bytes of its head read, `size` its whole). */
+static const char *stage_check_header(const BYTE *b, int got, DWORD size, int *parts, int *textures)
+{
+    if (got < STAGE_HEADER_BYTES || size < STAGE_HEADER_BYTES)
+        return "the header is shorter than 0x34 bytes";
+    if (stage_u32(b, 0) != 1 || stage_u32(b, 0x0c) != 0)
+        return "the header is no stage's (its word 0 is not 1, or it has bones)";
+    if (stage_u32(b, 0x14) < 1 || stage_u32(b, 0x14) > STAGE_PARTS_MAX || stage_u32(b, 0x18) > STAGE_TEXTURES_MAX)
+        return "the header lists no part, more than 100 parts or more than 10 textures";
+    *parts = (int)stage_u32(b, 0x14);
+    *textures = (int)stage_u32(b, 0x18);
+    return NULL;
+}
+
+static const char *stage_check_descriptor(const BYTE *b, int got, DWORD size)
+{
+    if (got != STAGE_DESCRIPTOR_BYTES || size != STAGE_DESCRIPTOR_BYTES)
+        return "the descriptor is not 8 bytes";
+    if (b[0] > STAGE_MODE_MAX)
+        return "the descriptor's draw mode is past 5";
+    return NULL;
+}
+
+/* A part: version 1 and the size its counts give, as FFNx's load_p_file reads it (loaders.cpp: the header, then
+   field_14 x 12, vertices x 12, normals x 12, texture coordinates x 8, vertex colours x 4, polygon colours x 4, edges
+   x 4, polygons x 24, field_28 x 24, field_2c x 3, hundreds x 100, groups x 56, boxes x 28, the normal index table
+   x 4 per vertex when its flag is set). */
+static const char *stage_check_p(const BYTE *b, int got, DWORD size)
+{
+    unsigned long long want;
+
+    if (got < STAGE_P_HEAD)
+        return "the part is shorter than its header";
+    if (stage_u32(b, 0) != 1)
+        return "the part's version is not 1";
+    want = STAGE_P_HEAD + 12ull * stage_u32(b, 0x14) + 12ull * stage_u32(b, 0x0c) + 12ull * stage_u32(b, 0x10) +
+           8ull * stage_u32(b, 0x18) + 4ull * stage_u32(b, 0x1c) + 4ull * stage_u32(b, 0x24) + 4ull * stage_u32(b, 0x20) +
+           24ull * stage_u32(b, 0x24) + 24ull * stage_u32(b, 0x28) + 3ull * stage_u32(b, 0x2c) + 100ull * stage_u32(b, 0x30) +
+           56ull * stage_u32(b, 0x34) + 28ull * stage_u32(b, 0x38) + (stage_u32(b, 0x3c) ? 4ull * stage_u32(b, 0x0c) : 0);
+    if (want != size)
+        return "the part's size is not the one its counts give";
+    return NULL;
+}
+
+/* A texture: version 1 and at least the size its header gives (the header, the palette when it has one, width x
+   height x bytes per pixel, the colour key array when its flag is set: FFNx's load_tex_file). */
+static const char *stage_check_tex(const BYTE *b, int got, DWORD size)
+{
+    unsigned long long want;
+
+    if (got < STAGE_TEX_HEAD)
+        return "the texture is shorter than its header";
+    if (stage_u32(b, 0) != 1)
+        return "the texture's version is not 1";
+    want = STAGE_TEX_HEAD + (stage_u32(b, 0x4c) ? 4ull * stage_u32(b, 0x58) : 0) +
+           (unsigned long long)stage_u32(b, 0x3c) * stage_u32(b, 0x40) * stage_u32(b, 0x68) +
+           (stage_u32(b, 0xbc) ? stage_u32(b, 0x30) : 0);
+    if (want > size)
+        return "the texture is shorter than its header says";
+    return NULL;
+}
+
+/* Appends `text` to out (`capacity` bytes, `*length` used); FALSE when it does not fit. */
+static BOOL stage_append(char *out, int capacity, int *length, const char *text)
+{
+    for (; *text; text++) {
+        if (*length + 1 >= capacity)
+            return FALSE;
+        out[(*length)++] = *text;
+    }
+    out[*length] = 0;
+    return TRUE;
+}
+
+/* Finds and checks every file of stage `name` (section "" for none) under `config` (the config folder, ending in a
+   separator) for carrier `location` (0-89) into *t: TRUE when every file is there and passes; else FALSE with what is
+   wrong in fault (STAGE_FAULT_MAX), and t->files 0. A file of the section's folder wins over the stage folder's. */
+static BOOL stage_resolve(const struct stage_io *io, const char *config, const char *name, const char *section, int location,
+                          struct stage_table *t, char *fault)
+{
+    BYTE head[STAGE_HEAD_MAX];
+    int n, d, length, model, count = 2;
+
+    t->files = t->parts = t->textures = 0;
+    t->mode = -1;
+    t->location = location;
+    for (n = 0; n < STAGE_SUFFIXES; n++)
+        t->where[n] = 0;
+    fault[0] = 0;
+    for (d = 0; d < 2; d++) {
+        length = 0;
+        t->dir[d][0] = 0;
+        wsprintfA(t->label[d], d && section[0] ? "%s\\%s\\%s\\" : "%s\\%s\\", STAGE_FOLDER_NAME, name, section);
+        if (d && !section[0]) {
+            t->label[1][0] = 0;
+            continue;
+        }
+        if (!stage_append(t->dir[d], STAGE_DIR_MAX, &length, config) || !stage_append(t->dir[d], STAGE_DIR_MAX, &length, t->label[d])) {
+            wsprintfA(fault, "the path of %s is too long", t->label[d]);
+            return FALSE;
+        }
+    }
+    if (location < 0 || location > 89) {
+        wsprintfA(fault, "the carrier location %d is not 0-89", location);
+        return FALSE;
+    }
+    model = STAGE_MODEL_FIRST + location;
+    t->carrier[0] = (char)('a' + model / 26 % 26);
+    t->carrier[1] = (char)('a' + model % 26);
+    t->carrier[2] = 0;
+    for (n = 0; n < count; n++) {
+        int suffix = n < 2 ? n : n < 2 + t->textures ? STAGE_SUFFIX_TEXTURE + (n - 2) : STAGE_SUFFIX_PART + (n - 2 - t->textures);
+        int want = suffix == 0 ? STAGE_HEADER_BYTES : suffix == 1 ? STAGE_DESCRIPTOR_BYTES + 1 :
+                   suffix < STAGE_SUFFIX_PART ? STAGE_TEX_HEAD : STAGE_P_HEAD;
+        char letters[3], path[STAGE_DIR_MAX + 4];
+        const char *wrong;
+        DWORD size = 0;
+        int got = -1;
+
+        letters[0] = (char)('a' + suffix / 26);
+        letters[1] = (char)('a' + suffix % 26);
+        letters[2] = 0;
+        for (d = section[0] ? 1 : 0; d >= 0; d--) {
+            length = 0;
+            path[0] = 0;
+            stage_append(path, sizeof path, &length, t->dir[d]);
+            stage_append(path, sizeof path, &length, letters);
+            got = io->head(io->context, path, head, want, &size);
+            if (got != -1)
+                break;
+        }
+        if (got == -1) {
+            const char *what = suffix == 0 ? "the header" : suffix == 1 ? "the descriptor" : suffix < STAGE_SUFFIX_PART ? "a texture" : "a part";
+
+            if (section[0])
+                wsprintfA(fault, "%s (%s) is in neither %s nor %s", letters, what, t->label[1], t->label[0]);
+            else
+                wsprintfA(fault, "%s%s (%s) is missing", t->label[0], letters, what);
+            return FALSE;
+        }
+        if (got < 0) {
+            wsprintfA(fault, "%s%s cannot be read", t->label[d], letters);
+            return FALSE;
+        }
+        wrong = suffix == 0 ? stage_check_header(head, got, size, &t->parts, &t->textures) :
+                suffix == 1 ? stage_check_descriptor(head, got, size) :
+                suffix < STAGE_SUFFIX_PART ? stage_check_tex(head, got, size) : stage_check_p(head, got, size);
+        if (wrong) {
+            wsprintfA(fault, "%s%s (%lu bytes): %s", t->label[d], letters, size, wrong);
+            t->parts = t->textures = 0;
+            return FALSE;
+        }
+        if (suffix == 0)
+            count = 2 + t->textures + t->parts;
+        if (suffix == 1)
+            t->mode = head[0];          /* (stage section) */
+        t->where[suffix] = (BYTE)(d + 1);
+    }
+    t->files = count;
+    return TRUE;
+}
+/* STAGE PURE END */
+
+/* STAGE RUN BEGIN  (CreateFileA, GetFileSize, ReadFile, CloseHandle, the Interlocked calls, lstrcpynA, wsprintfA,
+   log_line, driver_opens_settle: the native test stubs them; enemies_staged, config_dir, enemies_driver_found and the
+   battle's 3D data at addresses of its own) */
+#define STAGE_LOG_MAX           200
+static LONG stage_on;               /* 1: on; -1: not (the driver's opens are not seen); 0: enemies off (never tried) */
+static LONG stage_seen_3d, stage_generation, stage_served, stage_failed, stage_logged;
+static LONG stage_served_bits[(STAGE_SUFFIXES + 31) / 32];
+static struct stage_table stage_now;
+static char stage_battle[128];      /* the battle the stage is served for (the log) */
+
+static int stage_win_head(void *context, const char *path, BYTE *buffer, int want, DWORD *size)
+{
+    HANDLE file = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    DWORD got = 0, error;
+
+    (void)context;
+    if (file == INVALID_HANDLE_VALUE) {
+        error = GetLastError();
+        return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND ? -1 : -2;
+    }
+    *size = GetFileSize(file, NULL);
+    if (*size == INVALID_FILE_SIZE || !ReadFile(file, buffer, (DWORD)want, &got, NULL)) {
+        CloseHandle(file);
+        return -2;
+    }
+    CloseHandle(file);
+    return (int)got;
+}
+
+/* The served stage is given back: the table stops answering (first), the driver's slots go back unless another reason
+   holds them. Main thread (the battle's end, a new load); nothing when nothing is served. */
+static void stage_release(const char *why)
+{
+    if (!InterlockedExchange(&stage_armed, 0))
+        return;
+    InterlockedExchange(&stage_battle_holds, 0);
+    InterlockedExchange(&stage_seen_3d, 0);
+    driver_opens_settle();
+    if (InterlockedIncrement(&stage_logged) <= STAGE_LOG_MAX)
+        log_line("stage_model: %s: the stage of %s (%s) is given back: %ld of its %d files served%s; the driver's file opens are %s",
+                 why, stage_battle, stage_now.label[1][0] ? stage_now.label[1] : stage_now.label[0], stage_served, stage_now.files,
+                 stage_failed ? " (some could not be opened: the line above)" : "",
+                 driver_opens_in ? "taken (another reason holds them)" : "its own");
+}
+
+/* From the driver's opens (any thread) while a served stage holds them: the battle is over once its 3D data, seen
+   made, is gone. */
+static void stage_watch(void)
+{
+    LONG hold = stage_battle_holds;
+
+    if (!hold)
+        return;
+    if (*(const DWORD *)ENEMIES_ADDR_BATTLE_3D)
+        InterlockedExchange(&stage_seen_3d, hold);
+    else if (stage_seen_3d == hold && InterlockedCompareExchange(&stage_battle_holds, 0, hold) == hold) {
+        InterlockedCompareExchange(&stage_seen_3d, 0, hold);
+        InterlockedExchange(&stage_armed, 0);
+        driver_opens_settle();
+        if (InterlockedIncrement(&stage_logged) <= STAGE_LOG_MAX)
+            log_line("stage_model: the battle is over (its 3D data is freed): its stage is given back (%ld files served); the driver's file opens are %s",
+                     stage_served, driver_opens_in ? "still taken (another reason holds them)" : "its own again");
+    }
+}
+
+/* The driver's open of `full`: a read-only open of an existing file below direct\battle that is one of the served
+   stage's: its path into `path` (MAX_PATH + 200). */
+static BOOL stage_driver_answers(const char *full, DWORD access, DWORD disposition, char *path)
+{
+    const char *bare;
+    int n, length = 0;
+
+    if (!stage_armed || (access & (GENERIC_WRITE | GENERIC_ALL)) || disposition != OPEN_EXISTING)
+        return FALSE;
+    bare = enemies_driver_bare(full);
+    if (!bare || (n = stage_bare_index(&stage_now, bare)) < 0)
+        return FALSE;
+    path[0] = 0;
+    if (!stage_append(path, MAX_PATH + 200, &length, stage_now.dir[stage_now.where[n] - 1]) ||
+        !stage_append(path, MAX_PATH + 200, &length, "aa"))
+        return FALSE;
+    path[length - 2] = (char)('a' + n / 26);
+    path[length - 1] = (char)('a' + n % 26);
+    return TRUE;
+}
+
+/* After the open of the `path` stage_driver_answers gave for `bare`: counted; one line for the first file served and
+   for each that could not be opened (bounded). */
+static void stage_file_opened(const char *bare, const char *path, BOOL opened, DWORD error)
+{
+    int n = bare ? stage_bare_index(&stage_now, bare) : -1;
+    const char *relative = lstrlenA(path) >= lstrlenA(config_dir) ? path + lstrlenA(config_dir) : path;
+
+    if (n < 0)
+        return;
+    if (opened) {
+        LONG *word = stage_served_bits + n / 32, mask = (LONG)(1u << (n % 32)), seen;
+
+        do
+            seen = *word;
+        while (InterlockedCompareExchange(word, seen | mask, seen) != seen);
+        if (!(seen & mask) && InterlockedIncrement(&stage_served) == 1 && InterlockedIncrement(&stage_logged) <= STAGE_LOG_MAX)
+            log_line("stage_model: the driver asks for %s: %s is served (the first of the stage's files)", bare, relative);
+    } else if (InterlockedIncrement(&stage_failed) <= 8 && InterlockedIncrement(&stage_logged) <= STAGE_LOG_MAX) {
+        log_line("stage_model: the driver asks for %s: %s could not be opened (error %lu): the driver looks for %s itself", bare,
+                 relative, error, bare);
+    }
+}
+
+static BOOL stage_move_arm(int f, const char *where, const struct stage_table *t, char *fault);   /* (stage section) */
+
+/* The overwrite of formation f of the staged DLL scene (`where` names the battle): its stage served when it has one. */
+static void stage_arm(int f, const char *where)
+{
+    const char *name = enemies_staged.stage_model[f], *section = enemies_staged.stage_section[f];
+    int location = enemies_staged.image[EN_O_SETUP + 0x14 * f] | enemies_staged.image[EN_O_SETUP + 0x14 * f + 1] << 8, i;
+    char fault[STAGE_FAULT_MAX];
+    struct stage_io io;
+    BOOL said;
+
+    if (!name[0])
+        return;
+    said = InterlockedIncrement(&stage_logged) <= STAGE_LOG_MAX;
+    if (stage_on <= 0) {
+        if (said)
+            log_line("stage_model: %s names stages\\%s%s%s, but stage_model is NOT on (start-up line \"stage_model:\"): location %d's own stage plays",
+                     where, name, section[0] ? "\\" : "", section, location);
+        return;
+    }
+    if (*(const DWORD *)ENEMIES_ADDR_BATTLE_3D) {
+        if (said)
+            log_line("stage_model: %s names stages\\%s%s%s, but its stage is loaded already (a `next` formation: the game loads no stage for it): the stage of the battle's start stays",
+                     where, name, section[0] ? "\\" : "", section);
+        return;
+    }
+    stage_release("another stage is set up");     /* (not reached: every load releases first) */
+    io.head = stage_win_head;
+    io.context = NULL;
+    if (!stage_resolve(&io, config_dir, name, section, location, &stage_now, fault)) {
+        if (said)
+            log_line("stage_model: %s: stages\\%s%s%s is NOT served: %s: location %d's own stage plays", where, name,
+                     section[0] ? "\\" : "", section, fault, location);
+        return;
+    }
+    if (!stage_move_arm(f, where, &stage_now, fault)) {     /* (stage section) a stage.ini's rules: all or nothing too */
+        if (said)
+            log_line("stage_model: %s: stages\\%s%s%s is NOT served: %s: location %d's own stage plays", where, name,
+                     section[0] ? "\\" : "", section, fault, location);
+        return;
+    }
+    InterlockedExchange(&stage_served, 0);
+    InterlockedExchange(&stage_failed, 0);
+    for (i = 0; i < (STAGE_SUFFIXES + 31) / 32; i++)
+        InterlockedExchange(&stage_served_bits[i], 0);
+    lstrcpynA(stage_battle, where, sizeof stage_battle);
+    InterlockedExchange(&stage_armed, 1);       /* (last: every file checked, the table whole) */
+    if (enemies_driver_found) {
+        LONG hold = InterlockedIncrement(&stage_generation);
+
+        if (!hold)
+            hold = InterlockedIncrement(&stage_generation);     /* (never 0: 0 is "no hold") */
+        InterlockedExchange(&stage_seen_3d, 0);
+        InterlockedExchange(&stage_battle_holds, hold);
+        driver_opens_settle();
+    }
+    if (said)
+        log_line("stage_model: %s: %s (%d parts, %d textures: %d files%s) is served as location %d's files (%s..; FFNx names them STAGE%02d) until the battle is over",
+                 where, section[0] ? stage_now.label[1] : stage_now.label[0], stage_now.parts, stage_now.textures, stage_now.files,
+                 section[0] ? ", the section's first, then the stage folder's" : "", location, stage_now.carrier, location);
+}
+
+/* enemies_start, after enemies_find_driver_opens: on when the driver's file opens pass through this DLL. Patches nothing. */
+static void install_stage(void)
+{
+    if (!enemies_driver_found) {
+        stage_on = -1;
+        log_line("stage_model: NOT on: the driver's own file opens are not seen by this DLL (the stock driver, or its imports not found: the line \"enemies: on\"): a formation's stage_model is logged and not applied (the carrier location's own stage plays)");
+        return;
+    }
+    stage_on = 1;
+    log_line("stage_model: on (the driver's opens of direct\\battle\\<the carrier's letters>.. are answered from SpellExtConfig\\%s\\NAME\\[SECTION\\] while the battle that names it loads, every file checked first; given back at the battle's end, the next load, or once its 3D data is freed): a DLL scene's formation with stage_model = NAME[:SECTION] draws that stage; camera_records gives it its camera records",
+             STAGE_FOLDER_NAME);
+}
+/* STAGE RUN END */
+
+/* ---- The stage section: a stage baked in its own frame, drawn moved (stage_section; stage.ini) ----
+   How the game draws a stage (READ FROM CODE, junon_cannon_stage/stage4/PLAN.md 1.1): each frame
+   update_3d_battleground_0042e52e makes slot 0 (00bf2168, 0x34 bytes: rotation 9 shorts, translation 3 ints at +0x12,
+   angles +0x1e, local translation 3 shorts at +0x26, parent +0x30) the current matrix at 0042e5a6 (FUN_004302e8: the
+   slot composed with its parent, written back into the slot, made current); in mode 1 every part is drawn with that one
+   matrix by FUN_0042f1ad (no matrix of its own); parts 2-4 (the far band) are drawn one after another at 0042e9f0,
+   0042ea09, 0042ea24, their mask bits tested once before them. The game's moving stages (modes 2-4) move pieces the
+   same way, with slots of their own, and leave one of them current: whatever is drawn after the stage sets its own.
+   A folder with a stage.ini beside its parts is a stage baked in its own frame: [stage] sky_parts = still | move,
+   move = cut, fade_frames = 1-120, section N = x y z (N 1-16, each -65534..65534). A formation's stage_section = N
+   (or 1) picks the section whose anchor is drawn under the battle's origin: at 0042e5a6, after the game's call, two
+   slots of this DLL hung under slot 0 (identity rotation; the first takes minus the anchor clamped to +-32767 per
+   axis, the second the rest) are composed by the game's own FUN_004302e8, so the parts are drawn moved; with
+   sky_parts = still, slot 0's matrix is made current again before part 2 (0042e9f0: 00663673 / 00663707 on slot 0,
+   never FUN_004302e8 again, which would compose it twice and move the actors) and the moved one after part 4
+   (0042ea24). Slot 0, the fighters, the cameras, the effects and the mask are never written. All three calls are
+   checked with the bytes round them and chained, or none (one line at start-up).
+   The arm (stage_arm, every file checked, before anything is served): stage.ini read from the folder stage_model names
+   last (NAME:FOLDER: FOLDER\ only; NAME: NAME\ only); with one, the descriptor must be mode 1, every part must be that
+   folder's and the section named, else nothing is served. The offset goes on at the first stage frame once the stage is
+   loaded, and only when its header, its descriptor and every part were this DLL's files and the loaded descriptor says
+   mode 1 (else not this battle: one line). A `next` formation naming the same stage and folder and another named
+   section moves the battle there (transition (a), the cut): a fade to black with the game's black quad (FUN_005bd456,
+   drawn only when FUN_0066c3bf says the frame is drawn), the section switched at full black, held black until the next
+   formation's enemies were placed (the existing chain at 00429f9b) or 150 frames, then a fade back. It steps once a
+   stage frame, holds while effects are paused, and is in no task list: nothing waits on it. Given back (nothing of the
+   game's to put back) at the battle's end (far_exit_hook), at a new battle's scene load (its 3D data 0; not at a
+   `next`'s), and when the 3D data changes under it. */
+#define SITE_MOVE_COMPOSE       0x0042e5a6u  /* update_3d_battleground + 0x78: push 00bf2168; call FUN_004302e8 */
+#define SITE_MOVE_SKY_FIRST     0x0042e9f0u  /* + 0x4c2, mode 1: FUN_0042f1ad(2, [00be1128] + 0x40a4, 4, 0): part 2, the far band's first */
+#define SITE_MOVE_SKY_LAST      0x0042ea24u  /* + 0x4f6, mode 1: FUN_0042f1ad(4, ..): part 4, its last */
+#define SITE_MOVE_SLOT_BEFORE   0x0042e58fu  /* push 00bf2168; push 00bf2186; call 00662ad8; add esp, 8; push 00bf2168 */
+#define SITE_MOVE_BAND          0x0042e9ceu  /* mode 1's mask bit 2 test, then parts 2, 3, 4 (to 0042ea2b) */
+#define ADDR_MOVE_MODE_TABLE    0x0042ef9au  /* update_3d_battleground's jump table by mode: [1] = 0042e956 */
+#define FN_MOVE_COMPOSE         0x004302e8u  /* FUN_004302e8(slot): composed with its parent (+0x30), written back, made current */
+#define FN_MOVE_PART            0x0042f1adu  /* FUN_0042f1ad(n, buffer, a, b): stage part n drawn at the current matrix */
+#define FN_MOVE_SET_ROTATION    0x00663673u  /* FUN_00663673(block): its 9 shorts the current rotation */
+#define FN_MOVE_SET_PLACE       0x00663707u  /* FUN_00663707(block): its 3 ints at +0x12 the current translation */
+#define FN_MOVE_DESCRIPTOR      0x00428dceu  /* FUN_00428dce(3d data): the loaded stage's descriptor (byte 0: the mode), or 0 */
+#define FN_MOVE_BLACK           0x005bd456u  /* FUN_005bd456(alpha, 0, 0): the black quad (stage fx 2's fill alpha=) */
+#define FN_MOVE_DRAWING         0x0066c3bfu  /* gfx_is_drawing_frame */
+#define ADDR_MOVE_SLOT0         0x00bf2168u  /* the stage's slot: the actors' parent too (never written here) */
+#define ADDR_MOVE_PAUSED        0x00dc0e6cu  /* effects paused */
+#define ADDR_MOVE_BATTLE_3D     0x009adfd8u  /* the battle's 3D data (ENEMIES_ADDR_BATTLE_3D) */
+
+/* STAGE MOVE PURE BEGIN  (no Win32 call inside but wsprintfA: tested natively, junon_cannon_stage/stage4/dll/test) */
+#define STAGE_FRAME_FILE        "stage.ini"
+#define STAGE_FRAME_BYTES       4096        /* a longer stage.ini is refused */
+#define STAGE_FRAME_LINE_MAX    255
+#define STAGE_SECTIONS_MAX      16          /* = EN_STAGE_SECTIONS_MAX */
+#define STAGE_FRAME_REACH       65534       /* an anchor's value: two slots of +-32767 */
+#define STAGE_SLOT_REACH        32767
+#define STAGE_FADE_DEFAULT      15
+#define STAGE_FADE_MAX          120
+#define STAGE_HOLD_CAP          150         /* the frames black at most */
+#define STAGE_SLOT_BYTES        0x34
+#define STAGE_CUT_SWITCHED      1           /* stage_cut_step: the section changed (at full black) */
+#define STAGE_CUT_CAPPED        2           /* the hold reached STAGE_HOLD_CAP */
+#define STAGE_CUT_DONE          4           /* faded back in */
+enum { STAGE_CUT_IDLE, STAGE_CUT_OUT, STAGE_CUT_HOLD, STAGE_CUT_IN };
+enum { STAGE_NEXT_MOVE, STAGE_NEXT_OTHER, STAGE_NEXT_UNKNOWN, STAGE_NEXT_SAME };
+
+/* A stage.ini read. */
+struct stage_frame {
+    int sections;                               /* how many it names */
+    BYTE named[STAGE_SECTIONS_MAX + 1];         /* [1..16]: 1 when named */
+    int anchor[STAGE_SECTIONS_MAX + 1][3];      /* x y z in the stage's own frame */
+    int still;                                  /* 1: parts 2-4 drawn with the battle's slot 0, never moved */
+    int fade_frames;
+};
+
+/* Transition (a): the fade's place is `frames` of `fade` (alpha 255 x frames / fade). */
+struct stage_cut {
+    int state, frames, fade;
+    int current, target;                        /* sections: the one drawn, the one moved to */
+    int hold;                                   /* frames black after the switch */
+    LONG placed;                                /* the placements counted at the request */
+};
+
+static int stage_frame_space(char c)
+{
+    return c == ' ' || c == '\t';
+}
+
+static char stage_frame_lower(char c)
+{
+    return c >= 'A' && c <= 'Z' ? (char)(c + 'a' - 'A') : c;
+}
+
+/* [p, e) is the lower-case word w, in any case? */
+static BOOL stage_frame_is(const char *p, const char *e, const char *w)
+{
+    for (; p < e && *w; p++, w++)
+        if (stage_frame_lower(*p) != *w)
+            return FALSE;
+    return p == e && !*w;
+}
+
+/* Two names equal in any case? */
+static BOOL stage_frame_same(const char *a, const char *b)
+{
+    for (; *a && stage_frame_lower(*a) == stage_frame_lower(*b); a++, b++)
+        ;
+    return stage_frame_lower(*a) == stage_frame_lower(*b);
+}
+
+/* A whole number at *p (white space before it skipped, a sign, 1-6 digits) within -reach..reach: TRUE and *p past it. */
+static BOOL stage_frame_number(const char **p, const char *e, int reach, int *out)
+{
+    const char *c = *p;
+    int sign = 1, digits = 0;
+    long v = 0;
+
+    while (c < e && stage_frame_space(*c))
+        c++;
+    if (c < e && (*c == '-' || *c == '+'))
+        sign = *c++ == '-' ? -1 : 1;
+    for (; c < e && *c >= '0' && *c <= '9'; c++) {
+        if (++digits > 6)
+            return FALSE;
+        v = v * 10 + (*c - '0');
+    }
+    if (!digits || v > reach)
+        return FALSE;
+    *out = (int)(sign * v);
+    *p = c;
+    return TRUE;
+}
+
+/* [p, e), at most 40 characters, into out (41) for a fault line. */
+static const char *stage_frame_quote(const char *p, const char *e, char *out)
+{
+    int n = 0;
+
+    for (; p < e && n < 40; p++)
+        out[n++] = *p;
+    out[n] = 0;
+    return out;
+}
+
+/* stage.ini's `length` bytes at text into *fr: TRUE when every line is good; else FALSE with what is wrong in fault
+   (at most 200 characters). Lines end in CR LF, LF or CR; `;` starts a comment; keys and words in any case. */
+static BOOL stage_frame_parse(const char *text, int length, struct stage_frame *fr, char *fault)
+{
+    const char *c = text, *end = text + length;
+    int line = 0, seen_stage = 0, have_sky = 0, have_move = 0, have_fade = 0, i, a;
+    char quote[41];
+
+    fr->sections = 0;
+    for (i = 0; i <= STAGE_SECTIONS_MAX; i++) {
+        fr->named[i] = 0;
+        fr->anchor[i][0] = fr->anchor[i][1] = fr->anchor[i][2] = 0;
+    }
+    fr->still = 1;
+    fr->fade_frames = STAGE_FADE_DEFAULT;
+    fault[0] = 0;
+    while (c < end) {
+        const char *start = c, *stop, *e, *eq, *ke, *v;
+
+        line++;
+        for (; c < end && *c != '\n' && *c != '\r'; c++)
+            if (!*c) {
+                wsprintfA(fault, "line %d holds a byte 0 (stage.ini is text)", line);
+                return FALSE;
+            }
+        stop = c;
+        if (c < end && *c == '\r') {
+            c++;
+            if (c < end && *c == '\n')
+                c++;
+        } else if (c < end) {
+            c++;
+        }
+        if (stop - start > STAGE_FRAME_LINE_MAX) {
+            wsprintfA(fault, "line %d is longer than %d characters", line, STAGE_FRAME_LINE_MAX);
+            return FALSE;
+        }
+        for (e = start; e < stop && *e != ';'; e++)
+            ;
+        while (start < e && stage_frame_space(*start))
+            start++;
+        while (e > start && stage_frame_space(e[-1]))
+            e--;
+        if (start == e)
+            continue;
+        if (*start == '[') {
+            const char *n = start + 1, *ne = e - 1;
+
+            while (n < ne && stage_frame_space(*n))
+                n++;
+            while (ne > n && stage_frame_space(ne[-1]))
+                ne--;
+            if (e[-1] != ']' || e - start < 2 || !stage_frame_is(n, ne, "stage")) {
+                wsprintfA(fault, "line %d: %s: the only section is [stage]", line, stage_frame_quote(start, e, quote));
+                return FALSE;
+            }
+            if (seen_stage) {
+                wsprintfA(fault, "line %d: [stage] is given twice", line);
+                return FALSE;
+            }
+            seen_stage = 1;
+            continue;
+        }
+        if (!seen_stage) {
+            wsprintfA(fault, "line %d: a key before [stage]", line);
+            return FALSE;
+        }
+        for (eq = start; eq < e && *eq != '='; eq++)
+            ;
+        if (eq == e) {
+            wsprintfA(fault, "line %d: %s: not KEY = VALUE", line, stage_frame_quote(start, e, quote));
+            return FALSE;
+        }
+        for (ke = eq; ke > start && stage_frame_space(ke[-1]); ke--)
+            ;
+        for (v = eq + 1; v < e && stage_frame_space(*v); v++)
+            ;
+        if (stage_frame_is(start, ke, "sky_parts")) {
+            if (have_sky++) {
+                wsprintfA(fault, "line %d: sky_parts is given twice", line);
+                return FALSE;
+            }
+            if (stage_frame_is(v, e, "still") || stage_frame_is(v, e, "move")) {
+                fr->still = stage_frame_is(v, e, "still");
+            } else {
+                wsprintfA(fault, "line %d: sky_parts is still or move", line);
+                return FALSE;
+            }
+        } else if (stage_frame_is(start, ke, "move")) {
+            if (have_move++) {
+                wsprintfA(fault, "line %d: move is given twice", line);
+                return FALSE;
+            }
+            if (!stage_frame_is(v, e, "cut")) {
+                wsprintfA(fault, "line %d: move is cut (the only transition this DLL has)", line);
+                return FALSE;
+            }
+        } else if (stage_frame_is(start, ke, "fade_frames")) {
+            const char *p = v;
+            int n;
+
+            if (have_fade++) {
+                wsprintfA(fault, "line %d: fade_frames is given twice", line);
+                return FALSE;
+            }
+            if (!stage_frame_number(&p, e, STAGE_FADE_MAX, &n) || p != e || n < 1) {
+                wsprintfA(fault, "line %d: fade_frames is 1 to %d", line, STAGE_FADE_MAX);
+                return FALSE;
+            }
+            fr->fade_frames = n;
+        } else if (ke - start > 7 && stage_frame_is(start, start + 7, "section") && stage_frame_space(start[7])) {
+            const char *p = start + 7;
+            int n, xyz[3];
+
+            if (!stage_frame_number(&p, ke, 99, &n) || p != ke || n < 1 || n > STAGE_SECTIONS_MAX) {
+                wsprintfA(fault, "line %d: section N is 1 to %d", line, STAGE_SECTIONS_MAX);
+                return FALSE;
+            }
+            if (fr->named[n]) {
+                wsprintfA(fault, "line %d: section %d is given twice", line, n);
+                return FALSE;
+            }
+            p = v;
+            for (a = 0; a < 3; a++) {
+                if (a) {
+                    while (p < e && stage_frame_space(*p))
+                        p++;
+                    if (p < e && *p == ',')
+                        p++;
+                }
+                if (!stage_frame_number(&p, e, STAGE_FRAME_REACH, &xyz[a]) || (p < e && !stage_frame_space(*p) && *p != ','))
+                    break;
+            }
+            while (a == 3 && p < e && stage_frame_space(*p))
+                p++;
+            if (a < 3 || p != e) {
+                wsprintfA(fault, "line %d: section %d is three whole numbers x y z, each -%d to %d", line, n, STAGE_FRAME_REACH,
+                          STAGE_FRAME_REACH);
+                return FALSE;
+            }
+            fr->named[n] = 1;
+            fr->anchor[n][0] = xyz[0];
+            fr->anchor[n][1] = xyz[1];
+            fr->anchor[n][2] = xyz[2];
+            fr->sections++;
+        } else {
+            wsprintfA(fault, "line %d: unknown key \"%s\" (keys: fade_frames move section N sky_parts)", line,
+                      stage_frame_quote(start, ke, quote));
+            return FALSE;
+        }
+    }
+    if (!seen_stage) {
+        wsprintfA(fault, "it has no [stage]");
+        return FALSE;
+    }
+    if (!fr->sections) {
+        wsprintfA(fault, "it names no section (section 1 = x y z)");
+        return FALSE;
+    }
+    return TRUE;
+}
+
+/* One axis of the offset into the two slots: the first clamped to +-32767, the second the rest (0 for |value| <= 32767,
+   so one truncation only; |value| <= 65534 always fits). */
+static void stage_split(int value, short *first, short *rest)
+{
+    int a = value > STAGE_SLOT_REACH ? STAGE_SLOT_REACH : value < -STAGE_SLOT_REACH ? -STAGE_SLOT_REACH : value;
+
+    *first = (short)a;
+    *rest = (short)(value - a);
+}
+
+/* A slot record made afresh before each compose: identity rotation (4096 on the diagonal, what FUN_00662ad8 makes of
+   zero angles), translation and angles 0, `local` at +0x26, `parent` at +0x30. */
+static void stage_slot_fill(BYTE *slot, DWORD parent, const short *local)
+{
+    int i;
+
+    for (i = 0; i < STAGE_SLOT_BYTES; i++)
+        slot[i] = 0;
+    for (i = 0; i < 3; i++) {
+        slot[i * 8 + 1] = 0x10;                 /* rotation [0], [4], [8] = 4096 */
+        slot[0x26 + 2 * i] = (BYTE)local[i];
+        slot[0x27 + 2 * i] = (BYTE)((WORD)local[i] >> 8);
+    }
+    for (i = 0; i < 4; i++)
+        slot[0x30 + i] = (BYTE)(parent >> (8 * i));
+}
+
+static void stage_cut_start(struct stage_cut *c, int section, int fade)
+{
+    c->state = STAGE_CUT_IDLE;
+    c->frames = c->hold = 0;
+    c->placed = 0;
+    c->fade = fade;
+    c->current = c->target = section;
+}
+
+static int stage_cut_alpha(const struct stage_cut *c)
+{
+    return c->fade > 0 && c->frames > 0 ? 255 * c->frames / c->fade : 0;
+}
+
+/* A move to `section` asked (`placed`: the placements counted now): 0 nothing (it is the target already), 1 started or
+   re-aimed (it switches at the next full black), 2 switched at once (it was black: the hold starts again). */
+static int stage_cut_request(struct stage_cut *c, int section, LONG placed)
+{
+    if (section == c->target)
+        return 0;
+    c->target = section;
+    c->placed = placed;
+    if (c->state == STAGE_CUT_HOLD) {
+        c->current = section;
+        c->hold = 0;
+        return 2;
+    }
+    c->state = STAGE_CUT_OUT;                   /* (from IDLE, from OUT, or back from IN at the alpha it has) */
+    return 1;
+}
+
+/* One stage frame (`placed`: the placements counted now): STAGE_CUT_SWITCHED, _CAPPED, _DONE or 0. Nothing while paused. */
+static int stage_cut_step(struct stage_cut *c, int paused, LONG placed)
+{
+    if (paused)
+        return 0;
+    switch (c->state) {
+    case STAGE_CUT_OUT:
+        if (++c->frames < c->fade)
+            return 0;
+        c->frames = c->fade;
+        c->current = c->target;
+        c->state = STAGE_CUT_HOLD;
+        c->hold = 0;
+        return STAGE_CUT_SWITCHED;
+    case STAGE_CUT_HOLD:
+        c->hold++;
+        if (placed != c->placed) {
+            c->state = STAGE_CUT_IN;
+            return 0;
+        }
+        if (c->hold >= STAGE_HOLD_CAP) {
+            c->state = STAGE_CUT_IN;
+            return STAGE_CUT_CAPPED;
+        }
+        return 0;
+    case STAGE_CUT_IN:
+        if (--c->frames > 0)
+            return 0;
+        c->frames = 0;
+        c->state = STAGE_CUT_IDLE;
+        return STAGE_CUT_DONE;
+    }
+    return 0;
+}
+
+/* A `next` formation's keys against the moved stage (name, folder; `target` the section it is at or moving to): what it
+   asks; *section the section it names (1 when it names none). */
+static int stage_next_rule(const char *name, const char *folder, const char *next_name, const char *next_folder, int next_section,
+                           const struct stage_frame *fr, int target, int *section)
+{
+    *section = next_section ? next_section : 1;
+    if (!next_name[0] || !stage_frame_same(name, next_name) || !stage_frame_same(folder, next_folder))
+        return STAGE_NEXT_OTHER;
+    if (*section < 1 || *section > STAGE_SECTIONS_MAX || !fr->named[*section])
+        return STAGE_NEXT_UNKNOWN;
+    return *section == target ? STAGE_NEXT_SAME : STAGE_NEXT_MOVE;
+}
+
+/* Were the files the place rests on served (bit n of `bits`: the file of suffix n; parts at STAGE_SUFFIX_PART)? 0 yes;
+   1 the header not, 2 the descriptor not, 3 a part not (*part its number). */
+static int stage_move_served(const LONG *bits, int parts, int *part)
+{
+    int n;
+
+    *part = -1;
+    if (!(bits[0] & 1))
+        return 1;
+    if (!(bits[0] & 2))
+        return 2;
+    for (n = 0; n < parts; n++) {
+        int s = STAGE_SUFFIX_PART + n;
+
+        if (!(bits[s / 32] & (LONG)(1u << (s % 32)))) {
+            *part = n;
+            return 3;
+        }
+    }
+    return 0;
+}
+/* STAGE MOVE PURE END */
+
+/* STAGE MOVE RUN BEGIN  (CreateFileA, GetFileSize, ReadFile, CloseHandle, InterlockedIncrement, lstrcpynA, wsprintfA,
+   log_line, bytes_are, patch_call, stage_fill_site_ok and the game's routines at their addresses: the native test stubs
+   them; enemies_staged, stage_served_bits and the addresses at words of its own) */
+#define STAGE_MOVE_LOG_MAX      200
+static LONG stage_move_on;          /* 1: on; -1: not (the line at start-up); 0: never tried (enemies off) */
+static LONG stage_move_logged;
+static LONG stage_move_placements;  /* the game's placements of a next formation's enemies (00429f9b), counted */
+static int stage_move_applied;      /* this frame's 0042e5a6 made the moved matrix current (0042e9f0, 0042ea24 read it) */
+static DWORD stage_move_slot_words[2][STAGE_SLOT_BYTES / 4];   /* the two slots (DLL memory, the game's layout) */
+static struct {
+    int armed;                      /* a sectioned stage is served for this battle */
+    int verdict;                    /* 0: its stage not loaded yet; 1: drawn moved; -1: not in this battle */
+    DWORD d3;                       /* the battle's 3D data at the verdict */
+    int parts;
+    char name[EN_STAGE_NAME_MAX + 1], folder[EN_STAGE_NAME_MAX + 1];
+    char label[48], battle[128];
+    struct stage_frame frame;
+    struct stage_cut cut;
+    short first[3], rest[3];        /* the offset of the section drawn, as the two slots take it */
+} stage_move;
+
+static BOOL stage_move_say(void)
+{
+    return InterlockedIncrement(&stage_move_logged) <= STAGE_MOVE_LOG_MAX;
+}
+
+/* stage.ini's bytes into text (at most `capacity`): the count; -1 no such file; -2 unreadable or larger. */
+static int stage_move_read(const char *path, char *text, int capacity)
+{
+    HANDLE file = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    DWORD size, got = 0, error;
+
+    if (file == INVALID_HANDLE_VALUE) {
+        error = GetLastError();
+        return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND ? -1 : -2;
+    }
+    size = GetFileSize(file, NULL);
+    if (size == INVALID_FILE_SIZE || size > (DWORD)capacity || !ReadFile(file, text, size, &got, NULL) || got != size) {
+        CloseHandle(file);
+        return -2;
+    }
+    CloseHandle(file);
+    return (int)got;
+}
+
+/* The section's offset (minus its anchor) into the two slots' parts. */
+static void stage_move_place(int section)
+{
+    int a;
+
+    for (a = 0; a < 3; a++)
+        stage_split(-stage_move.frame.anchor[section][a], &stage_move.first[a], &stage_move.rest[a]);
+}
+
+/* The moved stage given back: nothing of the game's was written, so nothing is put back. Main thread. */
+static void stage_move_release(const char *why)
+{
+    stage_move_applied = 0;
+    if (!stage_move.armed)
+        return;
+    stage_move.armed = 0;
+    if (stage_move_say())
+        log_line("stage_section: %s: the stage of %s (%s) is given back (it was %s, at section %d%s)", why, stage_move.battle,
+                 stage_move.label, stage_move.verdict > 0 ? "drawn moved" : "not moved", stage_move.cut.current,
+                 stage_move.cut.state != STAGE_CUT_IDLE ? ", in a move: the fade stops with it" : "");
+    stage_move.verdict = 0;
+    stage_cut_start(&stage_move.cut, 0, 0);
+}
+
+/* stage_arm, every file found and checked, before anything is served: with a stage.ini in the folder the key names last,
+   a sectioned stage (TRUE: armed for this battle); without one, as it is (TRUE). FALSE: nothing may be served (fault). */
+static BOOL stage_move_arm(int f, const char *where, const struct stage_table *t, char *fault)
+{
+    const char *folder = enemies_staged.stage_section[f];
+    int d = folder[0] ? 1 : 0, asked = enemies_staged.stage_anchor[f], section = asked ? asked : 1, got, k, length = 0;
+    static char text[STAGE_FRAME_BYTES];    /* (static: a page on the stack would need a probe; main thread only) */
+    char path[STAGE_DIR_MAX + 16], why[256];
+    struct stage_frame fr;
+
+    stage_move_release("another stage is set up");
+    path[0] = 0;
+    if (!stage_append(path, sizeof path, &length, t->dir[d]) || !stage_append(path, sizeof path, &length, STAGE_FRAME_FILE)) {
+        wsprintfA(fault, "the path of %s%s is too long", t->label[d], STAGE_FRAME_FILE);
+        return FALSE;
+    }
+    got = stage_move_read(path, text, STAGE_FRAME_BYTES);
+    if (got == -1) {
+        if (asked && stage_move_say())
+            log_line("stage_section: %s: stage_section = %d, but %s has no %s: the stage is served as it is (not moved)", where, asked,
+                     t->label[d], STAGE_FRAME_FILE);
+        return TRUE;
+    }
+    if (got < 0) {
+        wsprintfA(fault, "%s%s cannot be read, or is larger than %d bytes", t->label[d], STAGE_FRAME_FILE, STAGE_FRAME_BYTES);
+        return FALSE;
+    }
+    if (!stage_frame_parse(text, got, &fr, why)) {
+        wsprintfA(fault, "%s%s: %s", t->label[d], STAGE_FRAME_FILE, why);
+        return FALSE;
+    }
+    if (stage_move_on <= 0) {
+        wsprintfA(fault, "%s holds a %s (a stage in its own frame), but stage_section is NOT on (start-up line \"stage_section:\")",
+                  t->label[d], STAGE_FRAME_FILE);
+        return FALSE;
+    }
+    if (t->mode != 1) {
+        wsprintfA(fault, "a stage with a %s draws in mode 1, and its descriptor says mode %d", STAGE_FRAME_FILE, t->mode);
+        return FALSE;
+    }
+    for (k = 0; k < t->parts; k++)
+        if (t->where[STAGE_SUFFIX_PART + k] != d + 1) {
+            int s = STAGE_SUFFIX_PART + k;
+
+            wsprintfA(fault, "part %c%c is not in %s (every part of a stage with a %s is that folder's)", 'a' + s / 26, 'a' + s % 26,
+                      t->label[d], STAGE_FRAME_FILE);
+            return FALSE;
+        }
+    if (!fr.named[section]) {
+        wsprintfA(fault, "section %d is not one %s%s names", section, t->label[d], STAGE_FRAME_FILE);
+        return FALSE;
+    }
+    stage_move.frame = fr;
+    stage_move.parts = t->parts;
+    stage_move.verdict = 0;
+    stage_move.d3 = 0;
+    lstrcpynA(stage_move.name, enemies_staged.stage_model[f], sizeof stage_move.name);
+    lstrcpynA(stage_move.folder, folder, sizeof stage_move.folder);
+    lstrcpynA(stage_move.label, t->label[d], sizeof stage_move.label);
+    lstrcpynA(stage_move.battle, where, sizeof stage_move.battle);
+    stage_cut_start(&stage_move.cut, section, fr.fade_frames);
+    stage_move_place(section);
+    stage_move.armed = 1;
+    if (stage_move_say())
+        log_line("stage_section: %s: %s is a stage in its own frame (%d sections; the sky parts %s; cut, %d frames a fade): section %d, drawn moved by (%d, %d, %d) once it is loaded",
+                 where, t->label[d], fr.sections, fr.still ? "still" : "moved too", fr.fade_frames, section, -fr.anchor[section][0],
+                 -fr.anchor[section][1], -fr.anchor[section][2]);
+    return TRUE;
+}
+
+/* The first stage frames: once the stage is loaded, moved only when it is wholly the served one and mode 1. */
+static void stage_move_judge(DWORD d3)
+{
+    DWORD descriptor;
+    int which, part, mode;
+
+    if (!d3 || !(descriptor = ((DWORD (__cdecl *)(DWORD))FN_MOVE_DESCRIPTOR)(d3)))
+        return;                         /* (not loaded yet: asked again next frame) */
+    mode = *(const BYTE *)descriptor;
+    which = stage_move_served(stage_served_bits, stage_move.parts, &part);
+    if (which || mode != 1) {
+        stage_move.verdict = -1;
+        if (stage_move_say()) {
+            if (which == 3)
+                log_line("stage_section: %s: part %d of %s was not this DLL's file: the stage is NOT moved in this battle", stage_move.battle,
+                         part, stage_move.label);
+            else if (which)
+                log_line("stage_section: %s: the stage's %s was not this DLL's file: the stage is NOT moved in this battle", stage_move.battle,
+                         which == 1 ? "header" : "descriptor");
+            else
+                log_line("stage_section: %s: the loaded stage draws in mode %d, not 1: the stage is NOT moved in this battle", stage_move.battle,
+                         mode);
+        }
+        return;
+    }
+    stage_move.verdict = 1;
+    stage_move.d3 = d3;
+    if (stage_move_say())
+        log_line("stage_section: %s: section %d: the stage is drawn moved by (%d, %d, %d)%s", stage_move.battle, stage_move.cut.current,
+                 stage_move.first[0] + stage_move.rest[0], stage_move.first[1] + stage_move.rest[1], stage_move.first[2] + stage_move.rest[2],
+                 stage_move.frame.still ? "; the sky parts 2-4 are not" : "");
+}
+
+/* At 0042e5a6 (push 00bf2168): the cut's step and its black quad, the game's FUN_004302e8 on slot 0, then the two DLL
+   slots composed under it (the moved matrix current). Every frame the stage is drawn. */
+static void __cdecl stage_move_compose_hook(DWORD slot)
+{
+    int on, event, alpha;
+
+    stage_move_applied = 0;
+    if (stage_move.armed) {
+        DWORD d3 = *(const DWORD *)ADDR_MOVE_BATTLE_3D;
+
+        if (stage_move.verdict > 0 && d3 != stage_move.d3)
+            stage_move_release("the battle's 3D data is not the one the stage was moved in");
+        else if (!stage_move.verdict)
+            stage_move_judge(d3);
+    }
+    on = stage_move.armed && stage_move.verdict > 0 && slot == ADDR_MOVE_SLOT0;
+    if (on) {
+        event = stage_cut_step(&stage_move.cut, *(const BYTE *)ADDR_MOVE_PAUSED != 0, stage_move_placements);
+        if (event & STAGE_CUT_SWITCHED) {
+            stage_move_place(stage_move.cut.current);
+            if (stage_move_say())
+                log_line("stage_section: %s: moved to section %d (the screen black): the stage is drawn moved by (%d, %d, %d)",
+                         stage_move.battle, stage_move.cut.current, stage_move.first[0] + stage_move.rest[0],
+                         stage_move.first[1] + stage_move.rest[1], stage_move.first[2] + stage_move.rest[2]);
+        }
+        if ((event & STAGE_CUT_CAPPED) && stage_move_say())
+            log_line("stage_section: %s: the next formation's enemies were not seen placed in %d frames: the fade comes back", stage_move.battle,
+                     STAGE_HOLD_CAP);
+        if ((event & STAGE_CUT_DONE) && stage_move_say())
+            log_line("stage_section: %s: faded back in at section %d", stage_move.battle, stage_move.cut.current);
+        alpha = stage_cut_alpha(&stage_move.cut);
+        if (alpha > 0 && stage_fill_site_ok() && ((int (__cdecl *)(void))FN_MOVE_DRAWING)())
+            ((DWORD (__cdecl *)(DWORD, DWORD, DWORD))FN_MOVE_BLACK)((DWORD)alpha, 0, 0);
+    }
+    ((void (__cdecl *)(DWORD))FN_MOVE_COMPOSE)(slot);
+    if (on) {
+        BYTE *a = (BYTE *)stage_move_slot_words[0], *b = (BYTE *)stage_move_slot_words[1];
+
+        stage_slot_fill(a, ADDR_MOVE_SLOT0, stage_move.first);
+        stage_slot_fill(b, (DWORD)a, stage_move.rest);
+        ((void (__cdecl *)(DWORD))FN_MOVE_COMPOSE)((DWORD)a);
+        ((void (__cdecl *)(DWORD))FN_MOVE_COMPOSE)((DWORD)b);
+        stage_move_applied = 1;
+    }
+}
+
+/* At 0042e9f0 (part 2, the far band's first): with still sky parts, slot 0's own matrix current again, then the game's
+   draw. */
+static void __cdecl stage_move_sky_first_hook(DWORD n, DWORD buffer, DWORD a, DWORD b)
+{
+    if (stage_move_applied && stage_move.frame.still) {
+        ((void (__cdecl *)(DWORD))FN_MOVE_SET_ROTATION)(ADDR_MOVE_SLOT0);
+        ((void (__cdecl *)(DWORD))FN_MOVE_SET_PLACE)(ADDR_MOVE_SLOT0);
+    }
+    ((void (__cdecl *)(DWORD, DWORD, DWORD, DWORD))FN_MOVE_PART)(n, buffer, a, b);
+}
+
+/* At 0042ea24 (part 4, its last): the game's draw, then the moved matrix current again for the parts after it. */
+static void __cdecl stage_move_sky_last_hook(DWORD n, DWORD buffer, DWORD a, DWORD b)
+{
+    ((void (__cdecl *)(DWORD, DWORD, DWORD, DWORD))FN_MOVE_PART)(n, buffer, a, b);
+    if (stage_move_applied && stage_move.frame.still) {
+        ((void (__cdecl *)(DWORD))FN_MOVE_SET_ROTATION)((DWORD)stage_move_slot_words[1]);
+        ((void (__cdecl *)(DWORD))FN_MOVE_SET_PLACE)((DWORD)stage_move_slot_words[1]);
+    }
+}
+
+/* At 00429f9b, after the game's placement of a next formation's enemies (sur_next_enemies_hook). */
+static void stage_move_placed(void)
+{
+    InterlockedIncrement(&stage_move_placements);
+}
+
+/* enemies_overwrite of a `next` formation (the battle's 3D data made): its stage_section moves the battle when it names
+   the moved stage and another of its sections. Nothing (no line) when no sectioned stage is armed. */
+static void stage_move_next(int f, const char *where)
+{
+    int rule, section, from = stage_move.cut.target;
+
+    if (!stage_move.armed || !*(const DWORD *)ADDR_MOVE_BATTLE_3D)
+        return;
+    rule = stage_next_rule(stage_move.name, stage_move.folder, enemies_staged.stage_model[f], enemies_staged.stage_section[f],
+                           enemies_staged.stage_anchor[f], &stage_move.frame, from, &section);
+    if (stage_move.verdict <= 0) {
+        if (stage_move_say())
+            log_line("stage_section: %s: the stage is not drawn moved in this battle (the line above): no move", where);
+        return;
+    }
+    if (rule == STAGE_NEXT_MOVE) {
+        int what = stage_cut_request(&stage_move.cut, section, stage_move_placements);
+
+        if (stage_move_say())
+            log_line("stage_section: %s: the battle moves from section %d to section %d: %s", where, from, section,
+                     what == 2 ? "switched at once (the screen is black)" : "a fade to black, the new section, a fade back");
+        return;
+    }
+    if (stage_move_say()) {
+        if (rule == STAGE_NEXT_OTHER)
+            log_line("stage_section: %s: the formation names another stage (or none): the battle stays at section %d", where, from);
+        else if (rule == STAGE_NEXT_UNKNOWN)
+            log_line("stage_section: %s: section %d is not one %s%s names: the battle stays at section %d", where, section,
+                     stage_move.label, STAGE_FRAME_FILE, from);
+        else
+            log_line("stage_section: %s: already at section %d: no move", where, from);
+    }
+}
+
+/* `call target` at `site`? */
+static BOOL stage_move_calls(DWORD site, DWORD target)
+{
+    const BYTE *p = (const BYTE *)site;
+
+    return p[0] == 0xe8 && site + 5 + *(const DWORD *)(p + 1) == target;
+}
+
+/* enemies_start, after install_stage: every byte round the three calls and of the routines checked, then all three
+   chained, or none. Needs stage_model on. */
+static void install_stage_move(int *ok, int *total)
+{
+    static const BYTE slot_before[] = { 0x68, 0x68, 0x21, 0xbf, 0x00, 0x68, 0x86, 0x21, 0xbf, 0x00, 0xe8, 0x3a, 0x45, 0x23, 0x00,
+                                        0x83, 0xc4, 0x08, 0x68, 0x68, 0x21, 0xbf, 0x00 };
+    static const BYTE slot_after[] = { 0x83, 0xc4, 0x04, 0x8b, 0x0d, 0xd8, 0xdf, 0x9a, 0x00 };
+    static const BYTE band[] = { 0x33, 0xc9, 0x8a, 0x0d, 0x64, 0xcb, 0xbf, 0x00, 0x83, 0xe1, 0x04, 0x85, 0xc9, 0x75, 0x4f, 0x6a, 0x00,
+                                 0x6a, 0x04, 0x8b, 0x15, 0x28, 0x11, 0xbe, 0x00, 0x81, 0xc2, 0xa4, 0x40, 0x00, 0x00, 0x52, 0x6a, 0x02,
+                                 0xe8, 0xb8, 0x07, 0x00, 0x00, 0x83, 0xc4, 0x10, 0x6a, 0x00, 0x6a, 0x04, 0xa1, 0x28, 0x11, 0xbe, 0x00,
+                                 0x05, 0xa4, 0x40, 0x00, 0x00, 0x50, 0x6a, 0x03, 0xe8, 0x9f, 0x07, 0x00, 0x00, 0x83, 0xc4, 0x10, 0x6a,
+                                 0x00, 0x6a, 0x04, 0x8b, 0x0d, 0x28, 0x11, 0xbe, 0x00, 0x81, 0xc1, 0xa4, 0x40, 0x00, 0x00, 0x51, 0x6a,
+                                 0x04, 0xe8, 0x84, 0x07, 0x00, 0x00, 0x83, 0xc4, 0x10 };
+    static const BYTE mode_table[] = { 0xde, 0xe5, 0x42, 0x00, 0x56, 0xe9, 0x42, 0x00 };
+    static const BYTE compose[] = { 0x55, 0x8b, 0xec, 0x51, 0x56, 0x57, 0xa1, 0xac, 0xe2, 0x8f, 0x00, 0xa3, 0xf8, 0xe0, 0x9a, 0x00 };
+    static const BYTE part[] = { 0x55, 0x8b, 0xec };
+    static const BYTE set_matrix[] = { 0x55, 0x8b, 0xec, 0xa1, 0xf0, 0xaa };
+    static const BYTE descriptor[] = { 0x55, 0x8b, 0xec, 0x51, 0xc7, 0x45, 0xfc, 0x00, 0x00, 0x00, 0x00, 0x83, 0x7d, 0x08, 0x00, 0x74,
+                                       0x11, 0x8b, 0x45, 0x08, 0x8b, 0x08, 0x51, 0xe8, 0x8b, 0xff, 0xff, 0xff };
+    static const struct { DWORD at; const BYTE *bytes; int count; } checks[] = {
+        { SITE_MOVE_SLOT_BEFORE, slot_before, sizeof slot_before },
+        { SITE_MOVE_COMPOSE + 5, slot_after, sizeof slot_after },
+        { SITE_MOVE_BAND, band, sizeof band },
+        { ADDR_MOVE_MODE_TABLE, mode_table, sizeof mode_table },
+        { FN_MOVE_COMPOSE, compose, sizeof compose },
+        { FN_MOVE_PART, part, sizeof part },
+        { FN_MOVE_SET_ROTATION, set_matrix, sizeof set_matrix },
+        { FN_MOVE_SET_PLACE, set_matrix, sizeof set_matrix },
+        { FN_MOVE_DESCRIPTOR, descriptor, sizeof descriptor },
+    };
+    char differ[sizeof checks / sizeof checks[0] * 9 + 1];
+    unsigned i;
+    int n = 0, patched = 0;
+
+    (*total)++;
+    if (stage_move_on)
+        return;
+    if (stage_on <= 0) {
+        stage_move_on = -1;
+        log_line("stage_section: NOT on: stage_model is not on (the line \"stage_model:\"): a folder with a %s is not served", STAGE_FRAME_FILE);
+        return;
+    }
+    differ[0] = 0;
+    for (i = 0; i < sizeof checks / sizeof checks[0]; i++)
+        if (!bytes_are(checks[i].at, checks[i].bytes, checks[i].count))
+            n += wsprintfA(differ + n, " %08lx", checks[i].at);
+    if (n || !stage_move_calls(SITE_MOVE_COMPOSE, FN_MOVE_COMPOSE) || !stage_move_calls(SITE_MOVE_SKY_FIRST, FN_MOVE_PART) ||
+        !stage_move_calls(SITE_MOVE_SKY_LAST, FN_MOVE_PART)) {
+        stage_move_on = -1;
+        log_line("stage_section: NOT on: the bytes at%s are not as the exe has them (or a call at %08lx, %08lx, %08lx goes elsewhere): a folder with a %s is not served (the folders without one are)",
+                 n ? differ : " (the calls)", SITE_MOVE_COMPOSE, SITE_MOVE_SKY_FIRST, SITE_MOVE_SKY_LAST, STAGE_FRAME_FILE);
+        return;
+    }
+    patched += patch_call(SITE_MOVE_COMPOSE, FN_MOVE_COMPOSE, stage_move_compose_hook);
+    patched += patch_call(SITE_MOVE_SKY_FIRST, FN_MOVE_PART, stage_move_sky_first_hook);
+    patched += patch_call(SITE_MOVE_SKY_LAST, FN_MOVE_PART, stage_move_sky_last_hook);
+    *ok += patched == 3;
+    stage_move_on = patched == 3 ? 1 : -1;
+    log_line("stage_section: %s (%08lx -> %08lx, %08lx and %08lx -> %08lx: %d of 3 chained; %08lx %08lx %08lx %08lx %08lx and the bytes round them as expected): a stage folder with a %s is drawn moved to a formation's stage_section, and a `next` formation's stage_section moves the battle (a cut: fade out, the new section, fade in)",
+             patched == 3 ? "on" : "NOT on", SITE_MOVE_COMPOSE, FN_MOVE_COMPOSE, SITE_MOVE_SKY_FIRST, SITE_MOVE_SKY_LAST, FN_MOVE_PART,
+             patched, FN_MOVE_COMPOSE, FN_MOVE_PART, FN_MOVE_SET_ROTATION, FN_MOVE_SET_PLACE, FN_MOVE_DESCRIPTOR, STAGE_FRAME_FILE);
+}
+/* STAGE MOVE RUN END */
+
 /* ---- the load (load_scene_hook) ---- */
 
 /* The DLL scene's buffers written over the stand-in's, the field's flags put back, the tail again, the
@@ -58919,11 +65211,20 @@ static void enemies_overwrite(DWORD number)
     int f = (int)(number & 3), i;
     struct en_tail t;
     BOOL any = FALSE;
+    char where[128];
+    BYTE records[0x30];
 
     copy_bytes((BYTE *)ADDR_SCENE_ENEMY_IDS, img + EN_O_IDS, 8);
     /* the set-up and the camera placement: the image's (the game's own scene.bin, as the compiler) when it holds
-       them, else the stand-in's (en_overwrite_formation) */
+       them, else the stand-in's (en_overwrite_formation); (camera records) the formation's own records whatever the
+       stand-in's are */
+    if (enemies_staged.camera_records[f])
+        copy_bytes(records, img + EN_O_CAMERA + 0x30 * f, 0x30);
     en_overwrite_formation(img, f, enemies_staged.stand_bytes, (BYTE *)ADDR_SCENE_SETUP, (BYTE *)ADDR_SCENE_CAMERA);
+    if (enemies_staged.camera_records[f]) {
+        copy_bytes((BYTE *)ADDR_SCENE_CAMERA, records, 0x30);
+        copy_bytes(img + EN_O_CAMERA + 0x30 * f, records, 0x30);
+    }
     copy_bytes((BYTE *)ADDR_SCENE_FORMATION, img + EN_O_ROWS + 0x60 * f, 0x60);
     copy_bytes((BYTE *)ADDR_SCENE_ENEMIES, img + EN_O_ENEMY, 0x228);
     copy_bytes((BYTE *)ADDR_SCENE_ATTACKS, img + EN_O_ATTACK, 0x380 + 0x40 + 0x400);  /* records, IDs, names: one run in both */
@@ -58942,6 +65243,16 @@ static void enemies_overwrite(DWORD number)
     *(WORD *)0x009aad0au = t.escape_now;
     *(WORD *)0x009aad0eu = t.escape_copy;
     sur_arm(f);                         /* (surrounded) armed when this formation is one */
+    wsprintfA(where, "battle %lu (DLL scene %d '%s' formation %d)", number, enemies_staged.scene, enemies_staged.scene_name, f);
+    far_apply(enemies_staged.far_plane[f], where);  /* (far plane) the formation's; without the key a raised one put back */
+    stage_arm(f, where);                /* (stage model) the formation's stage served for this battle when it names one */
+    stage_move_next(f, where);          /* (stage section) a `next` formation's section: the battle moves there */
+    if (enemies_staged.camera_records[f] && InterlockedIncrement(&stage_logged) <= STAGE_LOG_MAX) {
+        const short *r = (const short *)records;
+
+        log_line("camera_records: %s: the formation's camera records are the scene file's (record 0, the resting view: eye (%d, %d, %d), focus (%d, %d, %d))",
+                 where, r[0], r[1], r[2], r[3], r[4], r[5]);
+    }
     /* the pool: slot i's model from its folder for this battle */
     for (i = 0; i < ENEMIES_POOL_COUNT; i++) {
         enemies_model_assign(i, i < 3 && enemies_staged.served[i] ? enemies_staged.folder[i] : "");
@@ -58982,6 +65293,7 @@ static void enemies_load_scene(DWORD number, void *callback)
             if (!enemies_build(number)) {
                 enemies_load.failed = 1;
                 log_line("enemies: battle %lu: %s; the stand-in battle 0 (scene 0:0) plays", number, enemies_problem);
+                far_apply(0, "the stand-in battle 0");     /* (far plane) a raised one put back */
             } else {
                 enemies_built_line(line);
                 log_line("enemies: battle %lu (DLL scene %d '%s' formation %d, built at its load): enemies %s; stand-in battle %d; AI %d of 4096 bytes; %d attacks; %lu ms",
@@ -59168,6 +65480,9 @@ static void enemies_start(int *ok, int *total)
     opens = enemies_find_driver_opens();
     enemies_native_base_check();
     install_surrounded(ok, total);      /* (surrounded) the two placement calls */
+    install_far(ok, total);             /* (far plane) the battle's exit call, after every byte it reads is checked */
+    install_stage();                    /* (stage model) on when the driver's file opens pass through this DLL */
+    install_stage_move(ok, total);      /* (stage section) the stage's three draw calls, all or none (needs stage_model) */
     enemies_live = 1;
     enemies_read_registry();
     enemies_static_models();
@@ -59213,8 +65528,11 @@ static void load_game_settings(void)
     test_party_damage = 0;          /* (test_party_damage) off unless this reading names an amount */
     fields_keys_begin();           /* (field capacity) fields_file, fields_table_size, field_buffer_bytes: their defaults */
     bl_keys_begin();                /* (breaking limits) breaking_limits, wide_skeletons: their defaults */
+    flim_keys_begin();              /* (field limits) field_limits: off unless the file says on */
     enemies_keys_begin();           /* (enemies) enemies: off unless the file says on */
     battle_menu_keys_begin();       /* (battle menu) battle_menu and its test mode's keys: their defaults */
+    warp_menu_keys_begin();         /* (warp menu) warp_menu: on unless the file says off; the table is read again at the page's next opening */
+    sfx_pan_keys_begin();           /* (sfx pan) sfx_pan_fix: on unless the file says off; taken at the first reading only */
     text = read_whole_file(GAME_FILE_NAME, &size);
     if (text) {
         file_end = text + size;
@@ -59405,12 +65723,27 @@ static void load_game_settings(void)
                     log_line("game file line %d: %s", line_number, box_fault);
                     problems++;
                 }
+            } else if ((box_answer = flim_key_line(start, key_end, value, stop, &box_fault)) != 0) {    /* (field limits) field_limits */
+                if (box_answer < 0) {
+                    log_line("game file line %d: %s", line_number, box_fault);
+                    problems++;
+                }
             } else if ((box_answer = enemies_key_line(start, key_end, value, stop, &box_fault)) != 0) { /* (enemies) enemies */
                 if (box_answer < 0) {
                     log_line("game file line %d: %s", line_number, box_fault);
                     problems++;
                 }
             } else if ((box_answer = battle_menu_key_line(start, key_end, value, stop, &box_fault)) != 0) {   /* (battle menu) battle_menu, battle_menu_test, _rewards, _lose, _restore, _fast, _locked */
+                if (box_answer < 0) {
+                    log_line("game file line %d: %s", line_number, box_fault);
+                    problems++;
+                }
+            } else if ((box_answer = warp_menu_key_line(start, key_end, value, stop, &box_fault)) != 0) {   /* (warp menu) warp_menu */
+                if (box_answer < 0) {
+                    log_line("game file line %d: %s", line_number, box_fault);
+                    problems++;
+                }
+            } else if ((box_answer = sfx_pan_key_line(start, key_end, value, stop, &box_fault)) != 0) {     /* (sfx pan) sfx_pan_fix */
                 if (box_answer < 0) {
                     log_line("game file line %d: %s", line_number, box_fault);
                     problems++;
@@ -59446,10 +65779,13 @@ static void load_game_settings(void)
     box_keys_settle();              /* (the box) */
     fields_keys_settle();           /* (field capacity) built once at start-up: a later change is said, not taken */
     bl_keys_settle();               /* (breaking limits) the calls are patched once, at start-up */
+    flim_keys_settle(bl_master_asked);  /* (field limits) taken at the first reading; moved at the kernel load */
     bs_keys_settle();               /* (vertex bones) behind it: it needs that call */
     enemies_keys_settle();          /* (enemies) taken at start-up only; set up by install_hooks (enemies_start); before test_battle, which asks it */
     test_battle_settle();           /* (test_battle) */
     battle_menu_keys_settle();      /* (battle menu) one line when what the keys say has changed */
+    warp_menu_keys_settle();        /* (warp menu) one line when what the key says has changed */
+    sfx_pan_keys_settle();          /* (sfx pan) the two divisors patched at the first reading; a later change is said, not taken */
     {
         static LONG fixed_hooked, fixed_live;
 
@@ -65233,6 +71569,7 @@ static void reload_config(void)
     character_names_scanned = 0;                        /* the character file's names, for `equip` lists */
     load_spell_names();
     load_game_settings();
+    battle_frame_factor_read("Re-init .ini files");    /* (battle frame factor) the marker again */
     enemies_reread("Re-init .ini files");   /* (enemies) the registry and the folders again; nothing when off */
     load_effect_copies();       /* (before the spell file: a spell's `animation = 0x100` is looked up in it) */
     commands_views_reinit();    /* (new commands, stage 8) a lent list put back and forgotten before the spell file frees the lists and handles */
@@ -65252,6 +71589,7 @@ static void reload_config(void)
     shop_adds_gear_check();     /* (wide shop) the shop files' wide gear entries against the definitions as they are now */
     reload_characters();
     commands_learn_settle("Re-init .ini files");   /* (new commands, stage 9b) the learned list entries, after the items file and the characters (their limit items) */
+    commands_mix_settle("Re-init .ini files");     /* (new commands, mix) the item results, after the items file and the teaching items */
     rebuild_item_ranks();       /* the sort-by-name places of every 16-bit item number (0-511 placed as before), from the names as they are now (after the characters: a limit item is named in a sheet) */
     wide_items_report();        /* (stage 2) wide items of the items file as it is now: admitted, or why not; nothing with none defined */
     seat_equipment();
@@ -67353,6 +73691,8 @@ static void battle_view_input(void)
 }
 /* ==== BATTLE PAGE: end ==== */
 
+#include "warp_menu.inc"
+
 static const struct { const char *label; const char *(*run)(void); } menu_entries[] = {
     { "Re-init .ini files", menu_reinit },
     { "Check External Spells", menu_spells },
@@ -67364,14 +73704,38 @@ static const struct { const char *label; const char *(*run)(void); } menu_entrie
     { "Check External Characters", menu_characters },
     { "Check Current Seats", menu_seats },
     { "Check Shops", menu_shops },
-    { "Fight: external battles", menu_battles },     /* (battle menu) the last row: left out with battle_menu = off */
+    { "Fight: external battles", menu_battles },     /* (battle menu) left out with battle_menu = off */
+    { "Warp: fields, GameMoment", menu_warp },       /* (warp menu) the last row: left out with warp_menu = off */
 };
 #define MENU_ENTRY_COUNT        ((int)(sizeof menu_entries / sizeof menu_entries[0]))
 
-/* The rows the debug list shows: all, or all but the battle page's (battle_menu = off). */
+/* The rows the debug list shows: all, or all but the battle page's (battle_menu = off) and the warp page's (warp_menu = off). */
+static BOOL menu_entry_shown(int i)
+{
+    return i < MENU_ENTRY_COUNT - 2 || (i == MENU_ENTRY_COUNT - 2 ? battle_menu_shown() : warp_menu_shown());
+}
+
 static int menu_entry_count(void)
 {
-    return battle_menu_shown() ? MENU_ENTRY_COUNT : MENU_ENTRY_COUNT - 1;
+    int i, n = 0;
+
+    for (i = 0; i < MENU_ENTRY_COUNT; i++)
+        n += menu_entry_shown(i);
+    return n;
+}
+
+/* The entry the k-th shown row stands for. */
+static int menu_entry_index(int k)
+{
+    int i;
+
+    for (i = 0; i < MENU_ENTRY_COUNT; i++)
+        if (menu_entry_shown(i)) {
+            if (!k)
+                return i;
+            k--;
+        }
+    return 0;
 }
 
 static DWORD own_grid[14];
@@ -68004,6 +74368,7 @@ static void __cdecl own_menu_handler(DWORD frame)
                     : menu_view == 7 ? "SpellExt  -  current seats"
                     : menu_view == 9 ? "SpellExt  -  shops"
                     : menu_view == BATTLE_VIEW ? "SpellExt  -  external battles"
+                    : menu_view == WARP_VIEW ? "SpellExt  -  warp (a testing aid)"
                     : menu_view >= 5 ? "SpellExt  -  external characters" : "SpellExt  -  debug");
     menu_text(0x18, 0x0d, text, 7);
     if (menu_view) {
@@ -68024,13 +74389,15 @@ static void __cdecl own_menu_handler(DWORD frame)
             draw_shop_view();
         else if (menu_view == BATTLE_VIEW)
             draw_battle_view();
+        else if (menu_view == WARP_VIEW)
+            draw_warp_view();
         menu_text_quarters = 4;
         if (menu_view == 5)
             draw_character_list();
         menu_message = spell_view_line;
     } else {
         for (i = 0; i < menu_entry_count(); i++) {
-            encode_text(text, menu_entries[i].label);
+            encode_text(text, menu_entries[menu_entry_index(i)].label);
             menu_text(0x42, 0x33 + 0x10 + i * 0x1a, text, 7);
         }
     }
@@ -68050,6 +74417,8 @@ static void __cdecl own_menu_handler(DWORD frame)
             shop_view_input();
         else if (menu_view == BATTLE_VIEW)
             battle_view_input();
+        else if (menu_view == WARP_VIEW)
+            warp_view_input();
         else
             character_view_input();
         if (menu_view == 0)
@@ -68071,7 +74440,7 @@ static void __cdecl own_menu_handler(DWORD frame)
     if (((unsigned (__cdecl *)(unsigned))FN_BUTTON_PRESSED)(0x20)) {
         if (own_grid[1] < (DWORD)menu_entry_count()) {
             ((void (__cdecl *)(int))FN_MENU_SOUND)(1);
-            menu_message = menu_entries[own_grid[1]].run();
+            menu_message = menu_entries[menu_entry_index((int)own_grid[1])].run();
         }
     } else if (((unsigned (__cdecl *)(unsigned))FN_BUTTON_PRESSED)(0x40)) {
         ((void (__cdecl *)(int))FN_MENU_SOUND)(4);
@@ -70473,6 +76842,7 @@ static int __cdecl kernel_loader_hook(void)
     load_spells();
     install_hooks();
     fields_start();                 /* (field capacity) once: the field tables from the registry, or the game's (off) */
+    field_limits_kernel_load();     /* (field limits) once, after the registry: the rest of the field tables, or nothing */
     outfit_start_report();          /* (the outfit swap) says whether a field_model_when has its hook */
     effect_copies_check_files();    /* (after install_hooks, which indexes the loose files: a copy whose files are missing is dropped) */
     effect_copies_install();        /* (after install_hooks: the effect step must be this DLL's) */
@@ -70500,6 +76870,7 @@ static int __cdecl kernel_loader_hook(void)
     if (limit_item_hook_state == 0 && wide_items_mode == WIDE_ON)
         install_limit_item();   /* (C0b) with no new character defined the Item menu's use step was never hooked, and a wide item is admitted only with it: the hook serves new items alone then (no limit item can exist) */
     commands_learn_settle("a kernel load");    /* (new commands, stage 9b) the learned list entries, after the commands and items files and the characters */
+    commands_mix_settle("a kernel load");      /* (new commands, mix) the item results, after the items file and the teaching items */
     rebuild_item_ranks();       /* (a later kernel load read the files again; after the characters: a limit item is named in a sheet) */
     follow_esui_battle_avatars();
     fix_equipment_power();
@@ -70692,6 +77063,7 @@ BOOL WINAPI DllMain(HINSTANCE self, DWORD reason, LPVOID reserved)
         dll_module = self;
         AddVectoredExceptionHandler(1, crash_logger);
         fields_widen_maplist_block();   /* (field capacity, step 0) before the game reads its maplist; whatever the config */
+        field_limits_dllmain();         /* (field limits) the tables the driver takes from the game's code: only when the game file asks */
 #ifndef SPELLEXT_AS_MOD
         log_line("FF7 SpellExt loaded at %08lx; exe at %08lx, original driver at %08lx", (DWORD)self,
                  (DWORD)GetModuleHandleA(NULL), (DWORD)GetModuleHandleA("AF3DN_orig.dll"));
@@ -70707,6 +77079,7 @@ BOOL WINAPI DllMain(HINSTANCE self, DWORD reason, LPVOID reserved)
             show_tables_to_driver();
             if (!hook_driver_entry()) {
                 fields_give_back();     /* (field capacity) step 0's push back: an inactive DLL leaves the exe as it was */
+                field_limits_give_back();   /* (field limits) the start-up half back, the same way */
                 log_line("NOT active: without the driver's entry there is no safe moment to hook the game");
             }
         }

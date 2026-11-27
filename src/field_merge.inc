@@ -24,12 +24,13 @@
      - 7 bytes of code at the END of the bytecode:  CHAR m ; PC id ; RET | RET | RET
        slot 0 -> the CHAR (init runs to the first RET, main is the RET after it),
        slots 1 to 31 -> the last RET;
-     - a model entry at the end of section 3's models.
+     - a model entry after the last model a CHAR owns: at the end of section 3's models, or
+       before the models no CHAR reaches (below).
    So with k extras: every existing script offset moves by 72k (the header rows), the text
    table offset and every AKAO offset by 72k + 7k (+1, see below), sections 2 and 3 by the
    same, sections 4 to 9 by that plus the new model entries. Jumps inside scripts are relative
-   and the bytecode is not touched. New entities and models are LAST, so every existing entity
-   number and model number keeps its meaning.
+   and the bytecode is not touched. New entities are LAST and new models follow the last owned
+   one, so every existing entity number and every model a CHAR owns keeps its number.
    One field of the game's (snw_w) has script slots that point at the very end of the bytecode;
    one RET is put there first so that they do not run into the new entity's code. The same RET
    is written when the bytecode's last command is neither RET nor a jump back (a mod's field;
@@ -38,14 +39,24 @@
    The engine gives models to entities in the order their CHAR commands run (FUN_00614353 takes
    a running counter, not the operand), so the new entity only gets the new model if every
    model before it is taken by a CHAR: the number of CHAR commands in the bytecode must equal
-   the model count, or the field is refused; and so must the number the entities' first scripts
+   the script header's model count, or the field is refused; and so must the number the entities' first scripts
    run, walked as the engine runs them (to the first RET; a CHAR after a jump is refused). The
    same sweep finds a PC command for a seat's ID: a field that already has an entity for that
    character (one built by hand, or this merge done before) is not given a second one. A field
-   with no PC command at all is refused: its player is model 0 and its scripts rely on that. */
+   with no PC command at all is refused: its player is model 0 and its scripts rely on that.
 
-#define FM_MAX_ENTITIES 48      /* the engine's per-entity tables (00cbfb70, 00cc0830 ...) */
-#define FM_MAX_MODELS   16      /* the engine's model array, 16 x 0x88 at 00cc1670 */
+   MODELS NO CHAR REACHES (a mod's section 3 longer than its scripts; none of the game's own fields
+   is like that, 11 fields of field mods are, 2026-11): the script header and
+   the CHARs agree on N, section 3 lists N + u. The loader loads all N + u (FUN_0063d993, the count at
+   section 3 + 2); the CHARs own 0 .. N-1; models N .. N+u-1 are loaded and owned by nobody, and lie past
+   every loop bounded by the header's count (the reset 0060bcfa, the talk test 00636284, the body test
+   00637724). The new models are put IN at N, before them: the new CHARs take N .. N+k-1, every old CHAR
+   keeps its model, the unowned move to N+k .. and stay past the header (now N + k). With u = 0 this is
+   the append above, byte for byte. Any other disagreement is still refused. */
+
+#define FM_MAX_ENTITIES fm_room_entities     /* the engine's per-entity tables (00cbfb70, 00cc0830 ...): 48, or 255 */
+#define FM_MAX_MODELS   fm_room_models       /* the engine's model array, 16 x 0x88 at 00cc1670: 16, or 32 */
+static unsigned fm_room_entities = 48, fm_room_models = 16;  /* the game's; field limits sets 255 and 32 when it is on */
 #define FM_MAX_EXTRAS   4
 
 struct field_extra {
@@ -217,7 +228,7 @@ static unsigned field_add_entities(const unsigned char *in, unsigned in_len, uns
     unsigned ne, nm, strings, na, names, akao, rows, code_start, at_end = 0;
     unsigned nm3, models_end, p, pcs = 0, chars = 0, init_chars = 0, last_op = 0;
     unsigned cloud_fixed = 0, cloud_anims = 0, cloud_count = 0, cloud_three = 0, have_cloud = 0;
-    unsigned first_fixed = 0;
+    unsigned first_fixed = 0, split = 0;   /* split: where model nm (the first no CHAR reaches) starts in s3 */
     unsigned src_fixed, entry_tail, take[FM_MAX_EXTRAS], k = 0, grow1, grow3, total, name_len[FM_MAX_EXTRAS];
     unsigned anim_at[3], anim_len[3];
     int e, left_out = 0;
@@ -337,16 +348,18 @@ static unsigned field_add_entities(const unsigned char *in, unsigned in_len, uns
         return 0;
     }
     nm3 = fm_u16(s3 + 2);
-    if (nm3 != nm) {
+    /* nm3 > nm is taken only when the header and BOTH CHAR counts say nm (models nm .. nm3-1 then have no
+       CHAR); every other disagreement keeps the old refusal and its text */
+    if (nm3 != nm && (nm3 < nm || chars != nm || init_chars != nm)) {
         fm_why(why, why_cap, "the script section and the model section disagree on the number of models", -1);
         return 0;
     }
-    if (chars != nm3) {
+    if (chars != nm) {
         fm_why(why, why_cap, "the scripts' CHAR commands do not match the models (a new entity would get another's model), CHARs ",
                (long)chars);
         return 0;
     }
-    if (init_chars != nm3) {
+    if (init_chars != nm) {
         fm_why(why, why_cap, "the CHAR commands the entities' first scripts run do not match the models (a new entity would get another's model), CHARs run ",
                (long)init_chars);
         return 0;
@@ -367,7 +380,9 @@ static unsigned field_add_entities(const unsigned char *in, unsigned in_len, uns
         h = s3 + fixed + 2;
         if (!i)
             first_fixed = fixed;
-        if (!have_cloud && (h[0] | 0x20) == 'a' && (h[1] | 0x20) == 'a' && (h[2] | 0x20) == 'a' && (h[3] | 0x20) == 'a' &&
+        if (i == nm)
+            split = p;                              /* the first model no CHAR reaches */
+        if (!have_cloud && i < nm && (h[0] | 0x20) == 'a' && (h[1] | 0x20) == 'a' && (h[2] | 0x20) == 'a' && (h[3] | 0x20) == 'a' &&
             h[4] == '.' && (h[5] | 0x20) == 'h' && (h[6] | 0x20) == 'r' && (h[7] | 0x20) == 'c') {
             have_cloud = 1;
             cloud_fixed = fixed;
@@ -377,6 +392,8 @@ static unsigned field_add_entities(const unsigned char *in, unsigned in_len, uns
         p = end;
     }
     models_end = p;
+    if (nm == nm3)
+        split = models_end;                         /* every model has its CHAR: the new ones go last */
     s3_end = n3;
 
     /* ---- a field with no PC command at all ----
@@ -504,7 +521,7 @@ static unsigned field_add_entities(const unsigned char *in, unsigned in_len, uns
         out[at++] = 0x00;                                       /* RET for the slots that pointed at the end */
     for (i = 0; i < k; i++) {
         out[at++] = 0xa1;                                       /* CHAR */
-        out[at++] = (unsigned char)(nm3 + i);
+        out[at++] = (unsigned char)(nm + i);                    /* the model it will take (the operand is not read) */
         out[at++] = 0xa0;                                       /* PC */
         out[at++] = extra[take[i]].seat;
         out[at++] = 0x00;                                       /* RET: end of init */
@@ -517,7 +534,7 @@ static unsigned field_add_entities(const unsigned char *in, unsigned in_len, uns
     /* section 3 */
     fm_put32(out + at, fm_u32(in + off[2]) + grow3);
     at += 4;
-    fm_copy(out, &at, s3, models_end);
+    fm_copy(out, &at, s3, split);                               /* the header and the models with a CHAR */
     fm_put16(out + off[2] + grow1 + 4 + 2, nm3 + k);
     for (i = 0; i < k; i++) {
         unsigned a;
@@ -543,6 +560,7 @@ static unsigned field_add_entities(const unsigned char *in, unsigned in_len, uns
             }
         }
     }
+    fm_copy(out, &at, s3 + split, models_end - split);          /* the models no CHAR reaches (none: 0 bytes) */
     fm_copy(out, &at, s3 + models_end, s3_end - models_end);    /* whatever followed the models */
     /* sections 4 to 9 and anything after them */
     fm_copy(out, &at, in + off[3], in_len - off[3]);
